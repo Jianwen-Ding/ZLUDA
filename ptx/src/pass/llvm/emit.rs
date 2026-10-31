@@ -1716,17 +1716,13 @@ impl<'a> MethodEmitContext<'a> {
 
     fn emit_load_carry_flag(
         &mut self,
-        reverse_carry: bool,
         type_: ast::ScalarType,
     ) -> Result<LLVMValueRef, TranslateError> {
         let carry_flag = self.get_or_emit_carry_flag()?;
         let builder = self.builder;
         let pred_type = unsafe { LLVMIntTypeInContext(self.context, 1) };
-        let mut load =
+        let load =
             unsafe { LLVMBuildLoad2(builder, pred_type, carry_flag, LLVM_UNNAMED.as_ptr()) };
-        if reverse_carry {
-            load = self.emit_not_impl(pred_type, load);
-        }
         let zext = unsafe {
             LLVMBuildZExt(
                 builder,
@@ -1738,24 +1734,18 @@ impl<'a> MethodEmitContext<'a> {
         Ok(zext)
     }
 
-    fn emit_store_carry_flag(
-        &mut self,
-        reverse_carry: bool,
-        mut value: LLVMValueRef,
-    ) -> Result<(), TranslateError> {
+    fn emit_store_carry_flag(&mut self, value: LLVMValueRef) -> Result<(), TranslateError> {
         let carry_flag = self.get_or_emit_carry_flag()?;
-        if reverse_carry {
-            value = self.emit_not_impl(unsafe { LLVMIntTypeInContext(self.context, 1) }, value);
-        }
         unsafe {
             LLVMBuildStore(self.builder, value, carry_flag);
         };
         Ok(())
     }
 
+    /// `add.cc` / `addc` / `sub.cc` / `subc` / `mad.cc` / `madc`: CC.CF holds the carry of an addition and the borrow
+    /// of a subtraction ("borrow-out written to CC.CF", "d = a - (b + CC.CF)", PTX ISA 9.7.2.3-9.7.2.4).
     fn emit_extended_arithmetic(
         &mut self,
-        reverse_carry: bool,
         op: LLVMOpcode,
         op_name: &str,
         data: ast::CarryDetails,
@@ -1773,7 +1763,7 @@ impl<'a> MethodEmitContext<'a> {
                         self.builder,
                         op,
                         sum,
-                        self.emit_load_carry_flag(reverse_carry, data.type_)?,
+                        self.emit_load_carry_flag(data.type_)?,
                         LLVM_UNNAMED.as_ptr(),
                     )
                 }
@@ -1782,12 +1772,12 @@ impl<'a> MethodEmitContext<'a> {
                 // { sum, overflow } = lhs + rhs
                 let (sum, overflow) =
                     self.emit_binop_with_overflow(&op_name, data.type_, lhs, rhs)?;
-                self.emit_store_carry_flag(reverse_carry, overflow)?;
+                self.emit_store_carry_flag(overflow)?;
                 sum
             }
             ast::CarryKind::CarryInCarryOut => {
                 // { final_sum, final_overflow } = lhs + rhs + carry
-                let carry_in = self.emit_load_carry_flag(reverse_carry, data.type_)?;
+                let carry_in = self.emit_load_carry_flag(data.type_)?;
 
                 let (sum, overflow1) =
                     self.emit_binop_with_overflow(&op_name, data.type_, lhs, rhs)?;
@@ -1796,7 +1786,7 @@ impl<'a> MethodEmitContext<'a> {
                 let final_overflow = unsafe {
                     LLVMBuildOr(self.builder, overflow1, overflow2, LLVM_UNNAMED.as_ptr())
                 };
-                self.emit_store_carry_flag(reverse_carry, final_overflow)?;
+                self.emit_store_carry_flag(final_overflow)?;
                 final_sum
             }
         };
@@ -1811,7 +1801,6 @@ impl<'a> MethodEmitContext<'a> {
         arguments: ast::AddExtendedArgs<SpirvWord>,
     ) -> Result<(), TranslateError> {
         self.emit_extended_arithmetic(
-            false,
             LLVMOpcode::LLVMAdd,
             "uadd",
             data,
@@ -1827,7 +1816,6 @@ impl<'a> MethodEmitContext<'a> {
         arguments: ast::SubExtendedArgs<SpirvWord>,
     ) -> Result<(), TranslateError> {
         self.emit_extended_arithmetic(
-            true,
             LLVMOpcode::LLVMSub,
             "usub",
             data,
@@ -1851,7 +1839,6 @@ impl<'a> MethodEmitContext<'a> {
         let src3 = self.resolver.value(arguments.src3)?;
 
         self.emit_extended_arithmetic(
-            false,
             LLVMOpcode::LLVMAdd,
             "uadd",
             ast::CarryDetails {

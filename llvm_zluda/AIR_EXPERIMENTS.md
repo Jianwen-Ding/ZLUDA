@@ -322,3 +322,17 @@ failures); Geekbench GPU time 26.85 -> 26.09 s, score 53249 (within the 53441-54
   strict 20135 -> 19921. The remaining observers are real bit uses (sign tests, xor of the sign, or with sign bits):
   NaN canonicalization is no longer the main strict cost; the rest is denormal emulation (air.ieee-fp32) and
   comparisons on the bits. Test agx_tests/ftz-nan-phi.ptx.
+
+## Strict FP: .ftz min / max to the hardware (2026-10-31)
+
+LLVMZludaAirCompareFloatBits rewrote every f32 min / max on the bits (about 20 integer instructions), ignoring
+its `functions` argument, which the comparisons respect: AGX's f32 compare (fcmpsel ltn / gtn) already orders a
+denormal as zero, PTX's .ftz order, and the backend's lowering of minimumnum / maximumnum handles signed zeros and
+NaN operands. Now .ftz f32 min / max go to the hardware in AGX code (still on the bits for IEEE functions and for
+Metal). Cycles is .ftz throughout (3284 max.ftz, 1644 min.ftz).
+
+- intersect_closest strict 19921 -> 16732 instructions (default 15069).
+- Blender Open Data strict: monster 279 -> 345, junkshop 79.4 -> 97.7, classroom 65.5 -> 81.9 samples/min.
+- Geekbench strict 49641 -> 53084. llama strict 4/4 exact. Suites unchanged (strict 1928, default 1818).
+- New test agx_tests/ftz-minmax.ptx (denormals, NaNs, signed zeros): passes on the simulator and on the GPU
+  (agx_run_hw), as do ftz-nan-chain and ftz-nan-phi.

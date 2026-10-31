@@ -3349,6 +3349,10 @@ int LLVMZludaAirCompareFloatBits(LLVMModuleRef M, int functions)
             unsigned w = f32 ? 32 : 16;
             uint64_t sign = f32 ? 0x80000000 : 0x8000, magMask = sign - 1, inf = f32 ? 0x7f800000 : 0x7f80;
             bool ftz = f32 && F.getDenormalMode(APFloat::IEEEsingle()).Input != DenormalMode::IEEE;
+            // (as the comparisons: AGX's f32 min / max compare a denormal as zero, which is .ftz's order, with
+            // signed zeros and NaN operands done by the backend's lowering)
+            if (f32 && !(functions & (ftz ? 2 : 1)))
+                continue;
             IRBuilder<> B(II);
             Type *IT = B.getIntNTy(w);
             auto k = [&](uint64_t v) { return ConstantInt::get(IT, v); };

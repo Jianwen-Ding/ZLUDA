@@ -19,7 +19,7 @@ use crate::utils::{Context, Message, Module, PassBuilderOptions, TargetMachine};
 use crate::{
     LLVMZludaAgxKeepGlobals, LLVMZludaAgxLowerAddressSpaces, LLVMZludaAgxLowerClusters, LLVMZludaAgxSpillClusterShared,
     LLVMZludaAirFunctionPointers, LLVMZludaSetAirPrimitives, LLVMZludaAirGlobalsToBuffer, LLVMZludaAirInlineGlobalUsers,
-    LLVMZludaAirRemapAddressSpaces, LLVMZludaAirSharedLayout, LLVMZludaAirStaticRounding, LLVMZludaAirDropCompareFlushes, LLVMZludaAirExpandDivisions, LLVMZludaAirCanonicalNaNs, LLVMZludaAirCompareFloatBits, LLVMZludaAirKernelModule, LLVMZludaAirSaltKernels, LLVMZludaAgxCanonicalizeFoldedNaNs, LLVMZludaLinkUsedDefinitions,
+    LLVMZludaAirRemapAddressSpaces, LLVMZludaAirSharedLayout, LLVMZludaAirStaticRounding, LLVMZludaAirDropCompareFlushes, LLVMZludaAirDropMinMaxFixups, LLVMZludaAirExpandDivisions, LLVMZludaAirCanonicalNaNs, LLVMZludaAirTextureSampleHint, LLVMZludaAirCompareFloatBits, LLVMZludaAirKernelModule, LLVMZludaAirSaltKernels, LLVMZludaAgxCanonicalizeFoldedNaNs, LLVMZludaLinkUsedDefinitions,
     LLVMZludaUpgradeFunctionAttributes,
 };
 use llvm_sys::target_machine::{
@@ -221,6 +221,8 @@ pub fn compile_air(
     }
     // PTX's rounding modifiers as the static rounding of each operation (AIR has no mode register)
     unsafe { LLVMZludaAirDropCompareFlushes(linked.get()) };
+    // and the fix-ups of float min / max that only other min / max read
+    unsafe { LLVMZludaAirDropMinMaxFixups(linked.get()) };
     unsafe { LLVMZludaAirStaticRounding(linked.get(), strict_fp as i32) };
     // the AIR primitives internal once nothing creates new calls of them, so that the unused ones go
     let mut f = unsafe { llvm_sys::core::LLVMGetFirstFunction(linked.get()) };
@@ -357,7 +359,14 @@ pub fn compile_air(
         }
     }
 
-    // AGX: the portable AIR through agx-lower-air and the AGX backend
+    // AGX: the portable AIR through agx-lower-air and the AGX backend, with O3 again for AGX first
+    // (ZLUDA_AIR_AGX_PIPELINE: o3, none): its pipeline lowers AIR to AGX before anything else, and then optimizes
+    // with AGX's cost model, which AIR's O3 has not (Geekbench's GEMM unrolled half as far as AGX's
+    // threadgroup-load unrolling makes it: 24% slower)
+    let agx_pipeline: Option<&CStr> = match std::env::var("ZLUDA_AIR_AGX_PIPELINE").as_deref() {
+        Ok("none") => None,
+        _ => Some(c"default<O3>"),
+    };
     let agx_object = match agx_cpu {
         None => None,
         Some(cpu) => {
@@ -423,6 +432,9 @@ pub fn compile_air(
                                         LLVMZludaAirKernelModule(whole.get(), name.as_ptr())
                                     });
                                     drop(whole);
+                                    if let Some(pipeline) = agx_pipeline {
+                                        run(&one, pipeline, &agx, &PassBuilderOptions::new())?;
+                                    }
                                     let mut asm = Vec::new();
                                     if want_asm {
                                         asm = agx
@@ -457,6 +469,10 @@ pub fn compile_air(
                     hook(&object, String::from("o"));
                 }
                 return Ok(AirCompilation { portable, metal: metal_air, metal_globals, agx_object: Some(object) });
+            }
+            if let Some(pipeline) = agx_pipeline {
+                run(&linked, pipeline, &agx, &options)?;
+                stage("the AGX pipeline");
             }
             if let Some(hook) = text_hook {
                 stage("(writing the IR files)");
@@ -511,6 +527,8 @@ fn kernel_names(module: &Module) -> Vec<CString> {
 /// (air.precise-math); strict mode's canonical NaNs and denormal comparisons; function pointers as IDs.
 fn finish_air(ctx: &Context, module: &Module, strict_fp: bool) -> Result<(), String> {
     let fail = |err: *mut std::ffi::c_char| Message::new(unsafe { CStr::from_ptr(err) }).to_str().to_string();
+    // the texture unit's sample as an AIR hint, now that nothing optimizes its operands away
+    unsafe { LLVMZludaAirTextureSampleHint(module.get()) };
     // PTX has no fast math by default (only the .approx / .ftz forms, which the front end writes out): Metal is
     // to compile without it (air.precise-math), which also keeps the error-free transformations of the directed
     // rounding emulations intact

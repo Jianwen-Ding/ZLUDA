@@ -1,0 +1,80 @@
+// Directed rounding in recursive .func bodies (PTX ISA 9.7.3: .rp/.rm/.rz round each instruction, wherever it
+// is): functions that cannot be inlined take their caller's floating point mode as an argument on AIR.
+// Each adds a step n times, recursively; round to nearest would give 1.0, -1.0 and 1 + 10 * 2^-23.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.func (.reg .f32 r) up(.reg .f32 x, .reg .f32 t, .reg .u32 n)
+{
+    .reg .pred %p; .reg .u32 m;
+    setp.eq.u32 %p, n, 0;
+    @%p bra $done;
+    add.rp.f32 x, x, t;
+    sub.u32 m, n, 1;
+    call (x), up, (x, t, m);
+$done:
+    mov.f32 r, x;
+    ret;
+}
+.func (.reg .f32 r) down(.reg .f32 x, .reg .f32 t, .reg .u32 n)
+{
+    .reg .pred %p; .reg .u32 m;
+    setp.eq.u32 %p, n, 0;
+    @%p bra $done;
+    sub.rm.f32 x, x, t;
+    sub.u32 m, n, 1;
+    call (x), down, (x, t, m);
+$done:
+    mov.f32 r, x;
+    ret;
+}
+// mutually recursive, toward zero
+.func (.reg .f32 r) zb(.reg .f32 x, .reg .f32 t, .reg .u32 n);
+.func (.reg .f32 r) za(.reg .f32 x, .reg .f32 t, .reg .u32 n)
+{
+    .reg .pred %p; .reg .u32 m;
+    setp.eq.u32 %p, n, 0;
+    @%p bra $done;
+    add.rz.f32 x, x, t;
+    sub.u32 m, n, 1;
+    call (x), zb, (x, t, m);
+$done:
+    mov.f32 r, x;
+    ret;
+}
+.func (.reg .f32 r) zb(.reg .f32 x, .reg .f32 t, .reg .u32 n)
+{
+    .reg .pred %p; .reg .u32 m;
+    setp.eq.u32 %p, n, 0;
+    @%p bra $done;
+    add.rz.f32 x, x, t;
+    sub.u32 m, n, 1;
+    call (x), za, (x, t, m);
+$done:
+    mov.f32 r, x;
+    ret;
+}
+
+.visible .entry k(.param .u64 pin, .param .u64 pout)
+{
+    .reg .f32 %f<8>; .reg .u32 %n; .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [pin];
+    ld.param.u64 %rd2, [pout];
+    ld.global.f32 %f1, [%rd1];      // 1.0
+    ld.global.f32 %f2, [%rd1+4];    // 2^-24
+    ld.global.f32 %f3, [%rd1+8];    // 3 * 2^-24
+    ld.global.u32 %n, [%rd1+12];    // 5
+    call (%f4), up, (%f1, %f2, %n);
+    neg.f32 %f5, %f1;
+    call (%f5), down, (%f5, %f2, %n);
+    call (%f6), za, (%f1, %f3, %n);
+    add.rn.f32 %f7, %f1, %f2;       // the kernel's own: 1.0, a tie to even
+    st.global.v4.f32 [%rd2], {%f4, %f5, %f6, %f7};
+    ret;
+}
+
+.buffer IN .u32 = { 0x3F800000, 0x33800000, 0x34400000, 5 };
+.buffer OUT .u32 [4];
+.launch k <<< 1, 1 >>> (IN, OUT);
+.expect OUT .u32 = { 0x3F800005, 0xBF800005, 0x3F800005, 0x3F800000 };

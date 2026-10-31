@@ -217,7 +217,7 @@ pub fn to_llvm_module_with_options<'input>(
     agx_matrix::set_fast_mma(fast_mma && target.is_air());
     let directives = instruction_mode_to_global_mode::run(&mut flat_resolver, directives)?;
     on_pass_end("instruction_mode_to_global_mode");
-    let mut directives = insert_explicit_load_store::run(&mut flat_resolver, directives)?;
+    let mut directives = insert_explicit_load_store::run(&mut flat_resolver, directives, target.is_air())?;
     on_pass_end("insert_explicit_load_store");
     let mut metadata32 = None;
     if ast.address_size == 32 {

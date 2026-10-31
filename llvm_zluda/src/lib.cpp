@@ -2821,7 +2821,7 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
     }
     // A function whose operations take the mode it is called in (add.rp.f32 in a .func, whose caller sets the
     // rounding before the call) inlined where it is called directly, as the kernels' others were: the mode then
-    // reaches its operations. (Recursive ones keep round to nearest.)
+    // reaches its operations.
     {
         auto readsMode = [&](Function &F) {
             for (Instruction &I : instructions(F))
@@ -2849,6 +2849,59 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
             {
                 InlineFunctionInfo IFI;
                 InlineFunction(*CI, IFI);
+            }
+        }
+        // The ones still called (recursive functions, and those calling them) take the caller's mode as a last
+        // argument instead, which starts their mode: each call passes the mode at the call (a get of it, which
+        // makes the caller one of them too, up to the kernels)
+        for (bool again = true; again;)
+        {
+            again = false;
+            SmallVector<Function *, 4> work;
+            for (Function &F : *Mod)
+                if (!F.isDeclaration() && !F.hasFnAttribute("air-kernel") && !F.hasFnAttribute("zluda-fpmode-arg") &&
+                    readsMode(F) && !F.use_empty() &&
+                    all_of(F.users(), [&](User *U) {
+                        auto *CI = dyn_cast<CallInst>(U);
+                        return CI && CI->getCalledFunction() == &F;
+                    }))
+                    work.push_back(&F);
+            if (work.empty())
+                break;
+            if (!Get)
+                Get = Function::Create(FunctionType::get(Type::getInt32Ty(Ctx), false), GlobalValue::ExternalLinkage,
+                                       "__zluda_air.get.fpmode", Mod);
+            for (Function *F : work)
+            {
+                SmallVector<Type *, 8> params(F->getFunctionType()->params());
+                params.push_back(Type::getInt32Ty(Ctx));
+                Function *NF = Function::Create(FunctionType::get(F->getReturnType(), params, false), F->getLinkage(),
+                                                F->getAddressSpace(), "", Mod);
+                NF->copyAttributesFrom(F);
+                NF->addFnAttr("zluda-fpmode-arg");
+                NF->splice(NF->begin(), F);
+                for (unsigned i = 0; i < F->arg_size(); i++)
+                {
+                    F->getArg(i)->replaceAllUsesWith(NF->getArg(i));
+                    NF->getArg(i)->takeName(F->getArg(i));
+                }
+                NF->getArg(F->arg_size())->setName("fpmode.in");
+                NF->takeName(F);
+                for (User *U : make_early_inc_range(F->users()))
+                {
+                    auto *CI = cast<CallInst>(U);
+                    IRBuilder<> B(CI);
+                    SmallVector<Value *, 8> args(CI->args());
+                    args.push_back(B.CreateCall(Get));
+                    CallInst *New = B.CreateCall(NF, args);
+                    New->setCallingConv(CI->getCallingConv());
+                    New->setAttributes(CI->getAttributes());
+                    New->takeName(CI);
+                    CI->replaceAllUsesWith(New);
+                    CI->eraseFromParent();
+                }
+                F->eraseFromParent();
+                again = true;
             }
         }
     }
@@ -2879,7 +2932,11 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
         // or not, as its denormal mode, and a later mode as a set of all the bits)
         bool ftz32 = F.getDenormalMode(APFloat::IEEEsingle()).Output != DenormalMode::IEEE;
         bool ftz16 = F.getDenormalMode(APFloat::IEEEhalf()).Output != DenormalMode::IEEE;
-        Entry.CreateStore(ConstantInt::get(I32, 1 | (1 << 2) | (ftz32 ? 0x10 : 0) | (ftz16 ? 0x20 : 0)), mode);
+        Entry.CreateStore(F.hasFnAttribute("zluda-fpmode-arg")
+                              ? static_cast<Value *>(F.getArg(F.arg_size() - 1))
+                              : ConstantInt::get(I32, 1 | (1 << 2) | (ftz32 ? 0x10 : 0) | (ftz16 ? 0x20 : 0)),
+                          mode);
+        F.removeFnAttr("zluda-fpmode-arg");
         for (CallInst *CI : sets)
         {
             new StoreInst(CI->getArgOperand(0), mode, CI->getIterator());

@@ -9,25 +9,29 @@ use super::*;
 //   loads into `param::entry` loads
 // * All `.func` input arguments are turned into `.reg` arguments by another
 //   pass, so we do nothing there
+// `mutable_args`: give functions' .reg input arguments variables (see run_method); on AIR only for now: the AMD
+// target's LLVM IR snapshots (ptx/src/test/ll) would change, and need regenerating with the amdgpu feature.
 pub(super) fn run<'a, 'input>(
     resolver: &mut GlobalStringIdentResolver2<'input>,
     directives: Vec<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>,
+    mutable_args: bool,
 ) -> Result<Vec<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>, TranslateError> {
     directives
         .into_iter()
-        .map(|directive| run_directive(resolver, directive))
+        .map(|directive| run_directive(resolver, directive, mutable_args))
         .collect::<Result<Vec<_>, _>>()
 }
 
 fn run_directive<'a, 'input>(
     resolver: &mut GlobalStringIdentResolver2<'input>,
     directive: Directive2<ast::Instruction<SpirvWord>, SpirvWord>,
+    mutable_args: bool,
 ) -> Result<Directive2<ast::Instruction<SpirvWord>, SpirvWord>, TranslateError> {
     Ok(match directive {
         var @ Directive2::Variable(..) => var,
         Directive2::Method(method) => {
             let visitor = InsertMemSSAVisitor::new(resolver);
-            Directive2::Method(run_method(visitor, method)?)
+            Directive2::Method(run_method(visitor, method, mutable_args)?)
         }
     })
 }
@@ -35,6 +39,7 @@ fn run_directive<'a, 'input>(
 fn run_method<'a, 'input>(
     mut visitor: InsertMemSSAVisitor<'a, 'input>,
     mut method: Function<ast::Instruction<SpirvWord>, SpirvWord>,
+    mutable_args: bool,
 ) -> Result<Function<ast::Instruction<SpirvWord>, SpirvWord>, TranslateError> {
     if method.is_kernel() {
         for arg in method.input_arguments.iter_mut() {
@@ -52,10 +57,42 @@ fn run_method<'a, 'input>(
     for arg in method.return_arguments.iter_mut() {
         visitor.visit_variable(arg)?;
     }
+    // A function's .reg input arguments are registers the body may write (PTX ISA 5.1.1), also in a branch: each is
+    // a variable copied from the incoming value at the entry (mem2reg removes the copy where it is not written)
+    let mut entry = Vec::new();
+    if mutable_args && !method.is_kernel() && method.body.is_some() {
+        for arg in method.input_arguments.iter_mut() {
+            if arg.info.state_space != ast::StateSpace::Reg {
+                continue;
+            }
+            let old_name = arg.name;
+            let incoming = visitor
+                .resolver
+                .register_unnamed(Some((arg.info.v_type.clone(), ast::StateSpace::Reg)));
+            arg.name = incoming;
+            entry.push(Statement::Variable(ast::Variable {
+                name: old_name,
+                info: ast::VariableInfo {
+                    align: None,
+                    v_type: arg.info.v_type.clone(),
+                    state_space: ast::StateSpace::Reg,
+                    array_init: Vec::new(),
+                },
+            }));
+            entry.push(Statement::Instruction(ast::Instruction::Mov {
+                data: ast::MovDetails { typ: arg.info.v_type.clone() },
+                arguments: ast::MovArgs { dst: old_name, src: incoming },
+            }));
+        }
+    }
     let return_arguments = &method.return_arguments[..];
     let body = method
         .body
         .map(move |statements| {
+            // (after the body's first label, which starts every body)
+            let mut statements = statements;
+            let at = matches!(statements.first(), Some(Statement::Label(_))) as usize;
+            statements.splice(at..at, entry);
             let mut result = Vec::with_capacity(statements.len());
             for statement in statements {
                 run_statement(&mut visitor, return_arguments, &mut result, statement)?;

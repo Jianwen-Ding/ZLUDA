@@ -129,6 +129,9 @@ the order it was found:
   NaN (playground 2026-10-11-float-semantics), so their canonical NaN is one integer comparison with it
   (llvm 315e9fba): 28016 -> 24283 instructions, monster 261 -> 271, classroom 61.7 -> 63.4, the same image. Other
   producers (rcp, rsqrt, exp2, conversions) keep the two instructions: their NaN output is not established.
+  Then established (playground 2026-10-31-special-nan: rcp, rsqrt, exp2, log2 give 0x7fc00000 too; llvm
+  ca3980ea). Strict mode with all of it: Geekbench 48702 (default 54807), Open Data junkshop 76.6 (default 162),
+  llama.cpp pp128 382.5 t/s (default 430), completions exact.
 - The harness has error margins now: `--ulp N` and `--flush-ok` (float-typed checks only), PASS~ in its output.
 - **llama.cpp generation, where the time goes (AIR route, graph batching)**: 44 t/s, the main thread waiting on
   the GPU 80% of the time; kernels 14.4 ms per token (mul_mat_vec_q<Q5_1> 6.6 ms, 62 us a launch; the Q8_0 output

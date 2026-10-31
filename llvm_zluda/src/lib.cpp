@@ -33,6 +33,7 @@
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/Support/Alignment.h>
 #include <array>
+#include <map>
 #include <optional>
 #include <functional>
 #include <string>
@@ -3046,31 +3047,69 @@ int LLVMZludaAirCanonicalNaNs(LLVMModuleRef M)
                 if (auto *II = dyn_cast<IntrinsicInst>(UI))
                     return II->getIntrinsicID() == Intrinsic::fptoui_sat ||
                            II->getIntrinsicID() == Intrinsic::fptosi_sat;
-                // a .ftz flush on the bits, select((b & 0x7f800000) == 0, b & 0x80000000, b), back to a float: it
-                // passes a NaN on unchanged
+                // .ftz flushes on the bits, select((b & 0x7f800000) == 0, sign bits, b), back to a float: a NaN
+                // passes them unchanged (its exponent is not zero), also when a flushed value is flushed again (the
+                // next .ftz operation's operand) and the sign bits are shared among them
                 if (auto *BC = dyn_cast<BitCastInst>(UI); BC && BC->getType()->isIntegerTy(32))
                 {
                     using namespace PatternMatch;
-                    SelectInst *flush = nullptr;
-                    for (User *BU : BC->users())
-                        if (auto *Sel = dyn_cast<SelectInst>(BU); Sel && Sel->getFalseValue() == BC)
-                            flush = Sel;
-                    if (!flush ||
-                        !match(flush->getCondition(),
-                               m_SpecificICmp(ICmpInst::ICMP_EQ, m_And(m_Specific(BC), m_SpecificInt(0x7f800000)), m_Zero())) ||
-                        !match(flush->getTrueValue(), m_And(m_Specific(BC), m_SpecificInt(0x80000000))))
-                        return false;
-                    // (the bits read by nothing else than the flush's tests)
-                    auto *cond = cast<Instruction>(flush->getCondition());
-                    auto *mask = cast<Instruction>(cast<Instruction>(cond)->getOperand(0));
-                    auto *signBits = cast<Instruction>(flush->getTrueValue());
-                    if (!all_of(BC->users(), [&](User *X) { return X == flush || X == mask || X == signBits; }) ||
-                        !mask->hasOneUse() || !cond->hasOneUse() || !signBits->hasOneUse())
-                        return false;
-                    return !flush->use_empty() && all_of(flush->users(), [&](User *FU) {
-                        auto *Back = dyn_cast<BitCastInst>(FU);
-                        return Back && Back->getType()->isFloatTy() && usersIgnoreNaNBits(Back, depth + 1);
-                    });
+                    // the flush family: the bits and the flushes of a member, select(exponent of a member is
+                    // zero, x, member)
+                    SmallSetVector<Value *, 8> fam;
+                    fam.insert(BC);
+                    auto expZero = [&](Value *C) {
+                        Value *W;
+                        return match(C, m_SpecificICmp(ICmpInst::ICMP_EQ, m_And(m_Value(W), m_SpecificInt(0x7f800000)),
+                                                       m_Zero())) &&
+                               fam.contains(W);
+                    };
+                    for (unsigned k = 0; k < fam.size() && fam.size() < 16; k++)
+                        for (User *FU : fam[k]->users())
+                            if (auto *Sel = dyn_cast<SelectInst>(FU);
+                                Sel && fam.contains(Sel->getFalseValue()) && expZero(Sel->getCondition()))
+                                fam.insert(Sel);
+                    auto isFlush = [&](User *X) {
+                        auto *Sel = dyn_cast<SelectInst>(X);
+                        return Sel && fam.contains(Sel);
+                    };
+                    for (Value *W : fam)
+                        for (User *FU : W->users())
+                        {
+                            if (isFlush(FU) && cast<SelectInst>(FU)->getFalseValue() == W)
+                                continue;
+                            Value *X;
+                            // the exponent: tests that only choose flushes
+                            if (match(FU, m_And(m_Value(X), m_SpecificInt(0x7f800000))))
+                            {
+                                if (!all_of(FU->users(), [&](User *C) {
+                                        return match(C, m_SpecificICmp(ICmpInst::ICMP_EQ, m_Specific(FU), m_Zero())) &&
+                                               all_of(C->users(), [&](User *S) {
+                                                   return isFlush(S) && cast<SelectInst>(S)->getCondition() == C;
+                                               });
+                                    }))
+                                    return false;
+                                continue;
+                            }
+                            // the sign bits: what a flush chooses for a zero exponent, never for a NaN
+                            if (match(FU, m_And(m_Value(X), m_SpecificInt(0x80000000))))
+                            {
+                                if (!all_of(FU->users(), [&](User *S) {
+                                        return isFlush(S) && cast<SelectInst>(S)->getTrueValue() == FU &&
+                                               cast<SelectInst>(S)->getFalseValue() != FU;
+                                    }))
+                                    return false;
+                                continue;
+                            }
+                            // back to a float
+                            if (auto *Back = dyn_cast<BitCastInst>(FU); Back && Back->getType()->isFloatTy())
+                            {
+                                if (!usersIgnoreNaNBits(Back, depth + 1))
+                                    return false;
+                                continue;
+                            }
+                            return false;
+                        }
+                    return true;
                 }
                 if (!isa<SelectInst>(UI) && !isa<PHINode>(UI))
                     return false;
@@ -3094,6 +3133,40 @@ int LLVMZludaAirCanonicalNaNs(LLVMModuleRef M)
         for (Instruction *I : work)
             if (!unobserved(I))
                 observed.push_back(I);
+        // ZLUDA_AIR_NAN_WHY=1: the kinds of users that observe the canonicalized results
+        if (getenv("ZLUDA_AIR_NAN_WHY"))
+        {
+            std::map<std::string, unsigned> kinds;
+            for (Instruction *I : observed)
+                for (User *U : I->users())
+                    if (auto *UI = dyn_cast<Instruction>(U))
+                    {
+                        std::string k = UI->getOpcodeName();
+                        if (auto *CI = dyn_cast<CallInst>(UI))
+                            k += std::string(" ") + (CI->getCalledFunction() ? CI->getCalledFunction()->getName().str().substr(0, 40) : "indirect");
+                        if (auto *BC = dyn_cast<BitCastInst>(UI))
+                            for (User *BU : BC->users())
+                                if (auto *BI = dyn_cast<Instruction>(BU))
+                                    kinds[k + " -> " + BI->getOpcodeName()]++;
+                        kinds[k]++;
+                    }
+            unsigned shown = 0;
+            for (Instruction *I : observed)
+                for (User *U : I->users())
+                    if (auto *BC = dyn_cast<BitCastInst>(U); BC && shown < 3)
+                    {
+                        shown++;
+                        errs() << "[nan ex] " << *I << "\n[nan ex] " << *BC << "\n";
+                        for (User *BU : BC->users())
+                        {
+                            errs() << "[nan ex]   " << *BU << "\n";
+                            for (User *BU2 : BU->users())
+                                errs() << "[nan ex]     " << *BU2 << "\n";
+                        }
+                    }
+            for (auto &[k, n] : kinds)
+                errs() << "[nan why] " << F.getName().substr(0, 30) << " " << n << " " << k << "\n";
+        }
         for (Instruction *I : observed)
         {
             Type *T = I->getType();

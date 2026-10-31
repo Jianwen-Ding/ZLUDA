@@ -294,3 +294,16 @@ question was how many barriers a dependency analysis could drop.
   chain (norm -> mul -> matmul -> rope -> ...). At most ~15% of the ~6 ms/token barrier cost could go, about
   44 -> 47 t/s, for a multi-day compiler + runtime project. Not pursued; the allocation-level flag stays as an
   experiment.
+
+## Strict FP: canonical NaNs through chains of .ftz flushes (2026-10-31)
+
+`ZLUDA_AIR_NAN_WHY=1` (zoc) counts what observes each canonicalized result. In Cycles nearly all were .ftz operand
+flushes on the bits, select((b & 0x7f800000) == 0, sign, b), applied again to an already flushed value (the next
+.ftz operation) with LLVM sharing the sign bits between the two flushes; the pass only accepted a single flush.
+A NaN passes every flush of such a family unchanged (its exponent is not zero), so the whole family is now accepted.
+
+- Cycles intersect_closest, strict: 23765 -> 20135 instructions (default 15069).
+- PTX-formalization strict 397 / 1928, default 377 / 1818 (unchanged); new test agx_tests/ftz-nan-chain.ptx passes
+  strict (default mode does not canonicalize, by design).
+- Blender Open Data strict: monster 271 -> 279, junkshop 76.6 -> 80.0, classroom 63.4 -> 65.5 samples/min.
+- Geekbench strict 48702 -> 49641. llama strict completions 4/4 exact.

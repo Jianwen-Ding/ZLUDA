@@ -1,0 +1,41 @@
+.version 7.0
+.target sm_70
+.address_size 64
+
+// One thread, chains of .ftz f32 operations: a NaN result read by the next .ftz operation (whose operand flush the
+// compiler writes on the bits, sharing the sign bits between consecutive flushes) stays PTX's canonical NaN, and
+// denormals flush to a zero of their sign.
+.visible .entry chain(.param .u64 pin, .param .u64 pout)
+{
+    .reg .f32 %f<20>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [pin];
+    ld.param.u64 %rd2, [pout];
+    ld.global.f32 %f1, [%rd1];      // +inf
+    ld.global.f32 %f2, [%rd1+4];    // -inf
+    ld.global.f32 %f3, [%rd1+8];    // 0x00000003
+    ld.global.f32 %f4, [%rd1+12];   // 1.0
+    ld.global.f32 %f5, [%rd1+16];   // 0x80000005
+    add.ftz.f32 %f10, %f1, %f2;
+    mul.ftz.f32 %f11, %f10, %f4;
+    add.ftz.f32 %f12, %f11, %f3;
+    fma.rn.ftz.f32 %f13, %f12, %f4, %f5;
+    sub.ftz.f32 %f14, %f5, %f3;
+    mul.ftz.f32 %f15, %f14, %f4;
+    add.ftz.f32 %f16, %f15, %f5;
+    mul.ftz.f32 %f17, %f5, %f4;
+    add.ftz.f32 %f18, %f17, %f10;
+    st.global.f32 [%rd2], %f10;
+    st.global.f32 [%rd2+4], %f12;
+    st.global.f32 [%rd2+8], %f13;
+    st.global.f32 [%rd2+12], %f14;
+    st.global.f32 [%rd2+16], %f16;
+    st.global.f32 [%rd2+20], %f17;
+    st.global.f32 [%rd2+24], %f18;
+    ret;
+}
+
+.buffer IN .u32 = { 2139095040, 4286578688, 3, 1065353216, 2147483653 };
+.buffer OUT .u32 [7];
+.launch chain <<< 1, 1 >>> (IN, OUT);
+.expect OUT .u32 = { 2147483647, 2147483647, 2147483647, 2147483648, 2147483648, 2147483648, 2147483647 };

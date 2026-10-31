@@ -397,3 +397,11 @@ llama-app (cuBLAS linked statically, so -b 8 -ub 8; a cudart replacement is out 
   byte multiply-adds with every signed byte extended by a shift pair (AGX has no signed bitfield extract); bias or
   sign-correction rewrites cost more instructions, not fewer. A real gain needs packed 8- or 16-bit multiply-adds,
   which nothing measured so far establishes on AGX: a hardware probe first.
+- Packed integer operations for dp4a (asked for a probe): what is measured or documented already says there are
+  none. The playground's sub-op sweeps (2026-10-11-subop-spaces: intl, bitrev, popcount, simd_op reductions,
+  shuffles, convert) found no dot product or packed integer arithmetic; applegpu's documentation lists none, and its
+  device_load i8 format zero-extends only (snorm8 loads are lossy floats: -128 and -127 both give -1.0). The only
+  packed arithmetic is simd_matrix_fmadd16/32 (float, cooperative across the SIMD group), wasted on a matrix-vector
+  product. What 32-bit integer ops do have is free sign extension of 16-bit register halves (MOD_SX), which saves
+  about one instruction per signed operand of a dp4a (7 -> 6), not the 38% upper bound. Not pursued further; the
+  unexplored part (imadd's unused encoding bits) is speculative and earlier undefined encodings hung the GPU.

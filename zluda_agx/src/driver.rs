@@ -1239,6 +1239,14 @@ pub(crate) fn strict_fp() -> bool {
     std::env::var("ZLUDA_ROUNDING_STRICT").is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
+/// `ZLUDA_ROUNDING_STRICT_TEXTURES=f32` (with `ZLUDA_ROUNDING_STRICT`): texture filtering in f32 as outside strict
+/// mode, a few ulps from the exact filtering, instead of the software double precision sampler (zoc
+/// --strict-fp-f32-textures): an error margin for textures only, which most of strict mode's cost in texture-heavy
+/// kernels (Blender Cycles) is.
+pub(crate) fn strict_f32_textures() -> bool {
+    std::env::var("ZLUDA_ROUNDING_STRICT_TEXTURES").is_ok_and(|v| v == "f32")
+}
+
 /// `ZLUDA_AGX_CHECKED=1`: check every memory access of the kernels and report the first bad one with its source
 /// location (zoc --agx-checked), as compute-sanitizer's memcheck does.
 pub(crate) fn agx_checked() -> bool {
@@ -1311,6 +1319,10 @@ fn compile_or_cached(sources: &[&[u8]], cpu: &str, cached_only: bool) -> Result<
     if strict_fp {
         options.push("strict-fp");
     }
+    let f32_textures = strict_fp && strict_f32_textures();
+    if f32_textures {
+        options.push("strict-fp-f32-textures");
+    }
     let lineinfo = agx_lineinfo() && !checked;
     if lineinfo {
         options.push("lineinfo");
@@ -1356,6 +1368,7 @@ fn compile_or_cached(sources: &[&[u8]], cpu: &str, cached_only: bool) -> Result<
         args.extend(mesa.then(|| "--agx-strict".to_string()));
         args.extend(checked.then(|| "--agx-checked".to_string()));
         args.extend(strict_fp.then(|| "--strict-fp".to_string()));
+        args.extend((f32_textures && !direct).then(|| "--strict-fp-f32-textures".to_string()));
         args.extend(lineinfo.then(|| "--lineinfo".to_string()));
         args.extend(fast_mma.then(|| "--fast-mma".to_string()));
         args.extend((stack_size != DEFAULT_STACK_SIZE).then(|| format!("--stack-size={stack_size}")));

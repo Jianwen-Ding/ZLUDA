@@ -347,3 +347,18 @@ shade_light_nee x3.5. Strict code keeps many more real calls (shade_light_nee: 1
 - "all": a single Cycles compile ran 21+ minutes at 26 GB and was stopped. Undoes the compile-cost work; not a
   default. Next: why strict's O3 inlines less (constrained-FP intrinsics or strictfp attributes in the inline
   cost), to get default's inlining without forcing it.
+
+## Strict FP: the texture sampler (2026-10-31)
+
+The calls in strict shading kernels (1629 in shade_light_nee vs 156) are not Cycles functions left uninlined: they
+are the soft-f64 routines of the exact software texture sampler (__air_f64_mul, _from_u64, _floor, ...), which
+default mode runs as GPU floats. Skipping the strict-mode bit flushes of .ftz operations in functions that flush
+f32 denormals (the IEEE f32 emulation leaves those to the hardware) changed little (1629 -> 1615 calls; kept, suites
+unchanged).
+
+zoc --strict-fp-f32-textures (driver: ZLUDA_ROUNDING_STRICT_TEXTURES=f32, in the cache key) keeps strict arithmetic
+but filters tex.1d / tex.2d in f32 as default mode does. Blender junkshop strict 97.3 -> 144 samples/min (default
+160; shade_surface 43.7 -> 19.6 ms, shade_light_nee 23.8 -> 7.1 ms), compile warm-up 107 -> 92 s. Against the exact
+sampler (generated linear-filter tests, 256 coordinates each, simulator): f32 textures with one channel exact,
+two channels with border addressing within 2 ulp. Strict formalization suite unchanged with it (1928). Off by
+default: an error margin for textures only.

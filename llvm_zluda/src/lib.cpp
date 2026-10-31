@@ -2885,8 +2885,12 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
                 // strict mode keeps them (IEEE f32 emulation): flushed here only in strict mode or for the directed
                 // roundings, whose software emulation keeps denormals. (Flushed always, Blender Cycles' .ftz
                 // operations doubled its IR.)
+                // (In strict mode too where the function flushes f32 denormals, .ftz: the IEEE f32 emulation
+                // leaves such functions to the hardware, AIREmulateF64's ieeeF32. Flushed always, Cycles' strict
+                // functions were too large for O3 to inline: 1629 calls in shade_light_nee instead of 156.)
                 auto rounding = zludaModeField(m, 3);
-                bool hardware = !half && !strict && rounding && (*rounding & 3) == 1;
+                bool flushingFn = F.getDenormalMode(APFloat::IEEEsingle()).Output != DenormalMode::IEEE;
+                bool hardware = !half && (!strict || flushingFn) && rounding && (*rounding & 3) == 1;
                 if (!hardware && (!flushBit || *flushBit))
                 {
                     IRBuilder<> B(C);

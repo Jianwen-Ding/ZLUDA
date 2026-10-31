@@ -640,6 +640,8 @@ def compile_ptx(args, module, tmp, extra=(), env=None, product='m.o', target='ag
         flags = list(extra) + list(more)
         if getattr(args, 'strict_fp', False):
             flags.append('--strict-fp')
+        if getattr(args, 'f32_textures', False):
+            flags.append('--strict-fp-f32-textures')
         if getattr(args, 'agx_strict', False):
             flags.append('--agx-strict')
         # (--arch none: the AIR only, as compiled for Metal alone)
@@ -912,6 +914,8 @@ def main():
     ap.add_argument('--arch', default='agx-g14g')
     ap.add_argument('--strict-fp', action='store_true',
                     help='compile with zoc --strict-fp (software IEEE binary32, canonical NaNs)')
+    ap.add_argument('--strict-fp-f32-textures', dest='f32_textures', action='store_true',
+                    help='with --strict-fp: zoc --strict-fp-f32-textures (texture filtering in f32)')
     ap.add_argument('--agx-strict', action='store_true',
                     help='compile with zoc --agx-strict (only the instructions Mesa emits) and run agx_run '
                          '--agx-strict for --arch, so that any other instruction fails the test')

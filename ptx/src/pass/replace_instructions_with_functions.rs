@@ -6,13 +6,15 @@ pub(super) fn run<'input>(
     resolver: &mut GlobalStringIdentResolver2<'input>,
     target: Target,
     strict_fp: bool,
+    // strict_fp, except for textures (Options::f32_textures)
+    strict_tex: bool,
     directives: Vec<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>,
 ) -> Result<Vec<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>, TranslateError> {
     // We use BTreeMap here to have deterministic ordering of function declarations.
     let mut fn_declarations = BTreeMap::default();
     let remapped_directives = directives
         .into_iter()
-        .map(|directive| run_directive(resolver, target, strict_fp, &mut fn_declarations, directive))
+        .map(|directive| run_directive(resolver, target, strict_fp, strict_tex, &mut fn_declarations, directive))
         .collect::<Result<Vec<_>, _>>()?;
     let mut result = fn_declarations
         .into_iter()
@@ -38,6 +40,7 @@ fn run_directive<'input>(
     resolver: &mut GlobalStringIdentResolver2<'input>,
     target: Target,
     strict_fp: bool,
+    strict_tex: bool,
     fn_declarations: &mut BTreeMap<
         Cow<'input, str>,
         (
@@ -53,7 +56,7 @@ fn run_directive<'input>(
         Directive2::Method(mut method) => {
             method.body = method
                 .body
-                .map(|statements| run_statements(resolver, target, strict_fp, fn_declarations, statements))
+                .map(|statements| run_statements(resolver, target, strict_fp, strict_tex, fn_declarations, statements))
                 .transpose()?;
             Directive2::Method(method)
         }
@@ -95,6 +98,7 @@ fn run_statements<'input>(
     resolver: &mut GlobalStringIdentResolver2<'input>,
     target: Target,
     strict_fp: bool,
+    strict_tex: bool,
     fn_declarations: &mut BTreeMap<
         Cow<'input, str>,
         (
@@ -344,7 +348,7 @@ fn run_statements<'input>(
                 Statement::<ast::Instruction<SpirvWord>, SpirvWord>::Instruction(instruction) => {
                     smallvec![
                         Statement::<ast::Instruction<SpirvWord>, SpirvWord>::Instruction(
-                            run_instruction(resolver, target, strict_fp, fn_declarations, instruction)?
+                            run_instruction(resolver, target, strict_fp, strict_tex, fn_declarations, instruction)?
                         )
                     ]
                 }
@@ -362,6 +366,7 @@ fn run_instruction<'input>(
     resolver: &mut GlobalStringIdentResolver2<'input>,
     target: Target,
     strict_fp: bool,
+    strict_tex: bool,
     fn_declarations: &mut BTreeMap<
         Cow<'input, str>,
         (
@@ -441,8 +446,9 @@ fn run_instruction<'input>(
             );
             // tex.1d / tex.2d with float coordinates may use AGX's texture unit (zluda_ptx_impl_agx_tex.c), which
             // is not bit exact for linear filtering
+            // (also in strict mode with Options::f32_textures: strict_tex false)
             let unit = target.is_air()
-                && !strict_fp
+                && !strict_tex
                 && matches!(type_, ast::TexType::Texobj)
                 && ctype == ast::ScalarType::F32
                 && matches!(dims, ast::TexDimensions::D1 | ast::TexDimensions::D2);

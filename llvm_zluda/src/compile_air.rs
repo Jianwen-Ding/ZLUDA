@@ -362,10 +362,17 @@ pub fn compile_air(
     // AGX: the portable AIR through agx-lower-air and the AGX backend, with O3 again for AGX first
     // (ZLUDA_AIR_AGX_PIPELINE: o3, none): its pipeline lowers AIR to AGX before anything else, and then optimizes
     // with AGX's cost model, which AIR's O3 has not (Geekbench's GEMM unrolled half as far as AGX's
-    // threadgroup-load unrolling makes it: 24% slower)
-    let agx_pipeline: Option<&CStr> = match std::env::var("ZLUDA_AIR_AGX_PIPELINE").as_deref() {
+    // threadgroup-load unrolling makes it: 24% slower). Not by default for a large module's kernels compiled one
+    // at a time: each kernel's module repeats O3 on the functions it shares with the others (Blender Cycles: 44 ->
+    // 31 s of AGX code, the first render 67 -> 50 s, its GPU time unchanged).
+    let agx_pipeline_env = std::env::var("ZLUDA_AIR_AGX_PIPELINE");
+    let agx_pipeline: Option<&CStr> = match agx_pipeline_env.as_deref() {
         Ok("none") => None,
         _ => Some(c"default<O3>"),
+    };
+    let per_kernel_pipeline = match agx_pipeline_env.as_deref() {
+        Ok("o3") => agx_pipeline,
+        _ => None,
     };
     let agx_object = match agx_cpu {
         None => None,
@@ -430,7 +437,7 @@ pub fn compile_air(
                                         LLVMZludaAirKernelModule(whole.get(), name.as_ptr())
                                     });
                                     drop(whole);
-                                    if let Some(pipeline) = agx_pipeline {
+                                    if let Some(pipeline) = per_kernel_pipeline {
                                         run(&one, pipeline, &agx, &PassBuilderOptions::new())?;
                                     }
                                     let mut asm = Vec::new();

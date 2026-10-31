@@ -390,3 +390,10 @@ llama-app (cuBLAS linked statically, so -b 8 -ub 8; a cudart replacement is out 
   purpose registers, 832 threads per core, so occupancy is not what limits it. .maxnreg 56 or less makes it spill,
   and the replay (no stack memory) fails with "Bad address"; recompiled without a limit it runs as fast (21.3 us).
   This launch is small (512 rows); the 18944-row FFN projections are the ones to measure next.
+- The 18944 x 3584 Q4_K launch (38.2 MB of weights), captured and replayed on the GPU: 474 us back to back (cold
+  1.41 ms), ~80 GB/s, about a fifth of the rated bandwidth; two per layer, 28 layers: most of the 27 t/s.
+- dp4a is the cost: compiled with dp4a replaced by one multiply-add (wrong results, an upper bound only), the same
+  launch takes 277 us instead of 446 (-38%; 574 -> 491 instructions, 63 -> 49 registers). Each exact dp4a is four
+  byte multiply-adds with every signed byte extended by a shift pair (AGX has no signed bitfield extract); bias or
+  sign-correction rewrites cost more instructions, not fewer. A real gain needs packed 8- or 16-bit multiply-adds,
+  which nothing measured so far establishes on AGX: a hardware probe first.

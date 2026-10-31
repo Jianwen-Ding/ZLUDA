@@ -386,5 +386,7 @@ llama-app (cuBLAS linked statically, so -b 8 -ub 8; a cudart replacement is out 
 - ZLUDA_AGX_PROFILE is no guide here: every command shows a 50-60 us floor whatever its size (a 4-block copy as
   long as an 18944-row matrix-vector product).
 - The Q4_K matrix-vector kernel (mul_mat_vec_q<12>), captured (512 rows x 3584, 1 MB) and replayed on the GPU: 20.9
-  us back to back (58 us cold), ~49 GB/s, with 124 general purpose registers per thread (few threads per core for a
-  bandwidth-bound kernel). The next lead for large-model generation.
+  us back to back (58 us cold), ~49 GB/s. Its capture's regs.txt says 124, but in 16-bit halves: 62-63 general
+  purpose registers, 832 threads per core, so occupancy is not what limits it. .maxnreg 56 or less makes it spill,
+  and the replay (no stack memory) fails with "Bad address"; recompiled without a limit it runs as fast (21.3 us).
+  This launch is small (512 rows); the 18944-row FFN projections are the ones to measure next.

@@ -100,6 +100,34 @@ the order it was found:
 - **Device-flaky PTX tests**: ldm-0, ldm2-st0 and occupancy pass or fail from one run to the next with the same
   zoc; rerun them with the previous build before calling a change a regression.
 
+## Strict FP on the AIR route, and the zoc server, 2026-10-31 (second session, later)
+
+- **zoc --serve took the direct route** (fixed 455ba04): every module under 4 MiB that the driver compiled went
+  through `compile_agx` whatever `--target`. Small-module numbers before that commit (Geekbench, llama.cpp's
+  smaller modules, agx_bench_kernel timings) are of the direct route; Cycles, llama.cpp's 10 MB module and the
+  PTX-formalization harness were AIR. Found from strict f32 division timing differently through the server and
+  the command line. AIR route, corrected: Geekbench GPU score 54807 (direct with batching: 52974 / 53752).
+- **Strict mode (ZLUDA_ROUNDING_STRICT=1), AIR route, measured**: f32 add / mul / fma 3.3x the default mode's time
+  (the denormal test of each operation's run), div.rn 1.25x, sqrt.rn 1.8x. Geekbench 38260 -> 45168 after the
+  fixes below (default 54807); llama.cpp tg 41.7 vs 43.8 t/s, pp 378 vs 430 (completions exact both ways);
+  Blender default cube GPU time +6.7%; Open Data monster 261 / classroom 61.7 / junkshop 67.5 vs 466 / 133 / 162.
+  PTX-formalization: strict 397 files / 1928 checks, default 377 / 1818.
+- What helped strict mode: approximate divisions kept approximate (llvm b602fa44: div.approx / rcp.approx were
+  computed exactly, slower than div.rn); exact zero results without soft-f64 (c3f5e644: a zero result went to
+  soft-f64, 24-30x); bit-form .ftz flushes dropped where the ALU flushes (96c88d8f, 0cb73d79); canonical NaNs
+  only where observed (c15b98b, e8592d6); .ftz comparisons left to the hardware in AGX code (ce75cdb: Cycles is
+  .ftz throughout, ~15 instructions per comparison; classroom 42.8 -> 60.1).
+- **Dead ends**: an `!fpmath` error margin (ZLUDA_FP_ULP) for division and square root: on the AIR route
+  AIREmulateF64's fast path is already the hardware's division, 1.15-1.25x default, nothing left to relax
+  (AGXStrictFP, which it targeted, only serves the direct route). The canonical NaN test as a float compare
+  (`select(x uno x, NaN, x)`, one fcmpsel instead of and + icmpsel; intersect_closest 28016 -> 23590
+  instructions): LLVM folds the float select of a NaN into x (the payload is not kept: rounding-diff-f32 got
+  0x7fc00000); as an integer select on the float compare it lowered to 42923 instructions. Reverted.
+- What remains of strict mode's cost in Cycles is mostly the canonical NaN of values that are observed (stored,
+  passed through integers): ~5000 and + icmpsel pairs in intersect_closest (15076 instructions in the default mode,
+  28016 strict).
+- The harness has error margins now: `--ulp N` and `--flush-ok` (float-typed checks only), PASS~ in its output.
+
 ## Application benchmarks, AIR route, 2026-10-31 (second session)
 
 - **Blender: launch-time specialization cost 85% of a warm render.** Cycles' scalar arguments change at every

@@ -274,6 +274,8 @@ def dec_float(bits, t):
         return struct.unpack('<d', struct.pack('<Q', bits))[0]
     if t == 'f16':
         return struct.unpack('<e', struct.pack('<H', bits))[0]
+    if t == 'bf16':
+        return struct.unpack('<f', struct.pack('<I', bits << 16))[0]
     raise Unsupported(t)
 
 
@@ -905,7 +907,7 @@ def run_test(path, args):
                 # for the approximations instead of one admissible result (ZLUDA's tests only: K's harness has
                 # no such directive). KIND is ulp (from the correctly rounded value), rel or abs; BOUND a number
                 # or 2^E; an exact value nan wants any NaN, and an infinite or zero one the same bits
-                m = re.fullmatch(r'\.expectbound ([\w$.]+) \.(f32)\s*(@\s*(\d+))?\s*(ulp|rel|abs)\s+(\S+)\s*=\s*\{(.*)\}',
+                m = re.fullmatch(r'\.expectbound ([\w$.]+) \.(f32|f16|bf16)\s*(@\s*(\d+))?\s*(ulp|rel|abs)\s+(\S+)\s*=\s*\{(.*)\}',
                                  d)
                 if not m:
                     raise Unsupported('malformed .expectbound')

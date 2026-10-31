@@ -663,6 +663,9 @@ def compile_ptx(args, module, tmp, extra=(), env=None, product='m.o', target='ag
             flags.append('--agx-strict')
         # (--arch none: the AIR only, as compiled for Metal alone)
         arch = [] if args.arch == 'none' else ['--arch', args.arch]
+        # (the object alone, as the runtime compiles: the assembly took as long again, 60 s of tex-mip's 170)
+        if arch and product == 'm.o' and not getattr(args, 'keep_asm', False):
+            flags.append('--object-only')
         return subprocess.run([args.zoc, *flags, '--target', target, *arch, '--output-dir', tmp, src],
                               capture_output=True, text=True, timeout=args.timeout, env=env)
     try:
@@ -705,8 +708,8 @@ def run_test(path, args):
         if status:
             return status, detail
         out, rejected, tainted = detail
-        with open(os.path.join(tmp, 'm.asm')) as f:
-            asm = f.read()
+        asm_path = os.path.join(tmp, 'm.asm')
+        asm = open(asm_path).read() if os.path.exists(asm_path) else ''
         kernels, gdata, gsyms, gsizes, relocs = kernel_info(asm, os.path.join(tmp, 'm.o'), args.readelf, args.objcopy, tmp)
         params = kernel_params(module)
 
@@ -985,7 +988,8 @@ def main():
                          'counted apart (PASS~)')
     ap.add_argument('--flush-ok', dest='flush_ok', action='store_true',
                     help='also accept the same-signed zero for an expected subnormal (the default mode flushes)')
-    ap.add_argument('--timeout', type=int, default=120)
+    ap.add_argument('--timeout', type=int, default=300,
+                    help='seconds per zoc or agx_run run (the software texture sampling of --strict-fp takes ~100 s to compile)')
     ap.add_argument('--max-failures', type=int, default=4, help='failing elements listed per test')
     ap.add_argument('-j', type=int, default=os.cpu_count())
     ap.add_argument('--json', help='write the results to this file')

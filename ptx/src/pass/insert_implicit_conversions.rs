@@ -82,16 +82,24 @@ fn insert_implicit_conversions_impl<'input>(
             data.type_ = ast::TexType::Texobj;
         }
     }
+    // isspacep's address is 32-bit under .address_size 32 (widened where it is emitted)
+    let isspacep32 = is_32bit && matches!(stmt, ExpandedStatement::Instruction(ast::Instruction::Isspacep { .. }));
     let statement = stmt.visit_map::<SpirvWord, TranslateError>(
         &mut |operand,
               type_state: Option<(&ast::Type, ast::StateSpace)>,
-              is_dst,
+              is_dst: bool,
               relaxed_type_check| {
             let (instr_type, instruction_space) = match type_state {
                 None => return Ok(operand),
                 Some(t) => t,
             };
             let (operand_type, operand_space) = resolver.get_typed(operand)?;
+            if isspacep32
+                && !is_dst
+                && matches!(operand_type, ast::Type::Scalar(t) if t.size_of() == 4 && t.kind() != ast::ScalarKind::Float)
+            {
+                return Ok(operand);
+            }
             let conversion_fn = if relaxed_type_check {
                 if is_dst {
                     should_convert_relaxed_dst_wrapper

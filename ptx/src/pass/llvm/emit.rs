@@ -4821,6 +4821,14 @@ impl<'a> MethodEmitContext<'a> {
         let src = self.resolver.value(arguments.src)?;
         let i1_type = get_scalar_type(self.context, ast::ScalarType::Pred);
         let i64_type = get_scalar_type(self.context, ast::ScalarType::B64);
+        // (a 32-bit address of .address_size 32)
+        let src = unsafe {
+            if LLVMGetIntTypeWidth(LLVMTypeOf(src)) == 32 {
+                LLVMBuildZExt(self.builder, src, i64_type, LLVM_UNNAMED.as_ptr())
+            } else {
+                src
+            }
+        };
         let name = match space {
             ast::StateSpace::Global => "global",
             ast::StateSpace::Shared | ast::StateSpace::SharedCta | ast::StateSpace::SharedCluster => "shared",

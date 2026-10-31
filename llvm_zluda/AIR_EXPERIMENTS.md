@@ -125,7 +125,10 @@ the order it was found:
   0x7fc00000); as an integer select on the float compare it lowered to 42923 instructions. Reverted.
 - What remains of strict mode's cost in Cycles is mostly the canonical NaN of values that are observed (stored,
   passed through integers): ~5000 and + icmpsel pairs in intersect_closest (15076 instructions in the default mode,
-  28016 strict).
+  28016 strict). What worked instead of the float compare: fadd32 / fmul32 / fmadd32 return 0x7fc00000 for every
+  NaN (playground 2026-10-11-float-semantics), so their canonical NaN is one integer comparison with it
+  (llvm 315e9fba): 28016 -> 24283 instructions, monster 261 -> 271, classroom 61.7 -> 63.4, the same image. Other
+  producers (rcp, rsqrt, exp2, conversions) keep the two instructions: their NaN output is not established.
 - The harness has error margins now: `--ulp N` and `--flush-ok` (float-typed checks only), PASS~ in its output.
 - **llama.cpp generation, where the time goes (AIR route, graph batching)**: 44 t/s, the main thread waiting on
   the GPU 80% of the time; kernels 14.4 ms per token (mul_mat_vec_q<Q5_1> 6.6 ms, 62 us a launch; the Q8_0 output

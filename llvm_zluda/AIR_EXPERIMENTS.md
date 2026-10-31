@@ -127,6 +127,14 @@ the order it was found:
   passed through integers): ~5000 and + icmpsel pairs in intersect_closest (15076 instructions in the default mode,
   28016 strict).
 - The harness has error margins now: `--ulp N` and `--flush-ok` (float-typed checks only), PASS~ in its output.
+- **llama.cpp generation, where the time goes (AIR route, graph batching)**: 44 t/s, the main thread waiting on
+  the GPU 80% of the time; kernels 14.4 ms per token (mul_mat_vec_q<Q5_1> 6.6 ms, 62 us a launch; the Q8_0 output
+  projection 1.7 ms in one launch, ~5x its bandwidth bound), an empty dispatch in a graph 2.7-3.3 us (~490 per
+  token), cuGraphLaunch 20.3 ms and the logits' read-back 2.3 ms per token. Without the CDM barrier after each
+  batched dispatch generation ran at 61 t/s, with garbage output: the barriers are needed. Leaving out only the
+  barriers without a hazard needs each dispatch's read and write ranges: ggml keeps every intermediate tensor in
+  one allocation, so a test at allocation granularity finds a hazard everywhere. AGX has no signed bitfield
+  extract (bfeil / extr are unsigned), so dp4a's signed bytes stay two instructions each.
 
 ## Application benchmarks, AIR route, 2026-10-31 (second session)
 

@@ -19,7 +19,7 @@ use crate::utils::{Context, Message, Module, PassBuilderOptions, TargetMachine};
 use crate::{
     LLVMZludaAgxKeepGlobals, LLVMZludaAgxLowerAddressSpaces, LLVMZludaAgxLowerClusters, LLVMZludaAgxSpillClusterShared,
     LLVMZludaAirFunctionPointers, LLVMZludaSetAirPrimitives, LLVMZludaAirGlobalsToBuffer, LLVMZludaAirInlineGlobalUsers,
-    LLVMZludaAirRemapAddressSpaces, LLVMZludaAirSharedLayout, LLVMZludaAirStaticRounding, LLVMZludaAirDropCompareFlushes, LLVMZludaAirDropMinMaxFixups, LLVMZludaAirExpandDivisions, LLVMZludaAirCanonicalNaNs, LLVMZludaAirTextureSampleHint, LLVMZludaAirCompareFloatBits, LLVMZludaAirKernelModule, LLVMZludaAirSaltKernels, LLVMZludaAgxCanonicalizeFoldedNaNs, LLVMZludaLinkUsedDefinitions,
+    LLVMZludaAirRemapAddressSpaces, LLVMZludaAirSharedLayout, LLVMZludaAirStaticRounding, LLVMZludaAirDropCompareFlushes, LLVMZludaAirDropMinMaxFixups, LLVMZludaAirExpandDivisions, LLVMZludaAirCanonicalNaNs, LLVMZludaAirTextureSampleHint, LLVMZludaAirCompareFloatBits, LLVMZludaAirRangeReport, LLVMZludaAirKernelModule, LLVMZludaAirSaltKernels, LLVMZludaAgxCanonicalizeFoldedNaNs, LLVMZludaLinkUsedDefinitions,
     LLVMZludaUpgradeFunctionAttributes,
 };
 use llvm_sys::target_machine::{
@@ -629,6 +629,10 @@ fn finish_air(ctx: &Context, module: &Module, strict_fp: bool, compare_functions
         unsafe { LLVMZludaAirCompareFloatBits(module.get(), compare_functions) };
         // and the NaN constants the optimizations folded (as the Agx target)
         unsafe { LLVMZludaAgxCanonicalizeFoldedNaNs(module.get()) };
+    }
+    // ZLUDA_AIR_RANGE_REPORT=1: how many device memory accesses a launch could bound (dependency-aware barriers)
+    if std::env::var("ZLUDA_AIR_RANGE_REPORT").is_ok_and(|v| v == "1") {
+        unsafe { LLVMZludaAirRangeReport(module.get()) };
     }
     // function pointers as IDs and choices among direct calls: no AIR consumer has a call stack
     let mut err = std::ptr::null_mut();

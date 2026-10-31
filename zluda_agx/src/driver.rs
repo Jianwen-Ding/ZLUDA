@@ -485,6 +485,31 @@ impl Driver {
             }
             mine
         });
+        // ZLUDA_AGX_HAZARD_STATS=1: an estimate of how many batched barriers byte ranges could leave out, by the
+        // pointer values (tensors in one allocation start at different addresses) the dispatches share since the
+        // last estimated barrier; printed every 4096 dispatches
+        if batchable && std::env::var("ZLUDA_AGX_HAZARD_STATS").is_ok_and(|v| v == "1") {
+            use std::sync::Mutex;
+            static S: Mutex<(Vec<u64>, u64, u64)> = Mutex::new((Vec::new(), 0, 0));
+            let ptrs: Vec<u64> = args
+                .iter()
+                .flat_map(|a| a.chunks_exact(8))
+                .map(|w| u64::from_le_bytes(w.try_into().unwrap()))
+                .filter(|&v| ctx.address_range(v).is_some())
+                .collect();
+            let mut s = S.lock().unwrap();
+            let conflict = ptrs.iter().any(|p| s.0.contains(p)) || s.0.is_empty();
+            if conflict {
+                s.0 = ptrs;
+                s.2 += 1;
+            } else {
+                s.0.extend(ptrs);
+            }
+            s.1 += 1;
+            if s.1 % 4096 == 0 {
+                eprintln!("[ZLUDA_AGX] hazard stats: {} dispatches, {} barriers by shared pointer values", s.1, s.2);
+            }
+        }
         let fence = if batchable {
             // a batch of another stream, or one that this launch's waits would delay, goes first
             if batch.as_ref().is_some_and(|b| b.stream != sh || has_waits) {

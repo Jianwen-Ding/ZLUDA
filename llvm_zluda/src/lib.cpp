@@ -16,6 +16,12 @@
 #include <llvm/IR/ReplaceConstant.h>
 #include <llvm/Analysis/ConstantFolding.h>
 #include <llvm/Analysis/ValueTracking.h>
+#include <llvm/Analysis/ScalarEvolution.h>
+#include <llvm/Analysis/ScalarEvolutionExpressions.h>
+#include <llvm/Analysis/LoopInfo.h>
+#include <llvm/Analysis/AssumptionCache.h>
+#include <llvm/Analysis/TargetLibraryInfo.h>
+#include <llvm/IR/Dominators.h>
 #include <llvm/Support/KnownFPClass.h>
 #include <llvm/Transforms/Utils/ModuleUtils.h>
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
@@ -3454,6 +3460,147 @@ void LLVMZludaAirSaltKernels(LLVMModuleRef M, uint64_t length)
             AllocaInst *A = B.CreateAlloca(ArrayType::get(B.getInt8Ty(), length), nullptr, "zluda.salt");
             B.CreateStore(B.getInt8(0), A, /*isVolatile=*/true);
         }
+}
+
+LLVM_C_EXTERN_C_END
+
+LLVM_C_EXTERN_C_BEGIN
+
+// Air target, an estimate for dependency-aware barriers (ZLUDA_AIR_RANGE_REPORT): of each kernel's device memory
+// accesses, how many have an address that is a pointer argument (a 64-bit load from a parameter buffer) plus an
+// offset that scalar evolution writes in terms of constants, thread and group indices (system-value arguments),
+// scalar arguments and loops whose trip counts are such terms: what a launch could evaluate as the range of bytes
+// the access may touch. Prints one line per kernel to stderr; returns the number of kernels.
+int LLVMZludaAirRangeReport(LLVMModuleRef M)
+{
+    Module *Mod = unwrap(M);
+    int kernels = 0;
+    for (Function &F : *Mod)
+    {
+        if (F.isDeclaration() || !F.hasFnAttribute("air-kernel"))
+            continue;
+        kernels++;
+        TargetLibraryInfoImpl TLII(Mod->getTargetTriple());
+        TargetLibraryInfo TLI(TLII, &F);
+        AssumptionCache AC(F);
+        DominatorTree DT(F);
+        LoopInfo LI(DT);
+        ScalarEvolution SE(F, TLI, AC, DT, LI);
+        // a value a launch knows: a load from a parameter buffer, a system value, or a constant
+        std::function<bool(const SCEV *)> known = [&](const SCEV *S) -> bool {
+            struct Leaves
+            {
+                std::function<bool(const SCEV *)> &known;
+                ScalarEvolution &SE;
+                bool ok = true;
+                bool follow(const SCEV *S)
+                {
+                    if (auto *AR = dyn_cast<SCEVAddRecExpr>(S))
+                    {
+                        const SCEV *BTC = SE.getBackedgeTakenCount(AR->getLoop());
+                        if (isa<SCEVCouldNotCompute>(BTC) || !known(BTC))
+                        {
+                            if (getenv("ZLUDA_AIR_RANGE_REPORT_WHY"))
+                                errs() << "  [why] trip count of " << AR->getLoop()->getHeader()->getName() << ": " << *BTC << "\n";
+                            ok = false;
+                        }
+                    }
+                    if (auto *U = dyn_cast<SCEVUnknown>(S))
+                    {
+                        Value *V = U->getValue();
+                        bool leaf = false;
+                        // a pointer argument through its integer and address-space casts
+                        while (isa<PtrToIntInst>(V) || isa<IntToPtrInst>(V) || isa<AddrSpaceCastInst>(V))
+                            V = cast<Instruction>(V)->getOperand(0);
+                        if (auto *L = dyn_cast<LoadInst>(V))
+                            leaf = L->getPointerAddressSpace() == 2 &&
+                                   isa<Argument>(getUnderlyingObject(L->getPointerOperand()));
+                        else if (auto *E = dyn_cast<ExtractElementInst>(V))
+                        {
+                            // a system value: an argument, or AIR's position / size calls
+                            Value *Vec = E->getVectorOperand();
+                            auto *C = dyn_cast<CallInst>(Vec);
+                            Function *Callee = C ? C->getCalledFunction() : nullptr;
+                            leaf = isa<Argument>(Vec) || (Callee && Callee->getName().starts_with("air."));
+                        }
+                        else if (auto *C = dyn_cast<CallInst>(V))
+                            leaf = C->getCalledFunction() && C->getCalledFunction()->getName().starts_with("air.") &&
+                                   C->getCalledFunction()->doesNotAccessMemory();
+                        else if (isa<Argument>(V))
+                            leaf = true;
+                        if (!leaf)
+                        {
+                            if (getenv("ZLUDA_AIR_RANGE_REPORT_WHY"))
+                            {
+                                errs() << "  [why] " << *U->getValue() << "\n";
+                                if (auto *E = dyn_cast<ExtractElementInst>(U->getValue()))
+                                    errs() << "        of " << *E->getVectorOperand() << "\n";
+                            }
+                            ok = false;
+                        }
+                    }
+                    return ok;
+                }
+                bool isDone() const { return !ok; }
+            } leaves{known, SE};
+            SCEVTraversal<Leaves> T(leaves);
+            T.visitAll(S);
+            return leaves.ok;
+        };
+        unsigned total = 0, bounded = 0, base_unknown = 0;
+        for (Instruction &I : instructions(F))
+        {
+            Value *P = nullptr;
+            if (auto *L = dyn_cast<LoadInst>(&I))
+                P = L->getPointerOperand();
+            else if (auto *S = dyn_cast<StoreInst>(&I))
+                P = S->getPointerOperand();
+            else if (auto *A = dyn_cast<AtomicRMWInst>(&I))
+                P = A->getPointerOperand();
+            else if (auto *X = dyn_cast<AtomicCmpXchgInst>(&I))
+                P = X->getPointerOperand();
+            if (!P || P->getType()->getPointerAddressSpace() != 1)
+                continue;
+            total++;
+            // the address as an integer: AIR's addresses are integer arithmetic on a pointer argument's value,
+            // inttoptr'd
+            Value *A = P->stripPointerCasts();
+            while (auto *C = dyn_cast<AddrSpaceCastInst>(A))
+                A = C->getOperand(0)->stripPointerCasts();
+            const SCEV *S = isa<IntToPtrInst>(A) ? SE.getSCEV(cast<IntToPtrInst>(A)->getOperand(0)) : SE.getSCEV(A);
+            // its base: a 64-bit parameter load among its leaves
+            struct Base
+            {
+                bool found = false;
+                bool follow(const SCEV *X)
+                {
+                    if (auto *U = dyn_cast<SCEVUnknown>(X))
+                    {
+                        Value *V = U->getValue();
+                        while (isa<PtrToIntInst>(V) || isa<IntToPtrInst>(V) || isa<AddrSpaceCastInst>(V))
+                            V = cast<Instruction>(V)->getOperand(0);
+                        if (auto *L = dyn_cast<LoadInst>(V))
+                            if (L->getPointerAddressSpace() == 2 && L->getType()->getPrimitiveSizeInBits() == 64)
+                                found = true;
+                    }
+                    return true;
+                }
+                bool isDone() const { return false; }
+            } base;
+            SCEVTraversal<Base> BT(base);
+            BT.visitAll(S);
+            if (!base.found)
+            {
+                base_unknown++;
+                continue;
+            }
+            if (known(S))
+                bounded++;
+        }
+        errs() << "[zluda range] " << F.getName().substr(0, 70) << ": " << bounded << " of " << total
+               << " accesses bounded, " << base_unknown << " with an unknown base\n";
+    }
+    return kernels;
 }
 
 LLVM_C_EXTERN_C_END

@@ -275,3 +275,22 @@ fits in the M2 Max's 48 MB system cache: memory bandwidth cannot be measured thr
   other kernels' `!air.kernel` entries remain ("an !air.kernel entry names no function"). Round-trip through
   `.ll` and prune `!air.kernel` to the kept kernel.
 - **Never run Geekbench's BVH kernels with random (gbgen) inputs**: they hang the GPU.
+
+## Dependency-aware barriers (2026-10-31)
+
+Every batched dispatch ends with the CDM barrier (cache invalidate/flush, playground
+`2026-10-16-l2-command-boundary`). Leaving out every barrier gave llama tg 61 t/s but wrong output, so the
+question was how many barriers a dependency analysis could drop.
+
+- `ZLUDA_AGX_HAZARD_BARRIERS=1` (driver, off): barrier only before a dispatch whose argument allocations overlap
+  those since the last barrier. Correct (llama completions 4/4 exact) but no speed-up (tg 46.8 vs 48.6, pp 441 vs
+  447, within spread): ggml keeps all intermediate tensors in one allocation.
+- `ZLUDA_AIR_RANGE_REPORT=1` (compiler, report only; `_WHY=1` prints the blocking term): how many device accesses
+  scalar evolution writes as pointer argument + a function of launch values. llama.cpp's 1157 kernels: 2755 of
+  36961 accesses, no kernel entirely; blockers are grid-stride / data-dependent loops (trip counts not
+  computable), selects and phis, and 23903 accesses whose base is not a pointer argument.
+- `ZLUDA_AGX_HAZARD_STATS=1` (driver): the ceiling, assuming perfect byte ranges and taking only identical pointer
+  values as conflicts (optimistic). llama tg: 24366 of 28672 dispatches still need a barrier (85%): its graph is a
+  chain (norm -> mul -> matmul -> rope -> ...). At most ~15% of the ~6 ms/token barrier cost could go, about
+  44 -> 47 t/s, for a multi-day compiler + runtime project. Not pursued; the allocation-level flag stays as an
+  experiment.

@@ -1154,6 +1154,7 @@ fn tuning_directive<'a, 'input>(
         (Token::DotReqnctapercluster, _) => tuple1to3_u32.map(|(nx, ny, nz)| ast::TuningDirective::ReqNctaPerCluster(nx, ny, nz)),
         (Token::DotExplicitcluster, _) => empty.map(|_| ast::TuningDirective::ExplicitCluster),
         (Token::DotMaxclusterrank, _) => u32.map(ast::TuningDirective::MaxClusterRank),
+        (Token::DotMinperctamemory, _) => u32.map(ast::TuningDirective::MinPerCtaMemory),
         _ => fail
     }
     .parse_next(stream)
@@ -6146,6 +6147,8 @@ derive_parser!(
         DotReqntid,
         #[token(".minnctapersm")]
         DotMinnctapersm,
+        #[token(".minperctamemory")]
+        DotMinperctamemory,
         #[token(".reqnctapercluster")]
         DotReqnctapercluster,
         #[token(".explicitcluster")]

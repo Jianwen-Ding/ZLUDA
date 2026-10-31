@@ -50,6 +50,7 @@ MM_WINDOW = 1 << 36
 FAB_TABLE = 0x6ff000000000
 TEX_HEAP = 0x6fe000000000      # hardware texture descriptors (zluda_agx's texture heap)
 SAMPLER_HEAP = 0x6fe100000000  # hardware samplers
+PERCTA_BASE = 0x6fd000000000   # per-CTA global memory (.minperctamemory)
 
 
 class Unsupported(Exception):
@@ -415,8 +416,10 @@ def kernel_info(asm, obj, readelf, objcopy, tmp):
             args = [struct.unpack_from('<3I', d, q + 28 + 12 * i) for i in range(nargs)]
             # tagged extensions up to the record's end: 1 = cluster dimensions, 4 = the hidden threadgroup memory
             # size argument, 5 = the texture heap, 6 = 32-bit constants to preload, 7 = values computed from argument
-            # words (2 and 3 are checked mode's, which the harness does not run)
+            # words, 8 = the hidden per-CTA global memory argument and its slice size (2 and 3 are checked mode's,
+            # which the harness does not run)
             cluster, tgb_half, tex_half, consts, derived, e = (1, 1, 1), None, None, [], [], q + 28 + 12 * nargs
+            percta = None
             while e + 4 <= pos + size:
                 tag, = struct.unpack_from('<I', d, e)
                 if tag == 1 and e + 16 <= pos + size:
@@ -436,15 +439,18 @@ def kernel_info(asm, obj, readelf, objcopy, tmp):
                     n, = struct.unpack_from('<I', d, e + 4)
                     derived = [struct.unpack_from('<3I', d, e + 8 + 12 * i) for i in range(n)]
                     e += 8 + 12 * n
+                elif tag == 8 and e + 12 <= pos + size:
+                    percta = struct.unpack_from('<2I', d, e + 4)
+                    e += 12
                 else:
                     break
-            records[name] = (halves, tg_half, glob, tg_bytes, args, cluster, tgb_half, tex_half, consts, derived)
+            records[name] = (halves, tg_half, glob, tg_bytes, args, cluster, tgb_half, tex_half, consts, derived, percta)
             pos += size
     kernels = {}
     # a module with called functions (llc -agx-experimental-leaf-calls) has them after every kernel: a kernel's code
     # is then from its symbol to the end of .text, which holds what it calls (as agx_runtime loads it)
     calls = any(v[2] == 'FUNC' and n not in records for n, v in syms.items())
-    for name, (halves, tg_half, glob, tg_bytes, args, cluster, tgb_half, tex_half, consts, derived) in records.items():
+    for name, (halves, tg_half, glob, tg_bytes, args, cluster, tgb_half, tex_half, consts, derived, percta) in records.items():
         if name not in syms or syms[name][2] != 'FUNC':
             continue
         off, size = syms[name][0], syms[name][1]
@@ -462,6 +468,8 @@ def kernel_info(asm, obj, readelf, objcopy, tmp):
             'cluster': cluster,
             # the hidden argument set to the threadgroup memory of the launch, static and dynamic bytes
             'tgb_half': None if tgb_half in (None, 0xffffffff) else tgb_half,
+            # (half, slice bytes): the hidden argument set to a region of slice bytes per CTA (extension 8)
+            'percta': percta,
             # the texture heap address (extension 5, a module that samples with the texture unit)
             'tex_half': tex_half,
             # (half, value): 32-bit constants the launch preloads (extension 6, llc -agx-uniform-constants)
@@ -578,6 +586,15 @@ def simulate(args, tmp, name, k, ps, ops, grid, block, dyn, syms, mem, globals_m
         put(k['tgb_half'], k['shared'] + dyn, 4)
     if k['tex_half'] is not None:
         put(k['tex_half'], TEX_HEAP, 8)
+    if k['percta'] is not None:
+        # a zeroed region of the slice size per CTA of the grid (CTAs, not the threadgroups of clusters)
+        h, slice_bytes = k['percta']
+        if h != 0xffffffff:
+            put(h, PERCTA_BASE, 8)
+        f_pc = os.path.join(tmp, tag + '.percta.bin')
+        with open(f_pc, 'wb') as f:
+            f.write(b'\0' * max(16, grid[0] * grid[1] * grid[2] * slice_bytes))
+        extra = list(extra) + ['--map', '%#x=%s' % (PERCTA_BASE, f_pc)]
     for h, v in k['consts']:
         put(h, v, 4)
     for h, src, kind in k['derived']:

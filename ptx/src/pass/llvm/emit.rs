@@ -296,6 +296,15 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
         let name = CString::new(name).map_err(|_| error_unreachable())?;
         let mut fn_ = unsafe { LLVMGetNamedFunction(self.module, name.as_ptr()) };
         let threadgroup_bytes = method.is_kernel() && self.threadgroup_bytes_argument;
+        // .minperctamemory: the slice size, a multiple of 1024 bytes at least the directive's (PTX ISA 10.35)
+        let percta = (method.is_kernel() && self.target.is_air())
+            .then(|| {
+                method.tuning.iter().find_map(|t| match *t {
+                    ptx_parser::TuningDirective::MinPerCtaMemory(n) => Some((n as u64).div_ceil(1024) * 1024),
+                    _ => None,
+                })
+            })
+            .flatten();
         if fn_ == ptr::null_mut() {
             let i32_type = unsafe { LLVMInt32TypeInContext(self.context) };
             let fn_type = get_function_type(
@@ -305,7 +314,8 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                     .input_arguments
                     .iter()
                     .map(|v| get_input_argument_type(self.context, &v.info.v_type, v.info.state_space))
-                    .chain(threadgroup_bytes.then_some(Ok(i32_type))),
+                    .chain(threadgroup_bytes.then_some(Ok(i32_type)))
+                    .chain(percta.map(|_| Ok(unsafe { LLVMInt64TypeInContext(self.context) }))),
             )?;
             fn_ = unsafe { LLVMAddFunction(self.module, name.as_ptr(), fn_type) };
             self.emit_fn_attribute_string(fn_, "amdgpu-unsafe-fp-atomics", "true");
@@ -396,6 +406,12 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
             if threadgroup_bytes && unsafe { LLVMCountParams(fn_) } as usize > method.input_arguments.len() {
                 self.emit_threadgroup_bytes_argument(fn_, method.input_arguments.len() as u32);
             }
+            if let Some(size) = percta {
+                let index = method.input_arguments.len() as u32 + threadgroup_bytes as u32;
+                if unsafe { LLVMCountParams(fn_) } > index {
+                    self.emit_percta_argument(fn_, index, size);
+                }
+            }
             let base_32bit_memory = method.kernel_meta32.as_ref().map(|m| m.implicit_memory_ptr);
             // instructions before the first .loc are at line 0
             let subprogram = self.debug.as_ref().map(|d| {
@@ -456,6 +472,41 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                 LLVMSetAlignment(global, 4);
             }
             LLVMBuildStore(self.builder.get(), value, global);
+        }
+    }
+
+    // The hidden argument of the per-CTA global memory region's base ("agx-hidden"="perctamemory:<size>", which the
+    // launch sets to grid size * size bytes), stored with the slice size for %perctamemoryoffset and
+    // %perctamemorysize (zluda_ptx_impl_agx.ll)
+    fn emit_percta_argument(&mut self, fn_: LLVMValueRef, index: u32, size: u64) {
+        unsafe {
+            let value = LLVMGetParam(fn_, index);
+            let (key, role) = ("agx-hidden", format!("perctamemory:{size}"));
+            let attr = LLVMCreateStringAttribute(
+                self.context,
+                key.as_ptr().cast(),
+                key.len() as u32,
+                role.as_ptr().cast(),
+                role.len() as u32,
+            );
+            LLVMAddAttributeAtIndex(fn_, index + 1, attr);
+            let space = get_state_space(ast::StateSpace::Shared).unwrap_or(3);
+            for (name, type_, v, align) in [
+                (c"__zluda_agx_percta_base", LLVMInt64TypeInContext(self.context), value, 8),
+                (
+                    c"__zluda_agx_percta_size",
+                    LLVMInt32TypeInContext(self.context),
+                    LLVMConstInt(LLVMInt32TypeInContext(self.context), size, 0),
+                    4,
+                ),
+            ] {
+                let mut global = LLVMGetNamedGlobal(self.module, name.as_ptr());
+                if global.is_null() {
+                    global = LLVMAddGlobalInAddressSpace(self.module, type_, name.as_ptr(), space);
+                    LLVMSetAlignment(global, align);
+                }
+                LLVMBuildStore(self.builder.get(), v, global);
+            }
         }
     }
 
@@ -703,7 +754,8 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                     }
                     ptx_parser::TuningDirective::NoReturn
                     | ptx_parser::TuningDirective::ExplicitCluster
-                    | ptx_parser::TuningDirective::MaxClusterRank(_) => {}
+                    | ptx_parser::TuningDirective::MaxClusterRank(_)
+                    | ptx_parser::TuningDirective::MinPerCtaMemory(_) => {}
                 }
             }
             if let Some(t) = threads {
@@ -737,7 +789,8 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                 // clusters of several CTAs are only implemented for AGX: their instructions are rejected here
                 ptx_parser::TuningDirective::ReqNctaPerCluster(..)
                 | ptx_parser::TuningDirective::ExplicitCluster
-                | ptx_parser::TuningDirective::MaxClusterRank(_) => {}
+                | ptx_parser::TuningDirective::MaxClusterRank(_)
+                | ptx_parser::TuningDirective::MinPerCtaMemory(_) => {}
             }
         }
     }

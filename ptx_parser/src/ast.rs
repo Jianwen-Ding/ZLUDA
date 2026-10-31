@@ -3771,6 +3771,8 @@ pub enum TuningDirective {
     ReqNctaPerCluster(u32, u32, u32),
     ExplicitCluster,
     MaxClusterRank(u32),
+    /// .minperctamemory: the per-CTA global memory the kernel needs, in bytes (PTX ISA 11.4.10)
+    MinPerCtaMemory(u32),
 }
 
 pub struct MethodDeclaration<'input, ID> {

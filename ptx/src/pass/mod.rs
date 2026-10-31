@@ -416,6 +416,8 @@ enum PtxSpecialRegister {
     ReservedSmemOffsetBegin,
     ReservedSmemOffsetEnd,
     ReservedSmemOffsetCap,
+    PerctamemoryOffset,
+    PerctamemorySize,
     #[strum(disabled)]
     Envreg(u8),
     #[strum(disabled)]
@@ -462,6 +464,8 @@ impl PtxSpecialRegister {
             Self::ReservedSmemOffsetBegin => "%reserved_smem_offset_begin",
             Self::ReservedSmemOffsetEnd => "%reserved_smem_offset_end",
             Self::ReservedSmemOffsetCap => "%reserved_smem_offset_cap",
+            Self::PerctamemoryOffset => "%perctamemoryoffset",
+            Self::PerctamemorySize => "%perctamemorysize",
             Self::Envreg(n) => return Cow::Owned(format!("%envreg{}", n)),
             Self::Pm(n) => return Cow::Owned(format!("%pm{}", n)),
         })
@@ -531,6 +535,9 @@ impl PtxSpecialRegister {
             // launches is %envreg1:%envreg2)
             Self::Envreg(_) if target.is_air() => None,
             Self::Envreg(_) | Self::Pm(_) => Some(0),
+            // without per-CTA global memory (only AGX allocates it): "0 on Driver that doesn't support allocation
+            // of per CTA global memory" (PTX ISA 10.35)
+            Self::PerctamemorySize | Self::PerctamemoryOffset if !target.is_air() => Some(0),
             _ => None,
         }
     }
@@ -541,7 +548,7 @@ impl PtxSpecialRegister {
 
     fn get_function_return_type(self) -> ast::ScalarType {
         match self {
-            PtxSpecialRegister::Clock64 | PtxSpecialRegister::Globaltimer => {
+            PtxSpecialRegister::Clock64 | PtxSpecialRegister::Globaltimer | PtxSpecialRegister::PerctamemoryOffset => {
                 ast::ScalarType::U64
             }
             PtxSpecialRegister::IsExplicitCluster => ast::ScalarType::Pred,
@@ -589,6 +596,8 @@ impl PtxSpecialRegister {
             PtxSpecialRegister::ReservedSmemOffsetBegin => "sreg_reserved_smem_offset_begin",
             PtxSpecialRegister::ReservedSmemOffsetEnd => "sreg_reserved_smem_offset_end",
             PtxSpecialRegister::ReservedSmemOffsetCap => "sreg_reserved_smem_offset_cap",
+            PtxSpecialRegister::PerctamemoryOffset => "sreg_perctamemoryoffset",
+            PtxSpecialRegister::PerctamemorySize => "sreg_perctamemorysize",
             _ => "",
         }
     }

@@ -822,6 +822,10 @@ pub fn cdm_dispatch_with(
     c
 }
 
+/// The CDM barrier word (Mesa's unk0..19, the USC cache invalidate included) that orders the dispatches of one
+/// command, as a standalone word of a control stream.
+pub const CDM_BARRIER: [u8; 4] = (3u32 << 29 | 0xfffff).to_le_bytes();
+
 /// Firmware timestamps of one compute command, in `command_timestamp_frequency_hz` units.
 #[derive(Clone, Copy, Debug)]
 pub struct Timing {
@@ -871,6 +875,9 @@ pub struct Queue {
     verified: std::cell::Cell<u64>,
     /// The VM's `usc_generation` at this queue's last command.
     usc_seen: std::cell::Cell<u64>,
+    /// Whether a batched dispatch's words end with the CDM barrier (set to false by a caller that places the
+    /// barriers itself, `CDM_BARRIER`, between dispatches that may conflict).
+    pub trailing_barrier: std::cell::Cell<bool>,
     /// Rings for the per-launch objects: data (uniforms, control streams, parameter blocks) and USC (pipeline
     /// words). A launch costs no buffer object creation, mapping or binding.
     data_ring: (Bo, ring::RingAlloc),
@@ -957,6 +964,7 @@ impl Queue {
             in_flight: Default::default(),
             verified: Default::default(),
             usc_seen: std::cell::Cell::new(u64::MAX),
+            trailing_barrier: std::cell::Cell::new(true),
             data_ring: (vm.alloc_data(DATA_RING_BYTES)?, ring::RingAlloc::new(DATA_RING_BYTES)),
             usc_ring: (vm.alloc_usc(USC_RING_BYTES)?, ring::RingAlloc::new(USC_RING_BYTES)),
         })
@@ -2083,7 +2091,9 @@ impl LoadedModule {
             // Separate queue commands are ordered by firmware. Dispatches
             // within one command need the CDM barrier even when their code
             // is cached, or dependent kernels can overlap and read stale data.
-            let barrier = batched || queue.usc_seen.get() != vm.usc_generation || always_usc_barrier();
+            let barrier = (batched && queue.trailing_barrier.get())
+                || queue.usc_seen.get() != vm.usc_generation
+                || always_usc_barrier();
             queue.usc_seen.set(vm.usc_generation);
             let stream =
                 cdm_dispatch_with((pw - vm.usc_base) as u32, pipeline.uniform_halves(), g14x, global, local, barrier);

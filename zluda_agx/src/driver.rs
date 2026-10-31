@@ -229,8 +229,12 @@ fn queue_of<'a>(ctx: &'a mut Context, streams: &'a mut HashMap<usize, Stream>, s
 }
 
 /// Submits a batch's dispatches as one command of `queue`.
-fn submit_batch(queue: &mut Queue, b: Batch) -> Result<(), CUerror> {
+fn submit_batch(queue: &mut Queue, mut b: Batch) -> Result<(), CUerror> {
     if b.count > 0 {
+        // (with ZLUDA_AGX_HAZARD_BARRIERS the last dispatch has no barrier of its own)
+        if hazard_barriers() {
+            b.words.extend_from_slice(&agx_runtime::CDM_BARRIER);
+        }
         queue.submit_words(&b.words, None, None, &b.waits).map_err(from_io)?;
     }
     Ok(())
@@ -246,6 +250,17 @@ struct Batch {
     words: Vec<u8>,
     waits: Vec<Fence>,
     count: u32,
+    /// `ZLUDA_AGX_HAZARD_BARRIERS`: the allocations (start, end) the dispatches since the last barrier may touch
+    touched: Vec<(u64, u64)>,
+}
+
+/// `ZLUDA_AGX_HAZARD_BARRIERS=1` (experimental): in a batch, a barrier only before a dispatch whose arguments point
+/// into an allocation that a dispatch since the last barrier's point into too, and one at the end; consecutive
+/// dispatches on disjoint memory overlap. Only safe for kernels that reach memory through their arguments alone
+/// (not through pointers they load).
+fn hazard_barriers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ZLUDA_AGX_HAZARD_BARRIERS").is_ok_and(|v| v == "1"))
 }
 
 const MAX_BATCH: u32 = 64;
@@ -456,6 +471,20 @@ impl Driver {
             && capture.is_none()
             && k.stack_bytes == 0
             && k.texture_heap_half.is_none();
+        // ZLUDA_AGX_HAZARD_BARRIERS: the allocations this launch's arguments point into (every 8-byte word) and
+        // the module's globals
+        let mine: Option<Vec<(u64, u64)>> = (batchable && hazard_barriers()).then(|| {
+            let mut mine: Vec<(u64, u64)> = args
+                .iter()
+                .flat_map(|a| a.chunks_exact(8))
+                .filter_map(|w| ctx.address_range(u64::from_le_bytes(w.try_into().unwrap())))
+                .map(|(start, size)| (start, start + size))
+                .collect();
+            if let Some(va) = code.globals_va() {
+                mine.push((va, va + code.globals().len() as u64));
+            }
+            mine
+        });
         let fence = if batchable {
             // a batch of another stream, or one that this launch's waits would delay, goes first
             if batch.as_ref().is_some_and(|b| b.stream != sh || has_waits) {
@@ -468,8 +497,19 @@ impl Driver {
                 let s = streams.get_mut(&sh).ok_or(CUerror::INVALID_HANDLE)?;
                 (&mut s.queue, &mut s.waits)
             };
-            let b = batch.get_or_insert_with(|| Batch { stream: sh, words: Vec::new(), waits: std::mem::take(waits), count: 0 });
+            let b = batch.get_or_insert_with(|| Batch { stream: sh, words: Vec::new(), waits: std::mem::take(waits), count: 0, touched: Vec::new() });
+            if let Some(mine) = mine {
+                let conflict = mine.iter().any(|m| b.touched.iter().any(|t| m.0 < t.1 && t.0 < m.1));
+                if conflict {
+                    b.words.extend_from_slice(&agx_runtime::CDM_BARRIER);
+                    b.touched = mine;
+                } else {
+                    b.touched.extend(mine);
+                }
+                queue.trailing_barrier.set(false);
+            }
             let r = code.launch_params_words(&mut ctx.vm, queue, g14x, &name, args, grid, block, shared, &bounds, &mut b.words);
+            queue.trailing_barrier.set(true);
             match r {
                 Ok((fence, _, _)) => {
                     b.count += 1;

@@ -1638,6 +1638,9 @@ pub(crate) unsafe fn cuDeviceGetAttribute(pi: *mut c_int, attrib: CUdevice_attri
             A::CU_DEVICE_ATTRIBUTE_KERNEL_EXEC_TIMEOUT => 0,
             A::CU_DEVICE_ATTRIBUTE_TOTAL_CONSTANT_MEMORY => 65536,
             A::CU_DEVICE_ATTRIBUTE_TEXTURE_ALIGNMENT => 256,
+            // the row alignment of pitched memory (cuMemAllocPitch); Cycles pads 2D textures' rows to it (0 made
+            // their pitch 0)
+            A::CU_DEVICE_ATTRIBUTE_TEXTURE_PITCH_ALIGNMENT => 128,
             // multicast objects of one device (cuMulticastCreate), on the virtual memory management API
             A::CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED | A::CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED => 1,
             _ => 0,
@@ -3497,6 +3500,20 @@ unsafe fn copy_side(
 }
 
 unsafe fn memcpy_2d(c: *const CUDA_MEMCPY2D) -> CUresult {
+    let r = memcpy_2d_checked(c);
+    if r.is_err() && crate::log_enabled() {
+        if let Some(c) = c.as_ref() {
+            eprintln!(
+                "[zluda_agx] 2D copy failed: {r:?}: {} x {} bytes, src {:?} {:#x} pitch {} at ({}, {}), dst {:?} {:#x} pitch {} at ({}, {})",
+                c.WidthInBytes, c.Height, c.srcMemoryType, c.srcDevice.0 as u64, c.srcPitch, c.srcXInBytes, c.srcY,
+                c.dstMemoryType, c.dstDevice.0 as u64, c.dstPitch, c.dstXInBytes, c.dstY
+            );
+        }
+    }
+    r
+}
+
+unsafe fn memcpy_2d_checked(c: *const CUDA_MEMCPY2D) -> CUresult {
     let c = c.as_ref().ok_or(CUerror::INVALID_VALUE)?;
     let (w, h) = (c.WidthInBytes, c.Height);
     let array = CUmemorytype::CU_MEMORYTYPE_ARRAY;

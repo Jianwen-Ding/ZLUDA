@@ -256,6 +256,17 @@ def within_margin(want, got, t, args):
     return args.ulp > 0 and w == w and g == g and abs(ordered(want, t) - ordered(got, t)) <= args.ulp
 
 
+def is_any_nan(want, got, size):
+    """--nan-any: an expected canonical NaN of a 2-, 4- or 8-byte element (0x7fff, 0x7fffffff, 0x7fffffffffffffff, by
+    their bits whatever the element's declared type) and a NaN got of that width, for the results whose NaN PTX
+    leaves unspecified (single and half precision, ISA 8.x; f16 and f32 as such or packed)."""
+    exp = {2: (0x7fff, 0x7c00, 0x3ff), 4: (0x7fffffff, 0x7f800000, 0x7fffff),
+           8: (0x7fffffffffffffff, 0x7ff0000000000000, 0xfffffffffffff)}.get(size)
+    if not exp or want != exp[0]:
+        return False
+    return got & exp[1] == exp[1] and got & exp[2] != 0
+
+
 def dec_float(bits, t):
     if t == 'f32':
         return struct.unpack('<f', struct.pack('<I', bits))[0]
@@ -950,7 +961,9 @@ def run_test(path, args):
                 for i, v in enumerate(vals):
                     want = lit_bits(v, t, syms)
                     got = gread(syms[name] + (off + i) * SIZES[t], SIZES[t])
-                    if want != got:
+                    if want != got and getattr(args, 'nan_any', False) and is_any_nan(want, got, SIZES[t]):
+                        near = True
+                    elif want != got:
                         if within_margin(want, got, t, args):
                             near = True
                         else:
@@ -996,6 +1009,9 @@ def main():
     ap.add_argument('--ulp', type=int, default=0,
                     help='also accept float results within this many units in the last place (any NaN for a NaN), '
                          'counted apart (PASS~)')
+    ap.add_argument('--nan-any', dest='nan_any', action='store_true',
+                    help='also accept any NaN for an expected canonical NaN (counted as within the margin): the '
+                         'default mode, whose NaNs PTX leaves unspecified')
     ap.add_argument('--flush-ok', dest='flush_ok', action='store_true',
                     help='also accept the same-signed zero for an expected subnormal (the default mode flushes)')
     ap.add_argument('--timeout', type=int, default=300,

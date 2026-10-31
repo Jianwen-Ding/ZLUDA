@@ -172,7 +172,11 @@ the order it was found:
   Cycles' pack_instances copies those words from the mesh's BVH as they are: the host data, built on the CPU,
   already has them. Not the calls (inlined, the same), not the generic-pointer bug below (fixed, the same), not a
   backend option. Open: why this Blender build's mesh BVH2 leaves get no visibility / type (a Cycles issue of the
-  CUDA BVH2 path, or something Cycles reads from the driver).
+  CUDA BVH2 path, or something Cycles reads from the driver). Later: a log of the driver's host-to-device copies
+  shows Cycles itself uploads the mesh leaves as (2, 4, 0, 0) (the instance leaves written by pack_leaf directly
+  have theirs); Cycles' spatial-split, compact-BVH and BVH-type settings change nothing; and the build's commit
+  (ae6d847d66fa) does not exist in Blender's repository ("commit doesn't exist"), so the aarch64 build is a
+  third party's, with no official Linux ARM64 build to compare (blender.org publishes x64 only).
 - **Generic pointers across real calls** (fixed, llvm-project claude/air-calls-generic-pointers): a called
   function given a generic pointer to its caller's private memory accessed it as device memory
   (ptx/tools/agx_tests/private-ptr-call.ptx).

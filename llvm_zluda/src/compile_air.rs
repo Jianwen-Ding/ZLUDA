@@ -385,7 +385,7 @@ pub fn compile_air(
             // the module keeps every global variable, and the objects are merged into the one a whole-module
             // compilation makes (agx_merge). ZLUDA_AGX_PER_KERNEL: 1 always (several kernels), 0 never; by default
             // for portable AIR over 4 MB.
-            let kernels = kernel_names(&linked);
+            let mut kernels = kernel_names(&linked);
             let per_kernel = kernels.len() > 1
                 && match std::env::var("ZLUDA_AGX_PER_KERNEL").as_deref() {
                     Ok("1") => true,
@@ -393,6 +393,11 @@ pub fn compile_air(
                     _ => portable.len() > 4 << 20,
                 };
             if per_kernel {
+                // ZLUDA_AGX_ONLY_KERNELS (comma separated, for debugging): AGX code of only these kernels, compiled as
+                // in the whole module (the same global data layout), to replay one of them with other options
+                if let Ok(only) = std::env::var("ZLUDA_AGX_ONLY_KERNELS") {
+                    kernels.retain(|k| only.split(',').any(|o| k.to_bytes() == o.as_bytes()));
+                }
                 // Each kernel in a context of its own, read back from the portable AIR, which is freed whole after
                 // the kernel's code (the module and its context are done with: kept, they held Cycles' compilation
                 // at 4 GB before its largest kernel's 3)

@@ -733,8 +733,15 @@ impl Driver {
         let mut replay = m.replay(&r.kernel, &params, r.grid, r.block, r.shared, &bounds, &allocations, TABLE, PARAM_BLOCK)?;
         replay.add_textures(&self.ctx.vm);
         let mut regions = replay.regions.clone();
-        // every allocation an 8-byte word of the arguments points into
-        let words = r.params.iter().flat_map(|p| p.chunks_exact(8)).chain(replay.regions.first().filter(|(va, _)| *va == PARAM_BLOCK).into_iter().flat_map(|(_, b)| b.chunks_exact(8)));
+        // every allocation an 8-byte word of the arguments points into, or of the module's global data (Blender
+        // Cycles' kernel_params holds the addresses of its arrays)
+        let globals: Vec<u8> = m.globals_va().map(|_| m.globals().to_vec()).unwrap_or_default();
+        let words = r
+            .params
+            .iter()
+            .flat_map(|p| p.chunks_exact(8))
+            .chain(replay.regions.first().filter(|(va, _)| *va == PARAM_BLOCK).into_iter().flat_map(|(_, b)| b.chunks_exact(8)))
+            .chain(globals.chunks_exact(8));
         for w in words {
             if let Some((start, bytes)) = self.ctx.allocation(u64::from_le_bytes(w.try_into().unwrap())) {
                 if !regions.iter().any(|(va, _)| *va == start) {

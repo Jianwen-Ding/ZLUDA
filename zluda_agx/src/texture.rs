@@ -276,9 +276,18 @@ const SAMPLER_HEAP_BASE: u64 = 28;
 unsafe fn write_texture(d: &mut Driver, img: &Image, t: &CUDA_TEXTURE_DESC) -> Result<u64, CUerror> {
     let mut words = texture_words(img, t)?.to_vec();
     let mut native = 0;
-    // The texture unit is checked on the GPU for RGBA8 arrays only (agx_texture_check, M2 Max, 2026-10-23), so it is
-    // only used when ZLUDA_AGX_HARDWARE_TEXTURES is set.
-    if std::env::var_os("ZLUDA_AGX_HARDWARE_TEXTURES").is_some() && std::env::var_os("ZLUDA_AGX_SOFTWARE_TEXTURES").is_none() {
+    // The texture unit's point sampling gives the software sampler's results bit for bit in every form checked on the
+    // GPU (agx_texture_check, M2 Max, 2026-10-31: u8 / u16 / s8 / s16 / f16 / f32, 1, 2 and 4 channels, wrap, clamp,
+    // mirror and border, normalized or not, 1D, 2D and pitch-linear; 2^22 values each), so point-sampled textures use
+    // it by default. Its linear filtering differs from CUDA's 1/256 weights (up to 0.3% of the texel range with
+    // normalized coordinates; f16 results rounded to half), so linearly filtered ones only with
+    // ZLUDA_AGX_HARDWARE_TEXTURES=1. ZLUDA_AGX_SOFTWARE_TEXTURES keeps every texture in software.
+    let hardware = if std::env::var_os("ZLUDA_AGX_SOFTWARE_TEXTURES").is_some() {
+        false
+    } else {
+        std::env::var_os("ZLUDA_AGX_HARDWARE_TEXTURES").is_some() || !filters_linearly(img, t)
+    };
+    if hardware {
         let why = match native_descriptors(img, t) {
             None => Some("not a form the texture unit samples as the software sampler does"),
             Some((texture, sampler, integer, rank)) => match d.ctx.vm.add_texture(&texture).map_err(from_io)? {

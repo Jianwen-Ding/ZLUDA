@@ -23,6 +23,7 @@
 #include <llvm/IR/PatternMatch.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/ADT/SetVector.h>
+#include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/Support/Alignment.h>
 #include <array>
 #include <optional>
@@ -3017,7 +3018,30 @@ int LLVMZludaAirCanonicalNaNs(LLVMModuleRef M)
             if (arithmetic)
                 work.push_back(&I);
         }
+        // A NaN whose bits nothing observes needs no canonical form (f32, f16, bf16: their canonical NaN does not
+        // depend on the operands'): a value only read by operations that canonicalize their own results, by
+        // comparisons or by saturating conversions to integers (NaN gives 0). Convolutions of fma.rn.ftz.f32 had
+        // three instructions after every fma for it.
+        SmallPtrSet<Instruction *, 16> canonicalized(work.begin(), work.end());
+        auto unobserved = [&](Instruction *I) {
+            if (I->getType()->getScalarType()->isDoubleTy() || I->use_empty())
+                return false;
+            return all_of(I->users(), [&](User *U) {
+                auto *UI = dyn_cast<Instruction>(U);
+                if (!UI)
+                    return false;
+                if (isa<FCmpInst>(UI) || canonicalized.contains(UI))
+                    return true;
+                auto *II = dyn_cast<IntrinsicInst>(UI);
+                return II && (II->getIntrinsicID() == Intrinsic::fptoui_sat ||
+                              II->getIntrinsicID() == Intrinsic::fptosi_sat);
+            });
+        };
+        SmallVector<Instruction *, 64> observed;
         for (Instruction *I : work)
+            if (!unobserved(I))
+                observed.push_back(I);
+        for (Instruction *I : observed)
         {
             Type *T = I->getType();
             Type *S = T->getScalarType();

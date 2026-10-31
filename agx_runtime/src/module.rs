@@ -64,6 +64,9 @@ pub struct KernelInfo {
     /// The hidden 64-bit argument's half and the slice bytes of PTX's per-CTA global memory (`.agx.kernels`
     /// extension 8, a kernel with .minperctamemory): the launch sets it to a region of the slice bytes per CTA.
     pub per_cta_memory: Option<(u32, u32)>,
+    /// Half of the hidden 64-bit base of the 32-bit addresses of a module of PTX's .address_size 32 (`.agx.kernels`
+    /// extension 9): the launch sets it to the start of the data heap, below every allocation.
+    pub address32_base_half: Option<u32>,
 }
 
 /// Value `kind` of `.agx.kernels` extension 7 for the argument word `d`, a divisor: with l = ceil(log2(d)) (of |d|
@@ -297,6 +300,7 @@ impl<'a> Elf<'a> {
             let mut constants = Vec::new();
             let mut launch_values = Vec::new();
             let mut per_cta_memory = None;
+            let mut address32_base_half = None;
             while e < end {
                 match word(e)? {
                     1 if e + 4 <= end => {
@@ -358,6 +362,10 @@ impl<'a> Elf<'a> {
                         per_cta_memory = Some((word(e + 1)?, word(e + 2)?));
                         e += 3;
                     }
+                    9 if e + 2 <= end => {
+                        address32_base_half = Some(word(e + 1)?);
+                        e += 2;
+                    }
                     _ => break,
                 }
             }
@@ -381,6 +389,7 @@ impl<'a> Elf<'a> {
                     constants,
                     launch_values,
                     per_cta_memory,
+                    address32_base_half,
                 },
             );
             at += size / 4;
@@ -508,6 +517,7 @@ impl Module {
                     constants: Vec::new(),
                     launch_values: Vec::new(),
                     per_cta_memory: None,
+                    address32_base_half: None,
                 },
             );
         }
@@ -1096,6 +1106,7 @@ mod tests {
                 constants: Vec::new(),
                 launch_values: Vec::new(),
                 per_cta_memory: None,
+                    address32_base_half: None,
             }
         );
         assert_eq!(m.text.len(), 98);
@@ -1123,6 +1134,7 @@ mod tests {
             constants: Vec::new(),
             launch_values: Vec::new(),
             per_cta_memory: None,
+                    address32_base_half: None,
         };
         let u = pack_uniforms(
             &k,

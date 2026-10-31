@@ -420,6 +420,7 @@ def kernel_info(asm, obj, readelf, objcopy, tmp):
             # which the harness does not run)
             cluster, tgb_half, tex_half, consts, derived, e = (1, 1, 1), None, None, [], [], q + 28 + 12 * nargs
             percta = None
+            base32_half = None
             while e + 4 <= pos + size:
                 tag, = struct.unpack_from('<I', d, e)
                 if tag == 1 and e + 16 <= pos + size:
@@ -442,15 +443,20 @@ def kernel_info(asm, obj, readelf, objcopy, tmp):
                 elif tag == 8 and e + 12 <= pos + size:
                     percta = struct.unpack_from('<2I', d, e + 4)
                     e += 12
+                elif tag == 9 and e + 8 <= pos + size:
+                    base32_half, = struct.unpack_from('<I', d, e + 4)
+                    e += 8
                 else:
                     break
-            records[name] = (halves, tg_half, glob, tg_bytes, args, cluster, tgb_half, tex_half, consts, derived, percta)
+            records[name] = (halves, tg_half, glob, tg_bytes, args, cluster, tgb_half, tex_half, consts, derived, percta,
+                            base32_half)
             pos += size
     kernels = {}
     # a module with called functions (llc -agx-experimental-leaf-calls) has them after every kernel: a kernel's code
     # is then from its symbol to the end of .text, which holds what it calls (as agx_runtime loads it)
     calls = any(v[2] == 'FUNC' and n not in records for n, v in syms.items())
-    for name, (halves, tg_half, glob, tg_bytes, args, cluster, tgb_half, tex_half, consts, derived, percta) in records.items():
+    for name, (halves, tg_half, glob, tg_bytes, args, cluster, tgb_half, tex_half, consts, derived, percta,
+               base32_half) in records.items():
         if name not in syms or syms[name][2] != 'FUNC':
             continue
         off, size = syms[name][0], syms[name][1]
@@ -470,6 +476,8 @@ def kernel_info(asm, obj, readelf, objcopy, tmp):
             'tgb_half': None if tgb_half in (None, 0xffffffff) else tgb_half,
             # (half, slice bytes): the hidden argument set to a region of slice bytes per CTA (extension 8)
             'percta': percta,
+            # the hidden base of a 32-bit module's addresses (extension 9)
+            'base32_half': base32_half,
             # the texture heap address (extension 5, a module that samples with the texture unit)
             'tex_half': tex_half,
             # (half, value): 32-bit constants the launch preloads (extension 6, llc -agx-uniform-constants)
@@ -549,9 +557,9 @@ def simulate(args, tmp, name, k, ps, ops, grid, block, dyn, syms, mem, globals_m
             halves[half + j] = (value >> (16 * j)) & 0xffff
 
     ps_all = list(zip(ps, ops))
-    if address32:
-        # 32-bit modules take the 64-bit base of their 32-bit addresses as a last parameter; the harness
-        # buffers are below 4 GiB, so it is 0.
+    if address32 and k.get('base32_half') is None:
+        # 32-bit modules take the 64-bit base of their 32-bit addresses as a last parameter (a hidden argument,
+        # extension 9, in newer objects); the harness buffers are below 4 GiB, so it is 0.
         ps_all.append((('u64', 1, 8), '0'))
     if len(k['args']) != len(ps_all):
         raise Unsupported('kernel record argument count')
@@ -586,6 +594,8 @@ def simulate(args, tmp, name, k, ps, ops, grid, block, dyn, syms, mem, globals_m
         put(k['tgb_half'], k['shared'] + dyn, 4)
     if k['tex_half'] is not None:
         put(k['tex_half'], TEX_HEAP, 8)
+    if k.get('base32_half') not in (None, 0xffffffff):
+        put(k['base32_half'], 0, 8)
     if k['percta'] is not None:
         # a zeroed region of the slice size per CTA of the grid (CTAs, not the threadgroups of clusters)
         h, slice_bytes = k['percta']

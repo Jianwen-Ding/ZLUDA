@@ -811,7 +811,7 @@ impl Driver {
         const PARAM_BLOCK: u64 = 0x7f_0000_0000;
         const TABLE: u64 = 0x7e_0000_0000;
         let allocations = self.live_allocations();
-        let mut replay = m.replay(&r.kernel, &params, r.grid, r.block, r.shared, &bounds, &allocations, TABLE, PARAM_BLOCK)?;
+        let mut replay = m.replay(&r.kernel, &params, r.grid, r.block, r.shared, &bounds, &allocations, TABLE, PARAM_BLOCK, self.ctx.vm.data_base)?;
         replay.add_textures(&self.ctx.vm);
         let mut regions = replay.regions.clone();
         // every allocation an 8-byte word of the arguments points into, or of the module's global data (Blender
@@ -4362,6 +4362,7 @@ mod tests {
             &[],
             0x7e_0000_0000,
             0x7f_0000_0000,
+            0,
         )
         .unwrap();
         let mut regions = r.regions.clone();
@@ -4407,6 +4408,7 @@ mod tests {
             &allocations,
             0x7e_0000_0000,
             0x7f_0000_0000,
+            0,
         )
         .unwrap();
         assert!(r.regions.iter().any(|(va, b)| *va == 0x7e_0000_0000 && b.len() == 48), "the table is a region");

@@ -322,6 +322,9 @@ pub struct Vm {
     /// PTX's per-CTA global memory of the launches (`.agx.kernels` extension 8), grown to the largest asked for and
     /// shared by the commands of the address space (as `scratch`), with the smaller ones it replaced.
     per_cta: Vec<Bo>,
+    /// The start of the data heap, below every data allocation: the base of the 32-bit addresses of modules of
+    /// PTX's .address_size 32 (`.agx.kernels` extension 9), which reach the first 4 GiB of the heap.
+    pub data_base: u64,
     /// Counts USC allocations (module code, rings): a queue's next command invalidates the USC cache when this has
     /// changed since its last one.
     pub usc_generation: u64,
@@ -387,6 +390,7 @@ impl Vm {
             core_entries: scratch::core_entries(&p.core_masks, p.num_clusters_total, p.num_cores_per_cluster),
             scratch: None,
             per_cta: Vec::new(),
+            data_base,
             usc_generation: 0,
             textures: None,
         })
@@ -1503,8 +1507,14 @@ fn uniforms(
     record: Option<u64>,
     param_block: u64,
     per_cta: u64,
+    base32: u64,
 ) -> io::Result<(Vec<u16>, Vec<u8>)> {
     let (mut halves, block) = module::pack_params(k, params, threadgroups, globals, param_block).map_err(|e| invalid(e.to_string()))?;
+    if let Some(half) = k.address32_base_half.filter(|&h| h != u32::MAX) {
+        for (i, h) in halves.get_mut(half as usize..half as usize + 4).ok_or_else(|| invalid(format!("{}: hidden argument outside the uniforms", k.name)))?.iter_mut().enumerate() {
+            *h = (base32 >> (16 * i)) as u16;
+        }
+    }
     if let Some((half, _)) = k.per_cta_memory.filter(|&(h, _)| h != u32::MAX) {
         for (i, h) in halves.get_mut(half as usize..half as usize + 4).ok_or_else(|| invalid(format!("{}: hidden argument outside the uniforms", k.name)))?.iter_mut().enumerate() {
             *h = (per_cta >> (16 * i)) as u16;
@@ -1543,6 +1553,7 @@ pub fn replay(
     allocations: &[(u64, u64)],
     table_va: u64,
     param_block: u64,
+    base32: u64,
 ) -> io::Result<Replay> {
     let k = module.kernels.get(kernel).ok_or_else(|| invalid(format!("no kernel {kernel}")))?;
     let (threadgroups, local) = k.hardware_launch(threadgroups, local).map_err(|e| invalid(e.to_string()))?;
@@ -1564,6 +1575,7 @@ pub fn replay(
         record.map(|r| r.0),
         param_block,
         per_cta,
+        base32,
     )?;
     let code = module.text[k.offset as usize..(k.offset + k.size) as usize].to_vec();
     let mut regions: Vec<(u64, Vec<u8>)> = Vec::new();
@@ -2036,11 +2048,12 @@ impl LoadedModule {
             }
         }
         let per_cta = per_cta_region(vm, k, threadgroups)?;
-        let (mut halves, block) = self.uniforms(k, params, threadgroups, dynamic_shared, bounds, table, 0, per_cta)?;
+        let base32 = vm.data_base;
+        let (mut halves, block) = self.uniforms(k, params, threadgroups, dynamic_shared, bounds, table, 0, per_cta, base32)?;
         if !block.is_empty() {
             // the pointers in the uniforms depend on where the block lands
             let va = queue.stage(RingKind::Data, &block, 16)?;
-            halves = self.uniforms(k, params, threadgroups, dynamic_shared, bounds, table, va, per_cta)?.0;
+            halves = self.uniforms(k, params, threadgroups, dynamic_shared, bounds, table, va, per_cta, base32)?.0;
         }
         self.dispatch(vm, queue, g14x, k, &halves, Vec::new(), threadgroups, local, dynamic_shared, wait_for, None, &mut (None, None))
     }
@@ -2055,9 +2068,10 @@ impl LoadedModule {
         table: (u64, u32),
         param_block: u64,
         per_cta: u64,
+        base32: u64,
     ) -> io::Result<(Vec<u16>, Vec<u8>)> {
         let record = self.record.as_ref().map(|r| r.va);
-        uniforms(k, params, threadgroups, dynamic_shared, bounds, table, self.globals_va(), record, param_block, per_cta)
+        uniforms(k, params, threadgroups, dynamic_shared, bounds, table, self.globals_va(), record, param_block, per_cta, base32)
     }
 
     /// What a launch hands the hardware, for replaying it elsewhere (the AGX Performance Simulator's `agx_run`):
@@ -2073,6 +2087,7 @@ impl LoadedModule {
         allocations: &[(u64, u64)],
         table_va: u64,
         param_block: u64,
+        base32: u64,
     ) -> io::Result<Replay> {
         let globals = self.globals_va().map(|va| (va, self.globals()));
         let record = self.record.as_ref().map(|r| (r.va, &r.as_slice()[..module::CHECKED_RECORD_BYTES as usize]));
@@ -2089,6 +2104,7 @@ impl LoadedModule {
             allocations,
             table_va,
             param_block,
+            base32,
         )
     }
 
@@ -2203,10 +2219,11 @@ impl LoadedModule {
         }
         let (threadgroups, local) = k.hardware_launch(threadgroups, local).map_err(|e| invalid(e.to_string()))?;
         let per_cta = per_cta_region(vm, k, threadgroups)?;
-        let (mut halves, block) = self.uniforms(k, params, threadgroups, dynamic_shared, bounds, (0, 0), 0, per_cta)?;
+        let base32 = vm.data_base;
+        let (mut halves, block) = self.uniforms(k, params, threadgroups, dynamic_shared, bounds, (0, 0), 0, per_cta, base32)?;
         if !block.is_empty() {
             let va = queue.stage(RingKind::Data, &block, 16)?;
-            halves = self.uniforms(k, params, threadgroups, dynamic_shared, bounds, (0, 0), va, per_cta)?.0;
+            halves = self.uniforms(k, params, threadgroups, dynamic_shared, bounds, (0, 0), va, per_cta, base32)?.0;
         }
         let mut helper = (None, None);
         let fence =

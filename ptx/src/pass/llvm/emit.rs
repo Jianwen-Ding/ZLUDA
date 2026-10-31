@@ -296,6 +296,9 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
         let name = CString::new(name).map_err(|_| error_unreachable())?;
         let mut fn_ = unsafe { LLVMGetNamedFunction(self.module, name.as_ptr()) };
         let threadgroup_bytes = method.is_kernel() && self.threadgroup_bytes_argument;
+        let base32_hidden = (self.target.is_air() && method.is_kernel() && method.kernel_meta32.is_some())
+            .then(|| (method.input_arguments.len() as u32).checked_sub(1))
+            .flatten();
         // .minperctamemory: the slice size, a multiple of 1024 bytes at least the directive's (PTX ISA 10.35)
         let percta = (method.is_kernel() && self.target.is_air())
             .then(|| {
@@ -405,6 +408,21 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
             unsafe { LLVMPositionBuilderAtEnd(self.builder.get(), real_bb) };
             if threadgroup_bytes && unsafe { LLVMCountParams(fn_) } as usize > method.input_arguments.len() {
                 self.emit_threadgroup_bytes_argument(fn_, method.input_arguments.len() as u32);
+            }
+            // .address_size 32: the base of the 32-bit addresses, the last argument convert_32bit_to_64bit adds, is
+            // a hidden one the runtime sets on AGX (.agx.kernels extension 9)
+            if let Some(index) = base32_hidden {
+                let (key, role) = ("agx-hidden", "address32-base");
+                unsafe {
+                    let attr = LLVMCreateStringAttribute(
+                        self.context,
+                        key.as_ptr().cast(),
+                        key.len() as u32,
+                        role.as_ptr().cast(),
+                        role.len() as u32,
+                    );
+                    LLVMAddAttributeAtIndex(fn_, index + 1, attr);
+                }
             }
             if let Some(size) = percta {
                 let index = method.input_arguments.len() as u32 + threadgroup_bytes as u32;

@@ -627,10 +627,20 @@ are rounded once more, which is why `--strict-fp` does not use the unit. The
 formalization harness builds the same descriptors (`agx_run --sampler-heap`), and the texture tests pass both
 ways. On the GPU the texture unit first read zeros: `texture_sample`'s register sampler index of heap sampler k is
 k + 28 (the lower indices are sampler state slots; Mesa's Honeykrisp stores heap index + 28), which word 16 now holds.
-With it, `agx_texture_check` (a random RGBA8 1024 x 512 array at 2^20 coordinates, normalized, wrap) gives the
-software sampler's results on the M2 Max: identical integers, and normalized floats with linear filtering within
-1.3e-4. Until more forms are checked on the GPU, the texture unit is only used when `ZLUDA_AGX_HARDWARE_TEXTURES` is
-set; by default every texture takes the software path.
+`agx_texture_check` (random texels, 2^20 coordinates, some far outside the texture; options for the format,
+channels, address mode, filter, coordinates, 1D and pitch-linear) runs a form through the texture unit and through the
+software sampler; `ptx/tools/agx_texture_sweep.sh` compares the two (M2 Max, 2026-10-31, by probing only):
+
+- **Point sampling is bit-identical** in all 22 forms checked: u8, u16, s8, s16 (as integers and as normalized
+  floats), f16 and f32; 1, 2 and 4 channels; wrap, clamp, mirror and border; normalized and unnormalized
+  coordinates; 1D, 2D and pitch-linear. Point-sampled textures (and textures read as integers, which are point
+  sampled) therefore use the texture unit by default.
+- **Linear filtering differs** from CUDA's weights (9-bit fixed point, 8 fractional bits, CUDA Programming Guide,
+  "Linear Filtering"): with unnormalized coordinates within about 8e-6 for f32 and u16 texels and 1.2e-4 for 8-bit
+  ones; with normalized coordinates up to 0.1-0.3% of the texel range, at any texture size; f16 results are rounded
+  to half precision. Linearly filtered textures use the unit only with `ZLUDA_AGX_HARDWARE_TEXTURES=1`.
+
+`ZLUDA_AGX_SOFTWARE_TEXTURES` keeps every texture in software.
 
 Textures read as integers (`CU_TRSF_READ_AS_INTEGER` on 8- and 16-bit formats, and 32-bit integer formats) are point
 sampled even when linear filtering is asked for: CUDA documents linear filtering only for textures that return

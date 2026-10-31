@@ -508,6 +508,154 @@ static inline int geom_rank(int g) { return g == G_1D || g == G_A1D ? 1 : g == G
 static inline int geom_array(int g) { return g == G_A1D || g == G_A2D || g == G_ACUBE; }
 static inline int geom_cube(int g) { return g == G_CUBE || g == G_ACUBE; }
 
+// ---------------------------------------------------------------- exact, in integers
+
+// The double precision sampler above, for the textures whose texels are unsigned normalized integers (u8 and u16 read
+// as floats, Blender Cycles' byte images) sampled at level 0 with float coordinates and results: the same float
+// results, computed in integers, without soft-f64 (most of --strict-fp's cost in texture-heavy kernels).
+//
+// The coordinate scaled to texels is exact as 32.32 fixed point, floored (the floors and the 1/256 weights only
+// compare it with multiples of 2^-9, which flooring the bits below 2^-32 cannot cross). The filtered value is then
+// the exact rational E = sum(m_i * iv_i) / (65536 * max), m_i the products of the per-axis weights in 1/256 steps.
+// The double sampler rounds each texel value, product and sum to 53 bits; all its terms are non-negative, so its
+// sum is within 5 * 2^-53 * E of E and rounds to the float E rounds to unless E is that close to a midpoint between
+// floats. Those cases, coordinates beyond 2^30 texels and NaN or infinite ones take the double sampler.
+
+// floor(x * n * 2^32) for the float of bits b (x unscaled unless norm), or 0 with *ok = 0 when |x * n| >= 2^30 or x is not finite
+static inline int64_t fixed_coord(uint32_t b, int64_t n, int norm, int *ok) {
+    int e = (int)((b >> 23) & 0xff);
+    *ok = 0;
+    if (e == 0xff)
+        return 0;
+    // |x| = m * 2^(ex), m < 2^24 (denormals: no implicit bit)
+    int64_t m = (int64_t)(b & 0x7fffff) | (e ? (int64_t)1 << 23 : 0);
+    int ex = (e ? e : 1) - 150;
+    if (norm == 1) {
+        if (n > ((int64_t)1 << 24))
+            return 0;
+        m *= n;
+    }
+    int sh = ex + 32;
+    int64_t v;
+    if (sh >= 0) {
+        // m * 2^sh < 2^62 (|x * n| < 2^30)
+        if (m != 0 && (sh >= 62 || (m >> (62 - sh)) != 0))
+            return 0;
+        v = m << sh;
+        if (b >> 31)
+            v = -v;
+    } else {
+        // the bits below 2^-32 floored: toward zero for |x|, then one less for a negative x with any of them
+        int64_t lost = sh <= -63 ? m : (m & (((int64_t)1 << -sh) - 1));
+        v = sh <= -63 ? 0 : (m >> -sh);
+        if (b >> 31)
+            v = -v - (lost != 0);
+    }
+    *ok = 1;
+    return v;
+}
+
+// The float that E = num / (max * 2^16) rounds to (num > 0, E <= 1), or *ok = 0 when E is within 2^-50 * E of a
+// midpoint between floats (the double sampler's sum could round either way).
+static inline uint32_t exact_float(uint64_t num, uint64_t max, int *ok) {
+    if (num == 0)
+        return 0;
+    int lz = __builtin_clzll(num) - 1;
+    uint64_t big = num << lz;  // < 2^63
+    // (constant divisors: multiplies, not a division loop)
+    uint64_t q = max == 255 ? big / 255 : big / 65535;
+    uint64_t r = big - q * max;
+    int len = 64 - __builtin_clzll(q);
+    if (len < 25) {
+        *ok = 0;
+        return 0;
+    }
+    int shift = len - 24;
+    uint64_t mant = q >> shift, rem = q & (((uint64_t)1 << shift) - 1), half = (uint64_t)1 << (shift - 1);
+    // the distance to the midpoint, times max: (rem + r / max - half) * max
+    uint64_t above = rem * max + r, mid = half * max;
+    uint64_t dist = above > mid ? above - mid : mid - above;
+    // q * max <= big < 2^63
+    if (dist <= ((q * max) >> 50) + 1) {
+        *ok = 0;
+        return 0;
+    }
+    if (above > mid)
+        mant++;
+    // E = q * 2^-(16 + lz) / ... : the leading bit of q is 2^(len - 1)
+    int exp = len - 1 - 16 - lz;
+    if (mant >> 24) {
+        mant >>= 1;
+        exp++;
+    }
+    return (uint32_t)(exp + 127) << 23 | (uint32_t)(mant & 0x7fffff);
+}
+
+// tex.1d / tex.2d of an unsigned normalized texture at level 0 (point or linear), exactly as the double sampler;
+// *ok = 0 when it cannot be done here
+static inline v4u32 exact_unorm_sample(desc_t t, struct sampling *sm, int rank, uint32_t x, uint32_t y, int off0,
+                                       int off1, int *ok) {
+    v4u32 out = {0, 0, 0, 0};
+    *ok = 0;
+    uint64_t code = tw(t, 2);
+    if ((code != 0 && code != 1) || !tw(t, 7) || sm->filter > 1)
+        return out;
+    uint64_t max = code == 0 ? 255 : 65535;
+    int bytes = code_bytes(code);
+    int64_t ch = (int64_t)tw(t, 3);
+    int64_t n0 = lv_dim(t, 0, 0), n1 = lv_dim(t, 0, 1);
+    int linear = sm->filter == 1;
+    int okx, oky = 1;
+    // linear filtering samples around x - 0.5
+    int64_t vx = fixed_coord(x, n0, sm->norm, &okx) - (linear ? (int64_t)1 << 31 : 0);
+    int64_t vy = rank >= 2 ? fixed_coord(y, n1, sm->norm, &oky) - (linear ? (int64_t)1 << 31 : 0) : 0;
+    if (!okx || !oky)
+        return out;
+    int64_t fx = vx >> 32, fy = vy >> 32;
+    // the upper texels' weights in 1/256 steps (256 = 1.0): floor(frac * 256 + 0.5)
+    int64_t kx = linear ? (((vx & 0xffffffff) * 256 + ((int64_t)1 << 31)) >> 32) : 0;
+    int64_t ky = linear && rank >= 2 ? (((vy & 0xffffffff) * 256 + ((int64_t)1 << 31)) >> 32) : 0;
+    int64_t pitch = (int64_t)tw(t, 14);
+    // (vectors, not arrays: AGX code has no stack for local arrays)
+    v4u64 num = {0, 0, 0, 0};
+    int taps = linear ? 1 << rank : 1;
+    NO_UNROLL
+    for (int tap = 0; tap < taps; tap++) {
+        int dx = tap & 1, dy = (tap >> 1) & 1;
+        uint64_t w = (uint64_t)(dx ? kx : 256 - kx) * (uint64_t)(dy ? ky : 256 - ky);
+        if (w == 0)
+            continue;
+        int64_t i = ad_idx(sm->addr, fx + dx + off0, n0);
+        int64_t j = rank >= 2 ? ad_idx(sm->addr, fy + dy + off1, n1) : 0;
+        // a border texel is all zeros
+        if (i < 0 || j < 0)
+            continue;
+        uint64_t a = pitch ? tw(t, 1) + (uint64_t)(j * pitch + i * ch * bytes)
+                           : tw(t, 1) + (uint64_t)((j * n0 + i) * ch * bytes);
+        NO_UNROLL
+        for (int c = 0; c < 4; c++) {
+            uint64_t iv;
+            if (c < ch) {
+                const GLOBAL uint8_t *p = (const GLOBAL uint8_t *)(a + (uint64_t)(c * bytes));
+                iv = bytes == 1 ? p[0] : (uint64_t)p[0] | (uint64_t)p[1] << 8;
+            } else {
+                // missing channels read as (r, 0, 0, 1)
+                iv = c == 3 ? max : 0;
+            }
+            num[c] += w * iv;
+        }
+    }
+    int good = 1;
+    NO_UNROLL
+    for (int c = 0; c < 4; c++) {
+        int okc = 1;
+        out[c] = exact_float(num[c], max, &okc);
+        good &= okc;
+    }
+    *ok = good;
+    return out;
+}
+
 // The texture unit's sample of (x, y) (zluda_ptx_impl_agx.ll): word 16 of a texture descriptor that zluda_agx gave
 // hardware descriptors.
 v4u32 __zluda_ptx_impl_agx_tex_unit(uint64_t native, float x, float y);
@@ -569,6 +717,13 @@ API v4u32 __zluda_ptx_impl_agx_tex(desc_t t, desc_t s, int geom, int lod_mode, i
                        cube_norm(cube_tc(x, y, z), ma), 0.0, cube_layer(t, a, c0, x, y, z), 2);
     } else {
         int a = geom_array(geom), rank = geom_rank(geom);
+        // unsigned normalized textures at level 0 in integers (exact_unorm_sample), the double sampler otherwise
+        if ((geom == G_1D || geom == G_2D) && lod_mode == 0 && ctype_float && dtype == 0 && !has_ref) {
+            int ok;
+            v4u32 fast = exact_unorm_sample(t, &sm, rank, c0, c1, o0, o1, &ok);
+            if (ok)
+                return fast;
+        }
         double lam = lod_mode == 1 ? (double)lod : grad_lam(t, sm.norm, rank, dx, dy, 1.0);
         r = mip_sample(t, &sm, lod_mode != 0, lam, &q, ctype_float ? sm.filter : 0, sm.addr, sm.norm,
                        coord(cs[a], ctype_float), a + 1 < 4 ? coord(cs[a + 1], ctype_float) : 0.0,

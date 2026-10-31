@@ -231,6 +231,30 @@ def enc_float(x, t):
     raise Unsupported('float type ' + t)
 
 
+def ordered(bits, t):
+    """The float's bits as an integer that orders like the value (adjacent floats differ by 1)."""
+    width = SIZES[t] * 8
+    sign = 1 << (width - 1)
+    return -(bits & (sign - 1)) if bits & sign else bits
+
+
+def within_margin(want, got, t, args):
+    """Whether a float result that is not bit-exact is within --ulp units in the last place of the expected one (any
+    NaN for a NaN), or with --flush-ok is the same-signed zero of an expected subnormal (the default mode's
+    flushing)."""
+    if not is_float(t) or not (args.ulp or args.flush_ok):
+        return False
+    w, g = dec_float(want, t), dec_float(got, t)
+    if w != w and g != g:
+        return args.ulp > 0
+    width = SIZES[t] * 8
+    exp_mask = ((1 << width) - 1) >> 1 & ~((1 << {'f16': 10, 'bf16': 7, 'f32': 23, 'f64': 52}.get(t, 23)) - 1)
+    sign = 1 << (width - 1)
+    if args.flush_ok and want & exp_mask == 0 and got & ~sign == 0 and (want & sign) == (got & sign):
+        return True
+    return args.ulp > 0 and w == w and g == g and abs(ordered(want, t) - ordered(got, t)) <= args.ulp
+
+
 def dec_float(bits, t):
     if t == 'f32':
         return struct.unpack('<f', struct.pack('<I', bits))[0]
@@ -616,6 +640,8 @@ def compile_ptx(args, module, tmp, extra=(), env=None, product='m.o', target='ag
         flags = list(extra) + list(more)
         if getattr(args, 'strict_fp', False):
             flags.append('--strict-fp')
+        if getattr(args, 'f32_textures', False):
+            flags.append('--strict-fp-f32-textures')
         if getattr(args, 'agx_strict', False):
             flags.append('--agx-strict')
         # (--arch none: the AIR only, as compiled for Metal alone)
@@ -676,6 +702,7 @@ def run_test(path, args):
         for n, off in gsyms.items():
             syms[n] = GLOBALS_BASE + off
         failures, launches, skipped, passed, skipped_launches = [], 0, 0, 0, []
+        near_checks = 0
         # buffers a skipped launch could have written (its arguments), and what later launches derive from them
         tainted_bufs = set()
 
@@ -845,21 +872,30 @@ def run_test(path, args):
                     skipped += 1
                     continue
                 bad = []
+                near = False
                 for i, v in enumerate(vals):
                     want = lit_bits(v, t, syms)
                     got = gread(syms[name] + (off + i) * SIZES[t], SIZES[t])
                     if want != got:
-                        bad.append('%s[%d] expected %#x, got %#x' % (name, off + i, want, got))
+                        if within_margin(want, got, t, args):
+                            near = True
+                        else:
+                            bad.append('%s[%d] expected %#x, got %#x' % (name, off + i, want, got))
                 if bad:
                     failures += bad
                     args.counts['fail'] += 1
                 else:
                     passed += 1
+                    if near:
+                        args.counts['near'] += 1
+                        near_checks += 1
         args.counts['pass'] += passed
         args.counts['skip'] += skipped
         if failures:
             n = args.max_failures
             return 'FAIL', '; '.join(failures[:n]) + (' (+%d)' % (len(failures) - n) if len(failures) > n else '')
+        if near_checks and not skipped_launches:
+            return 'PASS~', '%d launch(es), %d check(s), %d within the margin' % (launches, passed, near_checks)
         if skipped_launches:
             return 'PARTIAL', '%d check(s) pass, %d skipped after rejected kernels %s; rejected: %s' % (
                 passed, skipped, ','.join(sorted(set(skipped_launches))), ' | '.join(rejected)[:200])
@@ -878,15 +914,22 @@ def main():
     ap.add_argument('--arch', default='agx-g14g')
     ap.add_argument('--strict-fp', action='store_true',
                     help='compile with zoc --strict-fp (software IEEE binary32, canonical NaNs)')
+    ap.add_argument('--strict-fp-f32-textures', dest='f32_textures', action='store_true',
+                    help='with --strict-fp: zoc --strict-fp-f32-textures (texture filtering in f32)')
     ap.add_argument('--agx-strict', action='store_true',
                     help='compile with zoc --agx-strict (only the instructions Mesa emits) and run agx_run '
                          '--agx-strict for --arch, so that any other instruction fails the test')
+    ap.add_argument('--ulp', type=int, default=0,
+                    help='also accept float results within this many units in the last place (any NaN for a NaN), '
+                         'counted apart (PASS~)')
+    ap.add_argument('--flush-ok', dest='flush_ok', action='store_true',
+                    help='also accept the same-signed zero for an expected subnormal (the default mode flushes)')
     ap.add_argument('--timeout', type=int, default=120)
     ap.add_argument('--max-failures', type=int, default=4, help='failing elements listed per test')
     ap.add_argument('-j', type=int, default=os.cpu_count())
     ap.add_argument('--json', help='write the results to this file')
     args = ap.parse_args()
-    args.counts = {'pass': 0, 'fail': 0, 'skip': 0}
+    args.counts = {'pass': 0, 'fail': 0, 'skip': 0, 'near': 0}
 
     def one(p):
         try:
@@ -903,11 +946,12 @@ def main():
         counts[status] = counts.get(status, 0) + 1
         print('%-14s %-40s %s' % (status, os.path.basename(p), detail))
     print('---- files:', ', '.join('%d %s' % (v, k) for k, v in sorted(counts.items())))
-    print('---- .expect checks: %(pass)d pass, %(fail)d fail, %(skip)d skipped (after a rejected kernel)' % args.counts)
+    print('---- .expect checks: %(pass)d pass (%(near)d of them within the margin), %(fail)d fail, %(skip)d skipped '
+          '(after a rejected kernel)' % args.counts)
     if args.json:
         with open(args.json, 'w') as f:
             json.dump({os.path.basename(p): {'status': s, 'detail': d} for p, (s, d) in results}, f, indent=1)
-    return 0 if all(s in ('PASS', 'PARTIAL', 'UNSUPPORTED', 'REJECTED') for _, (s, _) in results) else 1
+    return 0 if all(s in ('PASS', 'PASS~', 'PARTIAL', 'UNSUPPORTED', 'REJECTED') for _, (s, _) in results) else 1
 
 
 if __name__ == '__main__':

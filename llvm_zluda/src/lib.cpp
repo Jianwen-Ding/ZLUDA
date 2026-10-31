@@ -16,6 +16,12 @@
 #include <llvm/IR/ReplaceConstant.h>
 #include <llvm/Analysis/ConstantFolding.h>
 #include <llvm/Analysis/ValueTracking.h>
+#include <llvm/Analysis/ScalarEvolution.h>
+#include <llvm/Analysis/ScalarEvolutionExpressions.h>
+#include <llvm/Analysis/LoopInfo.h>
+#include <llvm/Analysis/AssumptionCache.h>
+#include <llvm/Analysis/TargetLibraryInfo.h>
+#include <llvm/IR/Dominators.h>
 #include <llvm/Support/KnownFPClass.h>
 #include <llvm/Transforms/Utils/ModuleUtils.h>
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
@@ -23,9 +29,13 @@
 #include <llvm/IR/PatternMatch.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/ADT/SetVector.h>
+#include <llvm/ADT/SmallPtrSet.h>
+#include <llvm/ADT/DenseMap.h>
 #include <llvm/Support/Alignment.h>
 #include <array>
+#include <map>
 #include <optional>
+#include <functional>
 #include <string>
 #include <llvm/IR/CallingConv.h>
 #ifdef ZLUDA_WITH_LLD
@@ -2875,8 +2885,12 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
                 // strict mode keeps them (IEEE f32 emulation): flushed here only in strict mode or for the directed
                 // roundings, whose software emulation keeps denormals. (Flushed always, Blender Cycles' .ftz
                 // operations doubled its IR.)
+                // (In strict mode too where the function flushes f32 denormals, .ftz: the IEEE f32 emulation
+                // leaves such functions to the hardware, AIREmulateF64's ieeeF32. Flushed always, Cycles' strict
+                // functions were too large for O3 to inline: 1629 calls in shade_light_nee instead of 156.)
                 auto rounding = zludaModeField(m, 3);
-                bool hardware = !half && !strict && rounding && (*rounding & 3) == 1;
+                bool flushingFn = F.getDenormalMode(APFloat::IEEEsingle()).Output != DenormalMode::IEEE;
+                bool hardware = !half && (!strict || flushingFn) && rounding && (*rounding & 3) == 1;
                 if (!hardware && (!flushBit || *flushBit))
                 {
                     IRBuilder<> B(C);
@@ -3017,7 +3031,173 @@ int LLVMZludaAirCanonicalNaNs(LLVMModuleRef M)
             if (arithmetic)
                 work.push_back(&I);
         }
+        // A NaN whose bits nothing observes needs no canonical form (f32, f16, bf16: their canonical NaN does not
+        // depend on the operands'): a value only read by operations that canonicalize their own results, by
+        // comparisons or by saturating conversions to integers (NaN gives 0). Convolutions of fma.rn.ftz.f32 had
+        // three instructions after every fma for it.
+        SmallPtrSet<Instruction *, 16> canonicalized(work.begin(), work.end());
+        // (selects and phis pass a value on unchanged: it is observed where what they make is; a phi cycle is
+        // assumed unobserved while it is checked, and the answers are forgotten when it is not)
+        DenseMap<Instruction *, bool> passedOn;
+        std::function<bool(Instruction *, unsigned)> usersIgnoreNaNBits = [&](Instruction *I, unsigned depth) {
+            if (I->use_empty() || depth > 8)
+                return false;
+            return all_of(I->users(), [&](User *U) {
+                auto *UI = dyn_cast<Instruction>(U);
+                if (!UI)
+                    return false;
+                if (isa<FCmpInst>(UI) || canonicalized.contains(UI))
+                    return true;
+                if (auto *II = dyn_cast<IntrinsicInst>(UI))
+                    return II->getIntrinsicID() == Intrinsic::fptoui_sat ||
+                           II->getIntrinsicID() == Intrinsic::fptosi_sat;
+                // .ftz flushes on the bits, select((b & 0x7f800000) == 0, sign bits, b), back to a float: a NaN
+                // passes them unchanged (its exponent is not zero), also when a flushed value is flushed again (the
+                // next .ftz operation's operand) and the sign bits are shared among them
+                if (auto *BC = dyn_cast<BitCastInst>(UI); BC && BC->getType()->isIntegerTy(32))
+                {
+                    using namespace PatternMatch;
+                    // the flush family: the bits and the flushes of a member, select(exponent of a member is
+                    // zero, x, member)
+                    SmallSetVector<Value *, 8> fam;
+                    fam.insert(BC);
+                    auto expZero = [&](Value *C) {
+                        Value *W;
+                        return match(C, m_SpecificICmp(ICmpInst::ICMP_EQ, m_And(m_Value(W), m_SpecificInt(0x7f800000)),
+                                                       m_Zero())) &&
+                               fam.contains(W);
+                    };
+                    // (and the integer selects and phis that pass a member on unchanged: their other operands are
+                    // other values, whose bits are their own concern)
+                    for (unsigned k = 0; k < fam.size() && fam.size() < 64; k++)
+                        for (User *FU : fam[k]->users())
+                        {
+                            if (auto *Sel = dyn_cast<SelectInst>(FU);
+                                Sel && fam.contains(Sel->getFalseValue()) && expZero(Sel->getCondition()))
+                                fam.insert(Sel);
+                            else if (auto *Sel = dyn_cast<SelectInst>(FU); Sel && Sel->getCondition() != fam[k])
+                                fam.insert(Sel);
+                            else if (isa<PHINode>(FU))
+                                fam.insert(FU);
+                        }
+                    if (fam.size() >= 64)
+                        return false;
+                    auto isFlush = [&](User *X) {
+                        auto *Sel = dyn_cast<SelectInst>(X);
+                        return Sel && fam.contains(Sel) && fam.contains(Sel->getFalseValue()) &&
+                               expZero(Sel->getCondition());
+                    };
+                    for (Value *W : fam)
+                        for (User *FU : W->users())
+                        {
+                            if (isFlush(FU) && cast<SelectInst>(FU)->getFalseValue() == W)
+                                continue;
+                            // passed on to another member
+                            if (fam.contains(FU) && (isa<PHINode>(FU) || cast<SelectInst>(FU)->getCondition() != W))
+                                continue;
+                            Value *X;
+                            // the exponent: tests that only choose flushes
+                            if (match(FU, m_And(m_Value(X), m_SpecificInt(0x7f800000))))
+                            {
+                                if (!all_of(FU->users(), [&](User *C) {
+                                        return match(C, m_SpecificICmp(ICmpInst::ICMP_EQ, m_Specific(FU), m_Zero())) &&
+                                               all_of(C->users(), [&](User *S) {
+                                                   return isFlush(S) && cast<SelectInst>(S)->getCondition() == C;
+                                               });
+                                    }))
+                                    return false;
+                                continue;
+                            }
+                            // the sign bits: what a flush chooses for a zero exponent, never for a NaN
+                            if (match(FU, m_And(m_Value(X), m_SpecificInt(0x80000000))))
+                            {
+                                if (!all_of(FU->users(), [&](User *S) {
+                                        return isFlush(S) && cast<SelectInst>(S)->getTrueValue() == FU &&
+                                               cast<SelectInst>(S)->getFalseValue() != FU;
+                                    }))
+                                    return false;
+                                continue;
+                            }
+                            // an unsigned comparison below the NaNs (a denormal test): false for every NaN, whatever
+                            // its bits (all are at least 0x7f800001 unsigned)
+                            const APInt *C;
+                            if (auto *Cmp = dyn_cast<ICmpInst>(FU);
+                                Cmp && Cmp->getOperand(0) == W && Cmp->getPredicate() == ICmpInst::ICMP_ULT &&
+                                match(Cmp->getOperand(1), m_APInt(C)) && C->ule(0x7f800001))
+                                continue;
+                            // back to a float
+                            if (auto *Back = dyn_cast<BitCastInst>(FU); Back && Back->getType()->isFloatTy())
+                            {
+                                if (!usersIgnoreNaNBits(Back, depth + 1))
+                                    return false;
+                                continue;
+                            }
+                            {
+                                static unsigned shown = 0;
+                                if (getenv("ZLUDA_AIR_NAN_WHY") && shown++ < 12)
+                                    errs() << "[nan fail] " << *W << "\n[nan fail]   used by " << *FU << "\n";
+                            }
+                            return false;
+                        }
+                    return true;
+                }
+                if (!isa<SelectInst>(UI) && !isa<PHINode>(UI))
+                    return false;
+                // (a select's condition is not passed on)
+                if (auto *Sel = dyn_cast<SelectInst>(UI); Sel && Sel->getCondition() == I)
+                    return false;
+                if (auto it = passedOn.find(UI); it != passedOn.end())
+                    return it->second;
+                passedOn[UI] = true;
+                bool r = usersIgnoreNaNBits(UI, depth + 1);
+                if (!r)
+                    passedOn.clear();
+                passedOn[UI] = r;
+                return r;
+            });
+        };
+        auto unobserved = [&](Instruction *I) {
+            return !I->getType()->getScalarType()->isDoubleTy() && usersIgnoreNaNBits(I, 0);
+        };
+        SmallVector<Instruction *, 64> observed;
         for (Instruction *I : work)
+            if (!unobserved(I))
+                observed.push_back(I);
+        // ZLUDA_AIR_NAN_WHY=1: the kinds of users that observe the canonicalized results
+        if (getenv("ZLUDA_AIR_NAN_WHY"))
+        {
+            std::map<std::string, unsigned> kinds;
+            for (Instruction *I : observed)
+                for (User *U : I->users())
+                    if (auto *UI = dyn_cast<Instruction>(U))
+                    {
+                        std::string k = UI->getOpcodeName();
+                        if (auto *CI = dyn_cast<CallInst>(UI))
+                            k += std::string(" ") + (CI->getCalledFunction() ? CI->getCalledFunction()->getName().str().substr(0, 40) : "indirect");
+                        if (auto *BC = dyn_cast<BitCastInst>(UI))
+                            for (User *BU : BC->users())
+                                if (auto *BI = dyn_cast<Instruction>(BU))
+                                    kinds[k + " -> " + BI->getOpcodeName()]++;
+                        kinds[k]++;
+                    }
+            unsigned shown = 0;
+            for (Instruction *I : observed)
+                for (User *U : I->users())
+                    if (auto *BC = dyn_cast<BitCastInst>(U); BC && shown < 3)
+                    {
+                        shown++;
+                        errs() << "[nan ex] " << *I << "\n[nan ex] " << *BC << "\n";
+                        for (User *BU : BC->users())
+                        {
+                            errs() << "[nan ex]   " << *BU << "\n";
+                            for (User *BU2 : BU->users())
+                                errs() << "[nan ex]     " << *BU2 << "\n";
+                        }
+                    }
+            for (auto &[k, n] : kinds)
+                errs() << "[nan why] " << F.getName().substr(0, 30) << " " << n << " " << k << "\n";
+        }
+        for (Instruction *I : observed)
         {
             Type *T = I->getType();
             Type *S = T->getScalarType();
@@ -3056,11 +3236,17 @@ LLVM_C_EXTERN_C_BEGIN
 // mul.rn.sat.f32 took a denormal product for zero. Each scalar fcmp of floats becomes an integer comparison of
 // keys that order like the floats (sign and magnitude to an unsigned order, +0 and -0 equal), with the
 // unordered cases from the bits. Returns the number of comparisons rewritten.
-int LLVMZludaAirCompareFloatBits(LLVMModuleRef M)
+// `functions`: the f32 comparisons of 1 the functions that keep f32 denormals (IEEE input), 2 the .ftz ones
+// (preserve-sign), 3 all (bfloat ones always). AGX's f32 compare flushes denormal operands itself, which is PTX's .ftz compare: its code needs only the IEEE ones
+// (Cycles is .ftz throughout: about 15 instructions for each of its compares otherwise); a Metal compilation with
+// denormals enabled needs both.
+int LLVMZludaAirCompareFloatBits(LLVMModuleRef M, int functions)
 {
     Module *Mod = unwrap(M);
     int count = 0;
     for (Function &F : *Mod)
+    {
+        bool ieee = F.getDenormalMode(APFloat::IEEEsingle()).Input == DenormalMode::IEEE;
         for (Instruction &I : make_early_inc_range(instructions(F)))
         {
             auto *C = dyn_cast<FCmpInst>(&I);
@@ -3071,6 +3257,9 @@ int LLVMZludaAirCompareFloatBits(LLVMModuleRef M)
             if (!E->isFloatTy() && !E->isBFloatTy())
                 continue;
             bool f32 = E->isFloatTy();
+            // (bfloat has no .ftz compare: always on the bits)
+            if (f32 && !(functions & (ieee ? 1 : 2)))
+                continue;
             uint64_t sign = f32 ? 0x80000000 : 0x8000, magMask = sign - 1, inf = f32 ? 0x7f800000 : 0x7f80;
             IRBuilder<> B(C);
             Type *IT = B.getIntNTy(f32 ? 32 : 16);
@@ -3164,6 +3353,10 @@ int LLVMZludaAirCompareFloatBits(LLVMModuleRef M)
             unsigned w = f32 ? 32 : 16;
             uint64_t sign = f32 ? 0x80000000 : 0x8000, magMask = sign - 1, inf = f32 ? 0x7f800000 : 0x7f80;
             bool ftz = f32 && F.getDenormalMode(APFloat::IEEEsingle()).Input != DenormalMode::IEEE;
+            // (as the comparisons: AGX's f32 min / max compare a denormal as zero, which is .ftz's order, with
+            // signed zeros and NaN operands done by the backend's lowering)
+            if (f32 && !(functions & (ftz ? 2 : 1)))
+                continue;
             IRBuilder<> B(II);
             Type *IT = B.getIntNTy(w);
             auto k = [&](uint64_t v) { return ConstantInt::get(IT, v); };
@@ -3278,6 +3471,7 @@ int LLVMZludaAirCompareFloatBits(LLVMModuleRef M)
             count++;
         }
     }
+    }
     return count;
 }
 
@@ -3373,6 +3567,147 @@ void LLVMZludaAirSaltKernels(LLVMModuleRef M, uint64_t length)
             AllocaInst *A = B.CreateAlloca(ArrayType::get(B.getInt8Ty(), length), nullptr, "zluda.salt");
             B.CreateStore(B.getInt8(0), A, /*isVolatile=*/true);
         }
+}
+
+LLVM_C_EXTERN_C_END
+
+LLVM_C_EXTERN_C_BEGIN
+
+// Air target, an estimate for dependency-aware barriers (ZLUDA_AIR_RANGE_REPORT): of each kernel's device memory
+// accesses, how many have an address that is a pointer argument (a 64-bit load from a parameter buffer) plus an
+// offset that scalar evolution writes in terms of constants, thread and group indices (system-value arguments),
+// scalar arguments and loops whose trip counts are such terms: what a launch could evaluate as the range of bytes
+// the access may touch. Prints one line per kernel to stderr; returns the number of kernels.
+int LLVMZludaAirRangeReport(LLVMModuleRef M)
+{
+    Module *Mod = unwrap(M);
+    int kernels = 0;
+    for (Function &F : *Mod)
+    {
+        if (F.isDeclaration() || !F.hasFnAttribute("air-kernel"))
+            continue;
+        kernels++;
+        TargetLibraryInfoImpl TLII(Mod->getTargetTriple());
+        TargetLibraryInfo TLI(TLII, &F);
+        AssumptionCache AC(F);
+        DominatorTree DT(F);
+        LoopInfo LI(DT);
+        ScalarEvolution SE(F, TLI, AC, DT, LI);
+        // a value a launch knows: a load from a parameter buffer, a system value, or a constant
+        std::function<bool(const SCEV *)> known = [&](const SCEV *S) -> bool {
+            struct Leaves
+            {
+                std::function<bool(const SCEV *)> &known;
+                ScalarEvolution &SE;
+                bool ok = true;
+                bool follow(const SCEV *S)
+                {
+                    if (auto *AR = dyn_cast<SCEVAddRecExpr>(S))
+                    {
+                        const SCEV *BTC = SE.getBackedgeTakenCount(AR->getLoop());
+                        if (isa<SCEVCouldNotCompute>(BTC) || !known(BTC))
+                        {
+                            if (getenv("ZLUDA_AIR_RANGE_REPORT_WHY"))
+                                errs() << "  [why] trip count of " << AR->getLoop()->getHeader()->getName() << ": " << *BTC << "\n";
+                            ok = false;
+                        }
+                    }
+                    if (auto *U = dyn_cast<SCEVUnknown>(S))
+                    {
+                        Value *V = U->getValue();
+                        bool leaf = false;
+                        // a pointer argument through its integer and address-space casts
+                        while (isa<PtrToIntInst>(V) || isa<IntToPtrInst>(V) || isa<AddrSpaceCastInst>(V))
+                            V = cast<Instruction>(V)->getOperand(0);
+                        if (auto *L = dyn_cast<LoadInst>(V))
+                            leaf = L->getPointerAddressSpace() == 2 &&
+                                   isa<Argument>(getUnderlyingObject(L->getPointerOperand()));
+                        else if (auto *E = dyn_cast<ExtractElementInst>(V))
+                        {
+                            // a system value: an argument, or AIR's position / size calls
+                            Value *Vec = E->getVectorOperand();
+                            auto *C = dyn_cast<CallInst>(Vec);
+                            Function *Callee = C ? C->getCalledFunction() : nullptr;
+                            leaf = isa<Argument>(Vec) || (Callee && Callee->getName().starts_with("air."));
+                        }
+                        else if (auto *C = dyn_cast<CallInst>(V))
+                            leaf = C->getCalledFunction() && C->getCalledFunction()->getName().starts_with("air.") &&
+                                   C->getCalledFunction()->doesNotAccessMemory();
+                        else if (isa<Argument>(V))
+                            leaf = true;
+                        if (!leaf)
+                        {
+                            if (getenv("ZLUDA_AIR_RANGE_REPORT_WHY"))
+                            {
+                                errs() << "  [why] " << *U->getValue() << "\n";
+                                if (auto *E = dyn_cast<ExtractElementInst>(U->getValue()))
+                                    errs() << "        of " << *E->getVectorOperand() << "\n";
+                            }
+                            ok = false;
+                        }
+                    }
+                    return ok;
+                }
+                bool isDone() const { return !ok; }
+            } leaves{known, SE};
+            SCEVTraversal<Leaves> T(leaves);
+            T.visitAll(S);
+            return leaves.ok;
+        };
+        unsigned total = 0, bounded = 0, base_unknown = 0;
+        for (Instruction &I : instructions(F))
+        {
+            Value *P = nullptr;
+            if (auto *L = dyn_cast<LoadInst>(&I))
+                P = L->getPointerOperand();
+            else if (auto *S = dyn_cast<StoreInst>(&I))
+                P = S->getPointerOperand();
+            else if (auto *A = dyn_cast<AtomicRMWInst>(&I))
+                P = A->getPointerOperand();
+            else if (auto *X = dyn_cast<AtomicCmpXchgInst>(&I))
+                P = X->getPointerOperand();
+            if (!P || P->getType()->getPointerAddressSpace() != 1)
+                continue;
+            total++;
+            // the address as an integer: AIR's addresses are integer arithmetic on a pointer argument's value,
+            // inttoptr'd
+            Value *A = P->stripPointerCasts();
+            while (auto *C = dyn_cast<AddrSpaceCastInst>(A))
+                A = C->getOperand(0)->stripPointerCasts();
+            const SCEV *S = isa<IntToPtrInst>(A) ? SE.getSCEV(cast<IntToPtrInst>(A)->getOperand(0)) : SE.getSCEV(A);
+            // its base: a 64-bit parameter load among its leaves
+            struct Base
+            {
+                bool found = false;
+                bool follow(const SCEV *X)
+                {
+                    if (auto *U = dyn_cast<SCEVUnknown>(X))
+                    {
+                        Value *V = U->getValue();
+                        while (isa<PtrToIntInst>(V) || isa<IntToPtrInst>(V) || isa<AddrSpaceCastInst>(V))
+                            V = cast<Instruction>(V)->getOperand(0);
+                        if (auto *L = dyn_cast<LoadInst>(V))
+                            if (L->getPointerAddressSpace() == 2 && L->getType()->getPrimitiveSizeInBits() == 64)
+                                found = true;
+                    }
+                    return true;
+                }
+                bool isDone() const { return false; }
+            } base;
+            SCEVTraversal<Base> BT(base);
+            BT.visitAll(S);
+            if (!base.found)
+            {
+                base_unknown++;
+                continue;
+            }
+            if (known(S))
+                bounded++;
+        }
+        errs() << "[zluda range] " << F.getName().substr(0, 70) << ": " << bounded << " of " << total
+               << " accesses bounded, " << base_unknown << " with an unknown base\n";
+    }
+    return kernels;
 }
 
 LLVM_C_EXTERN_C_END

@@ -3747,7 +3747,9 @@ impl<'a> MethodEmitContext<'a> {
                 unsafe {
                     let high = LLVMBuildShl(builder, high, c(lane), LLVM_UNNAMED.as_ptr());
                     let packed = LLVMBuildOr(builder, high, low, LLVM_UNNAMED.as_ptr());
-                    LLVMBuildTrunc(builder, packed, LLVMInt16TypeInContext(self.context), LLVM_UNNAMED.as_ptr())
+                    // i8 for a pair of 4-bit elements, else i16
+                    let pair_type = if lane == 4 { LLVMInt8TypeInContext(self.context) } else { LLVMInt16TypeInContext(self.context) };
+                    LLVMBuildTrunc(builder, packed, pair_type, LLVM_UNNAMED.as_ptr())
                 }
             }
             ast::MiniDirection::ToF16x2 | ast::MiniDirection::ToBf16x2 => {
@@ -3777,7 +3779,7 @@ impl<'a> MethodEmitContext<'a> {
                 }
             }
         };
-        // i16 or i32, as the destination type (an integer or packed halves)
+        // i8, i16 or i32, as the destination type (an integer or packed halves)
         let result = unsafe {
             LLVMBuildBitCast(builder, result, get_scalar_type(self.context, dst_type), LLVM_UNNAMED.as_ptr())
         };

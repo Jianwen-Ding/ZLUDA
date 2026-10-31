@@ -822,6 +822,10 @@ pub fn cdm_dispatch_with(
     c
 }
 
+/// The CDM barrier word (Mesa's unk0..19, the USC cache invalidate included) that orders the dispatches of one
+/// command, as a standalone word of a control stream.
+pub const CDM_BARRIER: [u8; 4] = (3u32 << 29 | 0xfffff).to_le_bytes();
+
 /// Firmware timestamps of one compute command, in `command_timestamp_frequency_hz` units.
 #[derive(Clone, Copy, Debug)]
 pub struct Timing {
@@ -871,6 +875,9 @@ pub struct Queue {
     verified: std::cell::Cell<u64>,
     /// The VM's `usc_generation` at this queue's last command.
     usc_seen: std::cell::Cell<u64>,
+    /// Whether a batched dispatch's words end with the CDM barrier (set to false by a caller that places the
+    /// barriers itself, `CDM_BARRIER`, between dispatches that may conflict).
+    pub trailing_barrier: std::cell::Cell<bool>,
     /// Rings for the per-launch objects: data (uniforms, control streams, parameter blocks) and USC (pipeline
     /// words). A launch costs no buffer object creation, mapping or binding.
     data_ring: (Bo, ring::RingAlloc),
@@ -957,6 +964,7 @@ impl Queue {
             in_flight: Default::default(),
             verified: Default::default(),
             usc_seen: std::cell::Cell::new(u64::MAX),
+            trailing_barrier: std::cell::Cell::new(true),
             data_ring: (vm.alloc_data(DATA_RING_BYTES)?, ring::RingAlloc::new(DATA_RING_BYTES)),
             usc_ring: (vm.alloc_usc(USC_RING_BYTES)?, ring::RingAlloc::new(USC_RING_BYTES)),
         })
@@ -1624,6 +1632,12 @@ pub fn heap_header(size: u32) -> [u8; 8] {
 pub const TIMER_SYMBOL: &str = "__zluda_agx_timer";
 pub const TIMER_BLOCK_BYTES: usize = 32;
 
+/// Symbol of the words a module reads as `%envreg0` to `%envreg31` (32 x u32, `ptx/lib/zluda_ptx_impl_agx.ll`).
+pub const ENVREG_SYMBOL: &str = "__zluda_agx_envreg";
+/// Bytes of a cooperative launch's grid-sync workspace (`%envreg1:%envreg2`), zeroed when made: CUDA's grid barrier
+/// counts arriving threadgroups in its word at 4 and flips the top bit to release them, so it needs no reset.
+pub const GRID_SYNC_BYTES: u64 = 256;
+
 /// The CPU's generic timer: its count and its frequency in Hz. Elsewhere than on aarch64 (tests), a count of a
 /// monotonic clock at 24 MHz.
 pub fn cpu_timer() -> (u64, u64) {
@@ -1719,8 +1733,26 @@ impl LoadedModule {
     pub fn new_sharing_globals(vm: &mut Vm, module: module::Module, other: &LoadedModule) -> io::Result<LoadedModule> {
         let alike = module.globals.len() == other.module.globals.len()
             && module.global_symbols.iter().all(|(name, at)| other.module.global_symbols.get(name) == Some(at));
+        // compiler-made constant tables only (LLVM's switch lookup tables, string and aggregate constants): no
+        // device variable to share; a recompilation's may differ, and it keeps its own
+        let private = |m: &module::Module| {
+            m.global_symbols.keys().all(|n| n.starts_with("switch.table.") || n.starts_with(".str") || n.starts_with("__const."))
+        };
+        if !alike && private(&module) && private(&other.module) && module.global_relocs.is_empty() {
+            return Self::load(vm, module, None);
+        }
         if !alike {
-            return Err(invalid("the modules lay out their global data differently".to_string()));
+            let first = module
+                .global_symbols
+                .iter()
+                .find(|(name, at)| other.module.global_symbols.get(*name) != Some(*at))
+                .map(|(name, at)| format!("{name} {at:?} vs {:?}", other.module.global_symbols.get(name)));
+            return Err(invalid(format!(
+                "the modules lay out their global data differently ({} vs {} bytes; {})",
+                module.globals.len(),
+                other.module.globals.len(),
+                first.unwrap_or_default()
+            )));
         }
         Self::load(vm, module, other.globals_va())
     }
@@ -1829,6 +1861,19 @@ impl LoadedModule {
 
     pub fn uses_timer(&self) -> bool {
         self.module.global_symbols.contains_key(TIMER_SYMBOL)
+    }
+
+    pub fn uses_envreg(&self) -> bool {
+        self.module.global_symbols.contains_key(ENVREG_SYMBOL)
+    }
+
+    /// Points the module's `%envreg1:%envreg2` (high : low) at a grid-sync workspace at `va` (`ENVREG_SYMBOL`).
+    pub fn set_grid_sync(&mut self, va: u64) {
+        let Some(&(off, _)) = self.module.global_symbols.get(ENVREG_SYMBOL) else { return };
+        let Some(g) = self.globals.as_mut() else { return };
+        let words = &mut g.as_mut_slice()[off as usize + 4..off as usize + 12];
+        words[..4].copy_from_slice(&((va >> 32) as u32).to_le_bytes());
+        words[4..].copy_from_slice(&(va as u32).to_le_bytes());
     }
 
     /// Points the module's clocks at a timer block at `va` (`TIMER_SYMBOL`).
@@ -2064,7 +2109,9 @@ impl LoadedModule {
             // Separate queue commands are ordered by firmware. Dispatches
             // within one command need the CDM barrier even when their code
             // is cached, or dependent kernels can overlap and read stale data.
-            let barrier = batched || queue.usc_seen.get() != vm.usc_generation || always_usc_barrier();
+            let barrier = (batched && queue.trailing_barrier.get())
+                || queue.usc_seen.get() != vm.usc_generation
+                || always_usc_barrier();
             queue.usc_seen.set(vm.usc_generation);
             let stream =
                 cdm_dispatch_with((pw - vm.usc_base) as u32, pipeline.uniform_halves(), g14x, global, local, barrier);

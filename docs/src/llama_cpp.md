@@ -117,3 +117,9 @@ Compiling with cuBLAS disabled might lead to performance degradation.
 
 ## Windows
 You need to install [HIP SDK](hip_sdk.html) to have access to rocBLAS
+
+### Qwen2.5-7B, 2026-10-31
+
+`Qwen2.5-7B-Instruct-Q4_K_M.gguf` (Apache-2.0), `llama-bench -ngl 99 -p 128 -n 64 -r 3 -fa 0 -b 8 -ub 8` on the AIR
+route: pp128 64.0 t/s, tg64 27.1 t/s. Qwen2.5-0.5B Q5_K_M with the same settings: pp128 ~440, tg128 ~125 t/s (since
+device-to-device copies in graphs run on the GPU in the graph's batch).

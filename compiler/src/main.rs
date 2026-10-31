@@ -44,6 +44,11 @@ pub struct Options {
     /// in software where the hardware differs. Slower
     strict_fp: bool,
 
+    #[bpaf(long("strict-fp-f32-textures"))]
+    /// With --strict-fp (--target air): texture filtering in f32 as without it, a few ulps from the model's exact
+    /// filtering, instead of the software double precision sampler (an error margin for textures only)
+    strict_fp_f32_textures: bool,
+
     #[bpaf(long("agx-strict"))]
     /// AGX: emit only the instructions Mesa's asahi compiler emits for the
     /// same GPU (M1 and M2 only); any other is an error
@@ -152,6 +157,7 @@ fn main_core() -> Result<(), CompilerError> {
             opts.arch,
             opts.ignore_errors,
             opts.strict_fp,
+            opts.strict_fp_f32_textures,
             opts.stack_size,
             opts.object_only,
         );
@@ -282,6 +288,7 @@ fn compile_agx(
         ptx::Options {
             target: ptx::Target::Agx,
             strict_fp,
+            f32_textures: false,
             // checked mode names the source of a bad access
             debug_locations: checked || lineinfo,
             stack_size,
@@ -301,6 +308,7 @@ fn compile_agx(
             ptx::Options {
                 target: ptx::Target::Agx,
                 strict_fp,
+                f32_textures: false,
                 debug_locations: checked || lineinfo,
                 stack_size,
                 fast_mma,
@@ -337,10 +345,12 @@ fn compile_air(
     arch: Option<String>,
     ignore_errors: bool,
     strict_fp: bool,
+    f32_textures: bool,
     stack_size: u32,
     object_only: bool,
 ) -> Result<(), CompilerError> {
-    let options = ptx::Options { target: ptx::Target::Air, strict_fp, stack_size, ..ptx::Options::default() };
+    let options =
+        ptx::Options { target: ptx::Target::Air, strict_fp, f32_textures, stack_size, ..ptx::Options::default() };
     let llvm = ptx_to_llvm(ignore_errors, !object_only, &texts[0], options)?;
     if !object_only {
         sink(&llvm.llvm_ir, "ll".to_string());
@@ -469,19 +479,34 @@ fn serve_one(args: &[String], texts: &[String]) -> Result<(Vec<u8>, Vec<u8>), St
     let sink = |bytes: &Vec<u8>, extension: String| {
         outputs.borrow_mut().insert(extension, bytes.clone());
     };
-    compile_agx(
-        texts,
-        &sink,
-        opts.arch,
-        opts.ignore_errors,
-        opts.strict_fp,
-        opts.agx_strict,
-        opts.agx_checked,
-        opts.lineinfo,
-        opts.stack_size,
-        opts.fast_mma,
-        opts.object_only,
-    )
+    // the target as zoc's command line takes it (--target air: PTX through AIR; it compiled every served request
+    // with the direct route before)
+    match opts.target.as_deref() {
+        Some("air") => compile_air(
+            texts,
+            &sink,
+            opts.arch,
+            opts.ignore_errors,
+            opts.strict_fp,
+            opts.strict_fp_f32_textures,
+            opts.stack_size,
+            opts.object_only,
+        ),
+        Some("agx") | None => compile_agx(
+            texts,
+            &sink,
+            opts.arch,
+            opts.ignore_errors,
+            opts.strict_fp,
+            opts.agx_strict,
+            opts.agx_checked,
+            opts.lineinfo,
+            opts.stack_size,
+            opts.fast_mma,
+            opts.object_only,
+        ),
+        Some(other) => return Err(format!("zoc --serve compiles for agx or air, not {other}")),
+    }
     .map_err(|e| e.to_string())?;
     let mut outputs = outputs.into_inner();
     let object = outputs.remove("o").ok_or("no object")?;

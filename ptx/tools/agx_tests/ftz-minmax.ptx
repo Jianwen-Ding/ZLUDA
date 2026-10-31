@@ -1,0 +1,47 @@
+.version 7.0
+.target sm_70
+.address_size 64
+
+// One thread: min.ftz / max.ftz with denormal, NaN and signed-zero operands (AGX's own f32 compare: a denormal
+// compares as zero, the result a signed zero).
+.visible .entry mm(.param .u64 pin, .param .u64 pout)
+{
+    .reg .f32 %f<24>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [pin];
+    ld.param.u64 %rd2, [pout];
+    ld.global.f32 %f1, [%rd1];      // 0x00000003 (denormal)
+    ld.global.f32 %f2, [%rd1+4];    // 0x80000005 (-denormal)
+    ld.global.f32 %f3, [%rd1+8];    // NaN 0x7fc00001
+    ld.global.f32 %f4, [%rd1+12];   // 1.0
+    ld.global.f32 %f5, [%rd1+16];   // -0.0
+    ld.global.f32 %f6, [%rd1+20];   // +0.0
+    min.ftz.f32 %f10, %f1, %f4;
+    max.ftz.f32 %f11, %f1, %f4;
+    min.ftz.f32 %f12, %f1, %f2;
+    max.ftz.f32 %f13, %f1, %f2;
+    min.ftz.f32 %f14, %f3, %f4;
+    max.ftz.f32 %f15, %f4, %f3;
+    min.ftz.f32 %f16, %f3, %f3;
+    min.ftz.f32 %f17, %f5, %f6;
+    max.ftz.f32 %f18, %f5, %f6;
+    min.ftz.f32 %f19, %f6, %f2;
+    max.ftz.f32 %f20, %f1, %f5;
+    st.global.f32 [%rd2], %f10;
+    st.global.f32 [%rd2+4], %f11;
+    st.global.f32 [%rd2+8], %f12;
+    st.global.f32 [%rd2+12], %f13;
+    st.global.f32 [%rd2+16], %f14;
+    st.global.f32 [%rd2+20], %f15;
+    st.global.f32 [%rd2+24], %f16;
+    st.global.f32 [%rd2+28], %f17;
+    st.global.f32 [%rd2+32], %f18;
+    st.global.f32 [%rd2+36], %f19;
+    st.global.f32 [%rd2+40], %f20;
+    ret;
+}
+
+.buffer IN .u32 = { 3, 2147483653, 2143289345, 1065353216, 2147483648, 0 };
+.buffer OUT .u32 [11];
+.launch mm <<< 1, 1 >>> (IN, OUT);
+.expect OUT .u32 = { 0, 1065353216, 2147483648, 0, 1065353216, 1065353216, 2147483647, 2147483648, 0, 2147483648, 0 };

@@ -5364,10 +5364,15 @@ pub struct CvtMiniDetails {
 }
 
 impl CvtMiniDetails {
+    // the packed pair's register: .b8 for two 4-bit .e2m1 elements, else .b16
+    fn pair_type(&self) -> Type {
+        Type::Scalar(if self.format == MiniFormat::E2m1x2 { ScalarType::B8 } else { ScalarType::B16 })
+    }
+
     pub fn dst_type(&self) -> Type {
         match self.direction {
             MiniDirection::ToF16x2 | MiniDirection::ToBf16x2 => Type::Scalar(ScalarType::B32),
-            _ => Type::Scalar(ScalarType::B16),
+            _ => self.pair_type(),
         }
     }
 
@@ -5375,7 +5380,7 @@ impl CvtMiniDetails {
         match self.direction {
             MiniDirection::FromF32 => Type::Scalar(ScalarType::F32),
             MiniDirection::FromF16x2 | MiniDirection::FromBf16x2 => Type::Scalar(ScalarType::B32),
-            MiniDirection::ToF16x2 | MiniDirection::ToBf16x2 => Type::Scalar(ScalarType::B16),
+            MiniDirection::ToF16x2 | MiniDirection::ToBf16x2 => self.pair_type(),
         }
     }
 }

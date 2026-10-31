@@ -19,7 +19,7 @@ use crate::utils::{Context, Message, Module, PassBuilderOptions, TargetMachine};
 use crate::{
     LLVMZludaAgxKeepGlobals, LLVMZludaAgxLowerAddressSpaces, LLVMZludaAgxLowerClusters, LLVMZludaAgxSpillClusterShared,
     LLVMZludaAirFunctionPointers, LLVMZludaSetAirPrimitives, LLVMZludaAirGlobalsToBuffer, LLVMZludaAirInlineGlobalUsers,
-    LLVMZludaAirRemapAddressSpaces, LLVMZludaAirSharedLayout, LLVMZludaAirStaticRounding, LLVMZludaAirDropCompareFlushes, LLVMZludaAirDropMinMaxFixups, LLVMZludaAirExpandDivisions, LLVMZludaAirCanonicalNaNs, LLVMZludaAirTextureSampleHint, LLVMZludaAirCompareFloatBits, LLVMZludaAirKernelModule, LLVMZludaAirSaltKernels, LLVMZludaAgxCanonicalizeFoldedNaNs, LLVMZludaLinkUsedDefinitions,
+    LLVMZludaAirRemapAddressSpaces, LLVMZludaAirSharedLayout, LLVMZludaAirStaticRounding, LLVMZludaAirDropCompareFlushes, LLVMZludaAirDropMinMaxFixups, LLVMZludaAirExpandDivisions, LLVMZludaAirCanonicalNaNs, LLVMZludaAirTextureSampleHint, LLVMZludaAirCompareFloatBits, LLVMZludaAirRangeReport, LLVMZludaAirKernelModule, LLVMZludaAirSaltKernels, LLVMZludaAgxCanonicalizeFoldedNaNs, LLVMZludaLinkUsedDefinitions,
     LLVMZludaUpgradeFunctionAttributes,
 };
 use llvm_sys::target_machine::{
@@ -287,7 +287,8 @@ pub fn compile_air(
             stage("O3 in AIR's address spaces");
         }
     }
-    finish_air(ctx, &linked, strict_fp)?;
+    // (AGX code from it: AGX's f32 compares flush as .ftz ones do; Metal-only: all on the bits)
+    finish_air(ctx, &linked, strict_fp, if agx_cpu.is_some() { 1 } else { 3 })?;
     // Metal: what only Metal needs from ZLUDA, on a copy, before the AIR kernel signatures are made (the
     // globals buffer is a kernel parameter like the others)
     let metal = match (metal_source, metal_pipeline) {
@@ -295,11 +296,15 @@ pub fn compile_air(
             unsafe { LLVMZludaAirExpandDivisions(source.get()) };
             run(&source, pipeline, &air, &options)?;
             stage("Metal copy: its pipeline");
-            finish_air(ctx, &source, strict_fp)?;
+            finish_air(ctx, &source, strict_fp, 3)?;
             source
         }
         _ => {
             let metal = linked.clone();
+            // (the .ftz functions' comparisons on the bits too, which the AGX code's module left to the hardware)
+            if strict_fp && agx_cpu.is_some() {
+                unsafe { LLVMZludaAirCompareFloatBits(metal.get(), 2) };
+            }
             // (with AGX code and the portable module's O3 for both: the Metal copy's divisions expanded here, and
             // what of them depends on the divisor only hoisted out of loops)
             if agx_cpu.is_some() && unsafe { LLVMZludaAirExpandDivisions(metal.get()) } > 0 {
@@ -362,10 +367,17 @@ pub fn compile_air(
     // AGX: the portable AIR through agx-lower-air and the AGX backend, with O3 again for AGX first
     // (ZLUDA_AIR_AGX_PIPELINE: o3, none): its pipeline lowers AIR to AGX before anything else, and then optimizes
     // with AGX's cost model, which AIR's O3 has not (Geekbench's GEMM unrolled half as far as AGX's
-    // threadgroup-load unrolling makes it: 24% slower)
-    let agx_pipeline: Option<&CStr> = match std::env::var("ZLUDA_AIR_AGX_PIPELINE").as_deref() {
+    // threadgroup-load unrolling makes it: 24% slower). Not by default for a large module's kernels compiled one
+    // at a time: each kernel's module repeats O3 on the functions it shares with the others (Blender Cycles: 44 ->
+    // 31 s of AGX code, the first render 67 -> 50 s, its GPU time unchanged).
+    let agx_pipeline_env = std::env::var("ZLUDA_AIR_AGX_PIPELINE");
+    let agx_pipeline: Option<&CStr> = match agx_pipeline_env.as_deref() {
         Ok("none") => None,
         _ => Some(c"default<O3>"),
+    };
+    let per_kernel_pipeline = match agx_pipeline_env.as_deref() {
+        Ok("o3") => agx_pipeline,
+        _ => None,
     };
     let agx_object = match agx_cpu {
         None => None,
@@ -378,7 +390,7 @@ pub fn compile_air(
             // the module keeps every global variable, and the objects are merged into the one a whole-module
             // compilation makes (agx_merge). ZLUDA_AGX_PER_KERNEL: 1 always (several kernels), 0 never; by default
             // for portable AIR over 4 MB.
-            let kernels = kernel_names(&linked);
+            let mut kernels = kernel_names(&linked);
             let per_kernel = kernels.len() > 1
                 && match std::env::var("ZLUDA_AGX_PER_KERNEL").as_deref() {
                     Ok("1") => true,
@@ -386,19 +398,29 @@ pub fn compile_air(
                     _ => portable.len() > 4 << 20,
                 };
             if per_kernel {
+                // ZLUDA_AGX_ONLY_KERNELS (comma separated, for debugging): AGX code of only these kernels, compiled as
+                // in the whole module (the same global data layout), to replay one of them with other options
+                if let Ok(only) = std::env::var("ZLUDA_AGX_ONLY_KERNELS") {
+                    kernels.retain(|k| only.split(',').any(|o| k.to_bytes() == o.as_bytes()));
+                }
                 // Each kernel in a context of its own, read back from the portable AIR, which is freed whole after
                 // the kernel's code (the module and its context are done with: kept, they held Cycles' compilation
                 // at 4 GB before its largest kernel's 3)
-                // On ZLUDA_AGX_JOBS threads (default: up to 4 of the cores, as each holds a kernel's compilation,
-                // up to about 1 GB for Cycles' largest with calls), each with its own context and target machine;
-                // the objects in the kernels' order.
+                // On ZLUDA_AGX_JOBS threads (default: every core the available memory allows, as each holds a
+                // kernel's compilation, up to about 1 GB for Cycles' largest with calls), each with its own context
+                // and target machine; the objects in the kernels' order.
                 drop(linked);
                 drop(agx);
                 let jobs = std::env::var("ZLUDA_AGX_JOBS")
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()).min(4))
+                    .unwrap_or_else(default_jobs)
                     .clamp(1, kernels.len());
+                // ZLUDA_AGX_INLINE_KERNELS (comma separated, or "all"): these kernels' functions inlined, no real
+                // calls (to tell a calls bug from another, and to measure calls against code size)
+                let inline_kernels: Vec<String> = std::env::var("ZLUDA_AGX_INLINE_KERNELS")
+                    .map(|v| v.split(',').map(str::to_string).collect())
+                    .unwrap_or_default();
                 let want_asm = text_hook.is_some();
                 let next = std::sync::atomic::AtomicUsize::new(0);
                 let results: Vec<std::sync::Mutex<Option<Result<(Vec<u8>, Vec<u8>), String>>>> =
@@ -420,9 +442,7 @@ pub fn compile_air(
                             loop {
                                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 let Some(name) = kernels.get(i) else { break };
-                                if timings {
-                                    eprintln!("[zluda air] AGX code of {}", name.to_string_lossy());
-                                }
+                                let started = std::time::Instant::now();
                                 let one_kernel = || -> Result<(Vec<u8>, Vec<u8>), String> {
                                     let kctx = Context::new();
                                     let kdiagnostics = Diagnostics::new(&kctx);
@@ -432,7 +452,10 @@ pub fn compile_air(
                                         LLVMZludaAirKernelModule(whole.get(), name.as_ptr())
                                     });
                                     drop(whole);
-                                    if let Some(pipeline) = agx_pipeline {
+                                    if inline_kernels.iter().any(|k| k == "all" || k.as_bytes() == name.to_bytes()) {
+                                        inline_everything(&one);
+                                    }
+                                    if let Some(pipeline) = per_kernel_pipeline {
                                         run(&one, pipeline, &agx, &PassBuilderOptions::new())?;
                                     }
                                     let mut asm = Vec::new();
@@ -447,7 +470,12 @@ pub fn compile_air(
                                     kdiagnostics.check()?;
                                     Ok((object, asm))
                                 };
-                                *results[i].lock().unwrap() = Some(one_kernel());
+                                let result = one_kernel();
+                                if timings {
+                                    let seconds = started.elapsed().as_secs_f64();
+                                    eprintln!("[zluda air] AGX code of {}: {seconds:.3} s", name.to_string_lossy());
+                                }
+                                *results[i].lock().unwrap() = Some(result);
                             }
                         });
                     }
@@ -499,6 +527,41 @@ pub fn compile_air(
     Ok(AirCompilation { portable, metal: metal_air, metal_globals, agx_object })
 }
 
+/// Marks every function of `module` that is not a kernel always-inline (and not no-inline), so that the AGX backend
+/// inlines it rather than keeping it as a real call.
+fn inline_everything(module: &Module) {
+    use llvm_sys::core::*;
+    unsafe {
+        let ctx = LLVMGetModuleContext(module.get());
+        let kind = |n: &str| LLVMGetEnumAttributeKindForName(n.as_ptr().cast(), n.len());
+        let (noinline, alwaysinline) = (kind("noinline"), kind("alwaysinline"));
+        let always = LLVMCreateEnumAttribute(ctx, alwaysinline, 0);
+        let mut f = LLVMGetFirstFunction(module.get());
+        while !f.is_null() {
+            let kernel = !LLVMGetStringAttributeAtIndex(f, llvm_sys::LLVMAttributeFunctionIndex, c"air-kernel".as_ptr(), 10).is_null();
+            if LLVMIsDeclaration(f) == 0 && !kernel {
+                LLVMRemoveEnumAttributeAtIndex(f, llvm_sys::LLVMAttributeFunctionIndex, noinline);
+                LLVMAddAttributeAtIndex(f, llvm_sys::LLVMAttributeFunctionIndex, always);
+            }
+            f = LLVMGetNextFunction(f);
+        }
+    }
+}
+
+/// Threads for a large module's per-kernel AGX code: the cores, at most one per `JOB_BYTES` of available memory
+/// (Linux's MemAvailable; 4 where it cannot be read, the default before).
+fn default_jobs() -> usize {
+    const JOB_BYTES: u64 = 3 << 29;
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let available_kb = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| {
+        m.lines().find_map(|l| l.strip_prefix("MemAvailable:")?.trim().strip_suffix("kB")?.trim().parse::<u64>().ok())
+    });
+    match available_kb {
+        Some(kb) => cores.min((kb * 1024 / JOB_BYTES) as usize).max(1),
+        None => cores.min(4),
+    }
+}
+
 /// The names of the kernels (functions with the air-kernel attribute) of `module`.
 fn kernel_names(module: &Module) -> Vec<CString> {
     let mut names = Vec::new();
@@ -525,7 +588,9 @@ fn kernel_names(module: &Module) -> Vec<CString> {
 
 /// After the last optimization of `module` in AIR's address spaces: Metal compiles without fast math
 /// (air.precise-math); strict mode's canonical NaNs and denormal comparisons; function pointers as IDs.
-fn finish_air(ctx: &Context, module: &Module, strict_fp: bool) -> Result<(), String> {
+/// `compare_functions`: the functions whose f32 comparisons go on the bits in strict mode (see
+/// LLVMZludaAirCompareFloatBits: 1 those keeping denormals, for AGX code; 3 all, for Metal).
+fn finish_air(ctx: &Context, module: &Module, strict_fp: bool, compare_functions: i32) -> Result<(), String> {
     let fail = |err: *mut std::ffi::c_char| Message::new(unsafe { CStr::from_ptr(err) }).to_str().to_string();
     // the texture unit's sample as an AIR hint, now that nothing optimizes its operands away
     unsafe { LLVMZludaAirTextureSampleHint(module.get()) };
@@ -561,9 +626,13 @@ fn finish_air(ctx: &Context, module: &Module, strict_fp: bool) -> Result<(), Str
         }
         unsafe { LLVMZludaAirCanonicalNaNs(module.get()) };
         // f32 comparisons on the bits (a flushing GPU compares a denormal as zero)
-        unsafe { LLVMZludaAirCompareFloatBits(module.get()) };
+        unsafe { LLVMZludaAirCompareFloatBits(module.get(), compare_functions) };
         // and the NaN constants the optimizations folded (as the Agx target)
         unsafe { LLVMZludaAgxCanonicalizeFoldedNaNs(module.get()) };
+    }
+    // ZLUDA_AIR_RANGE_REPORT=1: how many device memory accesses a launch could bound (dependency-aware barriers)
+    if std::env::var("ZLUDA_AIR_RANGE_REPORT").is_ok_and(|v| v == "1") {
+        unsafe { LLVMZludaAirRangeReport(module.get()) };
     }
     // function pointers as IDs and choices among direct calls: no AIR consumer has a call stack
     let mut err = std::ptr::null_mut();

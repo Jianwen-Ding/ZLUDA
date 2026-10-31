@@ -118,6 +118,11 @@ pub struct Options {
     /// canonical NaNs in software, and `.sat` keeps `-0.0`. Slower; ignored
     /// for AMDGPU.
     pub strict_fp: bool,
+    /// With `strict_fp`: `tex.1d` / `tex.2d` with float coordinates filter in f32 as outside it (the per-axis
+    /// weights still quantised to 1/256, each step rounded to nearest: a few ulps from the model's exact sum
+    /// rounded once) instead of the software double precision sampler, most of the strict code of texture-heavy
+    /// kernels. An error margin for textures only; the arithmetic stays strict.
+    pub f32_textures: bool,
     /// Keep `.loc` as LLVM debug locations (line tables only), for the AGX
     /// backend's checked mode to name the source of a bad access.
     pub debug_locations: bool,
@@ -165,7 +170,7 @@ pub fn to_llvm_module_with_options<'input>(
     options: Options,
     mut on_pass_end: impl FnMut(&str),
 ) -> Result<Module, TranslateError> {
-    let Options { target, strict_fp, debug_locations, stack_size, fast_mma } = options;
+    let Options { target, strict_fp, f32_textures, debug_locations, stack_size, fast_mma } = options;
     let strict_fp = strict_fp && target.is_air();
     let mut ast = ast;
     if !debug_locations {
@@ -226,7 +231,7 @@ pub fn to_llvm_module_with_options<'input>(
         insert_implicit_conversions::run(ast.address_size == 32, &mut flat_resolver, directives)?;
     on_pass_end("insert_implicit_conversions");
     let directives =
-        replace_instructions_with_functions::run(&mut flat_resolver, target, strict_fp, directives)?;
+        replace_instructions_with_functions::run(&mut flat_resolver, target, strict_fp, strict_fp && !f32_textures, directives)?;
     on_pass_end("replace_instructions_with_functions");
     let directives = hoist_globals::run(directives)?;
     on_pass_end("hoist_globals");
@@ -522,6 +527,9 @@ impl PtxSpecialRegister {
             Self::ClusterCtaid | Self::ClusterCtarank | Self::IsExplicitCluster => Some(0),
             Self::ClusterNctaid => Some((member.unwrap_or(0) < 3) as u64),
             Self::ClusterNctarank => Some(1),
+            // Apple GPUs read %envreg<n> from a table the driver writes (the grid-sync workspace of cooperative
+            // launches is %envreg1:%envreg2)
+            Self::Envreg(_) if target.is_air() => None,
             Self::Envreg(_) | Self::Pm(_) => Some(0),
             _ => None,
         }
@@ -542,7 +550,7 @@ impl PtxSpecialRegister {
     }
 
     fn get_function_input_type(self) -> Option<ast::ScalarType> {
-        if self.is_vector() {
+        if self.is_vector() || matches!(self, Self::Envreg(_)) {
             Some(ast::ScalarType::U8)
         } else {
             None
@@ -558,6 +566,7 @@ impl PtxSpecialRegister {
             PtxSpecialRegister::Clock => "sreg_clock",
             PtxSpecialRegister::Clock64 => "sreg_clock64",
             PtxSpecialRegister::Globaltimer => "sreg_globaltimer",
+            PtxSpecialRegister::Envreg(_) => "sreg_envreg",
             PtxSpecialRegister::LanemaskLt => "sreg_lanemask_lt",
             PtxSpecialRegister::LanemaskLe => "sreg_lanemask_le",
             PtxSpecialRegister::LanemaskGe => "sreg_lanemask_ge",
@@ -1532,7 +1541,9 @@ impl SpecialRegistersMap {
             ),
         ),
     ) {
-        for sreg in PtxSpecialRegister::all().filter(|sreg| sreg.needs_function(target)) {
+        // the %envreg<n> share one function (of n), declared for %envreg0
+        let declared = |sreg: &PtxSpecialRegister| !matches!(sreg, PtxSpecialRegister::Envreg(n) if *n != 0);
+        for sreg in PtxSpecialRegister::all().filter(|sreg| sreg.needs_function(target) && declared(sreg)) {
             let external_fn_name = [ZLUDA_PTX_PREFIX, sreg.get_unprefixed_function_name()].concat();
             let name = resolver.register_named(Cow::Owned(external_fn_name), None);
             let return_type = sreg.get_function_return_type();

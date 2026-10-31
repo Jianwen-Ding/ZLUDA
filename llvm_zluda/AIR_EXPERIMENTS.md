@@ -100,6 +100,87 @@ the order it was found:
 - **Device-flaky PTX tests**: ldm-0, ldm2-st0 and occupancy pass or fail from one run to the next with the same
   zoc; rerun them with the previous build before calling a change a regression.
 
+## Strict FP on the AIR route, and the zoc server, 2026-10-31 (second session, later)
+
+- **zoc --serve took the direct route** (fixed 455ba04): every module under 4 MiB that the driver compiled went
+  through `compile_agx` whatever `--target`. Small-module numbers before that commit (Geekbench, llama.cpp's
+  smaller modules, agx_bench_kernel timings) are of the direct route; Cycles, llama.cpp's 10 MB module and the
+  PTX-formalization harness were AIR. Found from strict f32 division timing differently through the server and
+  the command line. AIR route, corrected: Geekbench GPU score 54807 (direct with batching: 52974 / 53752).
+- **Strict mode (ZLUDA_ROUNDING_STRICT=1), AIR route, measured**: f32 add / mul / fma 3.3x the default mode's time
+  (the denormal test of each operation's run), div.rn 1.25x, sqrt.rn 1.8x. Geekbench 38260 -> 45168 after the
+  fixes below (default 54807); llama.cpp tg 41.7 vs 43.8 t/s, pp 378 vs 430 (completions exact both ways);
+  Blender default cube GPU time +6.7%; Open Data monster 261 / classroom 61.7 / junkshop 67.5 vs 466 / 133 / 162.
+  PTX-formalization: strict 397 files / 1928 checks, default 377 / 1818.
+- What helped strict mode: approximate divisions kept approximate (llvm b602fa44: div.approx / rcp.approx were
+  computed exactly, slower than div.rn); exact zero results without soft-f64 (c3f5e644: a zero result went to
+  soft-f64, 24-30x); bit-form .ftz flushes dropped where the ALU flushes (96c88d8f, 0cb73d79); canonical NaNs
+  only where observed (c15b98b, e8592d6); .ftz comparisons left to the hardware in AGX code (ce75cdb: Cycles is
+  .ftz throughout, ~15 instructions per comparison; classroom 42.8 -> 60.1).
+- **Dead ends**: an `!fpmath` error margin (ZLUDA_FP_ULP) for division and square root: on the AIR route
+  AIREmulateF64's fast path is already the hardware's division, 1.15-1.25x default, nothing left to relax
+  (AGXStrictFP, which it targeted, only serves the direct route). The canonical NaN test as a float compare
+  (`select(x uno x, NaN, x)`, one fcmpsel instead of and + icmpsel; intersect_closest 28016 -> 23590
+  instructions): LLVM folds the float select of a NaN into x (the payload is not kept: rounding-diff-f32 got
+  0x7fc00000); as an integer select on the float compare it lowered to 42923 instructions. Reverted.
+- What remains of strict mode's cost in Cycles is mostly the canonical NaN of values that are observed (stored,
+  passed through integers): ~5000 and + icmpsel pairs in intersect_closest (15076 instructions in the default mode,
+  28016 strict). What worked instead of the float compare: fadd32 / fmul32 / fmadd32 return 0x7fc00000 for every
+  NaN (playground 2026-10-11-float-semantics), so their canonical NaN is one integer comparison with it
+  (llvm 315e9fba): 28016 -> 24283 instructions, monster 261 -> 271, classroom 61.7 -> 63.4, the same image. Other
+  producers (rcp, rsqrt, exp2, conversions) keep the two instructions: their NaN output is not established.
+  Then established (playground 2026-10-31-special-nan: rcp, rsqrt, exp2, log2 give 0x7fc00000 too; llvm
+  ca3980ea). Strict mode with all of it: Geekbench 48702 (default 54807), Open Data junkshop 76.6 (default 162),
+  llama.cpp pp128 382.5 t/s (default 430), completions exact.
+- The harness has error margins now: `--ulp N` and `--flush-ok` (float-typed checks only), PASS~ in its output.
+- **llama.cpp generation, where the time goes (AIR route, graph batching)**: 44 t/s, the main thread waiting on
+  the GPU 80% of the time; kernels 14.4 ms per token (mul_mat_vec_q<Q5_1> 6.6 ms, 62 us a launch; the Q8_0 output
+  projection 1.7 ms in one launch, ~5x its bandwidth bound), an empty dispatch in a graph 2.7-3.3 us (~490 per
+  token), cuGraphLaunch 20.3 ms and the logits' read-back 2.3 ms per token. Without the CDM barrier after each
+  batched dispatch generation ran at 61 t/s, with garbage output: the barriers are needed. Leaving out only the
+  barriers without a hazard needs each dispatch's read and write ranges: ggml keeps every intermediate tensor in
+  one allocation, so a test at allocation granularity finds a hazard everywhere. AGX has no signed bitfield
+  extract (bfeil / extr are unsigned), so dp4a's signed bytes stay two instructions each.
+
+## Application benchmarks, AIR route, 2026-10-31 (second session)
+
+- **Blender: launch-time specialization cost 85% of a warm render.** Cycles' scalar arguments change at every
+  launch, and each new set made `specialized()` rewrite and hash all 13 MB of its PTX (~40 ms per launch against
+  ~2 ms of GPU work). Not specialized above 4 MiB: default cube 512x512 64 spp 5.77 -> 0.92 s, same image.
+  Specializing large modules only once arguments repeat (llama.cpp's do) gave no gain there (tg 41.3 -> 41.6 t/s,
+  pp 335 -> 314): left off.
+- **Cycles' compile (cold first render)**: per-kernel AGX code on every core memory allows (was 4 threads) 72.5 ->
+  44.2 s; no second O3 in each kernel's module (it repeated O3 on the functions the kernels share) 44 -> 31 s, the
+  first render at 1024x1024 67 -> 50 s, GPU time unchanged. With that O3, llama.cpp's 10 MB module failed to
+  compile ("Cannot select: store ... into %stack.0"), another reason it stays off.
+- **llama.cpp b11706 needed three fixes to start on the AIR route**: CUDA_MODULE_LOADING lazy by default (a
+  native-only start-up image), cvt.*.e2m1x2 with a .b8 register (FP4 quantize kernels), %envreg1:%envreg2 as the
+  grid-sync workspace (soft_max_f32_parallelize_cols traps on null). Greedy completions match the CPU's.
+  Qwen2.5 0.5B Q5_K_M, -fa 0 -b 8 -ub 8: pp128 335-337 t/s, tg 41-42 t/s. Generation is GPU-bound (the main
+  thread waits on the GPU 66% of the time): ~490 kernels per token, 14 ms of GPU time;
+  mul_mat_vec_q<Q5_1> is 45% of it and latency-bound (68.5 us for 3.3 MB, 82 registers, 18 SIMD-groups per core).
+  Its PTX is unrolled already: unroll, scheduler and memory-clustering options changed nothing (within 2%).
+- **Graph and launch batching (ZLUDA_AGX_GRAPH_BATCH=1 ZLUDA_AGX_LAUNCH_BATCH=1, still opt-in)**: llama.cpp pp128
+  335 -> 413-453 t/s, tg unchanged; Geekbench GPU score 51865 -> 52974; Blender 1024x1024 128 spp second render
+  1.70 -> 1.69 s, the same images and completions.
+- **Blender Open Data benchmark (script 3.1.2, scenes monster / junkshop / classroom)**: rendered once the device
+  reported CU_DEVICE_ATTRIBUTE_TEXTURE_PITCH_ALIGNMENT (0 made every 2D texture's pitch 0): 464.6 / 156.6 / 133.3
+  samples per minute. **Their images are wrong**: instanced objects (linked duplicates, collection instances) are
+  missing. Traced one ray through the BVH (agx_run --trace-pcs, AGX_TRACE_LANE): the instance push, transforms,
+  slab tests and stack are right; every leaf of an instanced mesh's own BVH holds visibility 0 and primitive type
+  0 in its .z / .w (a non-instanced scene's leaves hold 1693 and 1), so the traversal skips all their triangles.
+  Cycles' pack_instances copies those words from the mesh's BVH as they are: the host data, built on the CPU,
+  already has them. Not the calls (inlined, the same), not the generic-pointer bug below (fixed, the same), not a
+  backend option. Open: why this Blender build's mesh BVH2 leaves get no visibility / type (a Cycles issue of the
+  CUDA BVH2 path, or something Cycles reads from the driver). Later: a log of the driver's host-to-device copies
+  shows Cycles itself uploads the mesh leaves as (2, 4, 0, 0) (the instance leaves written by pack_leaf directly
+  have theirs); Cycles' spatial-split, compact-BVH and BVH-type settings change nothing; and the build's commit
+  (ae6d847d66fa) does not exist in Blender's repository ("commit doesn't exist"), so the aarch64 build is a
+  third party's, with no official Linux ARM64 build to compare (blender.org publishes x64 only).
+- **Generic pointers across real calls** (fixed, llvm-project claude/air-calls-generic-pointers): a called
+  function given a generic pointer to its caller's private memory accessed it as device memory
+  (ptx/tools/agx_tests/private-ptr-call.ptx).
+
 ## Application benchmarks, AIR route (driver default), 2026-10-31
 
 - **Geekbench 7 GPU (CUDA)**: every workload completes; summed GPU time 25.26 s (air06) vs 25.08 / 25.34 s on the
@@ -194,3 +275,143 @@ fits in the M2 Max's 48 MB system cache: memory bandwidth cannot be measured thr
   other kernels' `!air.kernel` entries remain ("an !air.kernel entry names no function"). Round-trip through
   `.ll` and prune `!air.kernel` to the kept kernel.
 - **Never run Geekbench's BVH kernels with random (gbgen) inputs**: they hang the GPU.
+
+## Dependency-aware barriers (2026-10-31)
+
+Every batched dispatch ends with the CDM barrier (cache invalidate/flush, playground
+`2026-10-16-l2-command-boundary`). Leaving out every barrier gave llama tg 61 t/s but wrong output, so the
+question was how many barriers a dependency analysis could drop.
+
+- `ZLUDA_AGX_HAZARD_BARRIERS=1` (driver, off): barrier only before a dispatch whose argument allocations overlap
+  those since the last barrier. Correct (llama completions 4/4 exact) but no speed-up (tg 46.8 vs 48.6, pp 441 vs
+  447, within spread): ggml keeps all intermediate tensors in one allocation.
+- `ZLUDA_AIR_RANGE_REPORT=1` (compiler, report only; `_WHY=1` prints the blocking term): how many device accesses
+  scalar evolution writes as pointer argument + a function of launch values. llama.cpp's 1157 kernels: 2755 of
+  36961 accesses, no kernel entirely; blockers are grid-stride / data-dependent loops (trip counts not
+  computable), selects and phis, and 23903 accesses whose base is not a pointer argument.
+- `ZLUDA_AGX_HAZARD_STATS=1` (driver): the ceiling, assuming perfect byte ranges and taking only identical pointer
+  values as conflicts (optimistic). llama tg: 24366 of 28672 dispatches still need a barrier (85%): its graph is a
+  chain (norm -> mul -> matmul -> rope -> ...). At most ~15% of the ~6 ms/token barrier cost could go, about
+  44 -> 47 t/s, for a multi-day compiler + runtime project. Not pursued; the allocation-level flag stays as an
+  experiment.
+
+## Strict FP: canonical NaNs through chains of .ftz flushes (2026-10-31)
+
+`ZLUDA_AIR_NAN_WHY=1` (zoc) counts what observes each canonicalized result. In Cycles nearly all were .ftz operand
+flushes on the bits, select((b & 0x7f800000) == 0, sign, b), applied again to an already flushed value (the next
+.ftz operation) with LLVM sharing the sign bits between the two flushes; the pass only accepted a single flush.
+A NaN passes every flush of such a family unchanged (its exponent is not zero), so the whole family is now accepted.
+
+- Cycles intersect_closest, strict: 23765 -> 20135 instructions (default 15069).
+- PTX-formalization strict 397 / 1928, default 377 / 1818 (unchanged); new test agx_tests/ftz-nan-chain.ptx passes
+  strict (default mode does not canonicalize, by design).
+- Blender Open Data strict: monster 271 -> 279, junkshop 76.6 -> 80.0, classroom 63.4 -> 65.5 samples/min.
+- Geekbench strict 48702 -> 49641. llama strict completions 4/4 exact.
+
+## Geekbench "errors" in default mode (2026-10-31)
+
+The 10 errors of a default Geekbench run: 6 are CUDA 701 (launch out of resources) at 1024-thread blocks of an
+image filter, from Geekbench's block-size search (the kernel's registers allow fewer threads per core; correct,
+the search moves on). The rest were launch-time specializations of the ray tracer (trace_bvh, hit_surface,
+generate_rays, ...) that failed to load: "the modules lay out their global data differently". Their only global
+data is LLVM's switch lookup tables (switch.table.*), which a recompilation names and sizes differently. A
+module whose globals are only such compiler-made constants now keeps its own copy. All specializations load (0
+failures); Geekbench GPU time 26.85 -> 26.09 s, score 53249 (within the 53441-54812 spread of earlier runs).
+- Then: the flush family also passes through integer selects and phis of the flushed bits, and unsigned
+  comparisons below the NaNs (x < C, C <= 0x7f800001: false for every NaN) do not observe them. intersect_closest
+  strict 20135 -> 19921. The remaining observers are real bit uses (sign tests, xor of the sign, or with sign bits):
+  NaN canonicalization is no longer the main strict cost; the rest is denormal emulation (air.ieee-fp32) and
+  comparisons on the bits. Test agx_tests/ftz-nan-phi.ptx.
+
+## Strict FP: .ftz min / max to the hardware (2026-10-31)
+
+LLVMZludaAirCompareFloatBits rewrote every f32 min / max on the bits (about 20 integer instructions), ignoring
+its `functions` argument, which the comparisons respect: AGX's f32 compare (fcmpsel ltn / gtn) already orders a
+denormal as zero, PTX's .ftz order, and the backend's lowering of minimumnum / maximumnum handles signed zeros and
+NaN operands. Now .ftz f32 min / max go to the hardware in AGX code (still on the bits for IEEE functions and for
+Metal). Cycles is .ftz throughout (3284 max.ftz, 1644 min.ftz).
+
+- intersect_closest strict 19921 -> 16732 instructions (default 15069).
+- Blender Open Data strict: monster 279 -> 345, junkshop 79.4 -> 97.7, classroom 65.5 -> 81.9 samples/min.
+- Geekbench strict 49641 -> 53084. llama strict 4/4 exact. Suites unchanged (strict 1928, default 1818).
+- New test agx_tests/ftz-minmax.ptx (denormals, NaNs, signed zeros): passes on the simulator and on the GPU
+  (agx_run_hw), as do ftz-nan-chain and ftz-nan-phi.
+
+## Strict FP: calls in the shading kernels (2026-10-31, open)
+
+Blender junkshop per-launch GPU time, strict vs default: intersect kernels now equal; shade_surface x2.3,
+shade_light_nee x3.5. Strict code keeps many more real calls (shade_light_nee: 1629 calls, 12332 stack loads vs
+156 / 3783 in default): the module-level O3 inlines less. ZLUDA_AGX_INLINE_KERNELS (now also "all"):
+- shade_light_nee and shade_surface inlined, strict junkshop 97.3 -> 122.1 samples/min (shade_surface 43.7 -> 27.0
+  ms, shade_light_nee 23.8 -> 12.1 ms), warm-up with compile 107 -> 144 s; default 159.7 -> 161.7.
+- "all": a single Cycles compile ran 21+ minutes at 26 GB and was stopped. Undoes the compile-cost work; not a
+  default. Next: why strict's O3 inlines less (constrained-FP intrinsics or strictfp attributes in the inline
+  cost), to get default's inlining without forcing it.
+
+## Strict FP: the texture sampler (2026-10-31)
+
+The calls in strict shading kernels (1629 in shade_light_nee vs 156) are not Cycles functions left uninlined: they
+are the soft-f64 routines of the exact software texture sampler (__air_f64_mul, _from_u64, _floor, ...), which
+default mode runs as GPU floats. Skipping the strict-mode bit flushes of .ftz operations in functions that flush
+f32 denormals (the IEEE f32 emulation leaves those to the hardware) changed little (1629 -> 1615 calls; kept, suites
+unchanged).
+
+zoc --strict-fp-f32-textures (driver: ZLUDA_ROUNDING_STRICT_TEXTURES=f32, in the cache key) keeps strict arithmetic
+but filters tex.1d / tex.2d in f32 as default mode does. Blender junkshop strict 97.3 -> 144 samples/min (default
+160; shade_surface 43.7 -> 19.6 ms, shade_light_nee 23.8 -> 7.1 ms), compile warm-up 107 -> 92 s. Against the exact
+sampler (generated linear-filter tests, 256 coordinates each, simulator): f32 textures with one channel exact,
+two channels with border addressing within 2 ulp. Strict formalization suite unchanged with it (1928). Off by
+default: an error margin for textures only.
+
+## llama generation: device copies inside the graph's batch (2026-10-31)
+
+ZLUDA_AGX_GRAPH_TIMING=1 (driver) prints each graph's shape and its host time. llama.cpp's token graph is 506
+kernel launches with 24 device-to-device copies between the layers (L13 D1 L20 D1 ... L13). Each copy waited for
+the GPU (sync_all) and copied on the CPU: 25 commands per token and 13 ms of host waiting, nearly all of the token's
+time. Device copies in a graph are now a dispatch of built-in copy kernels (16-, 4- or 1-byte units, compiled once
+through the AIR route) inside the batch, ordered by its barriers; module globals and copies outside graphs as before.
+
+- llama tg128 47.3 -> 124.9 t/s (same session, -b 8 -ub 8); pp128 436 -> 441. Strict: tg128 130.8, pp128 401.6.
+- Completions 4/4 exact in both modes; driver tests pass.
+- (llama-bench without -b 8 -ub 8 aborts in cublasCreate: this llama-app links cuBLAS statically, whose fatbin has
+  no PTX; not a driver regression.)
+
+## A larger model: Qwen2.5-7B-Instruct Q4_K_M (2026-10-31)
+
+Apache-2.0 GGUF (bartowski/Qwen2.5-7B-Instruct-GGUF, 4.36 GiB) in /scratch/models/qwen2.5-7b; the bundled
+llama-app (cuBLAS linked statically, so -b 8 -ub 8; a cudart replacement is out of ZLUDA's scope).
+
+- pp128 64.0 t/s, tg64 27.1 t/s (AIR route, default mode, after the in-batch device copies).
+- tg reads all 4.36 GiB of weights per token: ~118 GiB/s, about 30% of the M2 Max's rated bandwidth.
+- ZLUDA_AGX_PROFILE is no guide here: every command shows a 50-60 us floor whatever its size (a 4-block copy as
+  long as an 18944-row matrix-vector product).
+- The Q4_K matrix-vector kernel (mul_mat_vec_q<12>), captured (512 rows x 3584, 1 MB) and replayed on the GPU: 20.9
+  us back to back (58 us cold), ~49 GB/s. Its capture's regs.txt says 124, but in 16-bit halves: 62-63 general
+  purpose registers, 832 threads per core, so occupancy is not what limits it. .maxnreg 56 or less makes it spill,
+  and the replay (no stack memory) fails with "Bad address"; recompiled without a limit it runs as fast (21.3 us).
+  This launch is small (512 rows); the 18944-row FFN projections are the ones to measure next.
+- The 18944 x 3584 Q4_K launch (38.2 MB of weights), captured and replayed on the GPU: 474 us back to back (cold
+  1.41 ms), ~80 GB/s, about a fifth of the rated bandwidth; two per layer, 28 layers: most of the 27 t/s.
+- dp4a is the cost: compiled with dp4a replaced by one multiply-add (wrong results, an upper bound only), the same
+  launch takes 277 us instead of 446 (-38%; 574 -> 491 instructions, 63 -> 49 registers). Each exact dp4a is four
+  byte multiply-adds with every signed byte extended by a shift pair (AGX has no signed bitfield extract); bias or
+  sign-correction rewrites cost more instructions, not fewer. A real gain needs packed 8- or 16-bit multiply-adds,
+  which nothing measured so far establishes on AGX: a hardware probe first.
+- Packed integer operations for dp4a (asked for a probe): what is measured or documented already says there are
+  none. The playground's sub-op sweeps (2026-10-11-subop-spaces: intl, bitrev, popcount, simd_op reductions,
+  shuffles, convert) found no dot product or packed integer arithmetic; applegpu's documentation lists none, and its
+  device_load i8 format zero-extends only (snorm8 loads are lossy floats: -128 and -127 both give -1.0). The only
+  packed arithmetic is simd_matrix_fmadd16/32 (float, cooperative across the SIMD group), wasted on a matrix-vector
+  product. What 32-bit integer ops do have is free sign extension of 16-bit register halves (MOD_SX), which saves
+  about one instruction per signed operand of a dp4a (7 -> 6), not the 38% upper bound. Not pursued further; the
+  unexplored part (imadd's unused encoding bits) is speculative and earlier undefined encodings hung the GPU.
+
+## Strict FP: exact texture filtering in integers (2026-10-31)
+
+The exact double precision sampler, the remaining strict-mode cost in Cycles, now has an integer path for unsigned
+normalized textures (u8 / u16 read as floats, level 0, tex.1d / tex.2d), bit-identical to the double sampler (see
+the commit and zluda_ptx_impl_agx_tex.c's exact_unorm_sample; 70 generated reference cases, suites unchanged).
+Blender Open Data strict: junkshop 97 -> 153 (default 160), classroom 82 -> 128 (133), monster 345 -> 429 (466)
+samples/min. The opt-in ZLUDA_ROUNDING_STRICT_TEXTURES=f32 is no longer needed for speed on these scenes.
+Regenerating the texture block needs a clang: /scratch/clang-build (clang and NVPTX built from the tree); splice
+only that block (the other blocks keep clang 18's output) and drop repeated declarations.

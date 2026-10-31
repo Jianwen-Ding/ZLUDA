@@ -3080,11 +3080,17 @@ LLVM_C_EXTERN_C_BEGIN
 // mul.rn.sat.f32 took a denormal product for zero. Each scalar fcmp of floats becomes an integer comparison of
 // keys that order like the floats (sign and magnitude to an unsigned order, +0 and -0 equal), with the
 // unordered cases from the bits. Returns the number of comparisons rewritten.
-int LLVMZludaAirCompareFloatBits(LLVMModuleRef M)
+// `functions`: the f32 comparisons of 1 the functions that keep f32 denormals (IEEE input), 2 the .ftz ones
+// (preserve-sign), 3 all (bfloat ones always). AGX's f32 compare flushes denormal operands itself, which is PTX's .ftz compare: its code needs only the IEEE ones
+// (Cycles is .ftz throughout: about 15 instructions for each of its compares otherwise); a Metal compilation with
+// denormals enabled needs both.
+int LLVMZludaAirCompareFloatBits(LLVMModuleRef M, int functions)
 {
     Module *Mod = unwrap(M);
     int count = 0;
     for (Function &F : *Mod)
+    {
+        bool ieee = F.getDenormalMode(APFloat::IEEEsingle()).Input == DenormalMode::IEEE;
         for (Instruction &I : make_early_inc_range(instructions(F)))
         {
             auto *C = dyn_cast<FCmpInst>(&I);
@@ -3095,6 +3101,9 @@ int LLVMZludaAirCompareFloatBits(LLVMModuleRef M)
             if (!E->isFloatTy() && !E->isBFloatTy())
                 continue;
             bool f32 = E->isFloatTy();
+            // (bfloat has no .ftz compare: always on the bits)
+            if (f32 && !(functions & (ieee ? 1 : 2)))
+                continue;
             uint64_t sign = f32 ? 0x80000000 : 0x8000, magMask = sign - 1, inf = f32 ? 0x7f800000 : 0x7f80;
             IRBuilder<> B(C);
             Type *IT = B.getIntNTy(f32 ? 32 : 16);
@@ -3301,6 +3310,7 @@ int LLVMZludaAirCompareFloatBits(LLVMModuleRef M)
             II->replaceUsesWithIf(f, [&](Use &U) { return U.getUser() != res; });
             count++;
         }
+    }
     }
     return count;
 }

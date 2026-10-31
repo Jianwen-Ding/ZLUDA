@@ -287,7 +287,8 @@ pub fn compile_air(
             stage("O3 in AIR's address spaces");
         }
     }
-    finish_air(ctx, &linked, strict_fp)?;
+    // (AGX code from it: AGX's f32 compares flush as .ftz ones do; Metal-only: all on the bits)
+    finish_air(ctx, &linked, strict_fp, if agx_cpu.is_some() { 1 } else { 3 })?;
     // Metal: what only Metal needs from ZLUDA, on a copy, before the AIR kernel signatures are made (the
     // globals buffer is a kernel parameter like the others)
     let metal = match (metal_source, metal_pipeline) {
@@ -295,11 +296,15 @@ pub fn compile_air(
             unsafe { LLVMZludaAirExpandDivisions(source.get()) };
             run(&source, pipeline, &air, &options)?;
             stage("Metal copy: its pipeline");
-            finish_air(ctx, &source, strict_fp)?;
+            finish_air(ctx, &source, strict_fp, 3)?;
             source
         }
         _ => {
             let metal = linked.clone();
+            // (the .ftz functions' comparisons on the bits too, which the AGX code's module left to the hardware)
+            if strict_fp && agx_cpu.is_some() {
+                unsafe { LLVMZludaAirCompareFloatBits(metal.get(), 2) };
+            }
             // (with AGX code and the portable module's O3 for both: the Metal copy's divisions expanded here, and
             // what of them depends on the divisor only hoisted out of loops)
             if agx_cpu.is_some() && unsafe { LLVMZludaAirExpandDivisions(metal.get()) } > 0 {
@@ -583,7 +588,9 @@ fn kernel_names(module: &Module) -> Vec<CString> {
 
 /// After the last optimization of `module` in AIR's address spaces: Metal compiles without fast math
 /// (air.precise-math); strict mode's canonical NaNs and denormal comparisons; function pointers as IDs.
-fn finish_air(ctx: &Context, module: &Module, strict_fp: bool) -> Result<(), String> {
+/// `compare_functions`: the functions whose f32 comparisons go on the bits in strict mode (see
+/// LLVMZludaAirCompareFloatBits: 1 those keeping denormals, for AGX code; 3 all, for Metal).
+fn finish_air(ctx: &Context, module: &Module, strict_fp: bool, compare_functions: i32) -> Result<(), String> {
     let fail = |err: *mut std::ffi::c_char| Message::new(unsafe { CStr::from_ptr(err) }).to_str().to_string();
     // the texture unit's sample as an AIR hint, now that nothing optimizes its operands away
     unsafe { LLVMZludaAirTextureSampleHint(module.get()) };
@@ -619,7 +626,7 @@ fn finish_air(ctx: &Context, module: &Module, strict_fp: bool) -> Result<(), Str
         }
         unsafe { LLVMZludaAirCanonicalNaNs(module.get()) };
         // f32 comparisons on the bits (a flushing GPU compares a denormal as zero)
-        unsafe { LLVMZludaAirCompareFloatBits(module.get()) };
+        unsafe { LLVMZludaAirCompareFloatBits(module.get(), compare_functions) };
         // and the NaN constants the optimizations folded (as the Agx target)
         unsafe { LLVMZludaAgxCanonicalizeFoldedNaNs(module.get()) };
     }

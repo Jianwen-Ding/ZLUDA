@@ -375,3 +375,16 @@ through the AIR route) inside the batch, ordered by its barriers; module globals
 - Completions 4/4 exact in both modes; driver tests pass.
 - (llama-bench without -b 8 -ub 8 aborts in cublasCreate: this llama-app links cuBLAS statically, whose fatbin has
   no PTX; not a driver regression.)
+
+## A larger model: Qwen2.5-7B-Instruct Q4_K_M (2026-10-31)
+
+Apache-2.0 GGUF (bartowski/Qwen2.5-7B-Instruct-GGUF, 4.36 GiB) in /scratch/models/qwen2.5-7b; the bundled
+llama-app (cuBLAS linked statically, so -b 8 -ub 8; a cudart replacement is out of ZLUDA's scope).
+
+- pp128 64.0 t/s, tg64 27.1 t/s (AIR route, default mode, after the in-batch device copies).
+- tg reads all 4.36 GiB of weights per token: ~118 GiB/s, about 30% of the M2 Max's rated bandwidth.
+- ZLUDA_AGX_PROFILE is no guide here: every command shows a 50-60 us floor whatever its size (a 4-block copy as
+  long as an 18944-row matrix-vector product).
+- The Q4_K matrix-vector kernel (mul_mat_vec_q<12>), captured (512 rows x 3584, 1 MB) and replayed on the GPU: 20.9
+  us back to back (58 us cold), ~49 GB/s, with 124 general purpose registers per thread (few threads per core for a
+  bandwidth-bound kernel). The next lead for large-model generation.

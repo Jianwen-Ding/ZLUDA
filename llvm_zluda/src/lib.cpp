@@ -3026,8 +3026,14 @@ int LLVMZludaAirCanonicalNaNs(LLVMModuleRef M)
                 continue;
             bool arithmetic = isa<BinaryOperator>(I) || isa<UnaryOperator>(I) || isa<FPTruncInst>(I) ||
                               isa<FPExtInst>(I) || isa<SIToFPInst>(I) || isa<UIToFPInst>(I);
+            // (and AIR's fast math functions, air.fast_sin and the others the approximations become: PTX's
+            // single precision NaNs are unspecified, but this mode's are the canonical one)
             if (auto *CI = dyn_cast<CallInst>(&I))
-                arithmetic = CI->getCalledFunction() && CI->getCalledFunction()->isIntrinsic();
+            {
+                Function *Callee = CI->getCalledFunction();
+                arithmetic = Callee && (Callee->isIntrinsic() || (Callee->isDeclaration() &&
+                                                                  Callee->getName().starts_with("air.fast_")));
+            }
             if (arithmetic)
                 work.push_back(&I);
         }

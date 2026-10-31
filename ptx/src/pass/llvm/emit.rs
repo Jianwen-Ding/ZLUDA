@@ -5765,12 +5765,14 @@ impl<'a> MethodEmitContext<'a> {
             vec![(a, llvm_type), (b, llvm_type)],
         )?;
         // A NaN result of f64 is the first NaN operand, quieted ("NaN payloads are supported for double-precision
-        // instructions", PTX ISA 9.7.3): explicit, as the intrinsics are commutative and their operands may swap
+        // instructions", PTX ISA 9.7.3): explicit, as the intrinsics are commutative and their operands may swap.
+        // The operands before .abs: "if the result of max is NaN then the .xorsign and .abs modifiers will be
+        // ignored" (PTX ISA 9.7.3.11)
         let result = match data {
             ptx_parser::MinMaxDetails::Float(ptx_parser::MinMaxFloat { nan, .. })
-                if type_ == ast::ScalarType::F64 && !xorsign_abs && self.target.is_air() =>
+                if type_ == ast::ScalarType::F64 && self.target.is_air() =>
             unsafe {
-                let src_b = b;
+                let (a, src_b) = (original_a, original_b);
                 let b = self.builder;
                 let i64_type = get_scalar_type(self.context, ast::ScalarType::B64);
                 let quiet = |x| {

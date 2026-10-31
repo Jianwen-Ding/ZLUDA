@@ -469,19 +469,33 @@ fn serve_one(args: &[String], texts: &[String]) -> Result<(Vec<u8>, Vec<u8>), St
     let sink = |bytes: &Vec<u8>, extension: String| {
         outputs.borrow_mut().insert(extension, bytes.clone());
     };
-    compile_agx(
-        texts,
-        &sink,
-        opts.arch,
-        opts.ignore_errors,
-        opts.strict_fp,
-        opts.agx_strict,
-        opts.agx_checked,
-        opts.lineinfo,
-        opts.stack_size,
-        opts.fast_mma,
-        opts.object_only,
-    )
+    // the target as zoc's command line takes it (--target air: PTX through AIR; it compiled every served request
+    // with the direct route before)
+    match opts.target.as_deref() {
+        Some("air") => compile_air(
+            texts,
+            &sink,
+            opts.arch,
+            opts.ignore_errors,
+            opts.strict_fp,
+            opts.stack_size,
+            opts.object_only,
+        ),
+        Some("agx") | None => compile_agx(
+            texts,
+            &sink,
+            opts.arch,
+            opts.ignore_errors,
+            opts.strict_fp,
+            opts.agx_strict,
+            opts.agx_checked,
+            opts.lineinfo,
+            opts.stack_size,
+            opts.fast_mma,
+            opts.object_only,
+        ),
+        Some(other) => return Err(format!("zoc --serve compiles for agx or air, not {other}")),
+    }
     .map_err(|e| e.to_string())?;
     let mut outputs = outputs.into_inner();
     let object = outputs.remove("o").ok_or("no object")?;

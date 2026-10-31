@@ -416,8 +416,8 @@ pub fn compile_air(
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or_else(default_jobs)
                     .clamp(1, kernels.len());
-                // ZLUDA_AGX_INLINE_KERNELS (comma separated, for debugging): these kernels' functions inlined, no
-                // real calls, to tell a calls bug from another
+                // ZLUDA_AGX_INLINE_KERNELS (comma separated, or "all"): these kernels' functions inlined, no real
+                // calls (to tell a calls bug from another, and to measure calls against code size)
                 let inline_kernels: Vec<String> = std::env::var("ZLUDA_AGX_INLINE_KERNELS")
                     .map(|v| v.split(',').map(str::to_string).collect())
                     .unwrap_or_default();
@@ -452,7 +452,7 @@ pub fn compile_air(
                                         LLVMZludaAirKernelModule(whole.get(), name.as_ptr())
                                     });
                                     drop(whole);
-                                    if inline_kernels.iter().any(|k| k.as_bytes() == name.to_bytes()) {
+                                    if inline_kernels.iter().any(|k| k == "all" || k.as_bytes() == name.to_bytes()) {
                                         inline_everything(&one);
                                     }
                                     if let Some(pipeline) = per_kernel_pipeline {

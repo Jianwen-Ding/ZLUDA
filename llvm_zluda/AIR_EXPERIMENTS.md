@@ -336,3 +336,14 @@ Metal). Cycles is .ftz throughout (3284 max.ftz, 1644 min.ftz).
 - Geekbench strict 49641 -> 53084. llama strict 4/4 exact. Suites unchanged (strict 1928, default 1818).
 - New test agx_tests/ftz-minmax.ptx (denormals, NaNs, signed zeros): passes on the simulator and on the GPU
   (agx_run_hw), as do ftz-nan-chain and ftz-nan-phi.
+
+## Strict FP: calls in the shading kernels (2026-10-31, open)
+
+Blender junkshop per-launch GPU time, strict vs default: intersect kernels now equal; shade_surface x2.3,
+shade_light_nee x3.5. Strict code keeps many more real calls (shade_light_nee: 1629 calls, 12332 stack loads vs
+156 / 3783 in default): the module-level O3 inlines less. ZLUDA_AGX_INLINE_KERNELS (now also "all"):
+- shade_light_nee and shade_surface inlined, strict junkshop 97.3 -> 122.1 samples/min (shade_surface 43.7 -> 27.0
+  ms, shade_light_nee 23.8 -> 12.1 ms), warm-up with compile 107 -> 144 s; default 159.7 -> 161.7.
+- "all": a single Cycles compile ran 21+ minutes at 26 GB and was stopped. Undoes the compile-cost work; not a
+  default. Next: why strict's O3 inlines less (constrained-FP intrinsics or strictfp attributes in the inline
+  cost), to get default's inlining without forcing it.

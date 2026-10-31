@@ -24,9 +24,11 @@
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/ADT/SetVector.h>
 #include <llvm/ADT/SmallPtrSet.h>
+#include <llvm/ADT/DenseMap.h>
 #include <llvm/Support/Alignment.h>
 #include <array>
 #include <optional>
+#include <functional>
 #include <string>
 #include <llvm/IR/CallingConv.h>
 #ifdef ZLUDA_WITH_LLD
@@ -3023,8 +3025,11 @@ int LLVMZludaAirCanonicalNaNs(LLVMModuleRef M)
         // comparisons or by saturating conversions to integers (NaN gives 0). Convolutions of fma.rn.ftz.f32 had
         // three instructions after every fma for it.
         SmallPtrSet<Instruction *, 16> canonicalized(work.begin(), work.end());
-        auto unobserved = [&](Instruction *I) {
-            if (I->getType()->getScalarType()->isDoubleTy() || I->use_empty())
+        // (selects and phis pass a value on unchanged: it is observed where what they make is; a phi cycle is
+        // assumed unobserved while it is checked, and the answers are forgotten when it is not)
+        DenseMap<Instruction *, bool> passedOn;
+        std::function<bool(Instruction *, unsigned)> usersIgnoreNaNBits = [&](Instruction *I, unsigned depth) {
+            if (I->use_empty() || depth > 8)
                 return false;
             return all_of(I->users(), [&](User *U) {
                 auto *UI = dyn_cast<Instruction>(U);
@@ -3032,10 +3037,52 @@ int LLVMZludaAirCanonicalNaNs(LLVMModuleRef M)
                     return false;
                 if (isa<FCmpInst>(UI) || canonicalized.contains(UI))
                     return true;
-                auto *II = dyn_cast<IntrinsicInst>(UI);
-                return II && (II->getIntrinsicID() == Intrinsic::fptoui_sat ||
-                              II->getIntrinsicID() == Intrinsic::fptosi_sat);
+                if (auto *II = dyn_cast<IntrinsicInst>(UI))
+                    return II->getIntrinsicID() == Intrinsic::fptoui_sat ||
+                           II->getIntrinsicID() == Intrinsic::fptosi_sat;
+                // a .ftz flush on the bits, select((b & 0x7f800000) == 0, b & 0x80000000, b), back to a float: it
+                // passes a NaN on unchanged
+                if (auto *BC = dyn_cast<BitCastInst>(UI); BC && BC->getType()->isIntegerTy(32))
+                {
+                    using namespace PatternMatch;
+                    SelectInst *flush = nullptr;
+                    for (User *BU : BC->users())
+                        if (auto *Sel = dyn_cast<SelectInst>(BU); Sel && Sel->getFalseValue() == BC)
+                            flush = Sel;
+                    if (!flush ||
+                        !match(flush->getCondition(),
+                               m_SpecificICmp(ICmpInst::ICMP_EQ, m_And(m_Specific(BC), m_SpecificInt(0x7f800000)), m_Zero())) ||
+                        !match(flush->getTrueValue(), m_And(m_Specific(BC), m_SpecificInt(0x80000000))))
+                        return false;
+                    // (the bits read by nothing else than the flush's tests)
+                    auto *cond = cast<Instruction>(flush->getCondition());
+                    auto *mask = cast<Instruction>(cast<Instruction>(cond)->getOperand(0));
+                    auto *signBits = cast<Instruction>(flush->getTrueValue());
+                    if (!all_of(BC->users(), [&](User *X) { return X == flush || X == mask || X == signBits; }) ||
+                        !mask->hasOneUse() || !cond->hasOneUse() || !signBits->hasOneUse())
+                        return false;
+                    return !flush->use_empty() && all_of(flush->users(), [&](User *FU) {
+                        auto *Back = dyn_cast<BitCastInst>(FU);
+                        return Back && Back->getType()->isFloatTy() && usersIgnoreNaNBits(Back, depth + 1);
+                    });
+                }
+                if (!isa<SelectInst>(UI) && !isa<PHINode>(UI))
+                    return false;
+                // (a select's condition is not passed on)
+                if (auto *Sel = dyn_cast<SelectInst>(UI); Sel && Sel->getCondition() == I)
+                    return false;
+                if (auto it = passedOn.find(UI); it != passedOn.end())
+                    return it->second;
+                passedOn[UI] = true;
+                bool r = usersIgnoreNaNBits(UI, depth + 1);
+                if (!r)
+                    passedOn.clear();
+                passedOn[UI] = r;
+                return r;
             });
+        };
+        auto unobserved = [&](Instruction *I) {
+            return !I->getType()->getScalarType()->isDoubleTy() && usersIgnoreNaNBits(I, 0);
         };
         SmallVector<Instruction *, 64> observed;
         for (Instruction *I : work)

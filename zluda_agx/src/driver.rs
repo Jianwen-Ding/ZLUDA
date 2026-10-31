@@ -653,7 +653,11 @@ impl Driver {
     /// The specialization to launch for these arguments, once it is ready (see `Spec`); counts the launches and starts
     /// its compilation in the background.
     fn specialized(&mut self, m: usize, name: &str, args: &[&[u8]], block: [u32; 3]) -> Option<SpecKey> {
-        let src = self.spec_sources.get(&m)?.clone();
+        // (the module's PTX is cloned only to compile a specialization: a clone at every launch cost Geekbench's
+        // graphs several microseconds a launch)
+        if !self.spec_sources.contains_key(&m) {
+            return None;
+        }
         let mut scalars = Vec::new();
         for a in args.iter().filter(|a| a.len() <= 4) {
             scalars.push(a.len() as u8);
@@ -673,7 +677,7 @@ impl Driver {
             // a specialization compiled before (in an earlier run: it is in the compilation cache) is used from
             // the first launch, so that an application that times its launches to choose a block size (Geekbench)
             // times the code it will run
-            None => match crate::specialize::specialize_ptx(&src, name, args, block)
+            None => match crate::specialize::specialize_ptx(&self.spec_sources[&m], name, args, block)
                 .and_then(|(text, _)| cached_ptx(text.as_bytes(), &self.ctx.props.llvm_cpu))
             {
                 Some(compiled) => Spec::Pending(std::sync::Arc::new(std::sync::Mutex::new(Some(Ok(compiled))))),
@@ -685,6 +689,7 @@ impl Driver {
             Spec::Count(_) => {
                 let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
                 let (out, cpu, name) = (slot.clone(), self.ctx.props.llvm_cpu.clone(), name.to_string());
+                let src = self.spec_sources[&m].clone();
                 let owned: Vec<Vec<u8>> = args.iter().map(|a| a.to_vec()).collect();
                 std::thread::spawn(move || {
                     let _slot = CompileSlot::take();

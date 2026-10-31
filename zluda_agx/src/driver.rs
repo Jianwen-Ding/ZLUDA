@@ -4004,6 +4004,15 @@ pub(crate) unsafe fn cuGraphLaunch(exec: CUgraphExec, s: CUstream) -> CUresult {
                 }
                 shape += &format!("{last}{run}");
                 eprintln!("[zluda_agx] graph shape (L launch, M memset, D dtod, U htod, H dtoh): {shape}");
+                let copies: Vec<String> = ops
+                    .iter()
+                    .filter_map(|op| match op {
+                        Op::Copy { dst, src, n } => Some(format!("{n}B {src:#x}->{dst:#x}")),
+                        _ => None,
+                    })
+                    .take(4)
+                    .collect();
+                eprintln!("[zluda_agx] graph copies (first 4): {}", copies.join(", "));
             }
             if g.1 % 100 == 0 {
                 eprintln!(

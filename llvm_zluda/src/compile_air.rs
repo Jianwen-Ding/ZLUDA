@@ -389,15 +389,15 @@ pub fn compile_air(
                 // Each kernel in a context of its own, read back from the portable AIR, which is freed whole after
                 // the kernel's code (the module and its context are done with: kept, they held Cycles' compilation
                 // at 4 GB before its largest kernel's 3)
-                // On ZLUDA_AGX_JOBS threads (default: up to 4 of the cores, as each holds a kernel's compilation,
-                // up to about 1 GB for Cycles' largest with calls), each with its own context and target machine;
-                // the objects in the kernels' order.
+                // On ZLUDA_AGX_JOBS threads (default: every core the available memory allows, as each holds a
+                // kernel's compilation, up to about 1 GB for Cycles' largest with calls), each with its own context
+                // and target machine; the objects in the kernels' order.
                 drop(linked);
                 drop(agx);
                 let jobs = std::env::var("ZLUDA_AGX_JOBS")
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()).min(4))
+                    .unwrap_or_else(default_jobs)
                     .clamp(1, kernels.len());
                 let want_asm = text_hook.is_some();
                 let next = std::sync::atomic::AtomicUsize::new(0);
@@ -420,9 +420,7 @@ pub fn compile_air(
                             loop {
                                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 let Some(name) = kernels.get(i) else { break };
-                                if timings {
-                                    eprintln!("[zluda air] AGX code of {}", name.to_string_lossy());
-                                }
+                                let started = std::time::Instant::now();
                                 let one_kernel = || -> Result<(Vec<u8>, Vec<u8>), String> {
                                     let kctx = Context::new();
                                     let kdiagnostics = Diagnostics::new(&kctx);
@@ -447,7 +445,12 @@ pub fn compile_air(
                                     kdiagnostics.check()?;
                                     Ok((object, asm))
                                 };
-                                *results[i].lock().unwrap() = Some(one_kernel());
+                                let result = one_kernel();
+                                if timings {
+                                    let seconds = started.elapsed().as_secs_f64();
+                                    eprintln!("[zluda air] AGX code of {}: {seconds:.3} s", name.to_string_lossy());
+                                }
+                                *results[i].lock().unwrap() = Some(result);
                             }
                         });
                     }
@@ -497,6 +500,20 @@ pub fn compile_air(
         }
     };
     Ok(AirCompilation { portable, metal: metal_air, metal_globals, agx_object })
+}
+
+/// Threads for a large module's per-kernel AGX code: the cores, at most one per `JOB_BYTES` of available memory
+/// (Linux's MemAvailable; 4 where it cannot be read, the default before).
+fn default_jobs() -> usize {
+    const JOB_BYTES: u64 = 3 << 29;
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let available_kb = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| {
+        m.lines().find_map(|l| l.strip_prefix("MemAvailable:")?.trim().strip_suffix("kB")?.trim().parse::<u64>().ok())
+    });
+    match available_kb {
+        Some(kb) => cores.min((kb * 1024 / JOB_BYTES) as usize).max(1),
+        None => cores.min(4),
+    }
 }
 
 /// The names of the kernels (functions with the air-kernel attribute) of `module`.

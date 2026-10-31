@@ -1500,7 +1500,13 @@ impl<'a> MethodEmitContext<'a> {
             ConversionKind::BitToPtr => {
                 let src = self.resolver.value(conversion.src)?;
                 let ptr_type = get_pointer_type(self.context, conversion.to_space)?;
-                if let (
+                if let (Some(base32), ast::StateSpace::Generic, true) =
+                    (self.base_32bit_memory, conversion.to_space, self.target.is_air())
+                {
+                    let base = self.resolver.value(base32)?;
+                    let p = self.widen_generic32(src, base)?;
+                    self.resolver.register(conversion.dst, p);
+                } else if let (
                     Some(base32),
                     ast::StateSpace::Global | ast::StateSpace::Generic | ast::StateSpace::Const,
                 ) = (self.base_32bit_memory, conversion.to_space)
@@ -1549,12 +1555,24 @@ impl<'a> MethodEmitContext<'a> {
                 let src = self.resolver.value(conversion.src)?;
                 let dst_type = get_type(self.context, &conversion.to_type)?;
                 if let (
-                    Some(_),
+                    Some(base32),
                     ast::StateSpace::Global | ast::StateSpace::Generic | ast::StateSpace::Const,
                 ) = (self.base_32bit_memory, conversion.to_space)
                 {
-                    // Should never happen because globals are removed
-                    return Err(error_unreachable());
+                    // A module variable of a 32-bit module (kept on AGX, convert_32bit_to_64bit): its offset from
+                    // the base of the module's 32-bit addresses (elsewhere the variables are removed)
+                    if !self.target.is_air() {
+                        return Err(error_unreachable());
+                    }
+                    let i64_type = get_scalar_type(self.context, ast::ScalarType::B64);
+                    let base = self.resolver.value(base32)?;
+                    unsafe {
+                        let p = LLVMBuildPtrToInt(builder, src, i64_type, LLVM_UNNAMED.as_ptr());
+                        let offset = LLVMBuildSub(builder, p, base, LLVM_UNNAMED.as_ptr());
+                        self.resolver.with_result(conversion.dst, |dst| {
+                            LLVMBuildTruncOrBitCast(builder, offset, dst_type, dst)
+                        });
+                    }
                 } else {
                     self.resolver.with_result(conversion.dst, |dst| unsafe {
                         LLVMBuildPtrToInt(builder, src, dst_type, dst)
@@ -2814,6 +2832,36 @@ impl<'a> MethodEmitContext<'a> {
         Ok(())
     }
 
+    // A 32-bit generic address of .address_size 32 on AGX as a generic pointer: bit 31 tags the shared window and
+    // bit 30 the local one (their offsets in the low 30 bits, see emit_cvta); other addresses are offsets from the
+    // module's 64-bit base.
+    fn widen_generic32(&mut self, a32: LLVMValueRef, base: LLVMValueRef) -> Result<LLVMValueRef, TranslateError> {
+        let b = self.builder;
+        let i8_type = get_scalar_type(self.context, ast::ScalarType::B8);
+        let i32_type = get_scalar_type(self.context, ast::ScalarType::B32);
+        let i64_type = get_scalar_type(self.context, ast::ScalarType::B64);
+        let generic = get_pointer_type(self.context, ast::StateSpace::Generic)?;
+        let shared = get_pointer_type(self.context, ast::StateSpace::Shared)?;
+        let local = get_pointer_type(self.context, ast::StateSpace::Local)?;
+        unsafe {
+            let offset = LLVMBuildAnd(b, a32, LLVMConstInt(i32_type, 0x3fff_ffff, 0), LLVM_UNNAMED.as_ptr());
+            let sh = LLVMBuildIntToPtr(b, offset, shared, LLVM_UNNAMED.as_ptr());
+            let sh = LLVMBuildAddrSpaceCast(b, sh, generic, LLVM_UNNAMED.as_ptr());
+            let lo = LLVMBuildIntToPtr(b, offset, local, LLVM_UNNAMED.as_ptr());
+            let lo = LLVMBuildAddrSpaceCast(b, lo, generic, LLVM_UNNAMED.as_ptr());
+            let base_ptr = LLVMBuildIntToPtr(b, base, generic, LLVM_UNNAMED.as_ptr());
+            let mut index = [LLVMBuildZExt(b, a32, i64_type, LLVM_UNNAMED.as_ptr())];
+            let dev = LLVMBuildInBoundsGEP2(b, i8_type, base_ptr, index.as_mut_ptr(), 1, LLVM_UNNAMED.as_ptr());
+            let bit = |mask: u64| {
+                let m = LLVMBuildAnd(b, a32, LLVMConstInt(i32_type, mask, 0), LLVM_UNNAMED.as_ptr());
+                LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntNE, m, LLVMConstInt(i32_type, 0, 0), LLVM_UNNAMED.as_ptr())
+            };
+            let (is_sh, is_lo) = (bit(0x8000_0000), bit(0x4000_0000));
+            let p = LLVMBuildSelect(b, is_lo, lo, dev, LLVM_UNNAMED.as_ptr());
+            Ok(LLVMBuildSelect(b, is_sh, sh, p, LLVM_UNNAMED.as_ptr()))
+        }
+    }
+
     fn emit_cvta(
         &mut self,
         data: ptx_parser::CvtaDetails,
@@ -2837,6 +2885,29 @@ impl<'a> MethodEmitContext<'a> {
                 dst: arguments.dst,
                 src: arguments.src,
             });
+        }
+        // .address_size 32 on AGX: the shared and local windows inside the 32-bit generic space (PTX ISA 6.4.1.1),
+        // tagged with bit 31 and bit 30 (see widen_generic32)
+        if self.base_32bit_memory.is_some()
+            && self.target.is_air()
+            && data.size == 32
+            && matches!(data.state_space, ast::StateSpace::Shared | ast::StateSpace::Local)
+        {
+            let src = self.resolver.value(arguments.src)?;
+            let i32_type = get_scalar_type(self.context, ast::ScalarType::B32);
+            let tag = if data.state_space == ast::StateSpace::Shared { 0x8000_0000 } else { 0x4000_0000 };
+            let builder = self.builder;
+            self.resolver.with_result(arguments.dst, |dst| unsafe {
+                match data.direction {
+                    ptx_parser::CvtaDirection::ExplicitToGeneric => {
+                        LLVMBuildOr(builder, src, LLVMConstInt(i32_type, tag, 0), dst)
+                    }
+                    ptx_parser::CvtaDirection::GenericToExplicit => {
+                        LLVMBuildAnd(builder, src, LLVMConstInt(i32_type, 0x3fff_ffff, 0), dst)
+                    }
+                }
+            });
+            return Ok(());
         }
         let from_type = get_pointer_type(self.context, from_space)?;
         let dest_type = get_pointer_type(self.context, to_space)?;
@@ -4874,12 +4945,16 @@ impl<'a> MethodEmitContext<'a> {
         let src = self.resolver.value(arguments.src)?;
         let i1_type = get_scalar_type(self.context, ast::ScalarType::Pred);
         let i64_type = get_scalar_type(self.context, ast::ScalarType::B64);
-        // (a 32-bit address of .address_size 32)
+        // (a 32-bit address of .address_size 32: on AGX the generic pointer it stands for, see widen_generic32)
         let src = unsafe {
-            if LLVMGetIntTypeWidth(LLVMTypeOf(src)) == 32 {
-                LLVMBuildZExt(self.builder, src, i64_type, LLVM_UNNAMED.as_ptr())
-            } else {
+            if LLVMGetIntTypeWidth(LLVMTypeOf(src)) != 32 {
                 src
+            } else if let (Some(base32), true) = (self.base_32bit_memory, self.target.is_air()) {
+                let base = self.resolver.value(base32)?;
+                let p = self.widen_generic32(src, base)?;
+                LLVMBuildPtrToInt(self.builder, p, i64_type, LLVM_UNNAMED.as_ptr())
+            } else {
+                LLVMBuildZExt(self.builder, src, i64_type, LLVM_UNNAMED.as_ptr())
             }
         };
         let name = match space {

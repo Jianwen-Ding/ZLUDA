@@ -222,7 +222,7 @@ pub fn to_llvm_module_with_options<'input>(
     let mut metadata32 = None;
     if ast.address_size == 32 {
         let (new_directives, new_module32) =
-            convert_32bit_to_64bit::run(&mut flat_resolver, directives)?;
+            convert_32bit_to_64bit::run(&mut flat_resolver, directives, target.is_air())?;
         directives = new_directives;
         metadata32 = Some(new_module32);
         on_pass_end("convert_32bit_to_64bit");

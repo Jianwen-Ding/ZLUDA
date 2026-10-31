@@ -8,6 +8,11 @@
 //      * For each global variable, a 32 bit pseudo-pointer
 // A later pass will transform all loads from 32 bit pseudo-pointers into loads
 // from the 64 bit pointer with an offset
+//
+// With `keep_globals` (AGX, whose runtime places a module's variables in its
+// globals buffer) the .const and .global variables stay module variables: a
+// 32-bit address of one is its offset from the 64-bit base (see emit's
+// ConversionKind::AddressOf), which the runtime keeps within 4 GiB of them.
 
 use crate::{
     pass::{
@@ -23,6 +28,7 @@ use rustc_hash::FxHashMap;
 pub(super) fn run<'input>(
     resolver: &mut GlobalStringIdentResolver2<'input>,
     directives: Vec<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>,
+    keep_globals: bool,
 ) -> Result<
     (
         Vec<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>,
@@ -30,7 +36,11 @@ pub(super) fn run<'input>(
     ),
     TranslateError,
 > {
-    let (global_ids, globals) = collect_globals(resolver, &directives)?;
+    let (global_ids, globals) = if keep_globals {
+        (Vec::new(), Vec::new())
+    } else {
+        collect_globals(resolver, &directives)?
+    };
     let mut explicit_args_size_align = Vec::new();
     let directives = directives
         .into_iter()
@@ -40,6 +50,7 @@ pub(super) fn run<'input>(
                 directive,
                 &global_ids,
                 &mut explicit_args_size_align,
+                keep_globals,
             )
             .transpose()
         })
@@ -152,9 +163,10 @@ fn run_directive<'input>(
     directive: Directive2<ast::Instruction<SpirvWord>, SpirvWord>,
     globals_ids: &[SpirvWord],
     explicit_args_size_align: &mut Vec<(String, Vec<(u32, u32)>)>,
+    keep_globals: bool,
 ) -> Result<Option<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>, TranslateError> {
     Ok(match directive {
-        Directive2::Variable(linking, varinfo) if pass_through_variable(&varinfo) => {
+        Directive2::Variable(linking, varinfo) if keep_globals || pass_through_variable(&varinfo) => {
             Some(Directive2::Variable(linking, varinfo))
         }
         Directive2::Method(method) => Some(Directive2::Method(run_method(

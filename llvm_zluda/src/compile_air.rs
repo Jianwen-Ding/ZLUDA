@@ -411,6 +411,11 @@ pub fn compile_air(
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or_else(default_jobs)
                     .clamp(1, kernels.len());
+                // ZLUDA_AGX_INLINE_KERNELS (comma separated, for debugging): these kernels' functions inlined, no
+                // real calls, to tell a calls bug from another
+                let inline_kernels: Vec<String> = std::env::var("ZLUDA_AGX_INLINE_KERNELS")
+                    .map(|v| v.split(',').map(str::to_string).collect())
+                    .unwrap_or_default();
                 let want_asm = text_hook.is_some();
                 let next = std::sync::atomic::AtomicUsize::new(0);
                 let results: Vec<std::sync::Mutex<Option<Result<(Vec<u8>, Vec<u8>), String>>>> =
@@ -442,6 +447,9 @@ pub fn compile_air(
                                         LLVMZludaAirKernelModule(whole.get(), name.as_ptr())
                                     });
                                     drop(whole);
+                                    if inline_kernels.iter().any(|k| k.as_bytes() == name.to_bytes()) {
+                                        inline_everything(&one);
+                                    }
                                     if let Some(pipeline) = per_kernel_pipeline {
                                         run(&one, pipeline, &agx, &PassBuilderOptions::new())?;
                                     }
@@ -512,6 +520,27 @@ pub fn compile_air(
         }
     };
     Ok(AirCompilation { portable, metal: metal_air, metal_globals, agx_object })
+}
+
+/// Marks every function of `module` that is not a kernel always-inline (and not no-inline), so that the AGX backend
+/// inlines it rather than keeping it as a real call.
+fn inline_everything(module: &Module) {
+    use llvm_sys::core::*;
+    unsafe {
+        let ctx = LLVMGetModuleContext(module.get());
+        let kind = |n: &str| LLVMGetEnumAttributeKindForName(n.as_ptr().cast(), n.len());
+        let (noinline, alwaysinline) = (kind("noinline"), kind("alwaysinline"));
+        let always = LLVMCreateEnumAttribute(ctx, alwaysinline, 0);
+        let mut f = LLVMGetFirstFunction(module.get());
+        while !f.is_null() {
+            let kernel = !LLVMGetStringAttributeAtIndex(f, llvm_sys::LLVMAttributeFunctionIndex, c"air-kernel".as_ptr(), 10).is_null();
+            if LLVMIsDeclaration(f) == 0 && !kernel {
+                LLVMRemoveEnumAttributeAtIndex(f, llvm_sys::LLVMAttributeFunctionIndex, noinline);
+                LLVMAddAttributeAtIndex(f, llvm_sys::LLVMAttributeFunctionIndex, always);
+            }
+            f = LLVMGetNextFunction(f);
+        }
+    }
 }
 
 /// Threads for a large module's per-kernel AGX code: the cores, at most one per `JOB_BYTES` of available memory

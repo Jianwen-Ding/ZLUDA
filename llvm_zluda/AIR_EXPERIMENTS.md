@@ -100,6 +100,41 @@ the order it was found:
 - **Device-flaky PTX tests**: ldm-0, ldm2-st0 and occupancy pass or fail from one run to the next with the same
   zoc; rerun them with the previous build before calling a change a regression.
 
+## Application benchmarks, AIR route, 2026-10-31 (second session)
+
+- **Blender: launch-time specialization cost 85% of a warm render.** Cycles' scalar arguments change at every
+  launch, and each new set made `specialized()` rewrite and hash all 13 MB of its PTX (~40 ms per launch against
+  ~2 ms of GPU work). Not specialized above 4 MiB: default cube 512x512 64 spp 5.77 -> 0.92 s, same image.
+  Specializing large modules only once arguments repeat (llama.cpp's do) gave no gain there (tg 41.3 -> 41.6 t/s,
+  pp 335 -> 314): left off.
+- **Cycles' compile (cold first render)**: per-kernel AGX code on every core memory allows (was 4 threads) 72.5 ->
+  44.2 s; no second O3 in each kernel's module (it repeated O3 on the functions the kernels share) 44 -> 31 s, the
+  first render at 1024x1024 67 -> 50 s, GPU time unchanged. With that O3, llama.cpp's 10 MB module failed to
+  compile ("Cannot select: store ... into %stack.0"), another reason it stays off.
+- **llama.cpp b11706 needed three fixes to start on the AIR route**: CUDA_MODULE_LOADING lazy by default (a
+  native-only start-up image), cvt.*.e2m1x2 with a .b8 register (FP4 quantize kernels), %envreg1:%envreg2 as the
+  grid-sync workspace (soft_max_f32_parallelize_cols traps on null). Greedy completions match the CPU's.
+  Qwen2.5 0.5B Q5_K_M, -fa 0 -b 8 -ub 8: pp128 335-337 t/s, tg 41-42 t/s. Generation is GPU-bound (the main
+  thread waits on the GPU 66% of the time): ~490 kernels per token, 14 ms of GPU time;
+  mul_mat_vec_q<Q5_1> is 45% of it and latency-bound (68.5 us for 3.3 MB, 82 registers, 18 SIMD-groups per core).
+  Its PTX is unrolled already: unroll, scheduler and memory-clustering options changed nothing (within 2%).
+- **Graph and launch batching (ZLUDA_AGX_GRAPH_BATCH=1 ZLUDA_AGX_LAUNCH_BATCH=1, still opt-in)**: llama.cpp pp128
+  335 -> 413-453 t/s, tg unchanged; Geekbench GPU score 51865 -> 52974; Blender 1024x1024 128 spp second render
+  1.70 -> 1.69 s, the same images and completions.
+- **Blender Open Data benchmark (script 3.1.2, scenes monster / junkshop / classroom)**: rendered once the device
+  reported CU_DEVICE_ATTRIBUTE_TEXTURE_PITCH_ALIGNMENT (0 made every 2D texture's pitch 0): 464.6 / 156.6 / 133.3
+  samples per minute. **Their images are wrong**: instanced objects (linked duplicates, collection instances) are
+  missing. Traced one ray through the BVH (agx_run --trace-pcs, AGX_TRACE_LANE): the instance push, transforms,
+  slab tests and stack are right; every leaf of an instanced mesh's own BVH holds visibility 0 and primitive type
+  0 in its .z / .w (a non-instanced scene's leaves hold 1693 and 1), so the traversal skips all their triangles.
+  Cycles' pack_instances copies those words from the mesh's BVH as they are: the host data, built on the CPU,
+  already has them. Not the calls (inlined, the same), not the generic-pointer bug below (fixed, the same), not a
+  backend option. Open: why this Blender build's mesh BVH2 leaves get no visibility / type (a Cycles issue of the
+  CUDA BVH2 path, or something Cycles reads from the driver).
+- **Generic pointers across real calls** (fixed, llvm-project claude/air-calls-generic-pointers): a called
+  function given a generic pointer to its caller's private memory accessed it as device memory
+  (ptx/tools/agx_tests/private-ptr-call.ptx).
+
 ## Application benchmarks, AIR route (driver default), 2026-10-31
 
 - **Geekbench 7 GPU (CUDA)**: every workload completes; summed GPU time 25.26 s (air06) vs 25.08 / 25.34 s on the

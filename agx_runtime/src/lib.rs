@@ -319,9 +319,6 @@ pub struct Vm {
     /// Header entries of the present cores (`scratch::core_entries`).
     core_entries: Vec<u32>,
     scratch: Option<Scratch>,
-    /// PTX's per-CTA global memory of the launches (`.agx.kernels` extension 8), grown to the largest asked for and
-    /// shared by the commands of the address space (as `scratch`), with the smaller ones it replaced.
-    per_cta: Vec<Bo>,
     /// The start of the data heap, below every data allocation: the base of the 32-bit addresses of modules of
     /// PTX's .address_size 32 (`.agx.kernels` extension 9), which reach the first 4 GiB of the heap.
     pub data_base: u64,
@@ -389,7 +386,6 @@ impl Vm {
             data: Rc::new(RefCell::new(RangeAllocator::new(data_base, vc.kernel_start - data_base))),
             core_entries: scratch::core_entries(&p.core_masks, p.num_clusters_total, p.num_cores_per_cluster),
             scratch: None,
-            per_cta: Vec::new(),
             data_base,
             usc_generation: 0,
             textures: None,
@@ -496,16 +492,6 @@ impl Vm {
         let s = self.scratch.as_ref().unwrap();
         // a tagged USC pointer, as Mesa's agx_helper_program
         Ok(((s.helper.va - self.usc_base) as u32 | 1, s.buffer.va))
-    }
-
-    /// The address of at least `bytes` of PTX's per-CTA global memory for a launch (`.agx.kernels` extension 8),
-    /// 1024-byte aligned. The region grows to the largest size asked for; the ones it replaces stay mapped.
-    pub fn per_cta_memory(&mut self, bytes: u64) -> io::Result<u64> {
-        if self.per_cta.last().map_or(true, |b| b.size < bytes) {
-            let bo = self.alloc_data_aligned(bytes.max(1024), 1024)?;
-            self.per_cta.push(bo);
-        }
-        Ok(self.per_cta.last().unwrap().va)
     }
 
     /// The scratch buffer's header and block lists, to check the helper's counters (`scratch::core_counters`).
@@ -1486,12 +1472,15 @@ fn invalid(m: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, m)
 }
 
-/// The per-CTA global memory of a launch of `k` over hardware `threadgroups` (0 for a kernel without it): the slice
-/// bytes for each CTA, the threadgroups times the CTAs of a cluster.
-fn per_cta_region(vm: &mut Vm, k: &module::KernelInfo, threadgroups: [u32; 3]) -> io::Result<u64> {
-    let Some((_, slice)) = k.per_cta_memory else { return Ok(0) };
+/// The per-CTA global memory of a launch of `k` over hardware `threadgroups` (address 0 for a kernel without it):
+/// the slice bytes for each CTA, the threadgroups times the CTAs of a cluster, in a region of the launch's own,
+/// 1024-byte aligned, which the launch keeps until its fence (launches that overlap, on other queues too, never
+/// share one).
+fn per_cta_region(vm: &mut Vm, k: &module::KernelInfo, threadgroups: [u32; 3]) -> io::Result<(u64, Vec<Bo>)> {
+    let Some((_, slice)) = k.per_cta_memory else { return Ok((0, Vec::new())) };
     let ctas = threadgroups.iter().map(|&t| t as u64).product::<u64>() * k.cluster.iter().map(|&c| c as u64).product::<u64>();
-    vm.per_cta_memory(ctas * slice as u64)
+    let bo = vm.alloc_data_aligned((ctas * slice as u64).max(1024), 1024)?;
+    Ok((bo.va, vec![bo]))
 }
 
 /// The uniforms of a `launch_params_async` of `k` over hardware `threadgroups` with the parameter block at
@@ -2011,6 +2000,10 @@ impl LoadedModule {
         queue.collect()?;
         let k = self.kernel(kernel, dynamic_shared)?;
         let (threadgroups, local) = k.hardware_launch(threadgroups, local).map_err(|e| invalid(e.to_string()))?;
+        // (hidden arguments this path does not set: launch_params_async sets them)
+        if k.per_cta_memory.is_some() || k.address32_base_half.is_some() {
+            return Err(invalid(format!("{kernel}: per-CTA memory or 32-bit addresses need launch_params_async")));
+        }
         let halves = module::pack_uniforms(k, args, threadgroups, self.globals_va()).map_err(|e| invalid(e.to_string()))?;
         self.dispatch(vm, queue, g14x, k, &halves, Vec::new(), threadgroups, local, dynamic_shared, wait_for, None, &mut (None, None))
     }
@@ -2047,7 +2040,7 @@ impl LoadedModule {
                 table = (queue.stage(RingKind::Data, &bytes, 16)?, allocations.len() as u32);
             }
         }
-        let per_cta = per_cta_region(vm, k, threadgroups)?;
+        let (per_cta, keep) = per_cta_region(vm, k, threadgroups)?;
         let base32 = vm.data_base;
         let (mut halves, block) = self.uniforms(k, params, threadgroups, dynamic_shared, bounds, table, 0, per_cta, base32)?;
         if !block.is_empty() {
@@ -2055,7 +2048,7 @@ impl LoadedModule {
             let va = queue.stage(RingKind::Data, &block, 16)?;
             halves = self.uniforms(k, params, threadgroups, dynamic_shared, bounds, table, va, per_cta, base32)?.0;
         }
-        self.dispatch(vm, queue, g14x, k, &halves, Vec::new(), threadgroups, local, dynamic_shared, wait_for, None, &mut (None, None))
+        self.dispatch(vm, queue, g14x, k, &halves, keep, threadgroups, local, dynamic_shared, wait_for, None, &mut (None, None))
     }
 
     fn uniforms(
@@ -2218,7 +2211,7 @@ impl LoadedModule {
             return Err(invalid(format!("{kernel}: checked kernels are launched one per command")));
         }
         let (threadgroups, local) = k.hardware_launch(threadgroups, local).map_err(|e| invalid(e.to_string()))?;
-        let per_cta = per_cta_region(vm, k, threadgroups)?;
+        let (per_cta, keep) = per_cta_region(vm, k, threadgroups)?;
         let base32 = vm.data_base;
         let (mut halves, block) = self.uniforms(k, params, threadgroups, dynamic_shared, bounds, (0, 0), 0, per_cta, base32)?;
         if !block.is_empty() {
@@ -2227,7 +2220,7 @@ impl LoadedModule {
         }
         let mut helper = (None, None);
         let fence =
-            self.dispatch(vm, queue, g14x, k, &halves, Vec::new(), threadgroups, local, dynamic_shared, &[], Some(words), &mut helper)?;
+            self.dispatch(vm, queue, g14x, k, &halves, keep, threadgroups, local, dynamic_shared, &[], Some(words), &mut helper)?;
         Ok((fence, helper.0, helper.1))
     }
 }

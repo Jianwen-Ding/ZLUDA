@@ -702,12 +702,20 @@ impl Driver {
                     Some(Ok((object, asm))) => {
                         let generic = &self.modules[&m];
                         let loaded = module::Module::load(&object, &asm)
-                            .ok()
-                            .and_then(|module| LoadedModule::new_sharing_globals(&mut self.ctx.vm, module, generic).ok())
-                            .filter(|l| l.module.kernels.contains_key(name));
+                            .map_err(|e| e.to_string())
+                            .and_then(|module| {
+                                LoadedModule::new_sharing_globals(&mut self.ctx.vm, module, generic).map_err(|e| format!("{e:?}"))
+                            })
+                            .and_then(|l| {
+                                if l.module.kernels.contains_key(name) { Ok(l) } else { Err("no such kernel".into()) }
+                            });
                         if crate::log_enabled() {
-                            eprintln!("[zluda_agx] specialized {name} block {block:?}: {}", if loaded.is_some() { "ready" } else { "failed to load" });
+                            match &loaded {
+                                Ok(_) => eprintln!("[zluda_agx] specialized {name} block {block:?}: ready"),
+                                Err(e) => eprintln!("[zluda_agx] specialized {name} block {block:?}: failed to load: {e}"),
+                            }
                         }
+                        let loaded = loaded.ok();
                         match loaded {
                             Some(l) => (Spec::Ready(l), true),
                             None => (Spec::Failed, false),

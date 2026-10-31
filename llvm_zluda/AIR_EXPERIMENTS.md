@@ -307,3 +307,13 @@ A NaN passes every flush of such a family unchanged (its exponent is not zero), 
   strict (default mode does not canonicalize, by design).
 - Blender Open Data strict: monster 271 -> 279, junkshop 76.6 -> 80.0, classroom 63.4 -> 65.5 samples/min.
 - Geekbench strict 48702 -> 49641. llama strict completions 4/4 exact.
+
+## Geekbench "errors" in default mode (2026-10-31)
+
+The 10 errors of a default Geekbench run: 6 are CUDA 701 (launch out of resources) at 1024-thread blocks of an
+image filter, from Geekbench's block-size search (the kernel's registers allow fewer threads per core; correct,
+the search moves on). The rest were launch-time specializations of the ray tracer (trace_bvh, hit_surface,
+generate_rays, ...) that failed to load: "the modules lay out their global data differently". Their only global
+data is LLVM's switch lookup tables (switch.table.*), which a recompilation names and sizes differently. A
+module whose globals are only such compiler-made constants now keeps its own copy. All specializations load (0
+failures); Geekbench GPU time 26.85 -> 26.09 s, score 53249 (within the 53441-54812 spread of earlier runs).

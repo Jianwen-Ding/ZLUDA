@@ -1733,8 +1733,26 @@ impl LoadedModule {
     pub fn new_sharing_globals(vm: &mut Vm, module: module::Module, other: &LoadedModule) -> io::Result<LoadedModule> {
         let alike = module.globals.len() == other.module.globals.len()
             && module.global_symbols.iter().all(|(name, at)| other.module.global_symbols.get(name) == Some(at));
+        // compiler-made constant tables only (LLVM's switch lookup tables, string and aggregate constants): no
+        // device variable to share; a recompilation's may differ, and it keeps its own
+        let private = |m: &module::Module| {
+            m.global_symbols.keys().all(|n| n.starts_with("switch.table.") || n.starts_with(".str") || n.starts_with("__const."))
+        };
+        if !alike && private(&module) && private(&other.module) && module.global_relocs.is_empty() {
+            return Self::load(vm, module, None);
+        }
         if !alike {
-            return Err(invalid("the modules lay out their global data differently".to_string()));
+            let first = module
+                .global_symbols
+                .iter()
+                .find(|(name, at)| other.module.global_symbols.get(*name) != Some(*at))
+                .map(|(name, at)| format!("{name} {at:?} vs {:?}", other.module.global_symbols.get(name)));
+            return Err(invalid(format!(
+                "the modules lay out their global data differently ({} vs {} bytes; {})",
+                module.globals.len(),
+                other.module.globals.len(),
+                first.unwrap_or_default()
+            )));
         }
         Self::load(vm, module, other.globals_va())
     }

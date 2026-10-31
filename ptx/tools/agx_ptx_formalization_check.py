@@ -29,7 +29,7 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
-HARNESS = ('.buffer', '.launch', '.cooplaunch', '.print', '.expect', '.patch', '.append',
+HARNESS = ('.buffer', '.launch', '.cooplaunch', '.print', '.expect', '.expectbound', '.patch', '.append',
            '.tensormap', '.texture', '.sampler', '.surface', '.multimem', '.fabric',
            '.memmodel', '.ub', '.occupancy', '.convergence', '.isacheck')
 IGNORED = ('.print', '.memmodel', '.ub', '.occupancy', '.convergence', '.isacheck')
@@ -859,6 +859,50 @@ def run_test(path, args):
                 if err:
                     return 'SIM-ERROR', err
                 launches += 1
+            elif kw == '.expectbound':
+                # .expectbound NAME .f32 [@ OFF] KIND BOUND = { exact values }: the error bounds the ISA states
+                # for the approximations instead of one admissible result (ZLUDA's tests only: K's harness has
+                # no such directive). KIND is ulp (from the correctly rounded value), rel or abs; BOUND a number
+                # or 2^E; an exact value nan wants any NaN, and an infinite or zero one the same bits
+                m = re.fullmatch(r'\.expectbound ([\w$.]+) \.(f32)\s*(@\s*(\d+))?\s*(ulp|rel|abs)\s+(\S+)\s*=\s*\{(.*)\}',
+                                 d)
+                if not m:
+                    raise Unsupported('malformed .expectbound')
+                name, t, kind = m.group(1), m.group(2), m.group(5)
+                bound = m.group(6)
+                bound = 2.0 ** float(bound[2:]) if bound.startswith('2^') else float(bound)
+                off = int(m.group(4)) if m.group(4) else 0
+                if name not in syms:
+                    raise Unsupported('.expectbound of unknown symbol ' + name)
+                if skipped_launches and (name in tainted_bufs or name not in bufs):
+                    skipped += 1
+                    continue
+                bad = []
+                for i, v in enumerate(split_vals(m.group(7))):
+                    exact = float(v)
+                    gbits = gread(syms[name] + (off + i) * SIZES[t], SIZES[t])
+                    got = dec_float(gbits, t)
+                    if exact != exact:
+                        ok = got != got
+                    elif math.isinf(exact) or exact == 0 and kind != 'abs':
+                        ok = gbits == enc_float(exact, t)
+                    elif kind == 'ulp':
+                        # (from the rounded value, infinite where the exact one is beyond the format)
+                        ok = got == got and abs(ordered(gbits, t) - ordered(enc_float(exact, t), t)) <= bound
+                    elif got != got or math.isinf(got):
+                        ok = False
+                    elif kind == 'rel':
+                        ok = abs(got - exact) <= bound * abs(exact)
+                    else:
+                        ok = abs(got - exact) <= bound
+                    if not ok:
+                        bad.append('%s[%d] %s, got %#x (%r): %s error over %s' % (
+                            name, off + i, v, gbits, got, kind, m.group(6)))
+                if bad:
+                    failures += bad
+                    args.counts['fail'] += 1
+                else:
+                    passed += 1
             elif kw == '.expect':
                 m = re.fullmatch(r'\.expect ([\w$.]+) \.(\w+)\s*(@\s*(\d+))?\s*=\s*\{(.*)\}', d)
                 t = ty_of(m.group(2))

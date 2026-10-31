@@ -1,0 +1,63 @@
+// The floating point mode of a call: the rounding modifiers and denormal handling of instructions in .func
+// bodies (PTX ISA 9.7.3: .rp/.rm/.rz round each instruction; without .ftz, sm_20+ keeps f32 subnormals), whatever
+// the mode of the kernel that calls them. AIR has no mode register, so the functions take their caller's.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.func (.reg .f32 r) add_rp(.reg .f32 a, .reg .f32 b)
+{
+    add.rp.f32 r, a, b;
+    ret;
+}
+.func (.reg .f32 r) add_rm(.reg .f32 a, .reg .f32 b)
+{
+    add.rm.f32 r, a, b;
+    ret;
+}
+// a call two deep
+.func (.reg .f32 r) twice_rp(.reg .f32 a, .reg .f32 b)
+{
+    .reg .f32 t;
+    call (t), add_rp, (a, b);
+    call (r), add_rp, (t, b);
+    ret;
+}
+.func (.reg .f32 r) div_keep(.reg .f32 a, .reg .f32 b)
+{
+    div.rn.f32 r, a, b;
+    ret;
+}
+
+.visible .entry k(.param .u64 pin, .param .u64 pout)
+{
+    .reg .f32 %f<12>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [pin];
+    ld.param.u64 %rd2, [pout];
+    ld.global.f32 %f1, [%rd1];      // 1.0
+    ld.global.f32 %f2, [%rd1+4];    // 2^-24
+    ld.global.f32 %f3, [%rd1+8];    // 2^-126
+    ld.global.f32 %f4, [%rd1+12];   // 4.0
+    ld.global.f32 %f5, [%rd1+16];   // 0.5
+    mul.ftz.f32 %f6, %f3, %f5;      // 2^-127 flushed: +0
+    call (%f7), add_rp, (%f1, %f2); // 1 + 2^-23
+    neg.f32 %f8, %f1;
+    neg.f32 %f9, %f2;
+    call (%f8), add_rm, (%f8, %f9); // -(1 + 2^-23)
+    call (%f9), twice_rp, (%f1, %f2); // 1 + 2^-22
+    call (%f10), div_keep, (%f3, %f4); // 2^-128, subnormal
+    add.rn.f32 %f11, %f1, %f2;      // 1.0 (a tie, to even)
+    st.global.f32 [%rd2], %f6;
+    st.global.f32 [%rd2+4], %f7;
+    st.global.f32 [%rd2+8], %f8;
+    st.global.f32 [%rd2+12], %f9;
+    st.global.f32 [%rd2+16], %f10;
+    st.global.f32 [%rd2+20], %f11;
+    ret;
+}
+
+.buffer IN .u32 = { 0x3F800000, 0x33800000, 0x00800000, 0x40800000, 0x3F000000 };
+.buffer OUT .u32 [6];
+.launch k <<< 1, 1 >>> (IN, OUT);
+.expect OUT .u32 = { 0x00000000, 0x3F800001, 0xBF800001, 0x3F800002, 0x00200000, 0x3F800000 };

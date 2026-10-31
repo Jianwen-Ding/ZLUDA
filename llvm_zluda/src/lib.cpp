@@ -2792,6 +2792,39 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
         if (Rcp->use_empty())
             Rcp->eraseFromParent();
     }
+    // A function whose operations take the mode it is called in (add.rp.f32 in a .func, whose caller sets the
+    // rounding before the call) inlined where it is called directly, as the kernels' others were: the mode then
+    // reaches its operations. (Recursive ones keep round to nearest.)
+    {
+        auto readsMode = [&](Function &F) {
+            for (Instruction &I : instructions(F))
+                if (auto *CI = dyn_cast<CallInst>(&I))
+                {
+                    if (Get && CI->getCalledFunction() == Get)
+                        return true;
+                    if (auto *C = dyn_cast<ConstrainedFPIntrinsic>(CI); C && C->getRoundingMode() == RoundingMode::Dynamic)
+                        return true;
+                }
+            return false;
+        };
+        for (unsigned round = 0; round < 8; round++)
+        {
+            SmallVector<CallInst *, 16> calls;
+            for (Function &F : *Mod)
+                if (!F.isDeclaration() && !F.hasFnAttribute("air-kernel") &&
+                    readsMode(F))
+                    for (User *U : F.users())
+                        if (auto *CI = dyn_cast<CallInst>(U); CI && CI->getCalledFunction() == &F && CI->getFunction() != &F)
+                            calls.push_back(CI);
+            if (calls.empty())
+                break;
+            for (CallInst *CI : calls)
+            {
+                InlineFunctionInfo IFI;
+                InlineFunction(*CI, IFI);
+            }
+        }
+    }
     for (Function &F : *Mod)
     {
         if (F.isDeclaration())
@@ -2815,7 +2848,11 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
         Type *I32 = Type::getInt32Ty(Ctx);
         IRBuilder<> Entry(&*F.getEntryBlock().getFirstInsertionPt());
         AllocaInst *mode = Entry.CreateAlloca(I32, nullptr, "fpmode");
-        Entry.CreateStore(ConstantInt::get(I32, 1 | (1 << 2)), mode);
+        // (round to nearest, and the function's denormal modes: the front end writes a kernel's first mode, .ftz
+        // or not, as its denormal mode, and a later mode as a set of all the bits)
+        bool ftz32 = F.getDenormalMode(APFloat::IEEEsingle()).Output != DenormalMode::IEEE;
+        bool ftz16 = F.getDenormalMode(APFloat::IEEEhalf()).Output != DenormalMode::IEEE;
+        Entry.CreateStore(ConstantInt::get(I32, 1 | (1 << 2) | (ftz32 ? 0x10 : 0) | (ftz16 ? 0x20 : 0)), mode);
         for (CallInst *CI : sets)
         {
             new StoreInst(CI->getArgOperand(0), mode, CI->getIterator());
@@ -2847,6 +2884,36 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
                         again = true;
                     }
         }
+        // A function flushing denormals where an operation keeps them (div.rn.f32 after mul.ftz.f32): AGX has no
+        // denormal mode to switch, so the function keeps them, and its .ftz operations flush explicitly
+        auto flushTypeOf = [](ConstrainedFPIntrinsic *C) {
+            Type *T = C->getType();
+            if (C->getType()->isFPOrFPVectorTy() && C->arg_size() > 0 &&
+                C->getArgOperand(0)->getType()->isFPOrFPVectorTy())
+                T = C->getArgOperand(0)->getType();
+            return T->getScalarType();
+        };
+        bool keep32 = false, keep16 = false;
+        for (ConstrainedFPIntrinsic *C : ops)
+        {
+            Type *scalar = flushTypeOf(C);
+            if (!scalar->isHalfTy() && !scalar->isFloatTy())
+                continue;
+            bool half = scalar->isHalfTy();
+            auto f = zludaModeField(at[C]->getOperand(0), half ? 0x20 : 0x10);
+            if (!f || !*f)
+                (half ? keep16 : keep32) = true;
+        }
+        if ((keep32 && ftz32) || (keep16 && ftz16))
+        {
+            DenormalFPEnv env = F.getDenormalFPEnv();
+            if (keep32 && ftz32)
+                env.F32Mode = DenormalMode::getIEEE();
+            if (keep16 && ftz16)
+                env.DefaultMode = DenormalMode::getIEEE();
+            F.removeFnAttr(Attribute::DenormalFPEnv);
+            F.addFnAttr(Attribute::get(Ctx, Attribute::DenormalFPEnv, env.toIntValue()));
+        }
         for (ConstrainedFPIntrinsic *C : ops)
         {
             FreezeInst *Fr = at[C];
@@ -2876,11 +2943,8 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
                 uint64_t bit = half ? 0x20 : 0x10;
                 unsigned width = half ? 16 : 32;
                 uint64_t expMask = half ? 0x7c00 : 0x7f800000, signMask = half ? 0x8000 : 0x80000000;
+                // (the function's own denormal mode is the mode's initial bits)
                 auto flushBit = zludaModeField(m, bit);
-                // (the front end writes .ftz as the function's denormal mode, preserve-sign)
-                if (F.getDenormalMode(half ? APFloat::IEEEhalf() : APFloat::IEEEsingle()).Output !=
-                    DenormalMode::IEEE)
-                    flushBit = bit;
                 // An f32 operation rounding to nearest is the hardware's, which flushes f32 denormals itself unless
                 // strict mode keeps them (IEEE f32 emulation): flushed here only in strict mode or for the directed
                 // roundings, whose software emulation keeps denormals. (Flushed always, Blender Cycles' .ftz

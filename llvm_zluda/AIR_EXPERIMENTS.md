@@ -405,3 +405,13 @@ llama-app (cuBLAS linked statically, so -b 8 -ub 8; a cudart replacement is out 
   product. What 32-bit integer ops do have is free sign extension of 16-bit register halves (MOD_SX), which saves
   about one instruction per signed operand of a dp4a (7 -> 6), not the 38% upper bound. Not pursued further; the
   unexplored part (imadd's unused encoding bits) is speculative and earlier undefined encodings hung the GPU.
+
+## Strict FP: exact texture filtering in integers (2026-10-31)
+
+The exact double precision sampler, the remaining strict-mode cost in Cycles, now has an integer path for unsigned
+normalized textures (u8 / u16 read as floats, level 0, tex.1d / tex.2d), bit-identical to the double sampler (see
+the commit and zluda_ptx_impl_agx_tex.c's exact_unorm_sample; 70 generated reference cases, suites unchanged).
+Blender Open Data strict: junkshop 97 -> 153 (default 160), classroom 82 -> 128 (133), monster 345 -> 429 (466)
+samples/min. The opt-in ZLUDA_ROUNDING_STRICT_TEXTURES=f32 is no longer needed for speed on these scenes.
+Regenerating the texture block needs a clang: /scratch/clang-build (clang and NVPTX built from the tree); splice
+only that block (the other blocks keep clang 18's output) and drop repeated declarations.

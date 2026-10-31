@@ -250,11 +250,12 @@ struct Batch {
 
 const MAX_BATCH: u32 = 64;
 
-/// One command per kernel launch by default. The repaired batching path is
-/// opt-in while evaluating workload cost tradeoffs: ZLUDA_AGX_GRAPH_BATCH=1.
+/// A graph's kernel launches go into one command (`Batch`), submitted by the end of cuGraphLaunch;
+/// ZLUDA_AGX_GRAPH_BATCH=0 makes one command per launch. Gathered: llama.cpp prompt processing 335 -> 413 t/s,
+/// Geekbench 7 GPU score +2-3.5%, Blender Cycles unchanged (AIR route, 2026-10-31).
 fn graph_batching_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ZLUDA_AGX_GRAPH_BATCH").is_ok_and(|v| !v.is_empty() && v != "0"))
+    *ON.get_or_init(|| std::env::var("ZLUDA_AGX_GRAPH_BATCH").map_or(true, |v| v != "0"))
 }
 
 /// `ZLUDA_AGX_LAUNCH_BATCH=1`: ordinary kernel launches (outside graphs) are gathered into one command while the GPU

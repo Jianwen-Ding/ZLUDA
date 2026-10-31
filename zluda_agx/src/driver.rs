@@ -2395,7 +2395,7 @@ pub(crate) unsafe fn cuLibraryLoadData(
     _lib_values: *mut *mut c_void,
     _num_lib: c_uint,
 ) -> CUresult {
-    load_library_data(library, code, std::env::var("CUDA_MODULE_LOADING").is_ok_and(|v| v == "LAZY"))
+    load_library_data(library, code, lazy_loading())
 }
 
 unsafe fn load_library_data(library: *mut CUlibrary, code: *const c_void, lazy: bool) -> CUresult {
@@ -2499,8 +2499,15 @@ pub(crate) unsafe fn cuFuncSetCacheConfig(hfunc: CUfunction, _config: CUfunc_cac
     with(|d| d.functions.get(&(hfunc.0 as usize)).map(|_| ()).ok_or(CUerror::INVALID_HANDLE))
 }
 
+/// `CUDA_MODULE_LOADING`: lazy unless it is `EAGER`, CUDA's default since 12.2. Applications whose runtime
+/// registers native-only images it never launches (llama.cpp b11706's start-up) fail to start when they are loaded
+/// eagerly, as AGX has no PTX for them.
+fn lazy_loading() -> bool {
+    std::env::var("CUDA_MODULE_LOADING").map_or(true, |v| v != "EAGER")
+}
+
 pub(crate) unsafe fn cuModuleGetLoadingMode(mode: *mut CUmoduleLoadingMode) -> CUresult {
-    out(mode, if std::env::var("CUDA_MODULE_LOADING").is_ok_and(|v| v == "LAZY") {
+    out(mode, if lazy_loading() {
         CUmoduleLoadingMode_enum::CU_MODULE_LAZY_LOADING
     } else {
         CUmoduleLoadingMode_enum::CU_MODULE_EAGER_LOADING

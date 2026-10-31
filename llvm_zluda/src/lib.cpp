@@ -3063,19 +3063,33 @@ int LLVMZludaAirCanonicalNaNs(LLVMModuleRef M)
                                                        m_Zero())) &&
                                fam.contains(W);
                     };
-                    for (unsigned k = 0; k < fam.size() && fam.size() < 16; k++)
+                    // (and the integer selects and phis that pass a member on unchanged: their other operands are
+                    // other values, whose bits are their own concern)
+                    for (unsigned k = 0; k < fam.size() && fam.size() < 64; k++)
                         for (User *FU : fam[k]->users())
+                        {
                             if (auto *Sel = dyn_cast<SelectInst>(FU);
                                 Sel && fam.contains(Sel->getFalseValue()) && expZero(Sel->getCondition()))
                                 fam.insert(Sel);
+                            else if (auto *Sel = dyn_cast<SelectInst>(FU); Sel && Sel->getCondition() != fam[k])
+                                fam.insert(Sel);
+                            else if (isa<PHINode>(FU))
+                                fam.insert(FU);
+                        }
+                    if (fam.size() >= 64)
+                        return false;
                     auto isFlush = [&](User *X) {
                         auto *Sel = dyn_cast<SelectInst>(X);
-                        return Sel && fam.contains(Sel);
+                        return Sel && fam.contains(Sel) && fam.contains(Sel->getFalseValue()) &&
+                               expZero(Sel->getCondition());
                     };
                     for (Value *W : fam)
                         for (User *FU : W->users())
                         {
                             if (isFlush(FU) && cast<SelectInst>(FU)->getFalseValue() == W)
+                                continue;
+                            // passed on to another member
+                            if (fam.contains(FU) && (isa<PHINode>(FU) || cast<SelectInst>(FU)->getCondition() != W))
                                 continue;
                             Value *X;
                             // the exponent: tests that only choose flushes
@@ -3100,12 +3114,24 @@ int LLVMZludaAirCanonicalNaNs(LLVMModuleRef M)
                                     return false;
                                 continue;
                             }
+                            // an unsigned comparison below the NaNs (a denormal test): false for every NaN, whatever
+                            // its bits (all are at least 0x7f800001 unsigned)
+                            const APInt *C;
+                            if (auto *Cmp = dyn_cast<ICmpInst>(FU);
+                                Cmp && Cmp->getOperand(0) == W && Cmp->getPredicate() == ICmpInst::ICMP_ULT &&
+                                match(Cmp->getOperand(1), m_APInt(C)) && C->ule(0x7f800001))
+                                continue;
                             // back to a float
                             if (auto *Back = dyn_cast<BitCastInst>(FU); Back && Back->getType()->isFloatTy())
                             {
                                 if (!usersIgnoreNaNBits(Back, depth + 1))
                                     return false;
                                 continue;
+                            }
+                            {
+                                static unsigned shown = 0;
+                                if (getenv("ZLUDA_AIR_NAN_WHY") && shown++ < 12)
+                                    errs() << "[nan fail] " << *W << "\n[nan fail]   used by " << *FU << "\n";
                             }
                             return false;
                         }

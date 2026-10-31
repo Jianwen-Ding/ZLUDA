@@ -317,3 +317,8 @@ generate_rays, ...) that failed to load: "the modules lay out their global data 
 data is LLVM's switch lookup tables (switch.table.*), which a recompilation names and sizes differently. A
 module whose globals are only such compiler-made constants now keeps its own copy. All specializations load (0
 failures); Geekbench GPU time 26.85 -> 26.09 s, score 53249 (within the 53441-54812 spread of earlier runs).
+- Then: the flush family also passes through integer selects and phis of the flushed bits, and unsigned
+  comparisons below the NaNs (x < C, C <= 0x7f800001: false for every NaN) do not observe them. intersect_closest
+  strict 20135 -> 19921. The remaining observers are real bit uses (sign tests, xor of the sign, or with sign bits):
+  NaN canonicalization is no longer the main strict cost; the rest is denormal emulation (air.ieee-fp32) and
+  comparisons on the bits. Test agx_tests/ftz-nan-phi.ptx.

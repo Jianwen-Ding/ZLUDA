@@ -1,0 +1,38 @@
+.version 7.0
+.target sm_70
+.address_size 64
+
+// One thread: a NaN from an .ftz operation through a denormal test on its bits, a selp and a branch merge (an
+// integer phi of the flushed bits after compilation) into the next .ftz operation stays PTX's canonical NaN.
+.visible .entry phi(.param .u64 pin, .param .u64 pout)
+{
+    .reg .f32 %f<20>;
+    .reg .b32 %r<4>;
+    .reg .pred %p<3>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [pin];
+    ld.param.u64 %rd2, [pout];
+    ld.global.f32 %f1, [%rd1];      // +inf
+    ld.global.f32 %f2, [%rd1+4];    // -inf
+    ld.global.f32 %f3, [%rd1+8];    // 1.0
+    ld.global.u32 %r1, [%rd1+12];   // 1
+    add.ftz.f32 %f10, %f1, %f2;
+    mov.b32 %r2, %f10;
+    setp.lt.u32 %p1, %r2, 8388608;
+    selp.f32 %f11, 0f00000000, %f10, %p1;
+    mov.f32 %f12, %f3;
+    setp.eq.u32 %p2, %r1, 0;
+    @%p2 bra SKIP;
+    mov.f32 %f12, %f11;
+SKIP:
+    mul.ftz.f32 %f13, %f12, %f3;
+    add.ftz.f32 %f14, %f13, %f3;
+    st.global.f32 [%rd2], %f13;
+    st.global.f32 [%rd2+4], %f14;
+    ret;
+}
+
+.buffer IN .u32 = { 2139095040, 4286578688, 1065353216, 1 };
+.buffer OUT .u32 [2];
+.launch phi <<< 1, 1 >>> (IN, OUT);
+.expect OUT .u32 = { 2147483647, 2147483647 };

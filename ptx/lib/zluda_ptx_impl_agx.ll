@@ -218,7 +218,8 @@ define i32 @__zluda_ptx_impl_activemask() #2 {
   ret i32 %m
 }
 
-; Bit field extract and insert, with PTX's clamping of position and length.
+; Bit field extract and insert, with PTX's clamping of position and length: "pos = b & 0xff; len = c & 0xff" for
+; every type, 64-bit ones included (PTX ISA 9.7.1.20 bfe, 9.7.1.21 bfi).
 define i32 @__zluda_ptx_impl_bfe_u32(i32 %base, i32 %pos32, i32 %len32) #0 {
   %pos = and i32 %pos32, 255
   %len = and i32 %len32, 255
@@ -233,7 +234,9 @@ define i32 @__zluda_ptx_impl_bfe_u32(i32 %base, i32 %pos32, i32 %len32) #0 {
   ret i32 %r
 }
 
-define i64 @__zluda_ptx_impl_bfe_u64(i64 %base, i32 %pos, i32 %len) #0 {
+define i64 @__zluda_ptx_impl_bfe_u64(i64 %base, i32 %pos32, i32 %len32) #0 {
+  %pos = and i32 %pos32, 255
+  %len = and i32 %len32, 255
   %pos64 = zext i32 %pos to i64
   %len64 = zext i32 %len to i64
   %pos.big = icmp uge i32 %pos, 64
@@ -268,7 +271,9 @@ define i32 @__zluda_ptx_impl_bfe_s32(i32 %base, i32 %pos32, i32 %len32) #0 {
   ret i32 %r
 }
 
-define i64 @__zluda_ptx_impl_bfe_s64(i64 %base, i32 %pos, i32 %len) #0 {
+define i64 @__zluda_ptx_impl_bfe_s64(i64 %base, i32 %pos32, i32 %len32) #0 {
+  %pos = and i32 %pos32, 255
+  %len = and i32 %len32, 255
   %len.zero = icmp eq i32 %len, 0
   %pos.big = icmp uge i32 %pos, 64
   %sign = ashr i64 %base, 63
@@ -309,7 +314,9 @@ define i32 @__zluda_ptx_impl_bfi_b32(i32 %insert, i32 %base, i32 %pos32, i32 %le
   ret i32 %r
 }
 
-define i64 @__zluda_ptx_impl_bfi_b64(i64 %insert, i64 %base, i32 %pos, i32 %len) #0 {
+define i64 @__zluda_ptx_impl_bfi_b64(i64 %insert, i64 %base, i32 %pos32, i32 %len32) #0 {
+  %pos = and i32 %pos32, 255
+  %len = and i32 %len32, 255
   %pos.big = icmp uge i32 %pos, 64
   %len.big = icmp uge i32 %len, 64
   %pos64 = zext i32 %pos to i64

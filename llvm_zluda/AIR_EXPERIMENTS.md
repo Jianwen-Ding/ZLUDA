@@ -362,3 +362,16 @@ but filters tex.1d / tex.2d in f32 as default mode does. Blender junkshop strict
 sampler (generated linear-filter tests, 256 coordinates each, simulator): f32 textures with one channel exact,
 two channels with border addressing within 2 ulp. Strict formalization suite unchanged with it (1928). Off by
 default: an error margin for textures only.
+
+## llama generation: device copies inside the graph's batch (2026-10-31)
+
+ZLUDA_AGX_GRAPH_TIMING=1 (driver) prints each graph's shape and its host time. llama.cpp's token graph is 506
+kernel launches with 24 device-to-device copies between the layers (L13 D1 L20 D1 ... L13). Each copy waited for
+the GPU (sync_all) and copied on the CPU: 25 commands per token and 13 ms of host waiting, nearly all of the token's
+time. Device copies in a graph are now a dispatch of built-in copy kernels (16-, 4- or 1-byte units, compiled once
+through the AIR route) inside the batch, ordered by its barriers; module globals and copies outside graphs as before.
+
+- llama tg128 47.3 -> 124.9 t/s (same session, -b 8 -ub 8); pp128 436 -> 441. Strict: tg128 130.8, pp128 401.6.
+- Completions 4/4 exact in both modes; driver tests pass.
+- (llama-bench without -b 8 -ub 8 aborts in cublasCreate: this llama-app links cuBLAS statically, whose fatbin has
+  no PTX; not a driver regression.)

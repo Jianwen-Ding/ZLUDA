@@ -54,6 +54,8 @@ pub(crate) struct Driver {
     /// While a graph runs (cuGraphLaunch): its kernel launches gathered into one compute command (`Batch`).
     batching: bool,
     batch: Option<Batch>,
+    /// The copy kernels of `copy_in_batch` once loaded (None inside: they failed to)
+    copy_kernels: Option<Option<[usize; 3]>>,
     events: HashMap<usize, Event>,
     /// cuCtxSetLimit values of this context.
     limits: HashMap<u32, usize>,
@@ -916,8 +918,47 @@ impl Driver {
         self.copy_htod(dst, &tmp)
     }
 
+    /// A device-to-device copy as a dispatch of the batch being gathered (a graph's: ordered with its kernels by
+    /// their barriers), instead of waiting for the GPU and copying on the CPU; false when it cannot be (no batch,
+    /// a module's global data, which the CPU writes, or the copy kernels not compiling).
+    fn copy_in_batch(&mut self, dst: u64, src: u64, n: u64, sh: usize) -> Result<bool, CUerror> {
+        if !self.batching || n == 0 || self.module_global(dst, n).is_some() || self.module_global(src, n).is_some() {
+            return Ok(false);
+        }
+        if self.copy_kernels.is_none() {
+            self.copy_kernels = Some(unsafe { load_copy_kernels(self) }.ok());
+        }
+        let Some(Some(kernels)) = self.copy_kernels else { return Ok(false) };
+        // the widest unit that the addresses and the size are multiples of
+        let all = dst | src | n;
+        let (f, unit) = if all % 16 == 0 {
+            (kernels[0], 16)
+        } else if all % 4 == 0 {
+            (kernels[1], 4)
+        } else {
+            (kernels[2], 1)
+        };
+        let count = n / unit;
+        let block = 256u64;
+        let grid = count.div_ceil(block);
+        if grid > u32::MAX as u64 {
+            return Ok(false);
+        }
+        let args = [dst.to_le_bytes(), src.to_le_bytes(), count.to_le_bytes()];
+        let args: Vec<&[u8]> = args.iter().map(|a| &a[..]).collect();
+        self.launch(f, [grid as u32, 1, 1], [block as u32, 1, 1], 0, sh, &args)?;
+        Ok(true)
+    }
+
     fn run(&mut self, op: &Op, sh: usize) -> CUresult {
         match op {
+            Op::Copy { dst, src, n } if self.is_device(*dst) && self.is_device(*src) => {
+                if self.copy_in_batch(*dst, *src, *n as u64, sh)? {
+                    return Ok(());
+                }
+                self.sync_all()?;
+                self.copy_dtod(*dst, *src, *n as u64).map_err(from_io)
+            }
             Op::Launch { f, grid, block, shared, params } => {
                 let args: Vec<&[u8]> = params.iter().map(|p| &p[..]).collect();
                 self.launch(*f, *grid, *block, *shared, sh, &args)
@@ -947,6 +988,74 @@ impl Driver {
 // The runtime objects use Rc internally; they are only reached through DRIVER's mutex.
 unsafe impl Send for Driver {}
 
+/// The copy kernels of `Driver::copy_in_batch`: `count` units of 16, 4 or 1 bytes from `src` to `dst`, a unit per
+/// thread.
+const COPY_PTX: &str = ".version 7.0
+.target sm_70
+.address_size 64
+.visible .entry __zluda_agx_copy16(.param .u64 dst, .param .u64 src, .param .u64 count)
+{
+    .reg .u64 %d, %s, %n, %i, %o;
+    .reg .u32 %t, %b, %c, %w<4>;
+    .reg .pred %p;
+    ld.param.u64 %d, [dst]; ld.param.u64 %s, [src]; ld.param.u64 %n, [count];
+    mov.u32 %t, %tid.x; mov.u32 %b, %ctaid.x; mov.u32 %c, %ntid.x;
+    mul.wide.u32 %i, %b, %c; cvt.u64.u32 %o, %t; add.u64 %i, %i, %o;
+    setp.ge.u64 %p, %i, %n;
+    @%p bra DONE;
+    shl.b64 %o, %i, 4;
+    add.u64 %s, %s, %o; add.u64 %d, %d, %o;
+    ld.global.v4.u32 {%w0, %w1, %w2, %w3}, [%s];
+    st.global.v4.u32 [%d], {%w0, %w1, %w2, %w3};
+DONE:
+    ret;
+}
+.visible .entry __zluda_agx_copy4(.param .u64 dst, .param .u64 src, .param .u64 count)
+{
+    .reg .u64 %d, %s, %n, %i, %o;
+    .reg .u32 %t, %b, %c, %w;
+    .reg .pred %p;
+    ld.param.u64 %d, [dst]; ld.param.u64 %s, [src]; ld.param.u64 %n, [count];
+    mov.u32 %t, %tid.x; mov.u32 %b, %ctaid.x; mov.u32 %c, %ntid.x;
+    mul.wide.u32 %i, %b, %c; cvt.u64.u32 %o, %t; add.u64 %i, %i, %o;
+    setp.ge.u64 %p, %i, %n;
+    @%p bra DONE;
+    shl.b64 %o, %i, 2;
+    add.u64 %s, %s, %o; add.u64 %d, %d, %o;
+    ld.global.u32 %w, [%s];
+    st.global.u32 [%d], %w;
+DONE:
+    ret;
+}
+.visible .entry __zluda_agx_copy1(.param .u64 dst, .param .u64 src, .param .u64 count)
+{
+    .reg .u64 %d, %s, %n, %i, %o;
+    .reg .u32 %t, %b, %c;
+    .reg .u16 %h;
+    .reg .pred %p;
+    ld.param.u64 %d, [dst]; ld.param.u64 %s, [src]; ld.param.u64 %n, [count];
+    mov.u32 %t, %tid.x; mov.u32 %b, %ctaid.x; mov.u32 %c, %ntid.x;
+    mul.wide.u32 %i, %b, %c; cvt.u64.u32 %o, %t; add.u64 %i, %i, %o;
+    setp.ge.u64 %p, %i, %n;
+    @%p bra DONE;
+    add.u64 %s, %s, %i; add.u64 %d, %d, %i;
+    ld.global.u8 %h, [%s];
+    st.global.u8 [%d], %h;
+DONE:
+    ret;
+}
+\0";
+
+/// The handles of the copy kernels (16, 4 and 1 byte units).
+unsafe fn load_copy_kernels(d: &mut Driver) -> Result<[usize; 3], CUerror> {
+    let m = load_module_data(d, COPY_PTX.as_ptr())?;
+    Ok([
+        module_function(d, m, "__zluda_agx_copy16")?,
+        module_function(d, m, "__zluda_agx_copy4")?,
+        module_function(d, m, "__zluda_agx_copy1")?,
+    ])
+}
+
 /// The live contexts; None before cuInit.
 static DRIVER: Mutex<Option<contexts::Contexts<Driver>>> = Mutex::new(None);
 
@@ -967,6 +1076,7 @@ fn new_driver() -> Result<Driver, CUerror> {
         functions: HashMap::new(),
         lazy_sources: HashMap::new(),
         streams: HashMap::new(),
+        copy_kernels: None,
         free_queues: Vec::new(),
         batching: false,
         batch: None,
@@ -2203,8 +2313,14 @@ pub(crate) unsafe fn cuModuleGetFunction(hfunc: *mut CUfunction, hmod: CUmodule,
     if crate::log_enabled() {
         eprintln!("[zluda_agx] kernel lookup: module={:#x}, name={name}", hmod.0 as usize);
     }
-    let h = with(|d| {
-        let parent = hmod.0 as usize;
+    let h = with(|d| module_function(d, hmod.0 as usize, &name))?;
+    out(hfunc, CUfunction(h as *mut _))
+}
+
+/// The handle of a module's kernel `name` (cuModuleGetFunction): compiled now if the module is loaded lazily.
+fn module_function(d: &mut Driver, parent: usize, name: &str) -> Result<usize, CUerror> {
+    let name = name.to_string();
+    {
         let m = d.modules.get(&parent).ok_or(CUerror::INVALID_HANDLE)?;
         let module = if m.module.kernels.contains_key(&name) {
             parent
@@ -2255,8 +2371,7 @@ pub(crate) unsafe fn cuModuleGetFunction(hfunc: *mut CUfunction, hmod: CUmodule,
         let h = d.handle();
         d.functions.insert(h, (module, name));
         Ok(h)
-    })?;
-    out(hfunc, CUfunction(h as *mut _))
+    }
 }
 
 pub(crate) unsafe fn cuModuleGetGlobal_v2(dptr: *mut CUdeviceptr, bytes: *mut usize, hmod: CUmodule, name: *const c_char) -> CUresult {
@@ -3831,20 +3946,73 @@ pub(crate) unsafe fn cuGraphLaunch(exec: CUgraphExec, s: CUstream) -> CUresult {
         let ops = d.execs.remove(&(exec as usize)).ok_or(CUerror::INVALID_HANDLE)?;
         // consecutive kernel launches go into one command (Batch); anything else submits them first
         d.batching = graph_batching_enabled();
+        // ZLUDA_AGX_GRAPH_TIMING=1: host time of the launches, the other operations and the submits, every 100 graphs
+        let timing = std::env::var("ZLUDA_AGX_GRAPH_TIMING").is_ok_and(|v| v == "1");
+        let mut t = [std::time::Duration::ZERO; 3];
         let mut r = Ok(());
         for op in &ops {
-            if !matches!(op, Op::Launch { .. }) {
+            let launch = matches!(op, Op::Launch { .. });
+            if !launch {
+                let at = std::time::Instant::now();
                 r = d.flush_batch();
+                t[2] += at.elapsed();
             }
             if r.is_ok() {
+                let at = std::time::Instant::now();
                 r = d.run(op, s.0 as usize);
+                t[if launch { 0 } else { 1 }] += at.elapsed();
             }
             if r.is_err() {
                 break;
             }
         }
         d.batching = false;
+        let at = std::time::Instant::now();
         let flushed = d.flush_batch();
+        t[2] += at.elapsed();
+        if timing {
+            use std::sync::Mutex;
+            static SUM: Mutex<([std::time::Duration; 3], u32, usize)> = Mutex::new(([std::time::Duration::ZERO; 3], 0, 0));
+            let mut g = SUM.lock().unwrap();
+            for i in 0..3 {
+                g.0[i] += t[i];
+            }
+            g.1 += 1;
+            g.2 += ops.len();
+            if g.1 == 1 {
+                // the graph's shape: L launch, M memset, C copy (device/host per side), in order, run-length coded
+                let mut shape = String::new();
+                let mut last = ' ';
+                let mut run = 0;
+                for op in &ops {
+                    let c = match op {
+                        Op::Launch { .. } => 'L',
+                        Op::Memset { .. } => 'M',
+                        Op::Copy { dst, src, .. } => match (d.is_device(*dst), d.is_device(*src)) {
+                            (true, true) => 'D',
+                            (true, false) => 'U',
+                            (false, true) => 'H',
+                            _ => 'C',
+                        },
+                    };
+                    if c != last && run > 0 {
+                        shape += &format!("{last}{run} ");
+                        run = 0;
+                    }
+                    last = c;
+                    run += 1;
+                }
+                shape += &format!("{last}{run}");
+                eprintln!("[zluda_agx] graph shape (L launch, M memset, D dtod, U htod, H dtoh): {shape}");
+            }
+            if g.1 % 100 == 0 {
+                eprintln!(
+                    "[zluda_agx] graph timing per launch of {} ops: launches {:?}, other ops {:?}, submits {:?}",
+                    g.2 / g.1 as usize, g.0[0] / g.1, g.0[1] / g.1, g.0[2] / g.1
+                );
+                *g = ([std::time::Duration::ZERO; 3], 0, 0);
+            }
+        }
         d.execs.insert(exec as usize, ops);
         r.and(flushed)
     })

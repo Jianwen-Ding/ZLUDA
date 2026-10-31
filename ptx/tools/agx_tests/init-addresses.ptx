@@ -1,0 +1,53 @@
+// Variables initialized with addresses of other variables (PTX ISA 5.4.4: "variables that hold addresses of
+// variables or functions can also be initialized"; generic() for the generic address), read back by the
+// kernel and compared with the addresses it takes itself.
+.version 7.0
+.target sm_70
+.address_size 64
+
+.global .u32 a[4] = { 10, 20, 30, 40 };
+.const .u32 c = 7;
+.const .u64 ptrs[3] = { a, c, generic(a) };
+.global .u64 gptrs[2] = { a, generic(c) };
+
+.visible .entry k(.param .u64 pout)
+{
+    .reg .b64 %o, %p<6>, %q<4>;
+    .reg .b32 %r<4>;
+    ld.param.u64 %o, [pout];
+    ld.const.u64 %p1, [ptrs];
+    ld.const.u64 %p2, [ptrs+8];
+    ld.const.u64 %p3, [ptrs+16];
+    ld.global.u64 %p4, [gptrs];
+    ld.global.u64 %p5, [gptrs+8];
+    mov.u64 %q1, a;
+    mov.u64 %q2, c;
+    cvta.global.u64 %q3, %q1;
+    // the values through the loaded addresses
+    ld.global.u32 %r1, [%p1+8];     // 30
+    ld.const.u32 %r2, [%p2];        // 7
+    ld.u32 %r3, [%p3+12];           // 40, generic
+    st.global.v2.u32 [%o], {%r1, %r2};
+    st.global.u32 [%o+8], %r3;
+    ld.global.u32 %r1, [%p4+4];     // 20
+    ld.u32 %r2, [%p5];              // 7, generic
+    st.global.v2.u32 [%o+12], {%r1, %r2};
+    // the addresses equal the kernel's own
+    xor.b64 %p1, %p1, %q1;
+    xor.b64 %p2, %p2, %q2;
+    xor.b64 %p3, %p3, %q3;
+    xor.b64 %p4, %p4, %q1;
+    or.b64 %p1, %p1, %p2;
+    or.b64 %p1, %p1, %p3;
+    or.b64 %p1, %p1, %p4;
+    cvt.u32.u64 %r1, %p1;
+    shr.u64 %p1, %p1, 32;
+    cvt.u32.u64 %r2, %p1;
+    or.b32 %r1, %r1, %r2;
+    st.global.u32 [%o+20], %r1;
+    ret;
+}
+
+.buffer OUT .u32 [6];
+.launch k <<< 1, 1 >>> (OUT);
+.expect OUT .u32 = { 30, 7, 40, 20, 7, 0 };

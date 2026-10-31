@@ -1363,7 +1363,28 @@ static bool zludaIsBufferGlobal(GlobalVariable &GV)
         return false;
     if (GV.getAddressSpace() == 1)
         return true;
-    return GV.getAddressSpace() == 2 && zludaAddressEscapes(&GV);
+    if (GV.getAddressSpace() != 2)
+        return false;
+    if (zludaAddressEscapes(&GV))
+        return true;
+    // an initializer holding another variable's address (.const .u64 p[2] = { x, y }, PTX ISA 5.4.4): the address
+    // is the buffer's, known when it is, so the variable is in the buffer with its relocations
+    if (!GV.hasInitializer())
+        return false;
+    SmallVector<const Constant *, 16> work{GV.getInitializer()};
+    SmallPtrSet<const Constant *, 16> seen;
+    while (!work.empty())
+    {
+        const Constant *C = work.pop_back_val();
+        if (!seen.insert(C).second)
+            continue;
+        if (isa<GlobalVariable>(C))
+            return true;
+        for (const Use &U : C->operands())
+            if (auto *O = dyn_cast<Constant>(U.get()))
+                work.push_back(O);
+    }
+    return false;
 }
 
 // Replaces the uses in F of Old, a variable in address space 1 or 2, with
@@ -1855,7 +1876,13 @@ int LLVMZludaAirGlobalsToBuffer(LLVMModuleRef M, char **json, char **error)
     {
         GV->removeDeadConstantUsers();
         if (!GV->use_empty())
-            return fail(GV->getName().str() + " is used outside the kernels (in another variable's initializer?)");
+        {
+            std::string what;
+            raw_string_ostream os(what);
+            GV->user_back()->print(os);
+            return fail(GV->getName().str() + " is used outside the kernels (in another variable's initializer?): " +
+                        os.str());
+        }
         GV->eraseFromParent();
     }
     *json = LLVMCreateMessage(out.c_str());

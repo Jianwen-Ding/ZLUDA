@@ -24,7 +24,11 @@ pub(super) fn run<'a, 'input>(
                 kernel_attributes: None,
                 kernel_meta32: None,
             }));
-            sreg_to_function.insert(sreg, name);
+            if sreg == PtxSpecialRegister::Envreg(0) {
+                sreg_to_function.extend((0..32).map(|n| (PtxSpecialRegister::Envreg(n), name)));
+            } else {
+                sreg_to_function.insert(sreg, name);
+            }
         },
     );
     let mut visitor = SpecialRegisterResolver {
@@ -206,6 +210,11 @@ impl<'a, 'b, 'input> SpecialRegisterResolver<'a, 'input> {
                     value: ast::ImmediateValue::U64(value),
                 }));
                 Ok(dst)
+            }
+            // the register's number is the argument of its function
+            None if matches!(sreg, PtxSpecialRegister::Envreg(_)) => {
+                let PtxSpecialRegister::Envreg(n) = sreg else { unreachable!() };
+                self.emit_call(sreg, Some(n))
             }
             None => self.emit_call(sreg.canonical(self.target), member),
         }

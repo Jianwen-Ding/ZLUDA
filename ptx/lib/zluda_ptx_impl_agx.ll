@@ -112,6 +112,17 @@ define i32 @__zluda_ptx_impl_sreg_lanemask_gt() #0 {
 @__zluda_agx_timer = internal addrspace(1) externally_initialized global ptr addrspace(1) null, align 8
 @__zluda_ptx_impl_agx_clock = internal addrspace(1) global i32 0
 
+; %envreg0 to %envreg31: words the driver writes (agx_runtime::ENVREG_SYMBOL), zero where it writes none. The driver
+; writes a cooperative launch's grid-sync workspace as %envreg1 (high half) : %envreg2 (low half).
+@__zluda_agx_envreg = internal addrspace(1) externally_initialized global [32 x i32] zeroinitializer, align 4
+
+define i32 @__zluda_ptx_impl_sreg_envreg(i8 %n) #3 {
+  %i = zext i8 %n to i64
+  %p = getelementptr inbounds [32 x i32], ptr addrspace(1) @__zluda_agx_envreg, i64 0, i64 %i
+  %v = load i32, ptr addrspace(1) %p, align 4
+  ret i32 %v
+}
+
 define i32 @__zluda_ptx_impl_agx_clock_count() #3 {
   %c = atomicrmw add ptr addrspace(1) @__zluda_ptx_impl_agx_clock, i32 1 monotonic
   %r = add i32 %c, 1

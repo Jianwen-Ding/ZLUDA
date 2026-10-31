@@ -86,6 +86,9 @@ pub(crate) struct Driver {
     /// The timer block of the clocks (`%globaltimer`, `%clock64`, `nanosleep`), made when the first module that
     /// reads them is loaded, with the CPU thread that keeps it current
     timer: Option<Timer>,
+    /// The grid-sync workspace of cooperative launches (`%envreg1:%envreg2`), made when the first module that reads
+    /// them is loaded; one for the context, so cooperative launches that run at the same time would share it
+    grid_sync: Option<agx_runtime::Bo>,
     /// The physical allocations of the virtual memory management API (cuMemCreate), by handle, with their
     /// properties; a mapping keeps its allocation alive after cuMemRelease
     vmm: HashMap<u64, (std::rc::Rc<agx_runtime::Bo>, CUmemAllocationProp)>,
@@ -901,6 +904,7 @@ fn new_driver() -> Result<Driver, CUerror> {
         specs: Default::default(),
         heap: None,
         timer: None,
+        grid_sync: None,
         vmm: HashMap::new(),
         next_vmm: 1,
         multicast: HashMap::new(),
@@ -1877,6 +1881,14 @@ unsafe fn load_module_data(d: &mut Driver, bytes: *const u8) -> Result<usize, CU
             d.timer = Some(Timer::new(&mut d.ctx.vm, khz).map_err(from_io)?);
         }
         loaded.set_timer(d.timer.as_ref().unwrap().bo.va);
+    }
+    if loaded.uses_envreg() {
+        if d.grid_sync.is_none() {
+            let mut workspace = d.ctx.vm.alloc_data(agx_runtime::GRID_SYNC_BYTES).map_err(from_io)?;
+            workspace.as_mut_slice().fill(0);
+            d.grid_sync = Some(workspace);
+        }
+        loaded.set_grid_sync(d.grid_sync.as_ref().unwrap().va);
     }
     let h = d.handle();
     // the PTX of a module without heap or clock for launch-time specialization (its kernels' copies use the

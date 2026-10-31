@@ -1624,6 +1624,12 @@ pub fn heap_header(size: u32) -> [u8; 8] {
 pub const TIMER_SYMBOL: &str = "__zluda_agx_timer";
 pub const TIMER_BLOCK_BYTES: usize = 32;
 
+/// Symbol of the words a module reads as `%envreg0` to `%envreg31` (32 x u32, `ptx/lib/zluda_ptx_impl_agx.ll`).
+pub const ENVREG_SYMBOL: &str = "__zluda_agx_envreg";
+/// Bytes of a cooperative launch's grid-sync workspace (`%envreg1:%envreg2`), zeroed when made: CUDA's grid barrier
+/// counts arriving threadgroups in its word at 4 and flips the top bit to release them, so it needs no reset.
+pub const GRID_SYNC_BYTES: u64 = 256;
+
 /// The CPU's generic timer: its count and its frequency in Hz. Elsewhere than on aarch64 (tests), a count of a
 /// monotonic clock at 24 MHz.
 pub fn cpu_timer() -> (u64, u64) {
@@ -1829,6 +1835,19 @@ impl LoadedModule {
 
     pub fn uses_timer(&self) -> bool {
         self.module.global_symbols.contains_key(TIMER_SYMBOL)
+    }
+
+    pub fn uses_envreg(&self) -> bool {
+        self.module.global_symbols.contains_key(ENVREG_SYMBOL)
+    }
+
+    /// Points the module's `%envreg1:%envreg2` (high : low) at a grid-sync workspace at `va` (`ENVREG_SYMBOL`).
+    pub fn set_grid_sync(&mut self, va: u64) {
+        let Some(&(off, _)) = self.module.global_symbols.get(ENVREG_SYMBOL) else { return };
+        let Some(g) = self.globals.as_mut() else { return };
+        let words = &mut g.as_mut_slice()[off as usize + 4..off as usize + 12];
+        words[..4].copy_from_slice(&((va >> 32) as u32).to_le_bytes());
+        words[4..].copy_from_slice(&(va as u32).to_le_bytes());
     }
 
     /// Points the module's clocks at a timer block at `va` (`TIMER_SYMBOL`).

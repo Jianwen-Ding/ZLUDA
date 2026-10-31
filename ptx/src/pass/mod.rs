@@ -522,6 +522,9 @@ impl PtxSpecialRegister {
             Self::ClusterCtaid | Self::ClusterCtarank | Self::IsExplicitCluster => Some(0),
             Self::ClusterNctaid => Some((member.unwrap_or(0) < 3) as u64),
             Self::ClusterNctarank => Some(1),
+            // Apple GPUs read %envreg<n> from a table the driver writes (the grid-sync workspace of cooperative
+            // launches is %envreg1:%envreg2)
+            Self::Envreg(_) if target.is_air() => None,
             Self::Envreg(_) | Self::Pm(_) => Some(0),
             _ => None,
         }
@@ -542,7 +545,7 @@ impl PtxSpecialRegister {
     }
 
     fn get_function_input_type(self) -> Option<ast::ScalarType> {
-        if self.is_vector() {
+        if self.is_vector() || matches!(self, Self::Envreg(_)) {
             Some(ast::ScalarType::U8)
         } else {
             None
@@ -558,6 +561,7 @@ impl PtxSpecialRegister {
             PtxSpecialRegister::Clock => "sreg_clock",
             PtxSpecialRegister::Clock64 => "sreg_clock64",
             PtxSpecialRegister::Globaltimer => "sreg_globaltimer",
+            PtxSpecialRegister::Envreg(_) => "sreg_envreg",
             PtxSpecialRegister::LanemaskLt => "sreg_lanemask_lt",
             PtxSpecialRegister::LanemaskLe => "sreg_lanemask_le",
             PtxSpecialRegister::LanemaskGe => "sreg_lanemask_ge",
@@ -1532,7 +1536,9 @@ impl SpecialRegistersMap {
             ),
         ),
     ) {
-        for sreg in PtxSpecialRegister::all().filter(|sreg| sreg.needs_function(target)) {
+        // the %envreg<n> share one function (of n), declared for %envreg0
+        let declared = |sreg: &PtxSpecialRegister| !matches!(sreg, PtxSpecialRegister::Envreg(n) if *n != 0);
+        for sreg in PtxSpecialRegister::all().filter(|sreg| sreg.needs_function(target) && declared(sreg)) {
             let external_fn_name = [ZLUDA_PTX_PREFIX, sreg.get_unprefixed_function_name()].concat();
             let name = resolver.register_named(Cow::Owned(external_fn_name), None);
             let return_type = sreg.get_function_return_type();

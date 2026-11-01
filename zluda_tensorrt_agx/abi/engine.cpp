@@ -31,7 +31,7 @@ public:
     ICudaEngine* getPImpl() noexcept override{return owner;}
     int32_t getNbLayers() const noexcept override{return ztrtGetLayerCount(native);}
     IHostMemory* serialize() const noexcept override{try{return new HostMemory(native);}catch(...){error(logger,"native engine serialization failed");return nullptr;}}
-    IExecutionContext* createExecutionContext(ExecutionContextAllocationStrategy strategy) noexcept override{if(int32_t(strategy)!=0){error(logger,"only static native context allocation is supported");return nullptr;}auto context=ztrtAbiCreateContext(owner,native,logger);if(context)prepared=true;return context;}
+    IExecutionContext* createExecutionContext(ExecutionContextAllocationStrategy strategy) noexcept override{if(int32_t(strategy)!=0&&int32_t(strategy)!=2){error(logger,"only static and user-managed context allocation are supported");return nullptr;}auto context=ztrtAbiCreateContext(owner,native,logger,int32_t(strategy)==2);if(context)prepared=true;return context;}
     bool isRefittable() const noexcept override{return false;}
     char const* getName() const noexcept override{return "ZLUDA AGX native engine";}
     int32_t getNbOptimizationProfiles() const noexcept override{return 1;}

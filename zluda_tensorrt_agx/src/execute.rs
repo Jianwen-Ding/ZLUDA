@@ -154,12 +154,16 @@ pub struct Context {
     pointers: Vec<usize>,
     bound: Vec<bool>,
     bindings_validated: bool,
-    _workspace: Buffer,
+    _workspace: Option<Buffer>,
+    workspace_ptr: usize,
     resources: Arc<Resources>,
     last_stream: Option<usize>,
 }
 impl Context {
     pub(crate) fn new(plan: Arc<Plan>, cache: &ResourceCache) -> Result<Self> {
+        Self::new_with_workspace(plan,cache,true)
+    }
+    pub(crate) fn new_with_workspace(plan:Arc<Plan>,cache:&ResourceCache,allocate:bool)->Result<Self> {
         let owner = current()?;
         let resources = {
             let mut cache = cache.lock().map_err(|_| "GPU resource cache lock poisoned")?;
@@ -169,13 +173,26 @@ impl Context {
                 cache.insert(owner, resources.clone()); resources
             }
         };
-        let workspace = Buffer::new(plan.workspace, owner)?;
+        let workspace = if allocate {Some(Buffer::new(plan.workspace, owner)?)} else {None};
+        let workspace_ptr=workspace.as_ref().map_or(0,|b|b.ptr);
         let mut pointers = resources.pointers.clone();
         for (i, offset) in plan.offsets.iter().enumerate() {
-            if let Some(offset) = offset { pointers[i] = workspace.ptr.checked_add(*offset).ok_or("workspace address overflow")?; }
+            if let Some(offset) = offset { pointers[i] = workspace_ptr.checked_add(*offset).ok_or("workspace address overflow")?; }
         }
         let count = pointers.len();
-        Ok(Self { plan, owner, pointers, bound: vec![false; count], bindings_validated: false, _workspace: workspace, resources, last_stream: None })
+        Ok(Self { plan, owner, pointers, bound: vec![false; count], bindings_validated: false, _workspace: workspace, workspace_ptr, resources, last_stream: None })
+    }
+    /// Borrowed workspace remains caller-owned and alive until all enqueues finish.
+    pub fn set_workspace(&mut self,pointer:usize,bytes:usize)->Result<()> {
+        if current()?!=self.owner {return Err("execution context belongs to another CUDA context".into());}
+        if pointer!=0 && (pointer%256!=0 || bytes<self.plan.workspace) {return Err("workspace requires 256-byte alignment and sufficient bytes".into());}
+        if pointer==0 && bytes!=0 {return Err("null workspace has nonzero size".into());}
+        pointer.checked_add(self.plan.workspace).ok_or("workspace address overflow")?;
+        self.synchronize()?;
+        for (i,offset) in self.plan.offsets.iter().enumerate() {
+            if let Some(offset)=offset {self.pointers[i]=pointer+offset;}
+        }
+        self._workspace=None;self.workspace_ptr=pointer;self.bindings_validated=false;Ok(())
     }
     pub fn bind(&mut self, name: &str, pointer: usize, bytes: usize) -> Result<()> {
         let g = &self.plan.graph;
@@ -206,10 +223,16 @@ impl Context {
     /// Caller owns device buffers and keeps them alive until the stream finishes. One context is not concurrently enqueued.
     pub unsafe fn enqueue(&mut self, stream: CUstream) -> Result<()> {
         if current()? != self.owner { return Err("execution context belongs to another CUDA context".into()); }
+        if self.plan.workspace!=0 && self.workspace_ptr==0 {return Err("execution workspace is unbound".into());}
         let g = &self.plan.graph;
         if !self.bindings_validated {
             let io: Vec<usize> = g.inputs.iter().chain(&g.outputs).copied().collect();
             for &i in &io { if !self.bound[i] { return Err(format!("tensor {} has no device binding", g.tensors[i].name)); } }
+            for &i in &io {
+                if self.plan.workspace!=0 && self.pointers[i]<self.workspace_ptr+self.plan.workspace && self.workspace_ptr<self.pointers[i]+g.tensors[i].bytes()? {
+                    return Err("input/output binding overlaps workspace".into());
+                }
+            }
             for (at, &i) in io.iter().enumerate() {
                 for &j in &io[..at] {
                     if self.pointers[i] < self.pointers[j] + g.tensors[j].bytes()? && self.pointers[j] < self.pointers[i] + g.tensors[i].bytes()? {

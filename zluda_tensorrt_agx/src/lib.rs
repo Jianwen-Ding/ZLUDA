@@ -307,6 +307,12 @@ fn modify(g: &mut Graph, output: usize, f: impl FnOnce(&mut Op) -> Result<()>) -
 #[no_mangle] pub unsafe extern "C" fn ztrtCreateExecutionContext(p: *const Engine) -> *mut execute::Context {
     boundary(std::ptr::null_mut(), || Ok(Box::into_raw(Box::new(execute::Context::new(object(p)?.plan.clone(), &object(p)?.resources)?))))
 }
+#[no_mangle] pub unsafe extern "C" fn ztrtCreateExecutionContextWithoutDeviceMemory(p:*const Engine)->*mut execute::Context {
+    boundary(std::ptr::null_mut(),||{let e=object(p)?;Ok(Box::into_raw(Box::new(execute::Context::new_with_workspace(e.plan.clone(),&e.resources,false)?)))})
+}
+#[no_mangle] pub unsafe extern "C" fn ztrtSetDeviceMemory(p:*mut execute::Context,data:*mut c_void,bytes:usize)->i32 {
+    boundary(-1,||object_mut(p)?.set_workspace(data as usize,bytes).map(|_|0))
+}
 #[no_mangle] pub unsafe extern "C" fn ztrtDestroyExecutionContext(p: *mut execute::Context) { boundary((), || { if !p.is_null() { drop(Box::from_raw(p)); } Ok(()) }); }
 #[no_mangle] pub unsafe extern "C" fn ztrtSetTensorAddress(p: *mut execute::Context, name: *const c_char, data: *mut c_void, bytes: usize) -> i32 {
     boundary(-1, || { object_mut(p)?.bind(string(name)?, data as usize, bytes)?; Ok(0) })

@@ -42,7 +42,7 @@ cannot substitute for an independently compiled full-reference-header client ABI
 | --- | --- | --- |
 | Public enums, data layouts and callbacks | Initial subset aligned | Complete version-specific interface audit and independent client tests |
 | Public C factory/version exports | Isolated 1.7.1 configuration prototype | Client resolves documented exports and version negotiation works |
-| Runtime/engine/context dispatch objects | Runtime configuration and engine metadata/serialization adapter; context dispatch absent | Full applicable public pImpl/vtable contracts, ownership and error behavior verified |
+| Runtime/engine/context dispatch objects | Runtime, engine and static-f32 context prototypes with custom loading and user-managed workspace | Full applicable public pImpl/vtable contracts, ownership and error behavior verified |
 | Builder/network/layer dispatch objects | Source wrapper subset only | Reference-header model construction, configuration and destruction work |
 | Custom engine serialization | Native ZTRTAGX2 works | Roundtrip through public runtime ABI and independent client, without NVIDIA format assumptions |
 | Precision and shape coverage | Primarily static f32 | Required dtypes, shape tensors, profiles and dynamic execution validated |
@@ -124,7 +124,7 @@ alias libtensorrt_rtx.so and does not establish Geekbench support.
 `context.cpp` bridges static f32 engines to GPU execution through the reviewed context dispatch order.
 Supported calls include named I/O bindings, fixed shapes and contiguous strides, profile 0, synchronous
 `executeV2`, asynchronous `enqueueV3`, and context metadata. The public engine must outlive its contexts.
-External workspace, dynamic shape changes, allocator/profiler callbacks, auxiliary streams and debug
+Dynamic shape changes, allocator/profiler callbacks, auxiliary streams and debug
 instrumentation are explicitly unsupported. Runtime deserialization supports only our custom engine format.
 
 Run the GPU probe with our own driver and compiler:
@@ -137,7 +137,7 @@ python3 zluda_tensorrt_agx/tools/build_runtime_abi.py --output-dir /tmp/ztrt-con
 
 Add `--sanitize` to instrument the C++ adapter and probes; the linked native Rust backend is not
 AddressSanitizer-instrumented. The independent context-prefix probe verifies GPU results, rebinding and
-null unbinding, rejected external workspace, synchronous execution, explicit streams, CUDA graph
+null unbinding, workspace size/alignment/overlap validation, synchronous execution, explicit streams, CUDA graph
 capture/replay with changed inputs, and foreign-context restoration during destruction. Capture capability
 is conservatively reported only for the same explicit stream after successful warmup with complete bindings.
 These tests are not complete version-pinned vendor-header ABI validation or Geekbench compatibility.
@@ -209,3 +209,28 @@ read (zero EOF, negative error). Metadata parsing uses a bounded buffered reader
 consuming trailing bytes. Binary float weights preserve their little-endian bit patterns, with byte swapping on
 big-endian targets. The current platform is little-endian; the big-endian path is not hardware-tested.
 See [stream loading measurements](../validation/stream-loading.md) for the memory benchmark and limits.
+
+
+## Caller-managed execution workspace
+
+Static strategy 0 and user-managed strategy 2 now create GPU execution contexts. Strategy 2 omits activation
+workspace allocation; its immutable kernel/constant resources are still prepared and shared per engine/CUDA
+context. Strategy 1 remains unsupported. The runtime-config factory path remains incomplete.
+`setDeviceMemoryV2` connects caller scratch storage to the native context. Legacy `setDeviceMemory` uses the
+engine's required size, so the caller must ensure the actual allocation is large enough. Scratch must be
+256-byte aligned and at least the reported workspace size. Negative sizes, invalid alignment and insufficient
+sizes reject configuration; enqueue then fails until a successful setter call. Null/zero unbinds scratch, so
+nonzero-workspace engines cannot enqueue until memory is supplied again. Zero-workspace graphs need none.
+
+Switching workspace synchronizes this execution context before releasing any old internally owned buffer.
+Caller memory is never freed. I/O overlap with the scratch range is rejected before execution. Callers own
+device-pointer validity/lifetimes and must serialize contexts that share scratch. Existing captured graphs
+retain their recorded addresses and must be recaptured when their memory bindings change.
+
+The independent C ABI provides `ztrtCreateExecutionContextWithoutDeviceMemory` and `ztrtSetDeviceMemory`.
+Its failed setter leaves the previous configuration intact; the public void setter adapter separately blocks
+enqueue after a configuration error. All changes require the owning CUDA context to be current.
+The adapter probe tests undersized/unaligned storage, overlap rejection, null unbinding, successful execution
+with borrowed scratch, strategy-2 creation, and sequential scratch reuse after destroying one context.
+Final caller `cuMemFree` succeeds, checking that borrowed scratch was not freed by context destruction.
+Normal and C++ adapter/probe-ASan tests pass, as do native lifecycle, 99 GPU graph and 109 ONNX model checks.

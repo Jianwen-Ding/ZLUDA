@@ -14,7 +14,7 @@ class ContextImpl final:public apiv::VExecutionContext {
     Tensor* find(char const* key) noexcept{if(key)for(auto& t:tensors)if(t.name==key)return &t;return nullptr;}
     Tensor const* find(char const* key) const noexcept{if(key)for(auto const& t:tensors)if(t.name==key)return &t;return nullptr;}
     Dims invalid() const noexcept{Dims d;d.nbDims=-1;return d;}
-    bool ready() noexcept{if(externalMemory){error(logger,"ABI prototype: external context workspace is unsupported");return false;}for(auto const& t:tensors)if(!t.address){error(logger,"I/O tensor is unbound");return false;}return true;}
+    bool ready() noexcept{if(externalMemory){error(logger,"context workspace configuration is invalid");return false;}for(auto const& t:tensors)if(!t.address){error(logger,"I/O tensor is unbound");return false;}return true;}
     bool status(int32_t rc) noexcept{if(rc!=0){error(logger,ztrtGetLastError());return false;}return true;}
 public:
     ContextImpl(IExecutionContext* o,ICudaEngine* e,ZtrtContext* c,ZtrtEngine* model,ILogger* l):owner(o),engine(e),native(c),logger(l),workspace(ztrtGetWorkspaceSize(model)){
@@ -30,7 +30,7 @@ public:
     ICudaEngine const& getEngine() const noexcept override{return *engine;}
     void setName(char const* value) noexcept override{try{name=value?value:"";}catch(...){error(logger,"context name allocation failed");}}
     char const* getName() const noexcept override{return name.c_str();}
-    void setDeviceMemory(void* p) noexcept override{externalMemory=p!=nullptr;if(externalMemory)error(logger,"ABI prototype: external workspace is unsupported");}
+    void setDeviceMemory(void* p) noexcept override{setDeviceMemoryV2(p,p?int64_t(workspace):0);}
     int32_t getOptimizationProfile() const noexcept override{return 0;}
     bool allInputDimensionsSpecified() const noexcept override{return true;}
     void setErrorRecorder(IErrorRecorder* p) noexcept override{if(p)error(logger,"ABI prototype: error recorders are unsupported");}
@@ -68,7 +68,12 @@ public:
     bool getDebugState(char const*) const noexcept override{return false;}
     bool setAllTensorsDebugState(bool enabled) noexcept override{return !enabled;}
     size_t updateDeviceMemorySizeForShapes() noexcept override{return workspace;}
-    void setDeviceMemoryV2(void* p,int64_t size) noexcept override{externalMemory=p!=nullptr||size<0;if(externalMemory)error(logger,"ABI prototype: external workspace is unsupported");}
+    void setDeviceMemoryV2(void* p,int64_t size) noexcept override{
+        externalMemory=size<0;
+        if(externalMemory){error(logger,"negative workspace size");return;}
+        externalMemory=!status(ztrtSetDeviceMemory(native,p,size_t(size)));
+        warmed=false;lastStream=nullptr;
+    }
     IRuntimeConfig* getRuntimeConfig() const noexcept override{return nullptr;}
     bool setUnfusedTensorsDebugState(bool enabled) noexcept override{return !enabled;}
     bool getUnfusedTensorsDebugState() const noexcept override{return false;}
@@ -77,14 +82,14 @@ public:
 };
 class Context final:public IExecutionContext {
 public:
-    Context(ICudaEngine* engine,ZtrtEngine* model,ILogger* logger){
-        std::unique_ptr<ZtrtContext,decltype(&ztrtDestroyExecutionContext)> native(ztrtCreateExecutionContext(model),ztrtDestroyExecutionContext);
+    Context(ICudaEngine* engine,ZtrtEngine* model,ILogger* logger,bool managed){
+        std::unique_ptr<ZtrtContext,decltype(&ztrtDestroyExecutionContext)> native(managed?ztrtCreateExecutionContextWithoutDeviceMemory(model):ztrtCreateExecutionContext(model),ztrtDestroyExecutionContext);
         if(!native)throw std::runtime_error(ztrtGetLastError());
         mImpl=new ContextImpl(this,engine,native.get(),model,logger);native.release();
     }
     ~Context() noexcept override{delete mImpl;}
 };
 }
-nvinfer1::IExecutionContext* ztrtAbiCreateContext(nvinfer1::ICudaEngine* engine,ZtrtEngine* model,nvinfer1::ILogger* logger) noexcept{
-    try{return new Context(engine,model,logger);}catch(std::exception const& e){error(logger,e.what());return nullptr;}catch(...){error(logger,"context adapter allocation failed");return nullptr;}
+nvinfer1::IExecutionContext* ztrtAbiCreateContext(nvinfer1::ICudaEngine* engine,ZtrtEngine* model,nvinfer1::ILogger* logger,bool managed) noexcept{
+    try{return new Context(engine,model,logger,managed);}catch(std::exception const& e){error(logger,e.what());return nullptr;}catch(...){error(logger,"context adapter allocation failed");return nullptr;}
 }

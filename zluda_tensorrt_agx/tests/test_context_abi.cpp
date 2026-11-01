@@ -39,7 +39,12 @@ int main(int argc,char** argv){assert(argc==2);auto path=std::getenv("ZLUDA_AGX_
     assert(c->getTensorAddress("input")==dx&&c->getOutputTensorAddress("output")==dy&&c->getMaxOutputSize("output")==24&&c->getMaxOutputSize("input")==-1);
     assert(c->enqueueV3(nullptr));check(symbol<int(*)()>(driver,"cuCtxSynchronize")());check(download(output,dy,sizeof(output)));for(int i=0;i<6;++i)assert(std::abs(output[i]-(input[i]+float(i+1)))<1e-5f);
     assert(c->setTensorAddress("input",nullptr)&&!c->enqueueV3(nullptr)&&!c->getTensorAddress("input"));assert(c->setInputTensorAddress("input",dx));
-    c->setDeviceMemory(dy);assert(!c->enqueueV3(nullptr));c->setDeviceMemory(nullptr);
+    void* scratch=nullptr;check(alloc(&scratch,256));
+    c->setDeviceMemoryV2(scratch,255);assert(!c->enqueueV3(nullptr));
+    c->setDeviceMemoryV2(static_cast<char*>(scratch)+4,256);assert(!c->enqueueV3(nullptr));
+    c->setDeviceMemory(dy);assert(!c->enqueueV3(nullptr)); // I/O/workspace overlap.
+    c->setDeviceMemory(nullptr);assert(!c->enqueueV3(nullptr));
+    c->setDeviceMemoryV2(scratch,256);assert(c->enqueueV3(nullptr));
     for(float& v:input){v*=2;}
     check(upload(dx,input,sizeof(input)));void* bindings[2]={dx,dy};assert(c->executeV2(bindings));check(download(output,dy,sizeof(output)));for(int i=0;i<6;++i)assert(std::abs(output[i]-(input[i]+float(i+1)))<1e-5f);
     void* stream=nullptr;check(symbol<int(*)(void**,unsigned)>(driver,"cuStreamCreate")(&stream,1));assert(c->setOptimizationProfileAsync(0,stream)&&!c->setOptimizationProfileAsync(1,stream));assert(c->enqueueV3(stream));check(symbol<int(*)(void*)>(driver,"cuStreamSynchronize")(stream));assert(c->isStreamCapturable(stream)&&!c->isStreamCapturable(nullptr));
@@ -57,11 +62,18 @@ int main(int argc,char** argv){assert(argc==2);auto path=std::getenv("ZLUDA_AGX_
     assert(c->setNvtxVerbosity(1)&&!c->setNvtxVerbosity(2)&&c->getNvtxVerbosity()==1);
     assert(c->setAllTensorsDebugState(false)&&!c->setAllTensorsDebugState(true)&&!c->getRuntimeConfig());
     assert(c->setCommunicator(nullptr)&&!c->setCommunicator(reinterpret_cast<void*>(uintptr_t(1))));
-    c->setDeviceMemoryV2(dy,24);assert(!c->enqueueV3(nullptr));c->setDeviceMemoryV2(nullptr,0);
+    c->setDeviceMemoryV2(dy,24);assert(!c->enqueueV3(nullptr));c->setDeviceMemoryV2(scratch,256);
     assert(c->enqueueV3(nullptr));check(symbol<int(*)()>(driver,"cuCtxSynchronize")());
     assert(!c->setInputConsumedEvent(reinterpret_cast<void*>(uintptr_t(1)))&&!c->getInputConsumedEvent());assert(c->setOutputAllocator("output",nullptr)&&!c->setOutputAllocator("output",reinterpret_cast<void*>(uintptr_t(1))));
+    // A user-managed context has no activation allocation until memory is supplied.
+    auto managed=static_cast<probe::Context*>(engine->impl->createExecutionContext(2));assert(managed);
+    auto m=managed->impl;assert(m->setInputTensorAddress("input",dx)&&m->setOutputTensorAddress("output",dy));
+    assert(!m->enqueueV3(nullptr));m->setDeviceMemoryV2(scratch,256);assert(m->executeV2(bindings));
+    delete managed; // Borrowed scratch must remain alive and usable by the first context.
+    assert(c->executeV2(bindings));check(download(output,dy,sizeof(output)));
+    for(int i=0;i<6;++i){assert(std::abs(output[i]-(input[i]+float(i+1)))<1e-5f);}
     void* other=nullptr;check(symbol<int(*)(void**,unsigned,int)>(driver,"cuCtxCreate_v2")(&other,0,0));assert(!c->enqueueV3(nullptr));
     delete object;delete engine;void* current=nullptr;check(symbol<int(*)(void**)>(driver,"cuCtxGetCurrent")(&current));assert(current==other);
-    check(symbol<int(*)(void*)>(driver,"cuCtxSetCurrent")(primary));check(symbol<int(*)(void*)>(driver,"cuCtxDestroy_v2")(other));auto free=symbol<int(*)(void*)>(driver,"cuMemFree_v2");check(free(dx));check(free(dy));
+    check(symbol<int(*)(void*)>(driver,"cuCtxSetCurrent")(primary));check(symbol<int(*)(void*)>(driver,"cuCtxDestroy_v2")(other));auto free=symbol<int(*)(void*)>(driver,"cuMemFree_v2");check(free(scratch));check(free(dx));check(free(dy));
     assert(logger.errors>=5);dlclose(library);dlclose(driver);std::cout<<"PASS: public-style context dispatch GPU execution, bindings, shapes, streams and context restoration\n";
 }

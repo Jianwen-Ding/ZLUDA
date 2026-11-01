@@ -75,6 +75,11 @@ size_t ztrtGetWorkspaceSize(const ZtrtEngine*);
 size_t ztrtGetConstantBytes(const ZtrtEngine*);
 size_t ztrtGetFusedActivationCount(const ZtrtEngine*);
 ZtrtContext* ztrtCreateExecutionContext(const ZtrtEngine*);
+/* Caller-managed workspace: 256-byte aligned, at least ztrtGetWorkspaceSize bytes.
+ * Setting memory synchronizes this context before releasing its old owned workspace.
+ * NULL/0 unbinds; caller memory is never freed. Keep it alive until queued work finishes. */
+ZtrtContext* ztrtCreateExecutionContextWithoutDeviceMemory(const ZtrtEngine*);
+int32_t ztrtSetDeviceMemory(ZtrtContext*, void*, size_t);
 void ztrtDestroyExecutionContext(ZtrtContext*);
 /* Contexts are not concurrently callable. Bindings must not overlap each other. */
 int32_t ztrtSetTensorAddress(ZtrtContext*, const char*, void*, size_t);

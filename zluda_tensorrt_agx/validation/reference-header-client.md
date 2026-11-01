@@ -1,7 +1,7 @@
 # Independent public-header client: prepared, not yet verified
 
 Current status: the reference client has NOT been compiled or run against a complete independent RTX
-header set. Existing prefix probes and four offline tool tests do not establish that result. Direct HTTPS
+header set. Existing prefix probes and eleven offline tool tests do not establish that result. Direct HTTPS
 access to NVIDIA documentation is refused in the current shell environment. The public NVIDIA/TensorRT-RTX
 GitHub repository currently contains samples/demos, not the required interface header set.
 
@@ -43,5 +43,15 @@ Offline tool checks:
 python3 zluda_tensorrt_agx/tests/test_public_header_tools.py
 ```
 
-Four pass: source-line/HTML entity extraction, missing-source rejection, missing-license rejection and
-missing-header fail-closed behavior. The actual public-header compile/run gate remains outstanding.
+Eleven offline checks pass: source/entity extraction, missing source/license rejection, complete synthetic
+snapshot and dependency-cycle extraction, hash verification, mixed project versions, misleading body-version
+mentions, incorrect version macros, missing dependencies, existing-output preservation and missing-header
+fail-closed behavior. These fixtures are synthetic, not a real public-header compilation result.
+The actual public-header compile/run gate remains outstanding.
+
+
+Snapshots now require a fresh output path. Downloads and version/license checks finish before any snapshot
+is published; all files and the manifest are staged together and the directory is renamed into place.
+A failed extraction leaves no snapshot and existing snapshots are never overwritten. Version identity comes
+from the Doxygen project-name/version label, with HTML entities decoded, rather than arbitrary page-body text.
+The native/reference client itself remains uncompiled here until independently obtained headers are available.

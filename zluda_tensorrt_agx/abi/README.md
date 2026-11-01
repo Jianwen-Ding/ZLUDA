@@ -389,6 +389,6 @@ borrowed getter triggers the expected reference-lifetime assertion. No vendor co
 
 A real reference-header client and strict snapshot/compile harness are now prepared. The reference client
 has not yet compiled or run: a complete consistent public header set is still missing in this environment.
-Four offline parser/fail-closed tests pass and do not substitute for that ABI result. See
+Eleven offline parser/snapshot/fail-closed tests pass and do not substitute for that ABI result. See
 [reference-header-client.md](../validation/reference-header-client.md) for commands, provenance checks,
 current network limitation and the exact test scope. Full reference-header validation remains outstanding.

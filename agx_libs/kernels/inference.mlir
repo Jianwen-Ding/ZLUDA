@@ -33,7 +33,55 @@ gpu.module @inference {
             %t = math.tanh %v : f32
             scf.yield %t : f32
           } else {
-            scf.yield %v : f32
+            %tag4 = arith.constant 4 : i32
+            %is4 = arith.cmpi eq, %op, %tag4 : i32
+            %result4 = scf.if %is4 -> f32 {
+              %value4 = math.sqrt %v : f32
+              scf.yield %value4 : f32
+            } else {
+              %tag5 = arith.constant 5 : i32
+            %is5 = arith.cmpi eq, %op, %tag5 : i32
+            %result5 = scf.if %is5 -> f32 {
+              %value5 = math.exp %v : f32
+              scf.yield %value5 : f32
+            } else {
+              %tag6 = arith.constant 6 : i32
+            %is6 = arith.cmpi eq, %op, %tag6 : i32
+            %result6 = scf.if %is6 -> f32 {
+              %value6 = math.log %v : f32
+              scf.yield %value6 : f32
+            } else {
+              %tag7 = arith.constant 7 : i32
+            %is7 = arith.cmpi eq, %op, %tag7 : i32
+            %result7 = scf.if %is7 -> f32 {
+              %value7 = math.absf %v : f32
+              scf.yield %value7 : f32
+            } else {
+              %tag8 = arith.constant 8 : i32
+            %is8 = arith.cmpi eq, %op, %tag8 : i32
+            %result8 = scf.if %is8 -> f32 {
+              %value8 = arith.negf %v : f32
+              scf.yield %value8 : f32
+            } else {
+              %tag9 = arith.constant 9 : i32
+            %is9 = arith.cmpi eq, %op, %tag9 : i32
+            %result9 = scf.if %is9 -> f32 {
+              %value9 = arith.divf %f1, %v : f32
+              scf.yield %value9 : f32
+            } else {
+              scf.yield %v : f32
+            }
+            scf.yield %result9 : f32
+            }
+            scf.yield %result8 : f32
+            }
+            scf.yield %result7 : f32
+            }
+            scf.yield %result6 : f32
+            }
+            scf.yield %result5 : f32
+            }
+            scf.yield %result4 : f32
           }
           scf.yield %b : f32
         }

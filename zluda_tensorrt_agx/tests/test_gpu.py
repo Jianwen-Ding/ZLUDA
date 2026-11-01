@@ -18,6 +18,18 @@ for kind in ['relu','sigmoid','tanh','identity']:
     v=np.linspace(-12,12,21,dtype='f').reshape(3,7)
     ref={'relu':lambda:np.maximum(v,0),'sigmoid':lambda:1/(1+np.exp(-v)),'tanh':lambda:np.tanh(v),'identity':lambda:v}[kind]()
     run(g,{'x':v},{f't{y}':ref})
+# Unary extensions preserve serialized graph identity and write non-workgroup tails.
+for kind,fn in [('sqrt',np.sqrt),('exp',np.exp),('log',np.log),('abs',np.abs),('neg',np.negative),('reciprocal',np.reciprocal)]:
+    value=np.linspace(.125,8,257,dtype='f')
+    if kind in ['abs','neg']:value-=4
+    g=graph();x=tensor(g,'x',[257]);y=node(g,[257],'activation',input=x,kind=kind);g['outputs']=[y]
+    run(g,{'x':value},{f't{y}':fn(value)},roundtrip=True)
+# Domain boundaries, infinities and NaNs must classify like the CPU references.
+with np.errstate(all='ignore'):
+ for kind,fn in [('sqrt',np.sqrt),('exp',np.exp),('log',np.log),('abs',np.abs),('neg',np.negative),('reciprocal',np.reciprocal)]:
+    value=np.array([-np.inf,-100.,-1.,-0.,0.,1.,100.,np.inf,np.nan],dtype='f')
+    g=graph();x=tensor(g,'x',[9]);y=node(g,[9],'activation',input=x,kind=kind);g['outputs']=[y]
+    run(g,{'x':value},{f't{y}':fn(value)})
 # Stable softmax along every axis, including non-contiguous reduction rows.
 for axis in [0,1,2,-1]:
     g=graph(); x=tensor(g,'x',[2,3,5]); y=node(g,[2,3,5],'softmax',input=x,axis=axis); g['outputs']=[y]

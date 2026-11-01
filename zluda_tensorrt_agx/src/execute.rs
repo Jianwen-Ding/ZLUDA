@@ -174,7 +174,7 @@ impl Context {
     }
     unsafe fn unary(&self, input: usize, output: usize, kind: Unary, stream: CUstream) -> Result<()> {
         let mut x = self.pointers[input]; let mut y = self.pointers[output]; let mut n = self.plan.graph.tensors[output].elements()? as i32;
-        let mut op = match kind { Unary::Relu => 0i32, Unary::Sigmoid => 1, Unary::Tanh => 2, Unary::Identity => 3 };
+        let mut op = match kind { Unary::Relu => 0i32, Unary::Sigmoid => 1, Unary::Tanh => 2, Unary::Identity => 3, Unary::Sqrt => 4, Unary::Exp => 5, Unary::Log => 6, Unary::Abs => 7, Unary::Neg => 8, Unary::Reciprocal => 9, };
         self.launch(c"agx_infer_unary", n as usize, &mut [arg(&mut x), arg(&mut y), arg(&mut n), arg(&mut op)], stream)
     }
     /// Caller owns device buffers and keeps them alive until the stream finishes. One context is not concurrently enqueued.

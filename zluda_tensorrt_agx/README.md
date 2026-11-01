@@ -20,7 +20,7 @@ In particular, do not install `libcudart.so` for this implementation. CUDA Drive
 * Contiguous **f32**, static positive dimensions, rank 0 through 8, with at most `INT32_MAX` elements per tensor.
 * Matrix multiplication of rank-2 through rank-8 operands, with batch broadcasting and either matrix operand transposed, using the tiled MLIR/AIR GEMM engine.
 * NCHW 2-D convolution, including grouped/depthwise convolution, symmetric padding, strides, dilation, and bias.
-* ReLU, sigmoid, tanh, identity; add/multiply/subtract/divide/min/max with multidimensional broadcasting.
+* ReLU, sigmoid, tanh, identity, sqrt, exp, log, abs, negation, reciprocal; add/multiply/subtract/divide/min/max with multidimensional broadcasting.
 * Stable softmax along one axis; long contiguous rows use portable `gpu.subgroup_reduce` operations.
 * Max/average 2-D pooling with padding accounting; reshape, transpose, and concatenation along any axis.
 * Named device bindings, asynchronous stream execution, independently owned execution contexts, serialization.
@@ -33,7 +33,7 @@ Convolution, bias and a single-use ReLU share one output kernel. Bindings cannot
 waits for outstanding work before freeing owned buffers. The CUDA context must outlive its prepared engines and execution contexts.
 
 ONNX import supports standard-domain opsets 13–22, IR versions 4–13, static f32 I/O, embedded f32 weights, and
-constant i64 reshape shapes. Supported operators: `MatMul`, `Gemm`, `Conv`, `Relu`, `Sigmoid`, `Tanh`, `Identity`,
+constant i64 reshape shapes. Supported operators: `MatMul`, `Gemm`, `Conv`, `Relu`, `Sigmoid`, `Tanh`, `Identity`, `Sqrt`, `Exp`, `Log`, `Abs`, `Neg`, `Reciprocal`, `LayerNormalization`,
 `ReduceSum`, `ReduceMean`, `BatchNormalization` (inference with constant parameters), `Add`, `Mul`, `Sub`, `Div`, binary `Max`/`Min`, `Softmax`, `MaxPool`, `AveragePool`, `GlobalAveragePool`, `Flatten`,
 `Reshape`, `Transpose`, `Concat`, and tensor-valued `Constant` nodes. External weights, dynamic shapes, non-f32
 execution, custom operators/plugins, control flow, asymmetric/automatic padding, dilated/ceil pooling, and opaque
@@ -50,6 +50,10 @@ semantics. Dedicated portable MLIR kernels read strided input directly, with sta
 long axes. They need no coefficient vectors or transpose operations. Multiple axes use successive reductions;
 intermediate outputs use the normal liveness-managed workspace. The C API exposes `ztrtBuilderAddReduce`, and
 the source-level C++ subset exposes `addReduce` with `kSUM` and `kAVG`.
+
+LayerNormalization supports opsets 17–22 with f32 statistics, broadcast scale and optional bias, arbitrary suffix
+axes, and optional mean/inverse-standard-deviation outputs. It currently lowers to a sequence of reductions
+and pointwise kernels; a fused implementation remains a performance target.
 
 Inference BatchNormalization precomputes channel scale/shift at model build time and lowers to existing portable
 MLIR multiply/add kernels. A following ReLU is fused into the add. Training mode and dynamic normalization

@@ -37,7 +37,7 @@ for folder in sorted(a.captures.iterdir()):
         if relu:reference=np.maximum(reference,0)
     elif name=='agx_infer_unary':
         x,y,n,op=args;v=view(x,n)
-        reference=[lambda:np.maximum(v,0),lambda:1/(1+np.exp(-v)),lambda:np.tanh(v),lambda:v][op]()
+        reference=[lambda:np.maximum(v,0),lambda:1/(1+np.exp(-v)),lambda:np.tanh(v),lambda:v,lambda:np.sqrt(v),lambda:np.exp(v),lambda:np.log(v),lambda:np.abs(v),lambda:-v,lambda:1/v][op]()
     elif name in ['agx_infer_softmax','agx_infer_softmax_simd']:
         if len(args)==4:x,y,rows,channels=args;inner=1
         else:x,y,rows,channels,inner=args

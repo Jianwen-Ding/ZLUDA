@@ -35,7 +35,7 @@ unsafe fn shape(p: *const i64, rank: usize) -> Result<Vec<usize>> {
 }
 fn pos(v: i32) -> Result<usize> { if v <= 0 { Err("expected positive integer".into()) } else { Ok(v as usize) } }
 fn nonneg(v: i32) -> Result<usize> { if v < 0 { Err("expected nonnegative integer".into()) } else { Ok(v as usize) } }
-fn unary(v: i32) -> Result<Unary> { match v { 0 => Ok(Unary::Relu), 1 => Ok(Unary::Sigmoid), 2 => Ok(Unary::Tanh), 3 => Ok(Unary::Identity), _ => Err("unsupported activation".into()) } }
+fn unary(v: i32) -> Result<Unary> { match v { 0 => Ok(Unary::Relu), 1 => Ok(Unary::Sigmoid), 2 => Ok(Unary::Tanh), 3 => Ok(Unary::Identity), 4 => Ok(Unary::Sqrt), 5 => Ok(Unary::Exp), 6 => Ok(Unary::Log), 7 => Ok(Unary::Abs), 8 => Ok(Unary::Neg), 9 => Ok(Unary::Reciprocal),  _ => Err("unsupported activation".into()) } }
 fn binary(v: i32) -> Result<Binary> { match v { 0 => Ok(Binary::Add), 1 => Ok(Binary::Mul), 2 => Ok(Binary::Sub), 3 => Ok(Binary::Div), 4 => Ok(Binary::Max), 5 => Ok(Binary::Min), _ => Err("unsupported elementwise operation".into()) } }
 
 pub struct Builder { graph: Graph, workspace_limit: usize }

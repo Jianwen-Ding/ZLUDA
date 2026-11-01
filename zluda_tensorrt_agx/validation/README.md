@@ -207,3 +207,26 @@ workspace 256 -> 0. These are initial uncontrolled-clock measurements, not a gen
 
 The repeated PTX smoke check (`native-reductions-ptx.json`) has five passes and the same known cvt-0 failure:
 O22[15] expected 0xffff, got 0x0. This checkpoint changes no PTX compiler code and makes no full-compliance claim.
+
+## Unary math and LayerNormalization
+
+Added sqrt, exp, log, abs, negation and reciprocal to the original portable MLIR unary kernel. Native graph/C
+interfaces and the C++ addUnary source interface expose them; ONNX imports the corresponding standard ops.
+LayerNormalization (opsets 17–22) lowers the public f32 formulation through centered variance, reductions,
+square root/reciprocal, and broadcast scale/optional bias. Mean and inverse-standard-deviation outputs are
+supported, including an omitted mean slot. Other stash types and invalid axis/epsilon configurations fail.
+
+All 88 GPU graphs and 90 ONNX models pass. Tests cover unary workgroup tails/serialization, negative inputs,
+zero, infinities, NaNs, suffix normalization over several axes, 1024-channel rows, zero variance, optional bias
+and statistics. Finite-suite maximum absolute error is 2.44141e-4 (GPU graphs, including exp) and 3.05176e-5
+(ONNX); relative/absolute tolerances are applied per fixture. Nonfinite tests compare classifications, not full
+IEEE bitwise equivalence. All 10 Rust tests, C++ interface tests and lifecycle tests pass.
+
+All ten kernel families replay against NumPy on AGX Performance Simulator. Captures include every unary
+selector 0–9, so the new branches are exercised rather than only the unchanged ReLU branch. The same MLIR
+source emits upstream AIR and AGX artifacts. No target hints, relaxed precision flags or proprietary code used.
+
+`layernorm.json` records the initial unfused 64x1024 workload: median enqueue/sync 436.84 us, workspace 786,688
+bytes and constants 4,100 bytes. This is a baseline for fusion work, not an optimized-throughput claim. Runtime
+model support is broader, but dtype coverage, dynamic shapes, API/ABI completeness and NVIDIA engine format
+compatibility remain unresolved. Public formula: https://onnx.ai/onnx/operators/onnx__LayerNormalization.html

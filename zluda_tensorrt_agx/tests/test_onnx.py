@@ -31,7 +31,7 @@ def attr(name,value):
     if isinstance(value,str):return text(1,name)+var(20,3)+text(4,value)
     return text(1,name)+var(20,7)+blob(8,b''.join(vi(v) for v in value))
 def op(kind,inputs,output,**attrs):
-    return b''.join(text(1,n)for n in inputs)+text(2,output)+text(4,kind)+b''.join(blob(5,attr(k,v)) for k,v in attrs.items())
+    return b''.join(text(1,n)for n in inputs)+b''.join(text(2,n) for n in (output if isinstance(output,list) else [output]))+text(4,kind)+b''.join(blob(5,attr(k,v)) for k,v in attrs.items())
 def model(inputs,outputs,nodes,initializers=(),opset=17):
     graph=b''.join(blob(1,n)for n in nodes)+b''.join(blob(5,t)for t in initializers)+b''.join(blob(11,info(n,s))for n,s in inputs)+b''.join(blob(12,info(n,s))for n,s in outputs)
     return var(1,8)+blob(7,graph)+blob(8,var(2,opset))
@@ -117,6 +117,25 @@ for axes,flags in [([1,1],{}),([3],{}),([1],{'keepdims':2}),([1],{'noop_with_emp
     buf=C.create_string_buffer(data);assert not build_onnx(buf,len(data),1<<30)
 data=model([('x',[2,3])],[('y',[2,1])],[op('ReduceMean',['x'],'y',axes=[1])],opset=18)
 buf=C.create_string_buffer(data);assert not build_onnx(buf,len(data),1<<30)
+# Portable unary math and LayerNormalization including saved statistics outputs.
+for name,fn in [('Sqrt',np.sqrt),('Exp',np.exp),('Log',np.log),('Abs',np.abs),('Neg',np.negative),('Reciprocal',np.reciprocal)]:
+    x=np.linspace(.125,8,35,dtype='f').reshape(5,7)
+    execute(model([('x',x.shape)],[('y',x.shape)],[op(name,['x'],'y')]),{'x':x},{'y':fn(x)})
+for sh,axis in [((2,3,5),-1),((2,3,5),1),((2,37),-1),((3,5),0),((2,1024),-1)]:
+ for with_bias in [False,True]:
+    x=rng.normal(size=sh).astype('f');start=axis%len(sh);axes=tuple(range(start,len(sh)))
+    scale=rng.normal(size=sh[start:]).astype('f');bias=rng.normal(size=sh[start:]).astype('f')
+    mean=x.mean(axis=axes,keepdims=True);centered=x-mean;inverse=1/np.sqrt((centered*centered).mean(axis=axes,keepdims=True)+.003)
+    y=centered*inverse*scale+(bias if with_bias else 0)
+    inits=[constant('scale',scale)]+([constant('bias',bias)] if with_bias else [])
+    data=model([('x',sh)],[('y',sh),('mean',mean.shape),('inv',inverse.shape)],[op('LayerNormalization',['x','scale']+(['bias'] if with_bias else []),['y','mean','inv'],axis=axis,epsilon=.003)],inits,opset=17)
+    execute(data,{'x':x},{'y':y,'mean':mean,'inv':inverse})
+# Saved inverse output can skip the optional mean slot; constant input has zero variance.
+x=np.full((2,5),4.,dtype='f');scale=np.ones(5,dtype='f');inv=np.full((2,1),1/np.sqrt(.003),dtype='f')
+execute(model([('x',x.shape)],[('y',x.shape),('inv',inv.shape)],[op('LayerNormalization',['x','scale'],['y','','inv'],epsilon=.003)],[constant('scale',scale)],opset=17),{'x':x},{'y':np.zeros_like(x),'inv':inv})
+for attributes in [{'epsilon':-.01},{'stash_type':10},{'axis':3}]:
+    data=model([('x',[2,5])],[('y',[2,5])],[op('LayerNormalization',['x','scale'],'y',**attributes)],[constant('scale',np.ones(5))],opset=17)
+    buf=C.create_string_buffer(data);assert not build_onnx(buf,len(data),1<<30)
 # Malformed metadata and unsupported operators/attributes are explicit failures.
 for bad in [b'\0',b'\x80'*11,b'\x3a\xff\xff\xff\xff\x7f',model([('x',[2,3])],[('y',[2,3])],[op('Relu',['x'],'y',unknown=1)]),model([('x',[2,3])],[('y',[2,3])],[op('Erf',['x'],'y')]),model([('x',[2,3])],[('y',[2,3])],[op('Relu',['x'],'y')],opset=12)]:
     buf=C.create_string_buffer(bad);assert not build_onnx(buf,len(bad),1<<30),bad

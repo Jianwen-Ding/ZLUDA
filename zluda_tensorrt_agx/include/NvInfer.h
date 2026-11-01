@@ -17,6 +17,7 @@ enum class DataType : int32_t { kFLOAT=0, kHALF=1, kINT8=2, kINT32=3, kBOOL=4 };
 enum class TensorIOMode : int32_t { kNONE=-1, kINPUT=0, kOUTPUT=1 };
 enum class ActivationType : int32_t { kRELU=0, kSIGMOID=1, kTANH=2 };
 enum class ElementWiseOperation : int32_t { kSUM=0, kPROD=1, kSUB=2, kDIV=3, kMAX=4, kMIN=5 };
+enum class UnaryOperation : int32_t { kEXP=0, kLOG=1, kSQRT=2, kRECIP=3, kABS=4, kNEG=5 };
 enum class ReduceOperation : int32_t { kSUM=0, kPROD=1, kMAX=2, kMIN=3, kAVG=4 };
 enum class MatrixOperation : int32_t { kNONE=0, kTRANSPOSE=1, kVECTOR=2 };
 enum class PoolingType : int32_t { kMAX=0, kAVERAGE=1 };
@@ -117,6 +118,7 @@ public:
 class IActivationLayer : public ILayer { public: using ILayer::ILayer; };
 class IElementWiseLayer : public ILayer { public: using ILayer::ILayer; };
 class IMatrixMultiplyLayer : public ILayer { public: using ILayer::ILayer; };
+class IUnaryLayer : public ILayer { public: using ILayer::ILayer; };
 class IReduceLayer : public ILayer { public: using ILayer::ILayer; };
 class IConstantLayer : public ILayer { public: using ILayer::ILayer; };
 
@@ -159,6 +161,14 @@ public:
     IConstantLayer* addConstant(Dims dims,Weights weights) { return layer<IConstantLayer>(constant(dims,weights)); }
     IActivationLayer* addActivation(ITensor& x,ActivationType type) { return layer<IActivationLayer>(ztrtBuilderAddActivation(mBuilder,x.id(),int32_t(type))); }
     ILayer* addIdentity(ITensor& x) { return layer<ILayer>(ztrtBuilderAddActivation(mBuilder,x.id(),ZTRT_IDENTITY)); }
+    IUnaryLayer* addUnary(ITensor& x,UnaryOperation op) {
+        int32_t kind;
+        switch(op){case UnaryOperation::kEXP:kind=ZTRT_EXP;break;case UnaryOperation::kLOG:kind=ZTRT_LOG;break;
+            case UnaryOperation::kSQRT:kind=ZTRT_SQRT;break;case UnaryOperation::kRECIP:kind=ZTRT_RECIPROCAL;break;
+            case UnaryOperation::kABS:kind=ZTRT_ABS;break;case UnaryOperation::kNEG:kind=ZTRT_NEG;break;
+            default:report(mLogger,"unsupported unary operation");return nullptr;}
+        return layer<IUnaryLayer>(ztrtBuilderAddActivation(mBuilder,x.id(),kind));
+    }
     IReduceLayer* addReduce(ITensor& x,ReduceOperation op,uint32_t axes,bool keepDimensions) {
         if(op!=ReduceOperation::kSUM && op!=ReduceOperation::kAVG){report(mLogger,"only sum and average reductions are supported");return nullptr;}
         return layer<IReduceLayer>(ztrtBuilderAddReduce(mBuilder,x.id(),axes,op==ReduceOperation::kAVG?1:0,keepDimensions?1:0));

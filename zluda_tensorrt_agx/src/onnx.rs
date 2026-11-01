@@ -155,11 +155,17 @@ pub fn import(data:&[u8])->Result<Graph>{
         if !text(&n,8)?.is_empty(){return Err("ONNX local function overloads are not supported".into());}
         let inputs=nested(&n,1).map(|v|std::str::from_utf8(v?).map(str::to_owned).map_err(|e|e.to_string())).collect::<Result<Vec<_>>>()?;
         let outputs=nested(&n,2).map(|v|std::str::from_utf8(v?).map(str::to_owned).map_err(|e|e.to_string())).collect::<Result<Vec<_>>>()?;
-        if outputs.len()!=1 || outputs[0].is_empty() || ids.contains_key(&outputs[0]) || ints.contains_key(&outputs[0]){return Err(format!("{kind} requires one unique output"));}
+        if outputs.is_empty() || outputs[0].is_empty() || (kind!="LayerNormalization" && outputs.len()!=1) || outputs.len()>3 {
+            return Err(format!("unsupported {kind} output count"));
+        }
+        let mut seen=std::collections::HashSet::new();
+        for name in outputs.iter().filter(|s|!s.is_empty()) {
+            if !seen.insert(name)||ids.contains_key(name)||ints.contains_key(name){return Err("duplicate ONNX output name".into());}
+        }
         let expected = match kind.as_str() {
             "MatMul"|"Add"|"Mul"|"Sub"|"Div"|"Max"|"Min"|"Reshape" => 2..=2,
             "ReduceSum" => 1..=2, "ReduceMean" if opset.unwrap()>=18 => 1..=2,
-            "BatchNormalization" => 5..=5, "Gemm"|"Conv" => 2..=3, "Constant" => 0..=0, "Concat" => 1..=MAX_TENSORS,
+            "LayerNormalization" => 2..=3, "BatchNormalization" => 5..=5, "Gemm"|"Conv" => 2..=3, "Constant" => 0..=0, "Concat" => 1..=MAX_TENSORS,
             _ => 1..=1,
         };
         if !expected.contains(&inputs.len()) { return Err(format!("{kind}: wrong number of inputs")); }
@@ -199,6 +205,31 @@ pub fn import(data:&[u8])->Result<Graph>{
                 g.add_node(Op::ElementWise{a:get(0)?,b:get(1)?,kind:match kind.as_str(){"Add"=>Binary::Add,"Mul"=>Binary::Mul,"Sub"=>Binary::Sub,"Div"=>Binary::Div,"Max"=>Binary::Max,_=>Binary::Min}})?
             }
             "Relu"|"Sigmoid"|"Tanh"|"Identity"=>g.add_node(Op::Activation{input:get(0)?,kind:match kind.as_str(){"Relu"=>Unary::Relu,"Sigmoid"=>Unary::Sigmoid,"Tanh"=>Unary::Tanh,_=>Unary::Identity}})?,
+            "LayerNormalization"=>{
+                if opset.unwrap()<17{return Err("LayerNormalization requires opset >= 17".into());}
+                let x=get(0)?;let scale=get(1)?;let shape=g.tensors[x].shape.clone();
+                let axis=axis_index(take_int(&mut attrs,"axis",-1)? as isize,shape.len())?;
+                let epsilon=take_float(&mut attrs,"epsilon",1e-5)?;
+                if epsilon<0. || take_int(&mut attrs,"stash_type",1)?!=1{return Err("LayerNormalization requires nonnegative epsilon and f32 statistics".into());}
+                if broadcast(&shape,&g.tensors[scale].shape)?!=shape{return Err("LayerNormalization scale is not broadcastable to input".into());}
+                let bias=if inputs.get(2).is_some_and(|v|!v.is_empty()){Some(get(2)?)}else{None};
+                if let Some(b)=bias{if broadcast(&shape,&g.tensors[b].shape)?!=shape{return Err("LayerNormalization bias is not broadcastable to input".into());}}
+                let mut mean=x;
+                for a in (axis..shape.len()).rev(){mean=g.add_node(Op::Reduce{input:mean,axis:a as isize,mean:true,keepdims:true})?;}
+                let centered=g.add_node(Op::ElementWise{a:x,b:mean,kind:Binary::Sub})?;
+                let mut variance=g.add_node(Op::ElementWise{a:centered,b:centered,kind:Binary::Mul})?;
+                for a in (axis..shape.len()).rev(){variance=g.add_node(Op::Reduce{input:variance,axis:a as isize,mean:true,keepdims:true})?;}
+                let eps=g.add_input(format!("__onnx_ln_epsilon_{}",g.tensors.len()),vec![],Some(vec![epsilon]))?;
+                let variance=g.add_node(Op::ElementWise{a:variance,b:eps,kind:Binary::Add})?;
+                let denominator=g.add_node(Op::Activation{input:variance,kind:Unary::Sqrt})?;
+                let inverse=g.add_node(Op::Activation{input:denominator,kind:Unary::Reciprocal})?;
+                for (at,tensor) in [(1,mean),(2,inverse)] {
+                    if let Some(name)=outputs.get(at).filter(|s|!s.is_empty()) {g.tensors[tensor].name=name.clone();ids.insert(name.clone(),tensor);}
+                }
+                let normalized=g.add_node(Op::ElementWise{a:centered,b:inverse,kind:Binary::Mul})?;
+                let y=g.add_node(Op::ElementWise{a:normalized,b:scale,kind:Binary::Mul})?;
+                if let Some(b)=bias{g.add_node(Op::ElementWise{a:y,b,kind:Binary::Add})?}else{y}
+            }
             "BatchNormalization"=>{
                 let x=get(0)?; let shape=g.tensors[x].shape.clone();
                 if shape.len()<2{return Err("BatchNormalization needs a channel axis".into());}
@@ -225,6 +256,12 @@ pub fn import(data:&[u8])->Result<Graph>{
                 let y=g.add_node(Op::ElementWise{a:x,b:a,kind:Binary::Mul})?;
                 g.add_node(Op::ElementWise{a:y,b,kind:Binary::Add})?
             }
+            "Sqrt"=>g.add_node(Op::Activation{input:get(0)?,kind:Unary::Sqrt})?,
+            "Exp"=>g.add_node(Op::Activation{input:get(0)?,kind:Unary::Exp})?,
+            "Log"=>g.add_node(Op::Activation{input:get(0)?,kind:Unary::Log})?,
+            "Abs"=>g.add_node(Op::Activation{input:get(0)?,kind:Unary::Abs})?,
+            "Neg"=>g.add_node(Op::Activation{input:get(0)?,kind:Unary::Neg})?,
+            "Reciprocal"=>g.add_node(Op::Activation{input:get(0)?,kind:Unary::Reciprocal})?,
             "Softmax"=>g.add_node(Op::Softmax{input:get(0)?,axis:take_int(&mut attrs,"axis",-1)? as isize})?,
             "Conv"=>{
                 let x=get(0)?;let w=get(1)?;let shape=&g.tensors[w].shape;

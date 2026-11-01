@@ -37,6 +37,8 @@ int main(int argc,char** argv){
     std::unique_ptr<nvonnxparser::IParser> parser(nvonnxparser::createParser(*other,logger));assert(!parser->parse(bad,sizeof(bad)));assert(parser->getNbErrors()==1&&parser->getError(0));
     std::unique_ptr<INetworkDefinition> reduced(builder->createNetworkV2(0));
     auto rx=reduced->addInput("reduction_input",DataType::kFLOAT,Dims3(2,3,4));assert(rx);
+    auto squareRoot=reduced->addUnary(*rx,UnaryOperation::kSQRT);assert(squareRoot);
+    assert(!reduced->addUnary(*rx,static_cast<UnaryOperation>(999)));
     auto sum=reduced->addReduce(*rx,ReduceOperation::kSUM,5,false);assert(sum);
     auto rd=sum->getOutput(0)->getDimensions();assert(rd.nbDims==1&&rd.d[0]==3);
     auto avg=reduced->addReduce(*rx,ReduceOperation::kAVG,2,true);assert(avg);

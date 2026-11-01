@@ -28,7 +28,7 @@ pub fn elements(shape: &[usize]) -> Result<usize> {
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum Unary { Relu, Sigmoid, Tanh, Identity }
+pub enum Unary { Relu, Sigmoid, Tanh, Identity, Sqrt, Exp, Log, Abs, Neg, Reciprocal }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Binary { Add, Mul, Sub, Div, Max, Min }

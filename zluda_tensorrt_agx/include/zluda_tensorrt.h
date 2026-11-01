@@ -13,7 +13,7 @@ typedef struct ZtrtBuilder ZtrtBuilder;
 typedef struct ZtrtRuntime ZtrtRuntime;
 typedef struct ZtrtEngine ZtrtEngine;
 typedef struct ZtrtContext ZtrtContext;
-enum ZtrtUnary { ZTRT_RELU=0, ZTRT_SIGMOID=1, ZTRT_TANH=2, ZTRT_IDENTITY=3 };
+enum ZtrtUnary { ZTRT_RELU=0, ZTRT_SIGMOID=1, ZTRT_TANH=2, ZTRT_IDENTITY=3, ZTRT_SQRT=4, ZTRT_EXP=5, ZTRT_LOG=6, ZTRT_ABS=7, ZTRT_NEG=8, ZTRT_RECIPROCAL=9 };
 enum ZtrtBinary { ZTRT_ADD=0, ZTRT_MUL=1, ZTRT_SUB=2, ZTRT_DIV=3, ZTRT_MAX=4, ZTRT_MIN=5 };
 enum ZtrtPool { ZTRT_MAX_POOL=0, ZTRT_AVG_POOL=1 };
 uint32_t ztrtGetVersion(void);

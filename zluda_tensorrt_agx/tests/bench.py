@@ -15,6 +15,10 @@ g=graph();x=tensor(g,'x',[16,16,16,16]);b=tensor(g,'b',[16,16,16,16]);y=node(g,[
 g=graph();x=tensor(g,'x',[8,64,64]);w=tensor(g,'weights',[64,64],rng.normal(size=[64,64]));y=node(g,[8,64,64],'mat_mul',a=x,b=w);g['outputs']=[y];cases.append(('broadcast_matmul_8x64',g))
 g=graph();x=tensor(g,'x',[64,4096]);w=tensor(g,'coefficients',[4096,1],np.ones((4096,1),dtype='f'));y=node(g,[64,1],'mat_mul',a=x,b=w);y=node(g,[64],'reshape',input=y,shape=[64]);g['outputs']=[y];cases.append(('lowered_reduce_sum_64x4096',g))
 g=graph();x=tensor(g,'x',[64,4096]);y=node(g,[64],'reduce',input=x,axis=1,mean=False,keepdims=False);g['outputs']=[y];cases.append(('native_reduce_sum_64x4096',g))
+g=graph();x=tensor(g,'x',[64,1024]);scale=tensor(g,'scale',[1024],np.ones(1024,dtype='f'));eps=tensor(g,'epsilon',[],np.array(.003,dtype='f'))
+mean=node(g,[64,1],'reduce',input=x,axis=1,mean=True,keepdims=True);center=node(g,[64,1024],'element_wise',a=x,b=mean,kind='sub');sq=node(g,[64,1024],'element_wise',a=center,b=center,kind='mul')
+var=node(g,[64,1],'reduce',input=sq,axis=1,mean=True,keepdims=True);var=node(g,[64,1],'element_wise',a=var,b=eps,kind='add');std=node(g,[64,1],'activation',input=var,kind='sqrt');inv=node(g,[64,1],'activation',input=std,kind='reciprocal')
+y=node(g,[64,1024],'element_wise',a=center,b=inv,kind='mul');y=node(g,[64,1024],'element_wise',a=y,b=scale,kind='mul');g['outputs']=[y];cases.append(('layer_norm_64x1024',g))
 results=[]
 for name,g in cases:
     data=json.dumps(g,separators=(',',':')).encode();source=C.create_string_buffer(data);start=time.perf_counter_ns();e=ck(build(source,len(data),1<<30));build_ms=(time.perf_counter_ns()-start)/1e6

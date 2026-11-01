@@ -214,6 +214,9 @@ pub fn import(data:&[u8])->Result<Graph>{
                 if broadcast(&shape,&g.tensors[scale].shape)?!=shape{return Err("LayerNormalization scale is not broadcastable to input".into());}
                 let bias=if inputs.get(2).is_some_and(|v|!v.is_empty()){Some(get(2)?)}else{None};
                 if let Some(b)=bias{if broadcast(&shape,&g.tensors[b].shape)?!=shape{return Err("LayerNormalization bias is not broadcastable to input".into());}}
+                let normalized=if outputs.iter().skip(1).all(|s|s.is_empty()) {
+                    g.add_node(Op::LayerNorm{input:x,axis:axis as isize,epsilon})?
+                }else{
                 let mut mean=x;
                 for a in (axis..shape.len()).rev(){mean=g.add_node(Op::Reduce{input:mean,axis:a as isize,mean:true,keepdims:true})?;}
                 let centered=g.add_node(Op::ElementWise{a:x,b:mean,kind:Binary::Sub})?;
@@ -226,7 +229,8 @@ pub fn import(data:&[u8])->Result<Graph>{
                 for (at,tensor) in [(1,mean),(2,inverse)] {
                     if let Some(name)=outputs.get(at).filter(|s|!s.is_empty()) {g.tensors[tensor].name=name.clone();ids.insert(name.clone(),tensor);}
                 }
-                let normalized=g.add_node(Op::ElementWise{a:centered,b:inverse,kind:Binary::Mul})?;
+                g.add_node(Op::ElementWise{a:centered,b:inverse,kind:Binary::Mul})?
+                };
                 let y=g.add_node(Op::ElementWise{a:normalized,b:scale,kind:Binary::Mul})?;
                 if let Some(b)=bias{g.add_node(Op::ElementWise{a:y,b,kind:Binary::Add})?}else{y}
             }

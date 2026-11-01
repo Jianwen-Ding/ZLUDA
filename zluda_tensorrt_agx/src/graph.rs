@@ -49,6 +49,7 @@ pub enum Op {
     Pool2d { input: usize, kind: Pool, window: [usize; 2], #[serde(default = "pair_one")] stride: [usize; 2],
         #[serde(default)] padding: [usize; 2], #[serde(default)] include_padding: bool },
     Softmax { input: usize, axis: isize },
+    LayerNorm { input: usize, axis: isize, epsilon: f32 },
     Reduce { input: usize, axis: isize, mean: bool, keepdims: bool },
     Reshape { input: usize, shape: Vec<usize> },
     Transpose { input: usize, permutation: Vec<usize> },
@@ -61,7 +62,7 @@ impl Op {
             Self::Conv2d { input, weights, bias, .. } => { *input = map[*input]; *weights = map[*weights]; if let Some(b) = bias { *b = map[*b]; } }
             Self::Concat { inputs, .. } => { for i in inputs { *i = map[*i]; } }
             Self::Activation { input, .. } | Self::Pool2d { input, .. } | Self::Softmax { input, .. }
-                | Self::Reshape { input, .. } | Self::Transpose { input, .. } | Self::Reduce { input, .. } => *input = map[*input],
+                | Self::Reshape { input, .. } | Self::Transpose { input, .. } | Self::Reduce { input, .. } | Self::LayerNorm { input, .. } => *input = map[*input],
         }
     }
     pub fn inputs(&self) -> Vec<usize> {
@@ -70,7 +71,7 @@ impl Op {
             Self::Conv2d { input, weights, bias, .. } => { let mut v = vec![*input, *weights]; v.extend(*bias); v },
             Self::Concat { inputs, .. } => inputs.clone(),
             Self::Activation { input, .. } | Self::Pool2d { input, .. } | Self::Softmax { input, .. }
-                | Self::Reshape { input, .. } | Self::Transpose { input, .. } | Self::Reduce { input, .. } => vec![*input],
+                | Self::Reshape { input, .. } | Self::Transpose { input, .. } | Self::Reduce { input, .. } | Self::LayerNorm { input, .. } => vec![*input],
         }
     }
     pub fn shape(&self, tensors: &[Tensor]) -> Result<Vec<usize>> {
@@ -102,6 +103,10 @@ impl Op {
                 vec![x[0], x[1], spatial(x[2], window[0], padding[0], stride[0], 1)?, spatial(x[3], window[1], padding[1], stride[1], 1)?]
             }
             Self::Softmax { input, axis } => { let x = get(*input)?; axis_index(*axis, x.len())?; x.to_vec() },
+            Self::LayerNorm { input, axis, epsilon } => {
+                let shape=get(*input)?;axis_index(*axis,shape.len())?;
+                if !epsilon.is_finite()||*epsilon<0.{return Err("invalid LayerNorm epsilon".into());}shape.to_vec()
+            }
             Self::Reduce { input, axis, keepdims, .. } => {
                 let mut shape=get(*input)?.to_vec();let axis=axis_index(*axis,shape.len())?;
                 if *keepdims{shape[axis]=1;}else{shape.remove(axis);}shape

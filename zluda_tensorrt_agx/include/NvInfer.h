@@ -118,6 +118,14 @@ public:
 class IActivationLayer : public ILayer { public: using ILayer::ILayer; };
 class IElementWiseLayer : public ILayer { public: using ILayer::ILayer; };
 class IMatrixMultiplyLayer : public ILayer { public: using ILayer::ILayer; };
+class INormalizationLayer : public ILayer {
+    int32_t mCore;
+    float mEpsilon=1e-5f;
+public:
+    INormalizationLayer(ITensor* out,ZtrtBuilder* b,ILogger* l,int32_t core):ILayer(out,b,l),mCore(core){}
+    void setEpsilon(float epsilon){mEpsilon=epsilon;accept(ztrtBuilderConfigureLayerNorm(mBuilder,mCore,epsilon));}
+    float getEpsilon() const{return mEpsilon;}
+};
 class IUnaryLayer : public ILayer { public: using ILayer::ILayer; };
 class IReduceLayer : public ILayer { public: using ILayer::ILayer; };
 class IConstantLayer : public ILayer { public: using ILayer::ILayer; };
@@ -161,6 +169,19 @@ public:
     IConstantLayer* addConstant(Dims dims,Weights weights) { return layer<IConstantLayer>(constant(dims,weights)); }
     IActivationLayer* addActivation(ITensor& x,ActivationType type) { return layer<IActivationLayer>(ztrtBuilderAddActivation(mBuilder,x.id(),int32_t(type))); }
     ILayer* addIdentity(ITensor& x) { return layer<ILayer>(ztrtBuilderAddActivation(mBuilder,x.id(),ZTRT_IDENTITY)); }
+    INormalizationLayer* addNormalization(ITensor& x,ITensor& scale,ITensor& bias,uint32_t axes) {
+        auto shape=x.getDimensions();
+        if(shape.nbDims<1||shape.nbDims>8||axes==0||(axes>>shape.nbDims)!=0){report(mLogger,"invalid normalization axes");return nullptr;}
+        int32_t axis=0;while((axes&(1u<<axis))==0)++axis;
+        if(axes!=(((1u<<shape.nbDims)-1)^((1u<<axis)-1))){report(mLogger,"normalization currently requires suffix axes");return nullptr;}
+        auto compatible=[&](ITensor& value){auto d=value.getDimensions();if(d.nbDims<0||d.nbDims>shape.nbDims)return false;
+            for(int i=0;i<d.nbDims;++i){if(d.d[i]!=1&&d.d[i]!=shape.d[shape.nbDims-d.nbDims+i])return false;}
+            return true;};
+        if(!compatible(scale)||!compatible(bias)){report(mLogger,"normalization scale/bias are not broadcastable");return nullptr;}
+        int32_t core=ztrtBuilderAddLayerNorm(mBuilder,x.id(),axis,1e-5f);if(core<0){report(mLogger);return nullptr;}
+        int32_t scaled=ztrtBuilderAddElementWise(mBuilder,core,scale.id(),ZTRT_MUL);if(scaled<0){report(mLogger);return nullptr;}
+        return layer<INormalizationLayer>(ztrtBuilderAddElementWise(mBuilder,scaled,bias.id(),ZTRT_ADD),core);
+    }
     IUnaryLayer* addUnary(ITensor& x,UnaryOperation op) {
         int32_t kind;
         switch(op){case UnaryOperation::kEXP:kind=ZTRT_EXP;break;case UnaryOperation::kLOG:kind=ZTRT_LOG;break;

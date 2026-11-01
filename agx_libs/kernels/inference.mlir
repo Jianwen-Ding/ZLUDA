@@ -591,4 +591,104 @@ gpu.module @inference {
     }
     gpu.return
   }
+
+  // Fused two-pass centered statistics and normalization, using only standard MLIR.
+  gpu.func @agx_infer_layer_norm(%x0: memref<1xf32, 1>, %y0: memref<1xf32, 1>, %rows_: i32, %channels_: i32, %epsilon: f32) kernel {
+    %big = arith.constant 2147483647 : index
+    %x = memref.reinterpret_cast %x0 to offset: [0], sizes: [%big], strides: [1] : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %y = memref.reinterpret_cast %y0 to offset: [0], sizes: [%big], strides: [1] : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %zero = arith.constant 0 : index
+    %fzero = arith.constant 0.0 : f32
+    %fone = arith.constant 1.0 : f32
+    %id = gpu.global_id x
+    %width = arith.constant 1 : index
+    %lane = arith.constant 0 : index
+    %row = arith.addi %id, %zero : index
+    %rows = arith.index_cast %rows_ : i32 to index
+    %channels = arith.index_cast %channels_ : i32 to index
+    %count = arith.sitofp %channels_ : i32 to f32
+    %live = arith.cmpi ult, %row, %rows : index
+    scf.if %live {
+      %base = arith.muli %row, %channels : index
+      %local = scf.for %c = %lane to %channels step %width iter_args(%acc = %fzero) -> f32 {
+        %at = arith.addi %base, %c : index
+        %v = memref.load %x[%at] : memref<?xf32, strided<[1]>, 1>
+        %next = arith.addf %acc, %v : f32
+        scf.yield %next : f32
+      }
+      %sum = arith.addf %local, %fzero : f32
+      %mean = arith.divf %sum, %count : f32
+      %localvar = scf.for %c = %lane to %channels step %width iter_args(%acc = %fzero) -> f32 {
+        %at = arith.addi %base, %c : index
+        %v = memref.load %x[%at] : memref<?xf32, strided<[1]>, 1>
+        %d = arith.subf %v, %mean : f32
+        %squared = arith.mulf %d, %d : f32
+        %next = arith.addf %acc, %squared : f32
+        scf.yield %next : f32
+      }
+      %totalvar = arith.addf %localvar, %fzero : f32
+      %variance = arith.divf %totalvar, %count : f32
+      %regularized = arith.addf %variance, %epsilon : f32
+      %std = math.sqrt %regularized : f32
+      %inverse = arith.divf %fone, %std : f32
+      scf.for %c = %lane to %channels step %width {
+        %at = arith.addi %base, %c : index
+        %v = memref.load %x[%at] : memref<?xf32, strided<[1]>, 1>
+        %d = arith.subf %v, %mean : f32
+        %normalized = arith.mulf %d, %inverse : f32
+        memref.store %normalized, %y[%at] : memref<?xf32, strided<[1]>, 1>
+      }
+    }
+    gpu.return
+  }
+
+  // Fused two-pass centered statistics and normalization, using only standard MLIR.
+  gpu.func @agx_infer_layer_norm_simd(%x0: memref<1xf32, 1>, %y0: memref<1xf32, 1>, %rows_: i32, %channels_: i32, %epsilon: f32) kernel {
+    %big = arith.constant 2147483647 : index
+    %x = memref.reinterpret_cast %x0 to offset: [0], sizes: [%big], strides: [1] : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %y = memref.reinterpret_cast %y0 to offset: [0], sizes: [%big], strides: [1] : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %zero = arith.constant 0 : index
+    %fzero = arith.constant 0.0 : f32
+    %fone = arith.constant 1.0 : f32
+    %id = gpu.global_id x
+    %width = gpu.subgroup_size : index
+    %lane = gpu.lane_id
+    %row = arith.divui %id, %width : index
+    %rows = arith.index_cast %rows_ : i32 to index
+    %channels = arith.index_cast %channels_ : i32 to index
+    %count = arith.sitofp %channels_ : i32 to f32
+    %live = arith.cmpi ult, %row, %rows : index
+    scf.if %live {
+      %base = arith.muli %row, %channels : index
+      %local = scf.for %c = %lane to %channels step %width iter_args(%acc = %fzero) -> f32 {
+        %at = arith.addi %base, %c : index
+        %v = memref.load %x[%at] : memref<?xf32, strided<[1]>, 1>
+        %next = arith.addf %acc, %v : f32
+        scf.yield %next : f32
+      }
+      %sum = gpu.subgroup_reduce add %local : (f32) -> f32
+      %mean = arith.divf %sum, %count : f32
+      %localvar = scf.for %c = %lane to %channels step %width iter_args(%acc = %fzero) -> f32 {
+        %at = arith.addi %base, %c : index
+        %v = memref.load %x[%at] : memref<?xf32, strided<[1]>, 1>
+        %d = arith.subf %v, %mean : f32
+        %squared = arith.mulf %d, %d : f32
+        %next = arith.addf %acc, %squared : f32
+        scf.yield %next : f32
+      }
+      %totalvar = gpu.subgroup_reduce add %localvar : (f32) -> f32
+      %variance = arith.divf %totalvar, %count : f32
+      %regularized = arith.addf %variance, %epsilon : f32
+      %std = math.sqrt %regularized : f32
+      %inverse = arith.divf %fone, %std : f32
+      scf.for %c = %lane to %channels step %width {
+        %at = arith.addi %base, %c : index
+        %v = memref.load %x[%at] : memref<?xf32, strided<[1]>, 1>
+        %d = arith.subf %v, %mean : f32
+        %normalized = arith.mulf %d, %inverse : f32
+        memref.store %normalized, %y[%at] : memref<?xf32, strided<[1]>, 1>
+      }
+    }
+    gpu.return
+  }
 }

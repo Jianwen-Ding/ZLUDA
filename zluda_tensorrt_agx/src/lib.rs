@@ -110,6 +110,19 @@ unsafe fn copy_shape(s: &[usize], p: *mut i64, capacity: usize) -> Result<i32> {
 #[no_mangle] pub unsafe extern "C" fn ztrtBuilderAddActivation(p: *mut Builder, input: i32, kind: i32) -> i32 {
     boundary(-1, || Ok(object_mut(p)?.graph.add_node(Op::Activation { input: id(input)?, kind: unary(kind)? })? as i32))
 }
+/// Fused unscaled suffix normalization; scale and bias can be added as elementwise operations.
+#[no_mangle] pub unsafe extern "C" fn ztrtBuilderAddLayerNorm(p:*mut Builder,input:i32,axis:i32,epsilon:f32)->i32 {
+    boundary(-1,||Ok(object_mut(p)?.graph.add_node(Op::LayerNorm{input:id(input)?,axis:axis as isize,epsilon})? as i32))
+}
+#[no_mangle] pub unsafe extern "C" fn ztrtBuilderConfigureLayerNorm(p:*mut Builder,output:i32,epsilon:f32)->i32 {
+    boundary(-1,||{
+        let g=&mut object_mut(p)?.graph;let output=id(output)?;
+        let at=g.nodes.iter().position(|n|n.output==output).ok_or("unknown normalization layer")?;
+        let mut candidate=g.nodes[at].operation.clone();
+        if let Op::LayerNorm{epsilon:e,..}=&mut candidate{*e=epsilon;}else{return Err("expected normalization layer".into());}
+        candidate.shape(&g.tensors)?;g.nodes[at].operation=candidate;Ok(0)
+    })
+}
 /// Independent reduction API: kind 0 = sum, kind 1 = mean; axes are a rank-relative bitmask.
 #[no_mangle] pub unsafe extern "C" fn ztrtBuilderAddReduce(p:*mut Builder,input:i32,axes:u32,kind:i32,keepdims:i32)->i32 {
     boundary(-1,||{

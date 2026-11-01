@@ -101,6 +101,11 @@ impl Resources {
                 }
                 Op::Activation { .. } => { get(agx_libs::INFERENCE, c"agx_infer_unary")?; None }
                 Op::Pool2d { .. } => { get(agx_libs::INFERENCE, c"agx_infer_pool")?; None }
+                Op::LayerNorm { input, axis, .. } => {
+                    let shape=&plan.graph.tensors[*input].shape;let axis=axis_index(*axis,shape.len())?;
+                    let channels:usize=shape[axis..].iter().product();
+                    get(agx_libs::INFERENCE,if channels>=32 {c"agx_infer_layer_norm_simd"}else{c"agx_infer_layer_norm"})?;None
+                }
                 Op::Reduce { input, axis, .. } => {
                     let shape=&plan.graph.tensors[*input].shape;let axis=axis_index(*axis,shape.len())?;
                     get(agx_libs::INFERENCE,if shape[axis]>=32 {c"agx_infer_reduce_simd"}else{c"agx_infer_reduce"})?;None
@@ -252,6 +257,14 @@ impl Context {
                     let mut params = vec![arg(&mut xp), arg(&mut wp), arg(&mut bp), arg(&mut yp)];
                     params.extend(args.iter_mut().map(arg));
                     self.launch(c"agx_infer_conv2d", n, &mut params, stream)?;
+                }
+                Op::LayerNorm { input, axis, epsilon } => {
+                    let shape=&g.tensors[*input].shape;let axis=axis_index(*axis,shape.len())?;
+                    let mut channels=shape[axis..].iter().product::<usize>() as i32;
+                    let mut rows=(n/channels as usize) as i32;let mut epsilon=*epsilon;
+                    let mut x=self.pointers[*input];let mut y=self.pointers[yid];let simd=channels>=32;
+                    self.launch(if simd{c"agx_infer_layer_norm_simd"}else{c"agx_infer_layer_norm"},rows as usize*if simd{32}else{1},
+                        &mut[arg(&mut x),arg(&mut y),arg(&mut rows),arg(&mut channels),arg(&mut epsilon)],stream)?;
                 }
                 Op::Reduce { input, axis, mean, .. } => {
                     let shape=&g.tensors[*input].shape;let axis=axis_index(*axis,shape.len())?;

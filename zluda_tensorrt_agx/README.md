@@ -53,7 +53,9 @@ the source-level C++ subset exposes `addReduce` with `kSUM` and `kAVG`.
 
 LayerNormalization supports opsets 17–22 with f32 statistics, broadcast scale and optional bias, arbitrary suffix
 axes, and optional mean/inverse-standard-deviation outputs. It currently lowers to a sequence of reductions
-and pointwise kernels; a fused implementation remains a performance target.
+and pointwise kernels when saved statistics are requested. Output-only inference uses a fused portable
+statistics/normalization kernel followed by broadcast scale and optional bias. The source-level C++ builder
+also supports suffix-axis `addNormalization` and epsilon configuration; arbitrary axis masks remain unsupported.
 
 Inference BatchNormalization precomputes channel scale/shift at model build time and lowers to existing portable
 MLIR multiply/add kernels. A following ReLU is fused into the add. Training mode and dynamic normalization
@@ -139,7 +141,7 @@ the AGX Performance Simulator:
 
 ```sh
 ZLUDA_AGX_CAPTURE=/tmp/inference-captures \
-ZLUDA_AGX_CAPTURE_KERNELS=agx_infer_reduce,agx_infer_reduce_simd,agx_infer_conv2d,agx_infer_binary,agx_infer_unary,agx_infer_softmax,agx_infer_softmax_simd,agx_infer_pool,agx_infer_transpose,agx_infer_concat \
+ZLUDA_AGX_CAPTURE_KERNELS=agx_infer_layer_norm,agx_infer_layer_norm_simd,agx_infer_reduce,agx_infer_reduce_simd,agx_infer_conv2d,agx_infer_binary,agx_infer_unary,agx_infer_softmax,agx_infer_softmax_simd,agx_infer_pool,agx_infer_transpose,agx_infer_concat \
 ZLUDA_AGX_CAPTURE_MAX=1 python3 zluda_tensorrt_agx/tests/test_gpu.py
 python3 zluda_tensorrt_agx/tests/test_sim.py /tmp/inference-captures --agx-run /path/to/agx_run
 ```

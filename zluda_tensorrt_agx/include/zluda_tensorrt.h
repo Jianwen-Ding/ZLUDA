@@ -29,6 +29,9 @@ int32_t ztrtBuilderMarkOutput(ZtrtBuilder*, int32_t);
 int32_t ztrtBuilderAddMatMul(ZtrtBuilder*, int32_t, int32_t, int32_t, int32_t);
 int32_t ztrtBuilderAddElementWise(ZtrtBuilder*, int32_t, int32_t, int32_t);
 int32_t ztrtBuilderAddActivation(ZtrtBuilder*, int32_t, int32_t);
+/* Unscaled suffix normalization; finite nonnegative epsilon. */
+int32_t ztrtBuilderAddLayerNorm(ZtrtBuilder*, int32_t, int32_t, float);
+int32_t ztrtBuilderConfigureLayerNorm(ZtrtBuilder*, int32_t, float);
 /* axes bitmask, kind 0=sum or 1=mean, keepdims 0/1. */
 int32_t ztrtBuilderAddReduce(ZtrtBuilder*, int32_t, uint32_t, int32_t, int32_t);
 int32_t ztrtBuilderAddSoftmax(ZtrtBuilder*, int32_t, int32_t);

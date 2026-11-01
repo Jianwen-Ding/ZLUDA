@@ -43,6 +43,11 @@ for folder in sorted(a.captures.iterdir()):
         else:x,y,rows,channels,inner=args
         n=rows*channels;v=view(x,n).reshape(rows//inner,channels,inner)
         e=np.exp(v-v.max(axis=1,keepdims=True));reference=(e/e.sum(axis=1,keepdims=True)).reshape(-1)
+    elif name in ['agx_infer_layer_norm','agx_infer_layer_norm_simd']:
+        x,y,rows,channels,epsilon=args;n=rows*channels
+        epsilon=np.array([epsilon],dtype=np.uint32).view(np.float32)[0]
+        v=view(x,n).reshape(rows,channels);d=v-v.mean(axis=1,keepdims=True)
+        reference=(d/np.sqrt((d*d).mean(axis=1,keepdims=True)+epsilon)).reshape(-1)
     elif name in ['agx_infer_reduce','agx_infer_reduce_simd']:
         x,y,rows,channels,inner,mean=args;n=rows
         value=view(x,rows*channels).reshape(rows//inner,channels,inner)
@@ -81,5 +86,5 @@ for folder in sorted(a.captures.iterdir()):
     else:raise AssertionError(name)
     np.testing.assert_allclose(view(y,n,after=True),reference,rtol=5e-4,atol=3e-5,equal_nan=True,err_msg=name)
     passed.append(name);print('PASS',name)
-assert len(set(passed))==10,passed
-print('PASS: ten portable inference kernels on the simulator')
+assert len(set(passed))==12,passed
+print('PASS: twelve portable inference kernels on the simulator')

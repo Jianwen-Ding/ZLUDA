@@ -45,6 +45,18 @@ int main(int argc,char** argv){
     rd=avg->getOutput(0)->getDimensions();assert(rd.nbDims==3&&rd.d[1]==1);
     assert(!reduced->addReduce(*rx,ReduceOperation::kSUM,8,false));
     assert(!reduced->addReduce(*rx,ReduceOperation::kPROD,1,false));
+    std::unique_ptr<INetworkDefinition> normNetwork(builder->createNetworkV2(0));
+    auto nx=normNetwork->addInput("norm_input",DataType::kFLOAT,Dims2(2,4));assert(nx);
+    float ns[4]={1,1,1,1},nb[4]={0,0,0,0};
+    auto sn=normNetwork->addConstant(Dims{1,{4}},Weights{DataType::kFLOAT,ns,4});assert(sn);
+    auto bn=normNetwork->addConstant(Dims{1,{4}},Weights{DataType::kFLOAT,nb,4});assert(bn);
+    auto norm=normNetwork->addNormalization(*nx,*sn->getOutput(0),*bn->getOutput(0),2);assert(norm);
+    norm->setEpsilon(.003f);assert(norm->getEpsilon()==.003f);
+    normNetwork->markOutput(*norm->getOutput(0));
+    std::unique_ptr<IBuilderConfig> normConfig(builder->createBuilderConfig());
+    assert(std::unique_ptr<IHostMemory>(builder->buildSerializedNetwork(*normNetwork,*normConfig)));
+    norm->setEpsilon(-1.f);assert(!std::unique_ptr<IHostMemory>(builder->buildSerializedNetwork(*normNetwork,*normConfig)));
+    norm->setEpsilon(.003f);assert(std::unique_ptr<IHostMemory>(builder->buildSerializedNetwork(*normNetwork,*normConfig)));
     if(argc>1){
         std::ifstream file(argv[1],std::ios::binary);assert(file);
         std::vector<char> model((std::istreambuf_iterator<char>(file)),std::istreambuf_iterator<char>());

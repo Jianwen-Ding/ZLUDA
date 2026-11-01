@@ -230,3 +230,26 @@ source emits upstream AIR and AGX artifacts. No target hints, relaxed precision 
 bytes and constants 4,100 bytes. This is a baseline for fusion work, not an optimized-throughput claim. Runtime
 model support is broader, but dtype coverage, dynamic shapes, API/ABI completeness and NVIDIA engine format
 compatibility remain unresolved. Public formula: https://onnx.ai/onnx/operators/onnx__LayerNormalization.html
+
+## Fused output-only LayerNormalization
+
+Output-only ONNX LayerNormalization now uses a dedicated portable core: centered mean/variance and normalize
+are one kernel, followed by broadcast scale and optional bias. Short suffixes use a serial per-row kernel; long
+suffixes use standard MLIR subgroup reductions. It uses centered squared differences rather than subtracting
+E[x]^2 from E[x^2]. Requests for optional saved statistics retain the existing graph path. Accumulation ordering
+can differ from the decomposed path, so numerical equivalence is tolerance-based rather than bitwise.
+
+Native C exposes the unscaled core and epsilon configuration; the independent C++ source interface exposes
+suffix-mask addNormalization with broadcast scale/bias and setEpsilon. Invalid epsilon makes the layer invalid
+for building, and a subsequent valid setter restores it. Arbitrary/non-suffix axis masks are explicitly rejected.
+
+All 93 GPU graphs and 100 ONNX models pass; tests compare fused and saved-statistics paths with the same CPU
+reference, across axes, row lengths and bias choices. C++ builder/configuration tests, 10 Rust tests and lifecycle
+checks pass. All twelve primitive kernel families, including both normalization variants, replay against NumPy
+on AGX Performance Simulator. AIR bitcode/text and AGX fat objects regenerate from the same standard MLIR source.
+No target hints, relaxed math flags or proprietary implementation inputs were used.
+
+`fused-layernorm.json`: the same-process 64x1024 comparison measured 357.19 us for the decomposed graph versus
+84.86 us for the fused core plus scale. Workspace was 786,688 versus 262,144 bytes. These are initial uncontrolled
+clock measurements. Scale/bias fusion, saved-statistics fusion, full normalization axis coverage and broader
+precision/ABI support remain open work; this checkpoint does not establish full TensorRT compatibility.

@@ -130,6 +130,8 @@ for sh,axis in [((2,3,5),-1),((2,3,5),1),((2,37),-1),((3,5),0),((2,1024),-1)]:
     inits=[constant('scale',scale)]+([constant('bias',bias)] if with_bias else [])
     data=model([('x',sh)],[('y',sh),('mean',mean.shape),('inv',inverse.shape)],[op('LayerNormalization',['x','scale']+(['bias'] if with_bias else []),['y','mean','inv'],axis=axis,epsilon=.003)],inits,opset=17)
     execute(data,{'x':x},{'y':y,'mean':mean,'inv':inverse})
+    fused=model([('x',sh)],[('y',sh)],[op('LayerNormalization',['x','scale']+(['bias'] if with_bias else []),'y',axis=axis,epsilon=.003)],inits,opset=17)
+    execute(fused,{'x':x},{'y':y})
 # Saved inverse output can skip the optional mean slot; constant input has zero variance.
 x=np.full((2,5),4.,dtype='f');scale=np.ones(5,dtype='f');inv=np.full((2,1),1/np.sqrt(.003),dtype='f')
 execute(model([('x',x.shape)],[('y',x.shape),('inv',inv.shape)],[op('LayerNormalization',['x','scale'],['y','','inv'],epsilon=.003)],[constant('scale',scale)],opset=17),{'x':x},{'y':np.zeros_like(x),'inv':inv})

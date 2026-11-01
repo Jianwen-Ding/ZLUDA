@@ -65,6 +65,13 @@ for shape,axis in [([3,7],1),([3,37],1),([3,4096],1),([2,37,5],1),([2,3,5],0)]:
     y=node(g,ref.shape,'reduce',input=x,axis=axis,mean=mean,keepdims=False);g['outputs']=[y]
     info=run(g,{'x':value},{f't{y}':ref},roundtrip=True,atol=2e-4,rtol=5e-4);assert info['workspace']==0
 
+# Fused centered normalization covers short/long rows, suffix axes and workgroup tails.
+for sh,axis in [([3,5],1),([3,37],1),([2,3,5],1),([3,1024],1),([2,3,5],0)]:
+    value=rng.normal(size=sh).astype('f');axes=tuple(range(axis,len(sh)))
+    mean=value.mean(axis=axes,keepdims=True);d=value-mean;ref=d/np.sqrt((d*d).mean(axis=axes,keepdims=True)+.003)
+    g=graph();x=tensor(g,'x',sh);y=node(g,sh,'layer_norm',input=x,axis=axis,epsilon=.003);g['outputs']=[y]
+    info=run(g,{'x':value},{f't{y}':ref},roundtrip=True);assert info['workspace']==0
+
 def conv_ref(x,w,b,stride,pad,dil,groups):
     N,C,H,W=x.shape; K,_,R,S_=w.shape
     P_=(H+2*pad[0]-dil[0]*(R-1)-1)//stride[0]+1

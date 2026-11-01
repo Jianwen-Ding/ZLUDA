@@ -859,7 +859,8 @@ mod imp {
                     )
                 }
                 Step::Shared { src, dst, tw, n, per, count, stride, dist, offset, inverse } => (
-                    func(c"agx_fft_shared", c"agx_fft_shared_f64")?,
+                    // the 8 KiB buffer when it is enough (more workgroups per core: 14-16% faster than 32 KiB)
+                    if per * n <= 1024 { func(c"agx_fft_shared", c"agx_fft_shared_f64")? } else { func(c"agx_fft_shared_2048", c"agx_fft_shared_2048_f64")? },
                     vec![ptr(src).byte_add(cb * offset), ptr(dst).byte_add(cb * offset), ptr(Buf::Tw(tw))],
                     vec![n as i32, count as i32, stride as i32, dist as i32, inverse.map_or(inv, i32::from)],
                     [groups(count, per as u32), 1],

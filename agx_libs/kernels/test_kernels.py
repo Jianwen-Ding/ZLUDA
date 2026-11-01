@@ -626,8 +626,9 @@ def case_fft_shared(a, obj, tmp, n, batch, stride, dist, inverse, rnd):
     """agx_fft_shared: whole transforms in threadgroup memory, as zluda_fft_agx launches it."""
     total = max((b * dist + (n - 1) * stride for b in range(batch)), default=0) + 1
     data = [complex(rnd.uniform(-1, 1), rnd.uniform(-1, 1)) for _ in range(total)]
-    per = min(max(1, min(256 // (n // 4), 4096 // n)), batch)
-    (buf,) = run(a, obj, "agx_fft_shared",
+    per = min(max(1, min(256 // (n // 4), 2048 // n)), batch)
+    # the 8 KiB kernel when it is enough, as zluda_fft_agx picks it
+    (buf,) = run(a, obj, "agx_fft_shared" if per * n <= 1024 else "agx_fft_shared_2048",
                  [("buf", pack(interleave(data), "f")), ("buf", pack([0.0] * (2 * total), "f"), True),
                   ("buf", pack(twiddles(n), "f")), ("i32", n), ("i32", batch), ("i32", stride), ("i32", dist),
                   ("i32", inverse)], (n // 4 * -(-batch // per), per), (n // 4, per), tmp)

@@ -1482,7 +1482,10 @@ GPU clock (16 x 65536: 263 us at 10 iterations, 83 us warm); `fftbench.c` and `r
 first. Warm, the threadgroup-memory transform against the passes: 16 x 65536 454 -> 83 us, 256 x 4096 212 -> 120,
 1024 x 1024 267 -> 140, 2048 x 512 314 -> 163; Bluestein against radix-p: 37 x 8192 388 / 232 (radix-p), 67 x 4096
 422 / 308 (radix-p), 101 x 2048 235 / 293, 1009 x 64 90 / 736. Spreading the sequences of a column transform over
-neighbouring lanes (dist 1) measured no gain and is not used. Power-of-two lengths use radix-4 Stockham passes
+neighbouring lanes (dist 1) measured no gain and is not used. The kernel declares 8 KiB of threadgroup memory (256 threads x 4 elements
+always fit it for n <= 1024) and a 16 KiB copy (`agx_fft_shared_2048`) serves n = 2048: with 32 KiB a core held 2
+of its workgroups, now 3 (registers limit it next); 16 x 65536 83 -> 72 us, 256 x 4096 120 -> 100, 1024 x 1024 139
+-> 116, 2-D R2C 1024 x 1024 330 -> 289 us, n = 2048 unchanged. Power-of-two lengths use radix-4 Stockham passes
 (after one radix-2 pass when log2 n is odd), alternating two work buffers; each odd prime factor adds a pass of
 its radix (`agx_fft_radixr`, one thread per output, r complex multiply-adds each). Lengths whose largest prime
 factor is above 100 use Bluestein's algorithm instead: the transform as a convolution of length m (a power of two of

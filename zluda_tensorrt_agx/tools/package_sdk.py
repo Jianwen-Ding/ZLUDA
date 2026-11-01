@@ -23,9 +23,10 @@ files = {
     args.target_dir / 'ztrt-compile': 'bin/ztrt-compile',
     crate / 'examples/native.cpp': 'examples/native.cpp',
     crate / 'README.md': 'REFERENCE.md',
+    crate / 'abi/README.md': 'abi/README.md',
     repo / 'agx_libs/kernels/inference.mlir': 'kernels/inference.mlir',
 }
-for name in ['zluda_tensorrt.h', 'NvInfer.h', 'NvOnnxParser.h']:
+for name in ['zluda_tensorrt.h', 'NvInfer.h', 'NvInferRuntimeBase.h', 'NvOnnxParser.h']:
     files[crate / 'include' / name] = 'include/' + name
 for name in ['LICENSE-MIT', 'LICENSE-APACHE']:
     files[repo / name] = name

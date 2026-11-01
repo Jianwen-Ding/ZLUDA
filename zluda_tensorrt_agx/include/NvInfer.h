@@ -3,6 +3,7 @@
 // Independently implemented source-level subset of the documented TensorRT builder/runtime workflow.
 // This header and libtensorrt_agx have their own ABI and engine format. They are not NVIDIA binary ABI shims.
 #include "zluda_tensorrt.h"
+#include "NvInferRuntimeBase.h"
 #include <algorithm>
 #include <cstdint>
 #include <limits>
@@ -13,29 +14,23 @@
 #include <vector>
 
 namespace nvinfer1 {
-enum class DataType : int32_t { kFLOAT=0, kHALF=1, kINT8=2, kINT32=3, kBOOL=4 };
-enum class TensorIOMode : int32_t { kNONE=-1, kINPUT=0, kOUTPUT=1 };
 enum class ActivationType : int32_t { kRELU=0, kSIGMOID=1, kTANH=2 };
-enum class ElementWiseOperation : int32_t { kSUM=0, kPROD=1, kSUB=2, kDIV=3, kMAX=4, kMIN=5 };
+enum class ElementWiseOperation : int32_t { kSUM=0, kPROD=1, kMAX=2, kMIN=3, kSUB=4, kDIV=5, kPOW=6, kFLOOR_DIV=7, kAND=8, kOR=9, kXOR=10, kEQUAL=11, kGREATER=12, kLESS=13 };
 enum class UnaryOperation : int32_t { kEXP=0, kLOG=1, kSQRT=2, kRECIP=3, kABS=4, kNEG=5 };
 enum class ReduceOperation : int32_t { kSUM=0, kPROD=1, kMAX=2, kMIN=3, kAVG=4 };
 enum class MatrixOperation : int32_t { kNONE=0, kTRANSPOSE=1, kVECTOR=2 };
 enum class PoolingType : int32_t { kMAX=0, kAVERAGE=1 };
 enum class MemoryPoolType : int32_t { kWORKSPACE=0 };
-enum class BuilderFlag : int32_t { kFP16=0, kINT8=1, kTF32=2 };
+enum class BuilderFlag : int32_t { kFP16=0, kINT8=1, kTF32=6 };
 enum class NetworkDefinitionCreationFlag : int32_t { kEXPLICIT_BATCH=0, kSTRONGLY_TYPED=1 };
 using NetworkDefinitionCreationFlags = uint32_t;
-struct Dims { int32_t nbDims=0; int64_t d[8]{}; };
 struct Dims2 : Dims { Dims2(int64_t a, int64_t b) { nbDims=2; d[0]=a; d[1]=b; } };
 struct Dims3 : Dims { Dims3(int64_t a, int64_t b, int64_t c) { nbDims=3; d[0]=a; d[1]=b; d[2]=c; } };
 struct Dims4 : Dims { Dims4(int64_t a, int64_t b, int64_t c, int64_t e) { nbDims=4; d[0]=a; d[1]=b; d[2]=c; d[3]=e; } };
 struct Weights { DataType type; void const* values; int64_t count; };
-class ILogger {
-public:
-    enum class Severity : int32_t { kINTERNAL_ERROR=0, kERROR=1, kWARNING=2, kINFO=3, kVERBOSE=4 };
-    virtual void log(Severity severity, char const* message) noexcept = 0;
-    virtual ~ILogger() = default;
-};
+inline TensorIOMode tensorIOMode(int32_t mode) noexcept {
+    return mode==0?TensorIOMode::kINPUT:mode==1?TensorIOMode::kOUTPUT:TensorIOMode::kNONE;
+}
 inline void report(ILogger* l, char const* message=nullptr) { if (l) l->log(ILogger::Severity::kERROR, message ? message : ztrtGetLastError()); }
 inline bool validDims(Dims const& d) { if (d.nbDims<0 || d.nbDims>8) return false; for(int i=0;i<d.nbDims;++i) if(d.d[i]<=0) return false; return true; }
 inline int32_t narrow(int64_t v) { return v>=0 && v<=std::numeric_limits<int32_t>::max() ? int32_t(v) : -1; }
@@ -194,7 +189,14 @@ public:
         if(op!=ReduceOperation::kSUM && op!=ReduceOperation::kAVG){report(mLogger,"only sum and average reductions are supported");return nullptr;}
         return layer<IReduceLayer>(ztrtBuilderAddReduce(mBuilder,x.id(),axes,op==ReduceOperation::kAVG?1:0,keepDimensions?1:0));
     }
-    IElementWiseLayer* addElementWise(ITensor& a,ITensor& b,ElementWiseOperation op) { return layer<IElementWiseLayer>(ztrtBuilderAddElementWise(mBuilder,a.id(),b.id(),int32_t(op))); }
+    IElementWiseLayer* addElementWise(ITensor& a,ITensor& b,ElementWiseOperation op) {
+        int32_t kind;
+        switch(op){case ElementWiseOperation::kSUM:kind=ZTRT_ADD;break;case ElementWiseOperation::kPROD:kind=ZTRT_MUL;break;
+            case ElementWiseOperation::kSUB:kind=ZTRT_SUB;break;case ElementWiseOperation::kDIV:kind=ZTRT_DIV;break;
+            case ElementWiseOperation::kMAX:kind=ZTRT_MAX;break;case ElementWiseOperation::kMIN:kind=ZTRT_MIN;break;
+            default:report(mLogger,"unsupported elementwise operation");return nullptr;}
+        return layer<IElementWiseLayer>(ztrtBuilderAddElementWise(mBuilder,a.id(),b.id(),kind));
+    }
     IMatrixMultiplyLayer* addMatrixMultiply(ITensor& a,MatrixOperation ta,ITensor& b,MatrixOperation tb) {
         if(ta==MatrixOperation::kVECTOR || tb==MatrixOperation::kVECTOR) { report(mLogger,"matmul requires two matrices"); return nullptr; }
         return layer<IMatrixMultiplyLayer>(ztrtBuilderAddMatMul(mBuilder,a.id(),b.id(),int32_t(ta),int32_t(tb)));
@@ -250,7 +252,7 @@ class IExecutionContext {
 public:
     IExecutionContext(ZtrtContext* context,ZtrtEngine const* engine,ILogger* logger):mContext(context),mLogger(logger) {
         int32_t n=ztrtGetNbIOTensors(engine);
-        for(int32_t i=0;i<n;++i){auto name=ztrtGetIOTensorName(engine,i);Dims d;d.nbDims=ztrtGetTensorShape(engine,name,d.d,8);mInfo.emplace(name,Info{ztrtGetTensorBytes(engine,name),d,TensorIOMode(ztrtGetTensorIOMode(engine,name))});mOrder.emplace_back(name);}
+        for(int32_t i=0;i<n;++i){auto name=ztrtGetIOTensorName(engine,i);Dims d;d.nbDims=ztrtGetTensorShape(engine,name,d.d,8);mInfo.emplace(name,Info{ztrtGetTensorBytes(engine,name),d,tensorIOMode(ztrtGetTensorIOMode(engine,name))});mOrder.emplace_back(name);}
     }
     ~IExecutionContext(){ztrtDestroyExecutionContext(mContext);}
     IExecutionContext(IExecutionContext const&)=delete;
@@ -275,7 +277,7 @@ public:
     IHostMemory* serialize() const{return new IHostMemory(mEngine);}
     int32_t getNbIOTensors() const{return ztrtGetNbIOTensors(mEngine);}
     char const* getIOTensorName(int32_t i) const{return ztrtGetIOTensorName(mEngine,i);}
-    TensorIOMode getTensorIOMode(char const* name) const{return TensorIOMode(ztrtGetTensorIOMode(mEngine,name));}
+    TensorIOMode getTensorIOMode(char const* name) const{return tensorIOMode(ztrtGetTensorIOMode(mEngine,name));}
     Dims getTensorShape(char const* name) const{Dims d;d.nbDims=ztrtGetTensorShape(mEngine,name,d.d,8);return d;}
     DataType getTensorDataType(char const*) const{return DataType::kFLOAT;}
     int64_t getDeviceMemorySizeV2() const{return int64_t(ztrtGetWorkspaceSize(mEngine));}

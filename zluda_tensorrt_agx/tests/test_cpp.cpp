@@ -7,8 +7,19 @@
 #include <iterator>
 #include <memory>
 struct Logger final:nvinfer1::ILogger{int errors=0;void log(Severity,char const*)noexcept override{++errors;}};
+static_assert(int(nvinfer1::TensorIOMode::kNONE)==0&&int(nvinfer1::TensorIOMode::kINPUT)==1&&int(nvinfer1::TensorIOMode::kOUTPUT)==2);
+static_assert(int(nvinfer1::ElementWiseOperation::kMAX)==2&&int(nvinfer1::ElementWiseOperation::kMIN)==3&&int(nvinfer1::ElementWiseOperation::kSUB)==4&&int(nvinfer1::ElementWiseOperation::kDIV)==5);
+static_assert(int(nvinfer1::BuilderFlag::kTF32)==6);
+static_assert(sizeof(nvinfer1::Dims)==72&&offsetof(nvinfer1::Dims,d)==8);
+static_assert(sizeof(nvinfer1::InterfaceInfo)==16&&offsetof(nvinfer1::InterfaceInfo,major)==8);
+static_assert(sizeof(nvinfer1::Weights)==24&&offsetof(nvinfer1::Weights,values)==8&&offsetof(nvinfer1::Weights,count)==16);
 int main(int argc,char** argv){
     using namespace nvinfer1;Logger logger;
+    IVersionedInterface* versioned=&logger;
+    assert(versioned->getAPILanguage()==APILanguage::kCPP);
+    auto info=versioned->getInterfaceInfo();assert(std::strcmp(info.kind,"ILogger")==0&&info.major==1&&info.minor==0);
+    assert(tensorIOMode(-1)==TensorIOMode::kNONE&&tensorIOMode(0)==TensorIOMode::kINPUT&&tensorIOMode(1)==TensorIOMode::kOUTPUT);
+
     std::unique_ptr<IBuilder> builder(createInferBuilder(logger));
     std::unique_ptr<INetworkDefinition> network(builder->createNetworkV2(0));
     auto input=network->addInput("image",DataType::kFLOAT,Dims4(1,2,5,6));assert(input);
@@ -27,6 +38,7 @@ int main(int argc,char** argv){
     std::unique_ptr<ICudaEngine> engine(runtime->deserializeCudaEngine(blob->data(),blob->size()));assert(engine);
     assert(engine->getNbIOTensors()==2&&engine->getTensorIOMode("image")==TensorIOMode::kINPUT&&engine->getTensorIOMode("result")==TensorIOMode::kOUTPUT);
     shape=engine->getTensorShape("result");assert(shape.nbDims==4&&shape.d[0]==1&&shape.d[1]==4&&shape.d[2]==1&&shape.d[3]==1);
+    assert(engine->getTensorIOMode("missing")==TensorIOMode::kNONE);
     assert(logger.errors==0);
     // Invalid setters cannot silently build a model using the previous attribute value.
     conv->setStrideNd(Dims2(-1,2));assert(!std::unique_ptr<IHostMemory>(builder->buildSerializedNetwork(*network,*config)));
@@ -64,6 +76,20 @@ int main(int argc,char** argv){
     assert(ztrtBuilderTensorShape(gatherBuilder,gy,gyShape,2)==2&&gyShape[0]==2&&gyShape[1]==2);
     assert(ztrtBuilderMarkOutput(gatherBuilder,gy)==0);auto ge=ztrtBuilderBuild(gatherBuilder);assert(ge);
     ztrtDestroyEngine(ge);ztrtDestroyBuilder(gatherBuilder);
+    // Public enum integers differ from our stable C dispatch codes; verify every supported translation.
+    for(auto operation:{ElementWiseOperation::kSUM,ElementWiseOperation::kPROD,ElementWiseOperation::kSUB,ElementWiseOperation::kDIV,ElementWiseOperation::kMAX,ElementWiseOperation::kMIN}){
+        std::unique_ptr<INetworkDefinition> ew(builder->createNetworkV2(0));
+        auto a=ew->addInput("a",DataType::kFLOAT,Dims2(2,3));auto b=ew->addInput("b",DataType::kFLOAT,Dims2(2,3));
+        auto result=ew->addElementWise(*a,*b,operation);assert(result);ew->markOutput(*result->getOutput(0));
+        std::unique_ptr<IBuilderConfig> ewConfig(builder->createBuilderConfig());
+        std::unique_ptr<IHostMemory> saved(builder->buildSerializedNetwork(*ew,*ewConfig));assert(saved);
+        auto bytes=static_cast<unsigned char const*>(saved->data());uint64_t length=0;
+        for(int i=0;i<8;++i)length|=uint64_t(bytes[16+i])<<(8*i);
+        assert(length<=saved->size()-24);std::string metadata(reinterpret_cast<char const*>(bytes+24),size_t(length));
+        char const* kind=operation==ElementWiseOperation::kSUM?"add":operation==ElementWiseOperation::kPROD?"mul":operation==ElementWiseOperation::kSUB?"sub":operation==ElementWiseOperation::kDIV?"div":operation==ElementWiseOperation::kMAX?"max":"min";
+        assert(metadata.find(std::string("\"kind\":\"")+kind+"\"")!=std::string::npos);
+        assert(!ew->addElementWise(*a,*b,ElementWiseOperation::kPOW));
+    }
     if(argc>1){
         std::ifstream file(argv[1],std::ios::binary);assert(file);
         std::vector<char> model((std::istreambuf_iterator<char>(file)),std::istreambuf_iterator<char>());

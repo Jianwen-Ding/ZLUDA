@@ -272,3 +272,24 @@ activation workspace. Its 512 normalized i32 indices occupy 2,048 metadata bytes
 (plus arena alignment); the benchmark's constant_bytes field counts tensor weights and therefore shows zero,
 not zero total GPU memory. The output is caller-owned. This is an initial absolute measurement, not a speedup
 claim. Public semantics: https://onnx.ai/onnx/operators/onnx__Gather.html
+
+## Public interface alignment checkpoint
+
+A public-documentation ABI review found that the own C++ subset had nonstandard TensorIOMode and elementwise
+enum values, TF32's wrong numeric value, and an unversioned logger. The C++ interface now uses public values,
+explicitly translates to unchanged native C dispatch codes, and supplies Dims64/InterfaceInfo/APILanguage plus
+the public versioned logger interface. Adapted public declarations retain Apache-2.0 attribution. This uses
+open interface documentation, not proprietary SDK code or binary inspection.
+
+C++ checks validate 64-bit structure sizes/offsets, public numeric values, logger metadata/virtual calls,
+missing/input/output role mapping, six supported elementwise mappings to serialized native graph operations,
+and unsupported public operation rejection. A new end-to-end `test_cpp_gpu.cpp` independently builds,
+serializes, reloads and executes all six supported elementwise operations through the C++ API and our driver.
+Both C++ suites pass with -Wall -Wextra -Werror. The packaged MLP still returns [11, 11, 0, 0]. No Rust, GPU
+kernel or PTX compiler implementation changed in this checkpoint, and no throughput change is claimed.
+
+These tests compile against our corrected subset, not the complete independent vendor reference headers.
+Public factories, runtime/engine/context pImpl dispatch contracts, version negotiation and complete ABI tests
+remain unimplemented. Full ABI status, primary-source links and completion evidence are tracked in
+[abi/README.md](../abi/README.md). The moving documentation URLs exposed both 1.6.1 and 1.7.1 pages; no exact
+Geekbench RTX 1.6 compatibility claim is made. No NVIDIA engine format support was added.

@@ -5,6 +5,11 @@ on Asahi Linux. Its math kernels are portable MLIR, lowered to upstream AIR and 
 existing MLIR/AIR GEMM implementation with the other AGX math libraries. No new AGX-specific
 intrinsics or handwritten AGX instructions are used.
 
+[Public interface alignment and remaining ABI work](abi/README.md) tracks the full compatibility gap.
+The C++ interface now uses public enum values and a versioned logger; it explicitly translates to our stable
+native C codes. Recompile C++ dependents when adopting the updated headers. This is an interface correction,
+not a complete binary compatibility claim.
+
 The library has an independent C ABI (`include/zluda_tensorrt.h`) and a **source-level subset** of the documented
 TensorRT C++ builder/runtime API (`include/NvInfer.h`, `include/NvOnnxParser.h`). Applications using that subset can
 be compiled against these headers and `-ltensorrt_agx`. This is **not binary ABI compatibility** with NVIDIA's
@@ -161,9 +166,21 @@ execution contexts. Activation workspace remains private to each execution conte
 alive until its engines and execution contexts have been destroyed. An execution context retains its plan and
 resources if the engine handle is released first.
 
+To check public enum/layout alignment and execute all supported C++ elementwise translations on our driver:
+
+```sh
+c++ -std=c++17 -Wall -Wextra -Werror -I zluda_tensorrt_agx/include \
+    zluda_tensorrt_agx/tests/test_cpp_gpu.cpp -L target/release \
+    -Wl,-rpath,"$PWD/target/release" -ltensorrt_agx -ldl -o /tmp/ztrt-cpp-gpu-tests
+ZLUDA_AGX_LIBCUDA=/absolute/path/to/our/libcuda.so /tmp/ztrt-cpp-gpu-tests
+```
+
+These test our current source subset; they do not establish complete reference-header binary compatibility.
+
 ## Public sources and provenance
 
-The implementations are original project source. The interface subset follows the public
+The runtime and kernel implementations are original project source. Public type/logger declarations adapted
+from Apache-2.0 interface documentation retain attribution in `NvInferRuntimeBase.h`. The interface subset follows the public
 [TensorRT builder/runtime workflow](https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/inference-library/runtime-api.html).
 The ONNX reader follows the open [ONNX protobuf schema](https://github.com/onnx/onnx/blob/main/onnx/onnx.proto).
 No NVIDIA library has been inspected, disassembled, restored, loaded, or used as an implementation oracle for this

@@ -838,6 +838,16 @@ impl Driver {
                 }
             }
         }
+        // and the allocation right after each (up to 64 MiB of it): kernels read past the end of a buffer into the next
+        // one (llama.cpp's mul_mat_vec_q<Q5_K> reads beyond its 16 KiB quantized vector), which a replay must map too
+        let ends: Vec<u64> = regions.iter().map(|(va, b)| (va + b.len() as u64).next_multiple_of(16384)).collect();
+        for end in ends {
+            if let Some((start, bytes)) = self.ctx.allocation(end) {
+                if start == end && !regions.iter().any(|(va, _)| *va == start) {
+                    regions.push((start, bytes[..bytes.len().min(64 << 20)].to_vec()));
+                }
+            }
+        }
         // the texels of the texture objects among them (word 1 of a texture descriptor)
         let mut i = 0;
         while i < regions.len() {

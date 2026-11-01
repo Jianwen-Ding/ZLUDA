@@ -337,6 +337,18 @@ fn gathers(graph: bool, ordinary: bool, batch_of_stream: bool, queue_busy: bool)
     graph || (ordinary && (batch_of_stream || queue_busy))
 }
 
+/// ZLUDA_AGX_HAZARD_STATS=1 (read once: the launch path asked the environment at every launch).
+fn hazard_stats() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ZLUDA_AGX_HAZARD_STATS").is_ok_and(|v| v == "1"))
+}
+
+/// ZLUDA_AGX_CAPTURE (read once, as `hazard_stats`).
+fn capture_dir() -> Option<&'static std::ffi::OsStr> {
+    static DIR: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| std::env::var_os("ZLUDA_AGX_CAPTURE")).as_deref()
+}
+
 /// ZLUDA_AGX_GPU_COPIES=0: asynchronous device-to-device copies always wait for the GPU and copy on the CPU.
 fn gpu_async_copies() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -540,7 +552,7 @@ impl Driver {
         // ZLUDA_AGX_HAZARD_STATS=1: an estimate of how many batched barriers byte ranges could leave out, by the
         // pointer values (tensors in one allocation start at different addresses) the dispatches share since the
         // last estimated barrier; printed every 4096 dispatches
-        if batchable && std::env::var("ZLUDA_AGX_HAZARD_STATS").is_ok_and(|v| v == "1") {
+        if batchable && hazard_stats() {
             use std::sync::Mutex;
             static S: Mutex<(Vec<u64>, u64, u64)> = Mutex::new((Vec::new(), 0, 0));
             let ptrs: Vec<u64> = args
@@ -811,7 +823,7 @@ impl Driver {
         shared: u32,
         args: &[&[u8]],
     ) -> Result<Option<std::path::PathBuf>, CUerror> {
-        let Some(dir) = std::env::var_os("ZLUDA_AGX_CAPTURE") else { return Ok(None) };
+        let Some(dir) = capture_dir() else { return Ok(None) };
         let wanted = std::env::var("ZLUDA_AGX_CAPTURE_KERNELS").unwrap_or_else(|_| "all".into());
         if wanted != "all" && !wanted.split(',').any(|k| k == name) {
             return Ok(None);

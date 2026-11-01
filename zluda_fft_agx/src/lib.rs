@@ -826,6 +826,12 @@ mod imp {
             engine::function(agx_libs::FFT, if double { name64 } else { name }).map_err(status)
         };
         let groups = |threads: usize, block: u32| (threads.div_ceil(block as usize)) as u32;
+        // ~256 threads per workgroup: `len` threads per sequence along x, more sequences along y when that is short
+        // (16-thread workgroups made the packing kernels ~4x slower than their memory traffic)
+        let block2 = |len: usize| {
+            let x = len.next_power_of_two().clamp(32, 256) as u32;
+            [x, 256 / x]
+        };
         let inv = inverse as i32;
         // arguments: pointers, then i32 values
         let launch = |f, mut ptrs: Vec<*mut c_void>, mut ints: Vec<i32>, grid: [u32; 2], block: [u32; 2]| {
@@ -840,15 +846,15 @@ mod imp {
             #[allow(clippy::type_complexity)]
             let (f, ptrs, ints, grid, block, split): (_, Vec<*mut c_void>, Vec<i32>, [u32; 2], [u32; 2], Option<(usize, usize, usize)>) = match step {
                 Step::Radix { r: r @ (2 | 4), src, dst, tw, n, ns, count, stride, dist, offset, inverse } => {
-                    let bx = (n / r).clamp(1, 64) as u32;
+                    let b = block2(n / r);
                     let (f32_name, f64_name) =
                         if r == 4 { (c"agx_fft_radix4", c"agx_fft_radix4_f64") } else { (c"agx_fft_radix2", c"agx_fft_radix2_f64") };
                     (
                         func(f32_name, f64_name)?,
                         vec![ptr(src).byte_add(cb * offset), ptr(dst).byte_add(cb * offset), ptr(Buf::Tw(tw))],
                         vec![n as i32, ns as i32, count as i32, stride as i32, dist as i32, inverse.map_or(inv, i32::from)],
-                        [groups(n / r, bx), count as u32],
-                        [bx, 1],
+                        [groups(n / r, b[0]), groups(count, b[1])],
+                        b,
                         Some((2, cb * dist, cb * dist)),
                     )
                 }
@@ -861,13 +867,13 @@ mod imp {
                     None,
                 ),
                 Step::Radix { r, src, dst, tw, n, ns, count, stride, dist, offset, inverse } => {
-                    let bx = n.clamp(1, 64) as u32;
+                    let b = block2(n);
                     (
                         func(c"agx_fft_radixr", c"agx_fft_radixr_f64")?,
                         vec![ptr(src).byte_add(cb * offset), ptr(dst).byte_add(cb * offset), ptr(Buf::Tw(tw))],
                         vec![n as i32, ns as i32, r as i32, (n / r) as i32, (n / (r * ns)) as i32, count as i32, stride as i32, dist as i32, inverse.map_or(inv, i32::from)],
-                        [groups(n, bx), count as u32],
-                        [bx, 1],
+                        [groups(n, b[0]), groups(count, b[1])],
+                        b,
                         Some((5, cb * dist, cb * dist)),
                     )
                 }
@@ -875,56 +881,56 @@ mod imp {
                     func(c"agx_fft_chirp_in", c"agx_fft_chirp_in_f64")?,
                     vec![ptr(src).byte_add(cb * offset), ptr(dst), ptr(Buf::Tw(chirp))],
                     vec![n as i32, m as i32, count as i32, stride as i32, dist as i32, inv],
-                    [groups(m, 64), count as u32],
-                    [64, 1],
+                    [groups(m, block2(m)[0]), groups(count, block2(m)[1])],
+                    block2(m),
                     Some((2, cb * dist, cb * m)),
                 ),
                 Step::Pointwise { buf, kern, m, count } => (
                     func(c"agx_fft_pointwise", c"agx_fft_pointwise_f64")?,
                     vec![ptr(buf), ptr(Buf::Tw(kern))],
                     vec![m as i32, count as i32, inv],
-                    [groups(m, 64), count as u32],
-                    [64, 1],
+                    [groups(m, block2(m)[0]), groups(count, block2(m)[1])],
+                    block2(m),
                     Some((1, cb * m, 0)),
                 ),
                 Step::ChirpOut { src, dst, chirp, n, m, count, stride, dist, offset } => (
                     func(c"agx_fft_chirp_out", c"agx_fft_chirp_out_f64")?,
                     vec![ptr(src), ptr(dst).byte_add(cb * offset), ptr(Buf::Tw(chirp))],
                     vec![n as i32, m as i32, count as i32, stride as i32, dist as i32, inv],
-                    [groups(n, 64), count as u32],
-                    [64, 1],
+                    [groups(n, block2(n)[0]), groups(count, block2(n)[1])],
+                    block2(n),
                     Some((2, cb * m, cb * dist)),
                 ),
                 Step::Copy { src, dst, m, count, istride, idist, ostride, odist, ioffset, ooffset } => (
                     func(c"agx_fft_copy", c"agx_fft_copy_f64")?,
                     vec![ptr(src).byte_add(cb * ioffset), ptr(dst).byte_add(cb * ooffset)],
                     vec![m as i32, count as i32, istride as i32, idist as i32, ostride as i32, odist as i32],
-                    [groups(m, 16), count as u32],
-                    [16, 1],
+                    [groups(m, block2(m)[0]), groups(count, block2(m)[1])],
+                    block2(m),
                     Some((1, cb * idist, cb * odist)),
                 ),
                 Step::RealToComplex { src, dst, n, count, idist } => (
                     func(c"agx_fft_real_to_complex", c"agx_fft_real_to_complex_f64")?,
                     vec![ptr(src), ptr(dst)],
                     vec![n as i32, count as i32, idist as i32],
-                    [groups(n, 16), count as u32],
-                    [16, 1],
+                    [groups(n, block2(n)[0]), groups(count, block2(n)[1])],
+                    block2(n),
                     Some((1, rb * idist, cb * n)),
                 ),
                 Step::Hermitian { src, dst, n, count, idist } => (
                     func(c"agx_fft_hermitian", c"agx_fft_hermitian_f64")?,
                     vec![ptr(src), ptr(dst)],
                     vec![n as i32, count as i32, idist as i32],
-                    [groups(n, 16), count as u32],
-                    [16, 1],
+                    [groups(n, block2(n)[0]), groups(count, block2(n)[1])],
+                    block2(n),
                     Some((1, cb * idist, cb * n)),
                 ),
                 Step::RealPart { src, dst, n, count, odist } => (
                     func(c"agx_fft_real_part", c"agx_fft_real_part_f64")?,
                     vec![ptr(src), ptr(dst)],
                     vec![n as i32, count as i32, odist as i32],
-                    [groups(n, 16), count as u32],
-                    [16, 1],
+                    [groups(n, block2(n)[0]), groups(count, block2(n)[1])],
+                    block2(n),
                     Some((1, cb * n, rb * odist)),
                 ),
             };
@@ -939,7 +945,7 @@ mod imp {
                 p[1] = p[1].byte_add(first * dst_bytes);
                 let chunk = (count - first).min(65535);
                 v[at] = chunk as i32;
-                launch(f, p, v, [grid[0], chunk as u32], block)?;
+                launch(f, p, v, [grid[0], groups(chunk, block[1])], block)?;
             }
         }
         Ok(())

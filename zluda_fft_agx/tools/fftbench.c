@@ -25,6 +25,9 @@ int main(int argc, char **argv) {
     int (*exec)(cufftHandle, void *, void *, int) = dbl ? cufftExecZ2Z : cufftExecC2C;
     cufftHandle p; CK(cufftPlan1d(&p, n, dbl ? 0x69 /* CUFFT_Z2Z */ : 0x29 /* CUFFT_C2C */, batch));
     CK(exec(p, (void *)x, (void *)y, -1)); CK(cuCtxSynchronize());
+    // warm the GPU clock first: ~0.3 s of the same work queued in bursts (fewer iterations, or a sync after each,
+    // measure a partly idle clock)
+    for (double w = now(); now() - w < 0.3;) { for (int i = 0; i < 50; i++) CK(exec(p, (void *)x, (void *)y, -1)); CK(cuCtxSynchronize()); }
     double t = now();
     for (int i = 0; i < it; i++) CK(exec(p, (void *)x, (void *)y, -1));
     CK(cuCtxSynchronize()); double el = (now() - t) / it;

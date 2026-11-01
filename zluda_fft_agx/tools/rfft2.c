@@ -39,6 +39,8 @@ int main(int argc, char **argv) {
     void *rb = malloc(n * es); CK(cuMemcpyDtoH_v2(rb, z, n * es));
     double rerr = 0;
     for (size_t i = 0; i < n; i++) rerr = fmax(rerr, fabs((dbl ? ((double *)rb)[i] : ((float *)rb)[i]) / n - h[i]));
+    // warm the GPU clock first (~0.3 s, queued in bursts)
+    for (double w = now(); now() - w < 0.3;) { for (int i = 0; i < 50; i++) CK(fwd(pf, (void *)x, (void *)y)); CK(cuCtxSynchronize()); }
     double t = now(); for (int i = 0; i < it; i++) CK(fwd(pf, (void *)x, (void *)y)); CK(cuCtxSynchronize()); double tf = (now() - t) / it;
     t = now(); for (int i = 0; i < it; i++) { CK(cuMemcpyHtoD_v2(y, sb, 0)); CK(bwd(pb, (void *)y, (void *)z)); } CK(cuCtxSynchronize()); double tb = (now() - t) / it;
     printf("{\"type\":\"%s\",\"nx\":%d,\"ny\":%d,\"fwd_us\":%.1f,\"inv_us\":%.1f,\"r2c_err_rel\":%.2e,\"roundtrip_err\":%.2e}\n",

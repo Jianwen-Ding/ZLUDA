@@ -1475,7 +1475,9 @@ precision powers of two from 4 to 2048 run as one kernel in threadgroup memory i
 per sequence, 256 threads per workgroup, the first radix-2 stage done on the loaded values, the last radix-4 pass
 storing to device memory; the double precision lowering does not take f64 threadgroup buffers, so `build.rs` leaves
 it out of the f64 copies): 1024 x 256 107-138 -> 61-77 us, 1024 x 2048 535-566 -> 340-470 us, 16 x 131072 1201 ->
-377 us (`ZLUDA_AGX_FFT_SHARED=0` for the passes). Launches take up to 65535 sequences along grid y, the rest in
+377 us (`ZLUDA_AGX_FFT_SHARED=0` for the passes). Its workgroups go along grid x; along y measured the same
+(apple-documentation-playground novel-results/2026-11-01-grid-orientation; the 641 us in the message of commit
+411a3f6 was run-to-run spread, ~25% for this benchmark). Launches take up to 65535 sequences along grid y, the rest in
 further launches. The
 twiddles are computed on the host in double precision and uploaded with the
 plan. Double precision runs copies of the same kernels built for `f64`

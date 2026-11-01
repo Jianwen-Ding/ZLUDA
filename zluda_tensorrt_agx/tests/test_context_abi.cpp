@@ -56,6 +56,18 @@ int main(int argc,char** argv){assert(argc==2);auto path=std::getenv("ZLUDA_AGX_
     invalidShape=c->getTensorShape("input");invalidShape.d[0]=3;
     rejected([&]{return c->setInputShape("input",invalidShape);},Code::kINVALID_CONFIG);
     auto reports=recorder.reports.load();assert(c->getTensorShape("missing").nbDims==-1&&!c->getTensorAddress("missing"));assert(recorder.reports==reports);
+    // Developer Guide 8.6.1 section 5.2: replacing a child's recorder affects only that child.
+    Recorder childRecorder;c->setErrorRecorder(&childRecorder);
+    assert(childRecorder.references==1&&recorder.references==1&&c->getErrorRecorder()==&childRecorder);
+    auto parentErrors=recorder.reports.load();
+    assert(!engine->impl->setWeightStreamingBudgetV2(1));
+    assert(recorder.reports==parentErrors+1&&childRecorder.reports==0);
+    assert(!c->setCommunicator(reinterpret_cast<void*>(uintptr_t(1))));
+    assert(childRecorder.reports==1&&recorder.reports==parentErrors+1);
+    c->setErrorRecorder(nullptr);assert(childRecorder.references==0);
+    auto logged=logger.errors;assert(!c->setNvtxVerbosity(99));
+    assert(logger.errors==logged+1&&recorder.reports==parentErrors+1);
+    c->setErrorRecorder(&recorder);assert(recorder.references==2);
     assert(c->getOptimizationProfile()==0&&c->allInputDimensionsSpecified()&&c->inferShapes(0,nullptr)==0);
     auto shape=c->getTensorShape("input");assert(shape.nbDims==2&&shape.d[0]==2&&shape.d[1]==3);assert(c->setInputShape("input",shape));shape.d[0]=3;assert(!c->setInputShape("input",shape));
     auto strides=c->getTensorStrides("input");assert(strides.nbDims==2&&strides.d[0]==3&&strides.d[1]==1);assert(c->getTensorShape("missing").nbDims==-1);

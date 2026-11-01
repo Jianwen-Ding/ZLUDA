@@ -392,3 +392,11 @@ has not yet compiled or run: a complete consistent public header set is still mi
 Eleven offline parser/snapshot/fail-closed tests pass and do not substitute for that ABI result. See
 [reference-header-client.md](../validation/reference-header-client.md) for commands, provenance checks,
 current network limitation and the exact test scope. Full reference-header validation remains outstanding.
+
+
+## User-provided Developer Guide
+
+The supplied PDF is TensorRT 8.6.1 (April 2024), not an RTX 1.7.1 header set. Its error-handling section
+informs a new child-recorder isolation/fallback regression, but does not resolve the independent reference-
+header ABI gate. See [review and document fingerprint](../validation/user-developer-guide.md) for the source,
+page references, observed behavior and version limitations.

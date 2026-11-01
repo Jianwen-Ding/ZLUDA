@@ -1360,7 +1360,13 @@ it), as NVIDIA's does.
   (`agx_libs/kernels/blas.mlir`): `cublasSaxpy`, `Sscal`, `Scopy`, `Sswap`,
   `Sdot`, `Sasum`, `Snrm2`, `Isamax`, `Isamin`, `Sgemv` and `Sger`, with
   negative increments as BLAS defines them. `Sgemv` with a transposed A
-  gives each element of y a SIMD-group reading its column together. Reductions are deterministic:
+  gives each element of y a SIMD-group reading its column together; without
+  transposition, fewer than 8192 rows and unit increments split the columns
+  into chunks (~64K threads: `agx_sgemv_split` writes partial sums to the
+  handle's scratch, `agx_sgemv_sum` adds them in order), where a thread per row
+  walked every column: 1024 x 16384 2046 -> 217 us, 4096^2 553 -> 271 us, 64 x
+  8192 1070 -> 82 us (`tools/l2bench.c`; `ZLUDA_AGX_GEMV_SPLIT=0`: a thread per
+  row). Reductions are deterministic:
   1024 threads keep fixed partials that one thread combines in order. `nrm2`
   keeps a scaled sum of squares (LAPACK's `slassq`), so it does not overflow
   when the squares would. In host pointer mode a reduction waits for the

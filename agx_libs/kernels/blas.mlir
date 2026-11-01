@@ -264,6 +264,88 @@ gpu.module @agx_blas {
     gpu.return
   }
 
+  // y = A x for few rows, in two kernels: part[s m + i] = sum over the
+  // columns k of chunk s (s chunk .. (s + 1) chunk, below n) of A[i, k] x[k]
+  // (unit strides; an m x chunks grid, rows along x so a SIMD-group reads
+  // neighbouring elements of a column), then agx_sgemv_sum adds each row's
+  // partial sums in chunk order: y = alpha sum + beta y (y not read when beta
+  // is 0). For m too small to fill the GPU with a thread per row.
+  gpu.func @agx_sgemv_split(%a0: memref<1xf32, 1>, %x0: memref<1xf32, 1>,
+                            %part0: memref<1xf32, 1>, %m_: i64, %n_: i64, %lda_: i64,
+                            %chunk_: i64) kernel {
+    %i1 = arith.constant 1 : index
+    %f0 = arith.constant 0.0 : f32
+    %big = arith.constant 4611686018427387904 : index
+    %m = arith.index_cast %m_ : i64 to index
+    %n = arith.index_cast %n_ : i64 to index
+    %lda = arith.index_cast %lda_ : i64 to index
+    %chunk = arith.index_cast %chunk_ : i64 to index
+    %A = memref.reinterpret_cast %a0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %x = memref.reinterpret_cast %x0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %part = memref.reinterpret_cast %part0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %i = gpu.global_id x
+    %s = gpu.global_id y
+    %live = arith.cmpi ult, %i, %m : index
+    scf.if %live {
+      %k0 = arith.muli %s, %chunk : index
+      %k1a = arith.addi %k0, %chunk : index
+      %k1 = arith.minui %k1a, %n : index
+      %sum = scf.for %k = %k0 to %k1 step %i1 iter_args(%acc = %f0) -> f32 {
+        %kc = arith.muli %k, %lda : index
+        %p = arith.addi %kc, %i : index
+        %va = memref.load %A[%p] : memref<?xf32, strided<[1]>, 1>
+        %vx = memref.load %x[%k] : memref<?xf32, strided<[1]>, 1>
+        %acc1 = math.fma %va, %vx, %acc : f32
+        scf.yield %acc1 : f32
+      }
+      %sm = arith.muli %s, %m : index
+      %o = arith.addi %sm, %i : index
+      memref.store %sum, %part[%o] : memref<?xf32, strided<[1]>, 1>
+    }
+    gpu.return
+  }
+
+  // y[i] = alpha (part[i] + part[m + i] + ...) + beta y[i] over the chunks of
+  // agx_sgemv_split (unit stride; y not read when beta is 0). A thread per row.
+  gpu.func @agx_sgemv_sum(%part0: memref<1xf32, 1>, %y0: memref<1xf32, 1>, %m_: i64,
+                          %chunks_: i64, %alpha: f32, %beta: f32) kernel {
+    %i0 = arith.constant 0 : index
+    %i1 = arith.constant 1 : index
+    %f0 = arith.constant 0.0 : f32
+    %big = arith.constant 4611686018427387904 : index
+    %m = arith.index_cast %m_ : i64 to index
+    %chunks = arith.index_cast %chunks_ : i64 to index
+    %part = memref.reinterpret_cast %part0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %y = memref.reinterpret_cast %y0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %i = gpu.global_id x
+    %live = arith.cmpi ult, %i, %m : index
+    scf.if %live {
+      %sum = scf.for %s = %i0 to %chunks step %i1 iter_args(%acc = %f0) -> f32 {
+        %sm = arith.muli %s, %m : index
+        %o = arith.addi %sm, %i : index
+        %v = memref.load %part[%o] : memref<?xf32, strided<[1]>, 1>
+        %acc1 = arith.addf %acc, %v : f32
+        scf.yield %acc1 : f32
+      }
+      %scaled = arith.mulf %sum, %alpha : f32
+      %no_old = arith.cmpf oeq, %beta, %f0 : f32
+      %res = scf.if %no_old -> f32 {
+        scf.yield %scaled : f32
+      } else {
+        %old = memref.load %y[%i] : memref<?xf32, strided<[1]>, 1>
+        %ep = math.fma %old, %beta, %scaled : f32
+        scf.yield %ep : f32
+      }
+      memref.store %res, %y[%i] : memref<?xf32, strided<[1]>, 1>
+    }
+    gpu.return
+  }
+
   // y = alpha op(A) x + beta y for an m x n column-major A (op transposes
   // when trans is 1); y is not read when beta is 0. One thread per element
   // of y.

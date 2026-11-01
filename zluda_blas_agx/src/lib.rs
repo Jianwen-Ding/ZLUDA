@@ -1142,6 +1142,29 @@ mod imp {
                 [128, 1],
             );
         }
+        // few rows: the columns in chunks (agx_sgemv_split, partial sums in the handle's scratch, then agx_sgemv_sum in
+        // chunk order) so that ~64K threads run; a thread per row walked all n columns (1024 x 16384: 2.04 ms, 33 GB/s)
+        let chunks = (65536 / m.max(1)).clamp(1, (n / 64).max(1));
+        // (from 8192 rows a thread per row fills the GPU: 16384 x 1024 192 us one pass, 272 split)
+        if m < 8192 && chunks > 1 && incx == 1 && incy == 1 && std::env::var("ZLUDA_AGX_GEMV_SPLIT").map_or(true, |v| v != "0") {
+            let mut chunk = (n + chunks - 1) / chunks;
+            let mut nchunks = (n + chunk - 1) / chunk;
+            let mut part = scratch(h, (m * nchunks) as usize * std::mem::size_of::<T>())?;
+            blas_launch(
+                h,
+                T::kernel(c"agx_sgemv_split", c"agx_sgemv_split_f64"),
+                &mut [arg(&mut a), arg(&mut x), arg(&mut part), arg(&mut m), arg(&mut n), arg(&mut lda), arg(&mut chunk)],
+                [m, nchunks],
+                [64, 1],
+            )?;
+            return blas_launch(
+                h,
+                T::kernel(c"agx_sgemv_sum", c"agx_sgemv_sum_f64"),
+                &mut [arg(&mut part), arg(&mut y), arg(&mut m), arg(&mut nchunks), arg(&mut alpha), arg(&mut beta)],
+                [m, 1],
+                [64, 1],
+            );
+        }
         let mut trans = 0i64;
         let ylen = m;
         blas_launch(

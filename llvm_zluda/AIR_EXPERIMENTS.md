@@ -99,6 +99,14 @@ wall time, peak RSS, object md5).
   6.48, 1024^3 4.02, f16 C 5.39 TFLOPS). So the 32 accumulators per SIMD-group (register pressure, fewer resident
   SIMD-groups) cost more than the reuse gains, whatever the workgroup shape: 16 accumulators (32 x 32) is the
   better point for these kernels.
+- Dead end (as built), threadgroup-staged tile GEMM: agx_hgemm_tile64_cf{16,32}_tb with K in chunks of 32 staged
+  in 8 KiB of threadgroup memory by the 128 threads (16 scalar f16 loads of A and of B each, zero past K), a barrier,
+  the 4 x 4 fragments per SIMD-group from threadgroup memory (air.simdgroup_matrix_load from workgroup memory
+  compiles and is correct: hgemm kernel tests 21/21, 1024^3 max relative error 3.6e-6), a barrier: 2.5x slower
+  (4096^3 6.99 -> 2.75 TFLOPS, 512 x 512 x 4096 4.97 -> 1.30). The staging is the cost (scalar loads behind a bound
+  branch, B's transposed stores into threadgroup memory, two barriers per 32 of K); fragments loaded straight from
+  device memory are already efficient here. A competitive version needs vector loads, a conflict-free layout and
+  double buffering (generator: /scratch/perf-goal/tggemm/gen_tg.py, not kept).
 - Dead end, dp4a: a signed dp4a is 18 AGX instructions (4 imadd; the bytes extracted by bfi + asr pairs, asr 24 for
   byte 3). The free 16-bit sign extension (MOD_SX) exists only on add / multiply-add sources (IADD_I32_FROM16,
   IMADD_*_FROM32), not on shifts, so byte 1 (sext of the low half, then asr 8) is two instructions as now: no

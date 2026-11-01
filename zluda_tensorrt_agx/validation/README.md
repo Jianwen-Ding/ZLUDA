@@ -113,3 +113,17 @@ source-interface tests pass with the new format. This does not add NVIDIA engine
 `custom-serializer.json` records the same small benchmark: MatMul model build measured 1.87 ms versus 3.74 ms
 in `broadcast-after.json`; convolution model build measured 0.052 ms versus 0.098 ms. Build includes JSON input
 parsing and validation as well as serialization, so these are not isolated serializer throughput measurements.
+
+## Inference BatchNormalization
+
+The ONNX importer now accepts inference BatchNormalization with static f32 input and constant per-channel scale,
+bias, running mean and variance. Coefficients are precomputed once, then executed as portable MLIR multiply/add;
+following ReLU uses existing add/ReLU fusion. This removes runtime square roots and parameter normalization.
+It still uses two pointwise launches; a dedicated affine fusion remains a possible optimization. Folding can
+change floating-point rounding compared with computing the unfused expression.
+
+Four new GPU numerical fixtures cover ranks 2, 3, 4 and 5, nondefault epsilon and mixed-sign scales with ReLU.
+Training mode and negative variance rejection are checked. All 21 ONNX models pass (maximum absolute error
+4.76837e-7); all 9 Rust tests, 42 graph tests and lifecycle tests also pass. Official ONNX checker remains unavailable.
+No PTX compiler or MLIR kernel changes were made in this checkpoint.
+Public semantics: https://onnx.ai/onnx/operators/onnx__BatchNormalization.html

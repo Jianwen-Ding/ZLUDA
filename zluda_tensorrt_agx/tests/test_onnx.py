@@ -83,6 +83,17 @@ execute(model([('x',[2,3,4,5])],[('y',[2,3,1,1])],[op('GlobalAveragePool',['x'],
 value=constant('',np.array([1.,2.,3.],dtype='f'))
 constant_node=text(2,'y')+text(4,'Constant')+blob(5,text(1,'value')+var(20,4)+blob(5,value))
 execute(model([],[('y',[3])],[constant_node]),{}, {'y':np.array([1.,2.,3.],dtype='f')})
+# Inference BatchNormalization across ranks, with non-default epsilon and fused ReLU.
+for sh in [(2,3),(2,3,7),(2,3,4,5),(1,3,1,2,1)]:
+    x=rng.normal(size=sh).astype('f');scale=rng.normal(size=3).astype('f');bias=rng.normal(size=3).astype('f')
+    mean=rng.normal(size=3).astype('f');variance=rng.uniform(.01,2,size=3).astype('f');eps=.002
+    broad=[1,3]+[1]*(len(sh)-2)
+    ref=np.maximum((x-mean.reshape(broad))/np.sqrt(variance.reshape(broad)+eps)*scale.reshape(broad)+bias.reshape(broad),0)
+    data=model([('x',sh)],[('y',sh)],[op('BatchNormalization',['x','s','b','m','v'],'bn',epsilon=eps),op('Relu',['bn'],'y')],[constant('s',scale),constant('b',bias),constant('m',mean),constant('v',variance)])
+    execute(data,{'x':x},{'y':ref})
+for training,var_values in [(1,np.ones(3,dtype='f')),(0,-np.ones(3,dtype='f'))]:
+    data=model([('x',[2,3])],[('y',[2,3])],[op('BatchNormalization',['x','s','b','m','v'],'y',training_mode=training)],[constant('s',np.ones(3)),constant('b',np.zeros(3)),constant('m',np.zeros(3)),constant('v',var_values)])
+    buf=C.create_string_buffer(data);assert not build_onnx(buf,len(data),1<<30)
 # Malformed metadata and unsupported operators/attributes are explicit failures.
 for bad in [b'\0',b'\x80'*11,b'\x3a\xff\xff\xff\xff\x7f',model([('x',[2,3])],[('y',[2,3])],[op('Relu',['x'],'y',unknown=1)]),model([('x',[2,3])],[('y',[2,3])],[op('Erf',['x'],'y')]),model([('x',[2,3])],[('y',[2,3])],[op('Relu',['x'],'y')],opset=12)]:
     buf=C.create_string_buffer(bad);assert not build_onnx(buf,len(bad),1<<30),bad

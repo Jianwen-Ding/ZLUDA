@@ -34,10 +34,14 @@ waits for outstanding work before freeing owned buffers. The CUDA context must o
 
 ONNX import supports standard-domain opsets 13–22, IR versions 4–13, static f32 I/O, embedded f32 weights, and
 constant i64 reshape shapes. Supported operators: `MatMul`, `Gemm`, `Conv`, `Relu`, `Sigmoid`, `Tanh`, `Identity`,
-`Add`, `Mul`, `Sub`, `Div`, binary `Max`/`Min`, `Softmax`, `MaxPool`, `AveragePool`, `GlobalAveragePool`, `Flatten`,
+`BatchNormalization` (inference with constant parameters), `Add`, `Mul`, `Sub`, `Div`, binary `Max`/`Min`, `Softmax`, `MaxPool`, `AveragePool`, `GlobalAveragePool`, `Flatten`,
 `Reshape`, `Transpose`, `Concat`, and tensor-valued `Constant` nodes. External weights, dynamic shapes, non-f32
 execution, custom operators/plugins, control flow, asymmetric/automatic padding, dilated/ceil pooling, and opaque
 vendor engines return explicit errors. This operator set is not the entire TensorRT API.
+
+Inference BatchNormalization precomputes channel scale/shift at model build time and lowers to existing portable
+MLIR multiply/add kernels. A following ReLU is fused into the add. Training mode and dynamic normalization
+parameters are rejected; this does not implement training statistics updates.
 
 ## Build and run
 

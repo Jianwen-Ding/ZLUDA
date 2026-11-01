@@ -158,7 +158,7 @@ pub fn import(data:&[u8])->Result<Graph>{
         if outputs.len()!=1 || outputs[0].is_empty() || ids.contains_key(&outputs[0]) || ints.contains_key(&outputs[0]){return Err(format!("{kind} requires one unique output"));}
         let expected = match kind.as_str() {
             "MatMul"|"Add"|"Mul"|"Sub"|"Div"|"Max"|"Min"|"Reshape" => 2..=2,
-            "Gemm"|"Conv" => 2..=3, "Constant" => 0..=0, "Concat" => 1..=MAX_TENSORS,
+            "BatchNormalization" => 5..=5, "Gemm"|"Conv" => 2..=3, "Constant" => 0..=0, "Concat" => 1..=MAX_TENSORS,
             _ => 1..=1,
         };
         if !expected.contains(&inputs.len()) { return Err(format!("{kind}: wrong number of inputs")); }
@@ -188,6 +188,32 @@ pub fn import(data:&[u8])->Result<Graph>{
                 g.add_node(Op::ElementWise{a:get(0)?,b:get(1)?,kind:match kind.as_str(){"Add"=>Binary::Add,"Mul"=>Binary::Mul,"Sub"=>Binary::Sub,"Div"=>Binary::Div,"Max"=>Binary::Max,_=>Binary::Min}})?
             }
             "Relu"|"Sigmoid"|"Tanh"|"Identity"=>g.add_node(Op::Activation{input:get(0)?,kind:match kind.as_str(){"Relu"=>Unary::Relu,"Sigmoid"=>Unary::Sigmoid,"Tanh"=>Unary::Tanh,_=>Unary::Identity}})?,
+            "BatchNormalization"=>{
+                let x=get(0)?; let shape=g.tensors[x].shape.clone();
+                if shape.len()<2{return Err("BatchNormalization needs a channel axis".into());}
+                if take_int(&mut attrs,"training_mode",0)?!=0{return Err("BatchNormalization training mode is unsupported".into());}
+                let epsilon=take_float(&mut attrs,"epsilon",1e-5)?;
+                let _momentum=take_float(&mut attrs,"momentum",0.9)?;
+                if epsilon<0.{return Err("invalid BatchNormalization attributes".into());}
+                let parameters=(1..5).map(|i|{
+                    let t=&g.tensors[get(i)?];
+                    if t.shape!=[shape[1]]{return Err("BatchNormalization parameters must have shape [C]".into());}
+                    t.data.as_ref().ok_or_else(||"BatchNormalization parameters must be constant".to_owned())
+                }).collect::<Result<Vec<_>>>()?;
+                let mut scale=Vec::with_capacity(shape[1]);let mut shift=Vec::with_capacity(shape[1]);
+                for c in 0..shape[1]{
+                    let variance=parameters[3][c];let denominator=variance+epsilon;
+                    if variance<0. || denominator<=0. || !denominator.is_finite(){return Err("invalid BatchNormalization variance".into());}
+                    let a=parameters[0][c]/denominator.sqrt();let b=parameters[1][c]-parameters[2][c]*a;
+                    if !a.is_finite()||!b.is_finite(){return Err("BatchNormalization coefficients overflow".into());}
+                    scale.push(a);shift.push(b);
+                }
+                let mut broadcast=vec![1;shape.len()];broadcast[1]=shape[1];
+                let a=g.add_input(format!("__onnx_bn_scale_{}",g.tensors.len()),broadcast.clone(),Some(scale))?;
+                let b=g.add_input(format!("__onnx_bn_shift_{}",g.tensors.len()),broadcast,Some(shift))?;
+                let y=g.add_node(Op::ElementWise{a:x,b:a,kind:Binary::Mul})?;
+                g.add_node(Op::ElementWise{a:y,b,kind:Binary::Add})?
+            }
             "Softmax"=>g.add_node(Op::Softmax{input:get(0)?,axis:take_int(&mut attrs,"axis",-1)? as isize})?,
             "Conv"=>{
                 let x=get(0)?;let w=get(1)?;let shape=&g.tensors[w].shape;

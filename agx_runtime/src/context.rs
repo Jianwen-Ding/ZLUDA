@@ -312,9 +312,7 @@ impl Context {
     pub fn memset(&mut self, dst: u64, pattern: &[u8], count: u64) -> io::Result<()> {
         self.stream.synchronize()?;
         let n = pattern.len() as u64;
-        for chunk in self.bytes_mut(dst, count * n)?.chunks_exact_mut(n as usize) {
-            chunk.copy_from_slice(pattern);
-        }
+        fill_pattern(self.bytes_mut(dst, count * n)?, pattern);
         Ok(())
     }
 
@@ -380,5 +378,62 @@ mod tests {
         assert_eq!(d.name, "Apple M2 Max (G14C, 38 cores)");
         assert_eq!(d.llvm_cpu, "agx-g14c");
         assert_eq!((d.cores, d.clock_khz, d.warp_size), (38, 1_398_000, 32));
+    }
+}
+
+/// Fills `bytes` with copies of `pattern` (1, 2 or 4 bytes; `bytes` a multiple of it) as `fill` on bytes, halves or
+/// words: a copy of the pattern per element, its length known only at run time, ran at ~0.45 GB/s (a 384 MiB
+/// cudaMemsetAsync of llama.cpp's KV cache took 870 ms).
+pub fn fill_pattern(bytes: &mut [u8], pattern: &[u8]) {
+    fn typed<T: Copy>(bytes: &mut [u8], v: T, pattern: &[u8]) {
+        // SAFETY: any bit pattern is a valid u16 / u32; head and tail are the unaligned bytes
+        let (head, mid, tail) = unsafe { bytes.align_to_mut::<T>() };
+        let n = pattern.len();
+        // the elements are at multiples of n from the start: the head's bytes continue the pattern from its start
+        for (i, b) in head.iter_mut().enumerate() {
+            *b = pattern[i % n];
+        }
+        if head.len() % n != 0 {
+            // the aligned part starts inside an element: rotate the value by the head's phase
+            let phase = head.len() % n;
+            let rotated: Vec<u8> = (0..n).map(|i| pattern[(i + phase) % n]).collect();
+            let mut w = v;
+            unsafe { std::ptr::copy_nonoverlapping(rotated.as_ptr(), &mut w as *mut T as *mut u8, n) };
+            mid.fill(w);
+        } else {
+            mid.fill(v);
+        }
+        let start = head.len() + mid.len() * n;
+        for (i, b) in tail.iter_mut().enumerate() {
+            *b = pattern[(start + i) % n];
+        }
+    }
+    match *pattern {
+        [b] => bytes.fill(b),
+        [a, b] => typed(bytes, u16::from_ne_bytes([a, b]), pattern),
+        [a, b, c, d] => typed(bytes, u32::from_ne_bytes([a, b, c, d]), pattern),
+        _ => {
+            for chunk in bytes.chunks_exact_mut(pattern.len()) {
+                chunk.copy_from_slice(pattern);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod fill_tests {
+    #[test]
+    fn fill_pattern_matches_elementwise() {
+        for pattern in [&[7u8][..], &[1, 2], &[1, 2, 3, 4], &[9, 9, 9, 9]] {
+            for offset in 0..4 {
+                for count in [0usize, 1, 2, 3, 7, 64, 1000, 4097] {
+                    let mut buf = vec![0u8; offset + count * pattern.len() + 3];
+                    let fast = &mut buf[offset..offset + count * pattern.len()];
+                    super::fill_pattern(fast, pattern);
+                    let slow: Vec<u8> = pattern.iter().copied().cycle().take(count * pattern.len()).collect();
+                    assert_eq!(fast, &slow[..], "pattern {pattern:?} offset {offset} count {count}");
+                }
+            }
+        }
     }
 }

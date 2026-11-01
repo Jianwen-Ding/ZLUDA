@@ -2010,8 +2010,14 @@ pub(crate) unsafe fn cuMemcpyDtoD_v2(dst: CUdeviceptr, src: CUdeviceptr, n: usiz
 
 pub(crate) unsafe fn cuMemsetD8_v2(dst: CUdeviceptr, uc: u8, n: usize) -> CUresult {
     with(|d| {
+        let started = Instant::now();
         d.sync_all()?;
-        d.ctx.memset(dst.0 as u64, &[uc], n as u64).map_err(from_io)
+        let synced = started.elapsed();
+        d.ctx.memset(dst.0 as u64, &[uc], n as u64).map_err(from_io)?;
+        if crate::log_enabled() {
+            eprintln!("[zluda_agx] memset {n} bytes of {:#x}: wait {:.3} ms, fill {:.3} ms", dst.0 as u64, synced.as_secs_f64() * 1e3, (started.elapsed() - synced).as_secs_f64() * 1e3);
+        }
+        Ok(())
     })
 }
 

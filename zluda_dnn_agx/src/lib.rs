@@ -301,6 +301,27 @@ mod imp {
 
     struct Handle {
         stream: cudaStream_t,
+        /// Device buffers for the temporaries of the handle's calls (`temp`): (address, bytes, the stream that last
+        /// used it, in use). A buffer returns here when its call is done with it instead of being freed, which waited
+        /// for the GPU at every convolution through im2col (and allocated anew: object creation zeroes its pages).
+        pool: std::cell::RefCell<Vec<(*mut c_void, usize, cudaStream_t, bool)>>,
+    }
+
+    impl Handle {
+        fn new() -> Handle {
+            Handle { stream: cuda_types::cuda::CUstream(std::ptr::null_mut()), pool: Default::default() }
+        }
+    }
+
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            for &(p, _, stream, _) in self.pool.get_mut().iter() {
+                unsafe {
+                    let _ = engine::synchronize(stream);
+                    let _ = engine::free(p);
+                }
+            }
+        }
     }
 
     fn status(e: engine::Error) -> cudnnError_t {
@@ -368,7 +389,7 @@ mod imp {
         if !engine::available() {
             return Err(cudnnError_t::NOT_INITIALIZED);
         }
-        out(h, Box::into_raw(Box::new(Handle { stream: cuda_types::cuda::CUstream(std::ptr::null_mut()) })) as cudnnHandle_t)
+        out(h, Box::into_raw(Box::new(Handle::new())) as cudnnHandle_t)
     }
 
     pub(crate) unsafe fn cudnnDestroy(h: cudnnHandle_t) -> cudnnStatus_t {
@@ -1938,20 +1959,40 @@ mod imp {
         Ok(())
     }
 
-    /// Device memory released after the handle's stream finishes with it.
-    struct Temp(*mut c_void, cudaStream_t);
+    /// Device memory for one call's temporary, from the handle's pool: back in the pool when dropped, for the work
+    /// queued on the handle's stream after it (stream order keeps that work after the work that used it).
+    /// (The handle outlives its calls, which hold their temporaries.)
+    struct Temp(*mut c_void, *const Handle, usize);
 
     impl Drop for Temp {
         fn drop(&mut self) {
-            unsafe {
-                let _ = engine::synchronize(self.1);
-                let _ = engine::free(self.0);
-            }
+            let h = unsafe { &*self.1 };
+            let mut pool = h.pool.borrow_mut();
+            pool[self.2].2 = h.stream;
+            pool[self.2].3 = false;
         }
     }
 
     unsafe fn temp(h: &Handle, bytes: i64) -> Result<Temp, cudnnError_t> {
-        Ok(Temp(engine::alloc(bytes.max(4) as usize).map_err(status)?, h.stream))
+        let bytes = bytes.max(4) as usize;
+        let mut pool = h.pool.borrow_mut();
+        // the smallest free buffer that is large enough, else a new one
+        let free = (0..pool.len()).filter(|&i| !pool[i].3 && pool[i].1 >= bytes).min_by_key(|&i| pool[i].1);
+        let i = match free {
+            Some(i) => {
+                // used last on another stream: that stream's work on it first
+                if pool[i].2 .0 != h.stream.0 {
+                    engine::synchronize(pool[i].2).map_err(status)?;
+                }
+                i
+            }
+            None => {
+                pool.push((engine::alloc(bytes).map_err(status)?, bytes, h.stream, false));
+                pool.len() - 1
+            }
+        };
+        pool[i].3 = true;
+        Ok(Temp(pool[i].0, h as *const Handle, i))
     }
 
     #[allow(clippy::too_many_arguments)]

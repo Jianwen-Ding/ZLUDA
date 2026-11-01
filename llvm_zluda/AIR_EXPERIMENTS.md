@@ -41,6 +41,35 @@ section. GPU times are from the M2 Max behind the AIR service; "suite" is PTX-fo
   is now the slow part. Not over-inlining: shade_surface_mnee packaged alone keeps 162 functions, and
   `-air-keep-function-cost` 20000 / 5000 / 2000 left it byte-identical (its large functions are kept already).
 
+## Compile time, memory and host costs on Asahi (2026-11-01)
+
+No AIR service this session: GPU numbers are of the AGX code on the M2 Max through zluda_agx (Asahi DRM). Corpus:
+Geekbench's 15 modules and llama.cpp's 17 (`/scratch/perf-goal/ctime.py`: one zoc per module as the driver runs it,
+wall time, peak RSS, object md5).
+
+- **The Metal copy is not needed on Asahi** (`zoc --agx-only`, the driver and every served request): the clone of the
+  module for Metal, its passes and bitcode, and the portable AIR output. Objects byte-identical (30/30), corpus
+  51.5 -> 49.3 s.
+- **llama.cpp's 10 MB module (317 kernels): 28.6 s, 2.1 GB.** Serial: the first pipeline 9.8 s (InstCombine 55%, the
+  first of its three runs 3.7 s; SROA 19%: 311k allocas), O3 in AIR's address spaces 9.5 s; the per-kernel AGX code
+  6.7 s on 12 threads. The time is spread over 332 functions (median 3k lines), no outlier: what would shorten it is
+  optimizing the module in parallel parts (the IPO passes, globalopt and ipsccp, would then see a part's globals only:
+  unsound without care). Dead end: an early-cse / instsimplify / simplifycfg before the first InstCombine changes
+  nothing (7.98-8.19 s for the prefix). `ZLUDA_AIR_DUMP_FIRST=FILE` writes the module before the first pipeline for
+  `opt -time-passes`.
+- **"Cannot select: store (s64) into %stack.0"** (that module as a whole, and per kernel with O3): two zero
+  <2 x float> stores into one alloca, the DAG rebuilding a memory operand from the frame index with the stack's
+  pseudo source value in address space 0. Fixed in the AGX backend (getAddressSpaceForPseudoSourceKind, llvm-project
+  claude/perf-air-agx); llvm-reduce from the kernel to 6 lines. The default objects are unchanged by the fix.
+- **Host costs that libcudart programs hit** (llama.cpp b11706 links the CUDA runtime statically, so its start-up is
+  the runtime's): `ZLUDA_AGX_API_STATS` showed 1.75 of 2.5 s of start-up in cuMemsetD8Async, two 384 MiB memsets at
+  0.45 GB/s (a pattern copy per element, length known at run time; a micro-benchmark with a constant pattern length
+  had looked fast: measure the real call). Fill as typed slices: 866 -> 8 ms, start-up 0.72 s. Generation: per token
+  ~4.7 ms waiting for the logits (GPU time) and ~3 ms in cuGraphLaunch overlapping it; GPU-bound.
+- cuBLAS (agx) split K now also for f16 A/B with f32 C from K = 512: 896 x 64 x 896 98 -> 86 us, 128 x 512 x 896
+  99 -> 82 us (`zluda_blas_agx/tools/gemmbench.c`). Skinny n <= 8 products stay slow (0.2-0.3 TFLOPS: the dot kernel
+  reads A once per column), but ggml uses its own kernels there.
+
 ## Real calls in the AGX backend (`-agx-experimental-leaf-calls`), 2026-10-30
 
 The way out of Cycles' AGX memory: shade_shadow with its large helpers kept as called functions compiles in 14 s at

@@ -1042,13 +1042,12 @@ Destroyed streams keep their queue (up to 32) for the next `cuStreamCreate`: cre
 rings and timestamp buffer) costs ~1 ms, and applications that create and destroy a stream per operation (Geekbench 7:
 ~7,800 times a run) spent ~10 s of a 156 s run in it.
 
-Graph launches use one compute command per kernel by default. Batching remains opt-in with
-`ZLUDA_AGX_GRAPH_BATCH=1` while evaluating workload cost tradeoffs. Every batched dispatch now emits
-the CDM barrier even when shader code is cached: the old cached-code fast path could omit ordering
-between dependent kernels and corrupt Qwen output. The repaired path matches CPU output on the four
-llama integration prompts. In warm Qwen tests it improves prompt throughput but reduces generation
-throughput, so it is not enabled by default.
-With that option, kernel launches of a graph (`cuGraphLaunch`) are gathered into the control stream of one compute command, each
+Graph launches are batched by default (`ZLUDA_AGX_GRAPH_BATCH=0` makes one compute command per kernel; llama.cpp
+prompt processing 335 -> 413 t/s, Geekbench 7 +2-3.5%, Blender unchanged on the AIR route). Every batched dispatch
+emits the CDM barrier even when shader code is cached: the old cached-code fast path could omit ordering between
+dependent kernels and corrupt Qwen output; the repaired path matches CPU output on the four llama integration
+prompts. Device-to-device copies inside a graph run as copy kernels in its batch (llama.cpp generation 47 -> 125 t/s).
+Kernel launches of a graph (`cuGraphLaunch`) are gathered into the control stream of one compute command, each
 dispatch followed by the barrier after a launch, up to 64 per command; any other operation of the graph submits the
 launches gathered first. One command per launch costs ~20-30 us of host time (the submit ioctl) and ~15-20 us between
 commands on the GPU; gathered, 64 small launches take ~34 us of host time and ~5-7 us each on the GPU
@@ -1075,6 +1074,14 @@ different kernel choices, so they are a workload comparison rather than an isola
 A queue remembers the last timeline point it successfully waited on and checked for GPU faults. Synchronizing that
 same point again needs no DRM wait or status query. On the M2 Max, 50,000 empty `cuCtxSynchronize` calls after one
 completed launch take 122 ns each instead of 2,076 ns; a new launch still advances the point and is waited on.
+
+Memory operations are on the CPU, through the mapping of each allocation (unified memory): a memset fills a slice
+of bytes, 16-bit halves or 32-bit words (a fill a pattern copy at a time, its length known only at run time, ran at
+~0.45 GB/s: llama.cpp's start-up spent 1.75 of 2.5 s in two 384 MiB `cudaMemsetAsync` of its KV cache; now ~50 GB/s,
+start-up 0.72 s); device-to-device copies are one `memmove`. New allocations are not filled on the CPU: the kernel's
+pages of a new GEM object are zeroed already (`agx_runtime` example `zero_check`; `AGX_ZERO_ALLOC=1` fills anyway).
+An allocation commits its memory at once: creating a 512 MiB object takes ~20 ms (the kernel zeroing it), binding it
+~15 ms more, and the CPU's first touch of each 16 KiB page ~0.6 us (playground 2026-11-01-gem-zeroed-pages).
 
 `ZLUDA_AGX_API_STATS=FILE` appends, about once a second, a JSON line with the Unix time in milliseconds (`t`) and per
 CUDA function the calls so far and the host time spent in them (`[calls, ns]`, cumulative).

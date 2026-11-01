@@ -130,6 +130,14 @@ for ash,bsh in [([],[]),([2,3],[]),([1,1,2,1,1,1,1,3],[1,1,1,1,1,1,1,3])]:
     a=tensor(g,'a',ash);b=tensor(g,'b',bsh,bv);ref=av+bv;y=node(g,ref.shape,'element_wise',a=a,b=b,kind='add');g['outputs']=[y]
     run(g,{'a':av},{f't{y}':ref},roundtrip=True)
 g=graph();v=np.arange(7,dtype='f');y=tensor(g,'constant_output',[7],v);g['outputs']=[y];run(g,{}, {'constant_output':v},roundtrip=True)
+# Constant uploads cover the exact staging limit and mixed direct/staged weight blocks.
+for count in [262144,262145]:
+    g=graph();value=np.linspace(-1,1,count,dtype='f');x=tensor(g,'x',[count]);weights=np.full(count,.25,dtype='f')
+    w=tensor(g,'weights',[count],weights);y=node(g,[count],'element_wise',a=x,b=w,kind='add');ref=value+weights
+    if count>262144:
+        w2=tensor(g,'weights2',[count],np.full(count,.125,dtype='f'));y=node(g,[count],'element_wise',a=y,b=w2,kind='add');ref=ref+.125
+        scalar=tensor(g,'small',[],np.array(.5,dtype='f'));y=node(g,[count],'element_wise',a=y,b=scalar,kind='add');ref=ref+.5
+    g['outputs']=[y];run(g,{'x':value},{f't{y}':ref},roundtrip=True)
 # Missing, undersized, overlapping bindings and foreign serialization fail explicitly.
 g=graph(); x=tensor(g,'x',[4]); out=node(g,[4],'activation',input=x,kind='identity'); g['outputs']=[out]
 data=json.dumps(g).encode(); storage=C.create_string_buffer(data); e=ck(build(storage,len(data),1024)); c=ck(create(e)); p=alloc(np.zeros(4,dtype='f'))

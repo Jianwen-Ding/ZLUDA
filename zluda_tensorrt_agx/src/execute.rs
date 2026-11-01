@@ -57,11 +57,7 @@ impl Drop for ContextGuard {
 struct Buffer { ptr: usize, owner: usize }
 impl Buffer {
     fn new(bytes: usize, owner: usize) -> Result<Self> { Ok(Self { ptr: unsafe { gpu(engine::alloc(bytes))? } as usize, owner }) }
-    fn upload<T: Copy>(data: &[T], owner: usize) -> Result<Self> {
-        let b = Self::new(std::mem::size_of_val(data), owner)?;
-        unsafe { gpu(engine::write(b.ptr as *mut _, data.as_ptr().cast(), std::mem::size_of_val(data)))?; }
-        Ok(b)
-    }
+
 }
 impl Drop for Buffer {
     fn drop(&mut self) {
@@ -85,7 +81,9 @@ pub(crate) type ResourceCache = Mutex<HashMap<usize, Arc<Resources>>>;
 impl Resources {
     fn new(plan: &Plan, owner: usize) -> Result<Self> {
         let mut pointers = vec![0usize; plan.graph.tensors.len()];
-        let mut constant_data = Vec::with_capacity(plan.constant_bytes);
+        // Stage at most 1 MiB of small constants; upload large weights from the immutable plan.
+        let mut constant_data = Vec::with_capacity(plan.constant_bytes.min(1<<20));
+        let mut direct_constants=Vec::new();
         let mut constant_offsets = Vec::new();
         fn pack<T: Copy>(bytes: &mut Vec<u8>, data: &[T]) -> usize {
             let offset = bytes.len().div_ceil(256) * 256; bytes.resize(offset, 0);
@@ -94,13 +92,17 @@ impl Resources {
         }
         for (i, t) in plan.graph.tensors.iter().enumerate() {
             if let Some(data) = &t.data {
-                let offset = pack(&mut constant_data, data); constant_offsets.push((i, offset));
+                if constant_data.len().div_ceil(256)*256+std::mem::size_of_val(data.as_slice())<=1<<20 {
+                    let offset=pack(&mut constant_data,data);constant_offsets.push((i,offset));
+                } else {direct_constants.push((i,data.as_slice()));}
             }
         }
         let mut metadata = Vec::new();
         let mut binary_ranks = Vec::new();
         let mut functions = HashMap::new();
-        let mut get = |image, name| -> Result<()> { functions.insert(name, unsafe { gpu(engine::function(image, name))? }); Ok(()) };
+        let mut get = |image, name| -> Result<()> {
+            if !functions.contains_key(name) {functions.insert(name,unsafe{gpu(engine::function(image,name))?});} Ok(())
+        };
         for step in &plan.steps {
             let out = &plan.graph.tensors[step.node.output].shape;
             let meta = match &step.node.operation {
@@ -142,7 +144,20 @@ impl Resources {
             binary_ranks.push(meta.as_ref().map_or(0, |m| (m.len() / 3) as i32));
             metadata.push(meta.as_deref().map(|v| pack(&mut constant_data, v)));
         }
-        let constants = Buffer::upload(&constant_data, owner)?;
+        let mut bytes=constant_data.len();
+        let mut direct_offsets=Vec::with_capacity(direct_constants.len());
+        for &(id,data) in &direct_constants {
+            let offset=bytes.checked_add(255).ok_or("constant size overflow")?/256*256;
+            bytes=offset.checked_add(std::mem::size_of_val(data)).ok_or("constant size overflow")?;
+            direct_offsets.push((id,offset));
+        }
+        let constants=Buffer::new(bytes,owner)?;
+        if !constant_data.is_empty() {unsafe{gpu(engine::write(constants.ptr as *mut _,constant_data.as_ptr().cast(),constant_data.len()))?;}}
+        for ((_,data),&(id,offset)) in direct_constants.iter().zip(&direct_offsets) {
+            let destination=constants.ptr.checked_add(offset).ok_or("constant address overflow")?;
+            unsafe{gpu(engine::write(destination as *mut _,data.as_ptr().cast(),std::mem::size_of_val(*data)))?;}
+            pointers[id]=destination;
+        }
         for (i, offset) in constant_offsets { pointers[i] = constants.ptr.checked_add(offset).ok_or("constant address overflow")?; }
         for offset in metadata.iter_mut().flatten() { *offset = constants.ptr.checked_add(*offset).ok_or("metadata address overflow")?; }
         Ok(Self { pointers, metadata, binary_ranks, _constants: constants, functions })

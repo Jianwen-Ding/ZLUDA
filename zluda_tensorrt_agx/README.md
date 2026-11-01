@@ -190,3 +190,9 @@ from Apache-2.0 interface documentation retain attribution in `NvInferRuntimeBas
 The ONNX reader follows the open [ONNX protobuf schema](https://github.com/onnx/onnx/blob/main/onnx/onnx.proto).
 No NVIDIA library has been inspected, disassembled, restored, loaded, or used as an implementation oracle for this
 work. Tests use synthetic networks, independently encoded ONNX, CPU references, our AGX driver and the simulator.
+
+
+GPU resource preparation packs at most 1 MiB of small constant weights into its host staging buffer;
+larger weights upload directly from immutable graph storage. Metadata shares the small-constant device
+allocation, followed by aligned direct-upload weight regions. The device allocation remains shared per
+engine/CUDA context. See [resource preparation validation](validation/resource-preparation.md).

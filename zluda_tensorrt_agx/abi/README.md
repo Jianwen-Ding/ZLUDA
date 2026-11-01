@@ -383,3 +383,12 @@ reference remains until the child resumes. Both waits have five-second deadlines
 destruction then balance the final reference. Normal and C++ adapter/probe-ASan runs pass, including existing
 GPU context probes. An isolated source-copy negative control reverting only inspector inheritance to the old
 borrowed getter triggers the expected reference-lifetime assertion. No vendor code or artifact is used.
+
+
+## Independent reference-header verification gate
+
+A real reference-header client and strict snapshot/compile harness are now prepared. The reference client
+has not yet compiled or run: a complete consistent public header set is still missing in this environment.
+Four offline parser/fail-closed tests pass and do not substitute for that ABI result. See
+[reference-header-client.md](../validation/reference-header-client.md) for commands, provenance checks,
+current network limitation and the exact test scope. Full reference-header validation remains outstanding.

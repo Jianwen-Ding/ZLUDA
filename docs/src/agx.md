@@ -1442,14 +1442,19 @@ stream order without waiting. Warm, fp32 3x3, every result bit-identical
 0.38 -> 0.09 ms (against the build before the pool; the last step, one im2col
 launch per chunk instead of per image, took the host's time per call from
 0.6-0.8 ms to ~0.02 ms on the many-image shapes). `cudnnConvolutionBackwardFilter` does the same
-for one group and dense dy planes: dw = sum over n of dy[n] col^T. In f32 a
+for one group and dense dy planes: dw = sum over n of dy[n] col^T. A
 chunk of images (up to 64 MiB of col and of parts) is one im2col launch, one
 strided batched GEMM giving each image's part, and a GEMM against a vector of
 ones (kept by the handle) that sums the parts into dw with alpha and beta
-(`ZLUDA_AGX_DNN_WGRAD_BATCH=0`: an image at a time, as f16 does): warm, 3x3,
+(`ZLUDA_AGX_DNN_WGRAD_BATCH=0`: an image at a time): warm, 3x3,
 equal to a CPU reference (`convbench ... bf`), 64 x 32 x 8 x 8 2.07 -> 0.27 ms,
 8 x 64 x 56 x 56 3.37 -> 0.95 ms, 32 x 64 x 14 x 14 1.85 -> 0.76 ms, 16 x 128 x
-28 x 28 2.24 -> 1.43 ms. `cudnnConvolutionBackwardData`
+28 x 28 2.24 -> 1.43 ms. In f16 the parts are f16 (each rounded once, the
+sum computed in f32 and rounded once, where an image at a time rounded dw
+after every image): 64 x 32 x 8 x 8 2.01 -> 0.25 ms, 32 x 64 x 14 x 14 1.77
+-> 0.75 ms, 8 x 64 x 56 x 56 2.93 -> 0.87 ms, 16 x 128 x 28 x 28 2.00 -> 1.27
+ms, with the error against a double-precision reference 1.1-3.1e-3 -> 2.5-4.7e-4
+of the largest value (`convbench ... bf h`). `cudnnConvolutionBackwardData`
 (one group, dense dy planes) forms col = w^T dy[n] in f32 on the GEMM path
 and gathers dx[n] from it (`agx_conv2d_col2im_*`, each element of dx written
 once, rounded once for f16), a chunk of images (up to 64 MiB of col) per

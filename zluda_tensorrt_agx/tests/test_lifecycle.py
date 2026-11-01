@@ -16,6 +16,11 @@ c=ck(create(e))
 xv=np.array([[1,-2,3],[4,5,-6]],dtype='f');xp=alloc(xv);yp=alloc(np.full((2,2),np.nan,dtype='f'))
 assert bind(c,b'x',xp,xv.nbytes)==0 and bind(c,f't{y}'.encode(),yp,16)==0
 assert enqueue(c,None)==0 and sync(c)==0,err()
+# Rebinding invalidates the cached overlap check, including after a successful enqueue.
+assert bind(c,f't{y}'.encode(),xp,16)==0
+assert enqueue(c,None)==-1
+assert bind(c,f't{y}'.encode(),yp,16)==0
+assert enqueue(c,None)==0 and sync(c)==0,err()
 stream=P();dc('cuStreamCreate',C.byref(stream),I(1))
 graph_handle=P();exec_handle=P()
 dc('cuStreamBeginCapture_v2',stream,I(0));assert enqueue(c,stream)==0,err()

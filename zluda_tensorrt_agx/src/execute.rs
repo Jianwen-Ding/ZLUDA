@@ -120,6 +120,7 @@ pub struct Context {
     owner: usize,
     pointers: Vec<usize>,
     bound: Vec<bool>,
+    bindings_validated: bool,
     _workspace: Buffer,
     resources: Arc<Resources>,
     last_stream: Option<usize>,
@@ -141,7 +142,7 @@ impl Context {
             if let Some(offset) = offset { pointers[i] = workspace.ptr.checked_add(*offset).ok_or("workspace address overflow")?; }
         }
         let count = pointers.len();
-        Ok(Self { plan, owner, pointers, bound: vec![false; count], _workspace: workspace, resources, last_stream: None })
+        Ok(Self { plan, owner, pointers, bound: vec![false; count], bindings_validated: false, _workspace: workspace, resources, last_stream: None })
     }
     pub fn bind(&mut self, name: &str, pointer: usize, bytes: usize) -> Result<()> {
         let g = &self.plan.graph;
@@ -149,7 +150,7 @@ impl Context {
         if !g.inputs.contains(&i) && !g.outputs.contains(&i) { return Err("only graph inputs and outputs can be bound".into()); }
         if pointer == 0 || pointer % 4 != 0 || bytes < g.tensors[i].bytes()? { return Err("binding needs an aligned, non-null device pointer and sufficient bytes".into()); }
         pointer.checked_add(g.tensors[i].bytes()?).ok_or("binding address overflow")?;
-        self.pointers[i] = pointer; self.bound[i] = true; Ok(())
+        self.pointers[i] = pointer; self.bound[i] = true; self.bindings_validated = false; Ok(())
     }
     unsafe fn launch(&self, name: &'static CStr, threads: usize, params: &mut [*mut c_void], stream: CUstream) -> Result<()> {
         let f = *self.resources.functions.get(name).ok_or("inference kernel was not prepared")?;
@@ -173,14 +174,17 @@ impl Context {
     pub unsafe fn enqueue(&mut self, stream: CUstream) -> Result<()> {
         if current()? != self.owner { return Err("execution context belongs to another CUDA context".into()); }
         let g = &self.plan.graph;
-        let io: Vec<usize> = g.inputs.iter().chain(&g.outputs).copied().collect();
-        for &i in &io { if !self.bound[i] { return Err(format!("tensor {} has no device binding", g.tensors[i].name)); } }
-        for (at, &i) in io.iter().enumerate() {
-            for &j in &io[..at] {
-                if self.pointers[i] < self.pointers[j] + g.tensors[j].bytes()? && self.pointers[j] < self.pointers[i] + g.tensors[i].bytes()? {
-                    return Err("input/output bindings overlap".into());
+        if !self.bindings_validated {
+            let io: Vec<usize> = g.inputs.iter().chain(&g.outputs).copied().collect();
+            for &i in &io { if !self.bound[i] { return Err(format!("tensor {} has no device binding", g.tensors[i].name)); } }
+            for (at, &i) in io.iter().enumerate() {
+                for &j in &io[..at] {
+                    if self.pointers[i] < self.pointers[j] + g.tensors[j].bytes()? && self.pointers[j] < self.pointers[i] + g.tensors[i].bytes()? {
+                        return Err("input/output bindings overlap".into());
+                    }
                 }
             }
+            self.bindings_validated = true;
         }
         if let Some(last) = self.last_stream.filter(|&last| last != stream.0 as usize) { gpu(engine::synchronize(CUstream(last as *mut _)))?; }
         self.last_stream = Some(stream.0 as usize);

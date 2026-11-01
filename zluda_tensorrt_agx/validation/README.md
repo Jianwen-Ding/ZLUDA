@@ -62,3 +62,24 @@ C++ MLP and a complete ONNX convolution/pooling/dense/softmax classifier exercis
 
 Reproduction commands are in [the crate README](../README.md). Generated libraries, executables, AIR and AGX
 objects, simulator captures and the packaged SDK remain in scratch; this directory records source and results.
+
+## Follow-up: binding dispatch and expanded PTX run
+
+Unchanged execution bindings now reuse successful missing/overlap validation, avoiding its temporary allocation
+and pairwise comparisons on each enqueue. Every successful rebind invalidates that result. The lifecycle test
+checks overlap rejection after a previously successful enqueue and recovery after restoring the output binding.
+All 42 GPU graph tests and lifecycle tests pass. `bindings-cached.json` records a follow-up microbenchmark;
+GPU-dominated timings do not isolate the CPU validation saving, so no percentage speedup is claimed.
+
+Expanded strict-fp AIR/simulator check of all 184 `tests/zluda/*.ptx` files: 179 PASS, 2 FAIL, 1 COMPILE-ERROR,
+1 SIM-ERROR, 1 UNSUPPORTED. Exact results are in `ptx-expanded.json`. Nonpassing cases:
+
+* `call_rnd.ptx`: OUT[0] expected 0x1, got 0x0.
+* `div_noftz.ptx`: OUT[0] expected 0x26, got 0x0.
+* `const_ident.ptx`: compiler rejects variable `x` referenced outside kernels.
+* `ldmatrix.ptx`: simulator read of unmapped address 0x400017c at pc 56.
+* `bar_red_and_pred.ptx`: harness does not support initializer IN.
+
+These were run with the same existing compiler used for the earlier smoke check, without PTX compiler edits.
+They remain unresolved; this run alone does not classify their historical regression status. The unsupported
+initializer is a harness limitation rather than a numerical pass or failure. No proprietary code was inspected.

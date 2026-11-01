@@ -1,0 +1,738 @@
+{
+ "abs.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "activemask.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "add.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "add_extended.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "add_non_coherent.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "add_s32_sat.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "add_tuning.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "addc_cc_s32.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "and.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "atom_add.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "atom_add_float.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "atom_cas.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "atom_inc.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "b64tof64.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "bar_red_and_pred.ptx": {
+  "status": "UNSUPPORTED",
+  "detail": "initializer IN"
+ },
+ "bfe.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "bfi.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "bfind_shiftamt.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "block.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "bmsk_clamp_b32.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "bra.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "brev.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "call.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "call_rnd.ptx": {
+  "status": "FAIL",
+  "detail": "OUT[0] expected 0x1, got 0x0"
+ },
+ "clz.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "const.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "const_ident.ptx": {
+  "status": "COMPILE-ERROR",
+  "detail": "Error: x is used outside the kernels (in another variable's initializer?)"
+ },
+ "constant_f32.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "constant_negative.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "copysign.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "cos.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "cp_async.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "cvt_f16x2_f32.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "cvt_f64_f32.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "cvt_pack.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "cvt_relu_f16x2_f32.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "cvt_rn_bf16x2_f32.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "cvt_rn_f16x2_e4m3x2.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "cvt_rn_f16x2_e5m2x2.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "cvt_rn_satfinite_e4m3x2_f32.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "cvt_rn_satfinite_e5m2x2_f32.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "cvt_rni.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "cvt_rni_u16_f32.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "cvt_rzi.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "cvt_s16_s8.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "cvt_s32_f32.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "cvt_s64_s32.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "cvt_sat_s_u.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "cvta.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "div_approx.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "div_ftz.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "div_noftz.ptx": {
+  "status": "FAIL",
+  "detail": "OUT[0] expected 0x26, got 0x0"
+ },
+ "dp2a.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "dp4a.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "ex2.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "exit.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "extern_shared.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "extern_shared_call.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "fma.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "fma_bf16x2.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "fma_f16x2.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "fmax.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "global_array.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "global_array_f32.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "ld_st.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "ld_st_implicit.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "ld_st_offset.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "ldmatrix.ptx": {
+  "status": "SIM-ERROR",
+  "detail": "ldmatrix: read of unmapped address 0x400017c at pc 56"
+ },
+ "ldmatrix_trans.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "lg2.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "local_align.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "mad_extended.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "mad_s32.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "mad_wide.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "malformed_label.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "match_sync.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "max.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "membar.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "min.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "min_f16.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "mma_m16n8k16_f32_bf16_bf16_f32.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "mma_m16n8k16_f32_bf16_bf16_f32_2x.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "mma_m16n8k16_f32_f16_f16_f32.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "mma_m16n8k32_s32_s8_s8_s32.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "mma_m16n8k32_s32_s8_s8_s32_interleave.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "mov.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "mov_address.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "mul24_hi_s32.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "mul24_hi_u32.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "mul24_lo_s32.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "mul24_lo_u32.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "mul_ftz.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "mul_hi.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "mul_lo.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "mul_non_ftz.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "mul_wide.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "multiple_return.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "nanosleep.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "neg.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "non_scalar_ptr_offset.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "not.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "ntid.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "or.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "param_is_addressable.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "popc.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "popc_b64.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "pred_not.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "prmt.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "prmt_signext.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "prmt_slow.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "rcp.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "rcp_f64.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "redux_sync_add_u32_partial.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "redux_sync_op_s32.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "redux_sync_op_u32.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "reg_local.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "reg_multi.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "rem.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "rsqrt.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "sad_s64.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "selp.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "selp_true.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "set_f16.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "set_gt_f16x2.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "setp.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "setp_bool_and.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "setp_gt.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "setp_leu.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "setp_nan.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "setp_num.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "setp_pred2.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "shared_ptr_32.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "shared_ptr_take_address.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "shared_unify_extern.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "shared_unify_local.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "shared_variable.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "shf_l.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "shf_l_clamp.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "shf_l_wrap.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "shf_r.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "shf_r_clamp.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "shf_r_wrap.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "shfl_sync_bfly_b32_pred.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "shfl_sync_bfly_dynamic_delta_b32_pred.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "shfl_sync_down_b32_pred.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "shfl_sync_down_dynamic_delta_b32_pred.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "shfl_sync_idx_b32_pred.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "shfl_sync_idx_dynamic_delta_b32_pred.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "shfl_sync_mode_b32.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "shfl_sync_up_b32_pred.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "shfl_sync_up_dynamic_delta_b32_pred.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "shl.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "shr.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "shr_oob.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "sign_extend.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "sin.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "sink.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "sqrt.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "sqrt_rn_ftz.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "stateful_ld_st_ntid.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "stateful_ld_st_ntid_chain.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "stateful_ld_st_ntid_sub.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "stateful_ld_st_simple.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "stateful_neg_offset.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "sub.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "sub_extended.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "subc_cc_s32.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "tanh.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "tid.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "uint_to_fp_bf16.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "vector.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "vector4.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "vector8.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "vector8_extract.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "vector_extract.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "vector_operand.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "vote_all.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "vote_all_sub.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "vote_any.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "vote_ballot.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "vote_ballot_nosync.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "vshr_clamp.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "warp_sz.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "xor.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ }
+}

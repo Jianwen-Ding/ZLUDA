@@ -74,8 +74,10 @@ wall time, peak RSS, object md5).
   `ZLUDA_AIR_AGX_PIPELINE=o3`, experiment): llama.cpp's modules 44.1 -> 36.7 s (the 10 MB one 26.5 -> 22.1 s; peak
   2.08 -> 2.44 GB, every compiling thread running O3), completions 4/4 exact; but GPU time not shown to be equal
   (tg64 134.6 / 123.7 against 132.8, pp128 -2%; per kernel +1-4% everywhere, even in modules it does not change,
-  i.e. within the clock's variation). Not the default until a controlled comparison (the same kernels replayed
-  back to back) shows the code as fast.
+  i.e. within the clock's variation). Controlled (captures of both builds replayed alternately, 1000 back to back,
+  three times): mul_mat_vec_q<Q5_K> 121.7-122.6 -> 117.1-117.5 us (-4%), mul_mat_vec_q<Q5_1> 26.0 -> 26.2 us. But
+  Blender Cycles (75 kernels sharing many functions, each kernel's O3 repeating them) gains nothing: 43.4-49.7 ->
+  49.5-57.3 s, peak up to 6.9 GB. Left opt-in: it suits modules of independent kernels (llama.cpp's), not Cycles'.
 - Dead end: reading each kernel's module lazily from the portable AIR (getLazyBitcodeModule, materializing only the
   functions the kernel reaches, instead of parsing all 13 MB of Cycles per kernel): the same object, peak 6.1-6.3 GB
   against 6.3-6.7, the AGX stage 30.6-32.6 s against 26.6-32.1 (two runs each): within noise. Cycles' peak is the

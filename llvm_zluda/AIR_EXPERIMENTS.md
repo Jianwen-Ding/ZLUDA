@@ -70,6 +70,13 @@ wall time, peak RSS, object md5).
   llama.cpp's 10 MB module +0.9 s (26.5 -> 27.4 s, the stage runs in parallel), same peak memory; llama.cpp
   tg64 133.1 -> 134.5 t/s (two runs each, run-to-run spread +-1.3), pp128 equal. Within noise: left off (Cycles' compile
   paid 31 -> 44 s for it before).
+- **Small private arrays read at a run-time offset in registers** (LLVMZludaPromoteDynamicPrivateLoads, after the
+  first pipeline): ggml's mul_mat_vec_f<half> keeps a float[8] written at constant offsets and read once at
+  `[depot + 4 * lane]`, so the array went to the stack (80 bytes): stack setup ~7.5 us a launch plus scattered stack
+  traffic (playground stack-launch, stack-memory). As a select over the 8 constant-offset loads SROA keeps it in
+  registers: 46.1 -> 14.6 us and 53.8 -> 25.3 us per launch, llama.cpp pp128 445.6 -> 566.0 t/s, tg64 131.9 -> 133.9;
+  completions exact, formalization suite unchanged. Found from the simulator's worst capture (-72%), whose gap
+  turned out to be the stack.
 - Geekbench 7 GPU with all of the above: every workload completes (the block-size search's out-of-resources answers
   as before), summed GPU time 27.13 s against 25.93-26.85 s of earlier AIR-route runs; its largest difference,
   particle 2.39 s, is inside those runs' 2.04-2.42 s.

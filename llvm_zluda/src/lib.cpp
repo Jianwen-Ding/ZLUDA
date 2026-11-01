@@ -2815,7 +2815,15 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
         Type *I32 = Type::getInt32Ty(Ctx);
         IRBuilder<> Entry(&*F.getEntryBlock().getFirstInsertionPt());
         AllocaInst *mode = Entry.CreateAlloca(I32, nullptr, "fpmode");
-        Entry.CreateStore(ConstantInt::get(I32, 1 | (1 << 2)), mode);
+        auto flushes = [&](const fltSemantics &sem) {
+            auto denorm = F.getDenormalMode(sem);
+            return denorm.Output != DenormalMode::IEEE && denorm.Output != DenormalMode::Dynamic;
+        };
+        // Function attributes supply only the entry mode. A later PTX mode change may preserve
+        // subnormals even when the function's most common mode flushes them.
+        uint32_t initialMode = 1 | (1 << 2) | (flushes(APFloat::IEEEsingle()) ? 0x10 : 0) |
+                               (flushes(APFloat::IEEEhalf()) ? 0x20 : 0);
+        Entry.CreateStore(ConstantInt::get(I32, initialMode), mode);
         for (CallInst *CI : sets)
         {
             new StoreInst(CI->getArgOperand(0), mode, CI->getIterator());
@@ -2846,6 +2854,21 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
                             I.eraseFromParent();
                         again = true;
                     }
+        }
+        // Strict f32 emulation must not leave a function-wide FTZ attribute overriding an
+        // instruction that restores IEEE mode. Keep all-FTZ functions on their existing fast path.
+        if (strict && (initialMode & 0x10)) {
+            bool needsIEEE = llvm::any_of(ops, [&](ConstrainedFPIntrinsic *C) {
+                if (!C->getType()->getScalarType()->isFloatTy())
+                    return false;
+                auto bit = zludaModeField(at[C]->getOperand(0), 0x10);
+                return !bit || !*bit;
+            });
+            if (needsIEEE) {
+                auto env = F.getDenormalFPEnv();
+                env.F32Mode = DenormalMode::getIEEE();
+                F.addFnAttrs(AttrBuilder(Ctx).addDenormalFPEnvAttr(env));
+            }
         }
         for (ConstrainedFPIntrinsic *C : ops)
         {

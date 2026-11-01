@@ -1,0 +1,24 @@
+// Handwritten AIR regression: interleaved preserve/FTZ operations must retain their own modes.
+// Operand/product bits come from the MIT/Apache ZLUDA div_noftz formalization fixture.
+.version 6.5
+.target sm_30
+.address_size 64
+.visible .entry mixed_denorm(.param .u64 input, .param .u64 output) {
+    .reg .u64 in, out;
+    .reg .f32 a, b, preserved, flushed, product;
+    ld.param.u64 in, [input];
+    ld.param.u64 out, [output];
+    ld.global.f32 a, [in];
+    ld.global.f32 b, [in+4];
+    mul.ftz.f32 product, a, b;
+    div.rn.f32 preserved, a, b;
+    div.rn.ftz.f32 flushed, a, b;
+    st.global.f32 [out], preserved;
+    st.global.f32 [out+4], flushed;
+    st.global.f32 [out+8], product;
+    ret;
+}
+.buffer IN .u32 = { 0x16a2028d, 0x5e89f6ae };
+.buffer OUT .u32 [3];
+.launch mixed_denorm <<< 1, 1 >>> (IN, OUT);
+.expect OUT .u32 = { 0x26, 0, 0x35ae9ef4 };

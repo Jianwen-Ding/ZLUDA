@@ -60,6 +60,173 @@ gpu.module @agx_solver {
     gpu.return
   }
 
+  // Factors the panel of columns j0 .. j0 + jb (single precision only) of an
+  // m-row matrix in one workgroup (up to 1024 threads), as agx_lu_pivot / swap /
+  // scale / update do column by column with the update kept to the panel and
+  // the swaps to its columns (agx_lu_laswp applies them to the others): per
+  // column, each thread's largest |a[r, k]| over its rows (r = k + t, k + t +
+  // threads, ...; the first of equal ones), a SIMD-group and then a workgroup
+  // reduction to the pivot, the swap, then each thread scales and updates its
+  // rows. ipiv[k] = 1 + the pivot row; info = k + 1 for the first zero pivot
+  // (cleared at column 0). Launch one workgroup.
+  gpu.func @agx_lu_panel(%a0: memref<1xf32, 1>, %m_: i64, %lda_: i64, %j0_: i64, %jb_: i64,
+                         %ipiv0: memref<1xi32, 1>, %info0: memref<1xi32, 1>)
+      workgroup(%sv: memref<32xf32, #gpu.address_space<workgroup>>, %si: memref<33xi32, #gpu.address_space<workgroup>>) kernel {
+    %i0 = arith.constant 0 : index
+    %i1 = arith.constant 1 : index
+    %i32 = arith.constant 32 : index
+    // the threads of the workgroup (a multiple of 32, at most 1024) and its SIMD-groups
+    %i1024 = gpu.block_dim x
+    %nsg = arith.divui %i1024, %i32 : index
+    %z = arith.constant 0 : i32
+    %big = arith.constant 2147483647 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %f0 = arith.constant 0.0 : f32
+    %fm1 = arith.constant -1.0 : f32
+    %m = arith.index_cast %m_ : i64 to index
+    %lda = arith.index_cast %lda_ : i64 to index
+    %j0 = arith.index_cast %j0_ : i64 to index
+    %jb = arith.index_cast %jb_ : i64 to index
+    %j1 = arith.addi %j0, %jb : index
+    %t = gpu.thread_id x
+    %lane = arith.remui %t, %i32 : index
+    %sg = arith.divui %t, %i32 : index
+    %t0 = arith.cmpi eq, %t, %i0 : index
+    %l0 = arith.cmpi eq, %lane, %i0 : index
+    scf.for %k = %j0 to %j1 step %i1 {
+      %colk = arith.muli %k, %lda : index
+      // this thread's largest |a[r, k]|, r >= k (the first of equal ones; -1 for none)
+      %rs = arith.addi %k, %t : index
+      %best:2 = scf.for %r = %rs to %m step %i1024 iter_args(%bv = %fm1, %bi = %big) -> (f32, i32) {
+        %o = arith.addi %colk, %r : index
+        %v = func.call @agx_sv_ld(%a0, %o) : (memref<1xf32, 1>, index) -> f32
+        %av = math.absf %v : f32
+        %gt = arith.cmpf ogt, %av, %bv : f32
+        %ri = arith.index_cast %r : index to i32
+        %nv = arith.select %gt, %av, %bv : f32
+        %ni = arith.select %gt, %ri, %bi : i32
+        scf.yield %nv, %ni : f32, i32
+      }
+      %gmax = gpu.subgroup_reduce maxnumf %best#0 : (f32) -> f32
+      %is = arith.cmpf oeq, %best#0, %gmax : f32
+      %cand = arith.select %is, %best#1, %big : i32
+      %gidx = gpu.subgroup_reduce minui %cand : (i32) -> i32
+      scf.if %l0 {
+        memref.store %gmax, %sv[%sg] : memref<32xf32, #gpu.address_space<workgroup>>
+        memref.store %gidx, %si[%sg] : memref<33xi32, #gpu.address_space<workgroup>>
+      }
+      gpu.barrier
+      scf.if %t0 {
+        %w:2 = scf.for %q = %i0 to %nsg step %i1 iter_args(%wv = %fm1, %wi = %big) -> (f32, i32) {
+          %qv = memref.load %sv[%q] : memref<32xf32, #gpu.address_space<workgroup>>
+          %qi = memref.load %si[%q] : memref<33xi32, #gpu.address_space<workgroup>>
+          %gt = arith.cmpf ogt, %qv, %wv : f32
+          %eq = arith.cmpf oeq, %qv, %wv : f32
+          %lt = arith.cmpi ult, %qi, %wi : i32
+          %tie = arith.andi %eq, %lt : i1
+          %take = arith.ori %gt, %tie : i1
+          %nv = arith.select %take, %qv, %wv : f32
+          %ni = arith.select %take, %qi, %wi : i32
+          scf.yield %nv, %ni : f32, i32
+        }
+        memref.store %w#1, %si[%i32] : memref<33xi32, #gpu.address_space<workgroup>>
+        %p1 = arith.addi %w#1, %c1_i32 : i32
+        func.call @agx_sv_sti(%ipiv0, %k, %p1) : (memref<1xi32, 1>, index, i32) -> ()
+        %k0 = arith.cmpi eq, %k, %i0 : index
+        scf.if %k0 {
+          func.call @agx_sv_sti(%info0, %i0, %z) : (memref<1xi32, 1>, index, i32) -> ()
+        }
+        %zero = arith.cmpf oeq, %w#0, %f0 : f32
+        %old = func.call @agx_sv_ldi(%info0, %i0) : (memref<1xi32, 1>, index) -> i32
+        %none = arith.cmpi eq, %old, %z : i32
+        %set = arith.andi %zero, %none : i1
+        scf.if %set {
+          %k1 = arith.addi %k, %i1 : index
+          %ki = arith.index_cast %k1 : index to i32
+          func.call @agx_sv_sti(%info0, %i0, %ki) : (memref<1xi32, 1>, index, i32) -> ()
+        }
+      }
+      gpu.barrier
+      // the swap of rows k and p in the panel's columns (a thread per column)
+      %pi = memref.load %si[%i32] : memref<33xi32, #gpu.address_space<workgroup>>
+      %p = arith.index_cast %pi : i32 to index
+      %c = arith.addi %j0, %t : index
+      %in = arith.cmpi ult, %c, %j1 : index
+      %diff = arith.cmpi ne, %p, %k : index
+      %sw = arith.andi %in, %diff : i1
+      scf.if %sw {
+        %col = arith.muli %c, %lda : index
+        %ok = arith.addi %col, %k : index
+        %op = arith.addi %col, %p : index
+        %vk = func.call @agx_sv_ld(%a0, %ok) : (memref<1xf32, 1>, index) -> f32
+        %vp = func.call @agx_sv_ld(%a0, %op) : (memref<1xf32, 1>, index) -> f32
+        func.call @agx_sv_st(%a0, %ok, %vp) : (memref<1xf32, 1>, index, f32) -> ()
+        func.call @agx_sv_st(%a0, %op, %vk) : (memref<1xf32, 1>, index, f32) -> ()
+      }
+      gpu.barrier
+      // scale (unless the pivot is 0) and update this thread's rows r > k
+      %od = arith.addi %colk, %k : index
+      %piv = func.call @agx_sv_ld(%a0, %od) : (memref<1xf32, 1>, index) -> f32
+      %nz = arith.cmpf une, %piv, %f0 : f32
+      %k1 = arith.addi %k, %i1 : index
+      %r0 = arith.addi %k1, %t : index
+      scf.for %r = %r0 to %m step %i1024 {
+        %o = arith.addi %colk, %r : index
+        %v = func.call @agx_sv_ld(%a0, %o) : (memref<1xf32, 1>, index) -> f32
+        %qv = arith.divf %v, %piv : f32
+        %l = arith.select %nz, %qv, %v : f32
+        scf.if %nz {
+          func.call @agx_sv_st(%a0, %o, %l) : (memref<1xf32, 1>, index, f32) -> ()
+        }
+        scf.for %cc = %k1 to %j1 step %i1 {
+          %colc = arith.muli %cc, %lda : index
+          %okc = arith.addi %colc, %k : index
+          %orc = arith.addi %colc, %r : index
+          %u = func.call @agx_sv_ld(%a0, %okc) : (memref<1xf32, 1>, index) -> f32
+          %x = func.call @agx_sv_ld(%a0, %orc) : (memref<1xf32, 1>, index) -> f32
+          %nl = arith.negf %l : f32
+          %y = math.fma %nl, %u, %x : f32
+          func.call @agx_sv_st(%a0, %orc, %y) : (memref<1xf32, 1>, index, f32) -> ()
+        }
+      }
+      gpu.barrier
+    }
+    gpu.return
+  }
+
+  // The row swaps of a panel (ipiv[k] for k in j0 .. j0 + jb, in order) on the
+  // columns outside it (single precision only; a thread per column of n).
+  gpu.func @agx_lu_laswp(%a0: memref<1xf32, 1>, %n_: i64, %lda_: i64, %j0_: i64, %jb_: i64, %ipiv0: memref<1xi32, 1>) kernel {
+    %i1 = arith.constant 1 : index
+    %n = arith.index_cast %n_ : i64 to index
+    %lda = arith.index_cast %lda_ : i64 to index
+    %j0 = arith.index_cast %j0_ : i64 to index
+    %jb = arith.index_cast %jb_ : i64 to index
+    %j1 = arith.addi %j0, %jb : index
+    %c = gpu.global_id x
+    %live = arith.cmpi ult, %c, %n : index
+    %before = arith.cmpi ult, %c, %j0 : index
+    %after = arith.cmpi uge, %c, %j1 : index
+    %out = arith.ori %before, %after : i1
+    %go = arith.andi %live, %out : i1
+    scf.if %go {
+      %col = arith.muli %c, %lda : index
+      scf.for %k = %j0 to %j1 step %i1 {
+        %p = func.call @agx_sv_piv(%ipiv0, %k) : (memref<1xi32, 1>, index) -> index
+        %diff = arith.cmpi ne, %p, %k : index
+        scf.if %diff {
+          %ok = arith.addi %col, %k : index
+          %op = arith.addi %col, %p : index
+          %vk = func.call @agx_sv_ld(%a0, %ok) : (memref<1xf32, 1>, index) -> f32
+          %vp = func.call @agx_sv_ld(%a0, %op) : (memref<1xf32, 1>, index) -> f32
+          func.call @agx_sv_st(%a0, %ok, %vp) : (memref<1xf32, 1>, index, f32) -> ()
+          func.call @agx_sv_st(%a0, %op, %vk) : (memref<1xf32, 1>, index, f32) -> ()
+        }
+      }
+    }
+    gpu.return
+  }
+
   // ---- LU with partial pivoting (getrf), column k of an m x n matrix
 
   // ipiv[k] = 1 + the row of the largest |a[i, k]|, i >= k; info = k + 1 for

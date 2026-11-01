@@ -1638,11 +1638,17 @@ in the application's PTX and needs no library.
 their `_bufferSize` queries. The factorizations run one
 column at a time — a single-thread pivot or reflector step, then a parallel
 update of the rest of the matrix — and the solves run one thread per
-right-hand side. The f32 getrf with more than 64 columns to factor works by
-panels of 64 columns: the columns of a panel as above with the update kept to
-the panel, then the BLAS triangular solve for the panel's rows of U and one
-GEMM on the tile kernels for the rest of the matrix (the same pivots, the
-products summed in another order). The f32 potrf above 64 rows does the same
+right-hand side. The f32 getrf with more than 16 columns to factor works by
+panels of 16 columns, each factored in one launch (`agx_lu_panel`: a workgroup
+of 512 threads, per column a SIMD-group and workgroup reduction to the pivot,
+the swap, then each thread scales and updates its rows of the panel), its swaps
+applied to the other columns in another (`agx_lu_laswp`), then the BLAS
+triangular solve for the panel's rows of U and one GEMM on the tile kernels for
+the rest of the matrix (the same pivots, the products summed in another order).
+A column at a time was four dependent launches per column (~12 us each): n 512
+/ 1000 / 2048 / 4096 24.2 / 69.7 / 237 / 852 -> 5.2 / 12.9 / 33.3 / 116 ms
+(`tools/lubench.c`, the A x = b residual unchanged; 64-column panels: 189 ms at
+4096, a panel runs on one core). `ZLUDA_AGX_LU_PANEL=0`: a column at a time. The f32 potrf above 64 rows does the same
 by panels, the rest of the triangle updated with each panel by a syrk on the
 tile GEMM (the other triangle is not written); after a non-positive minor the
 later kernels do nothing, but that panel's update still reaches the trailing

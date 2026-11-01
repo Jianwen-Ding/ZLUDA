@@ -134,6 +134,14 @@ unsafe fn solves(h: &Handle, double: bool, n: i64, nrhs: i64, a: *const c_void, 
 /// right-hand side.
 const SOLVE_BLOCKED_MIN: i64 = 64;
 
+/// The threads of agx_lu_panel's workgroup (1024 do not launch: registers).
+const LU_PANEL_THREADS: i64 = 512;
+
+/// The columns of an agx_lu_panel panel: a panel runs on one core, column by column, so narrow panels and more of the
+/// work in the trailing GEMM (M2 Max, n 512 / 2048 / 4096: 8 columns 6.4 / 37.7 / 143 ms, 16 5.2 / 33.3 / 116, 32
+/// 6.2 / 39.7 / 129, 64 8.8 / 59.3 / 189).
+const LU_PANEL_COLS: i64 = 16;
+
 /// The columns of a panel of the blocked f32 getrf.
 const LU_BLOCK: i64 = 64;
 
@@ -157,6 +165,60 @@ unsafe fn getrf(h: &Handle, double: bool, m: c_int, n: c_int, a: *mut c_void, ld
     let mn = m.min(n) as i64;
     let block = if double || mn <= LU_BLOCK { mn } else { LU_BLOCK };
     let at = |r: i64, c: i64| (a as *mut f32).add((r + c * lda as i64) as usize) as *mut c_void;
+    // f32 panels of LU_PANEL_COLS in one launch each (agx_lu_panel, a workgroup of LU_PANEL_THREADS) and their swaps on
+    // the other columns in another (agx_lu_laswp): a column at a time is four dependent launches (n 512: 24.5 ms, 4096:
+    // 849 ms, ~12 us per launch). ZLUDA_AGX_LU_PANEL=0: a column at a time, panels of LU_BLOCK.
+    if !double && mn > LU_PANEL_COLS && std::env::var("ZLUDA_AGX_LU_PANEL").map_or(true, |v| v != "0") {
+        for j0 in (0..mn).step_by(LU_PANEL_COLS as usize) {
+            let (mut j0_, mut jb) = (j0, LU_PANEL_COLS.min(mn - j0));
+            run(
+                h,
+                c"agx_lu_panel",
+                &mut [arg(&mut pa), arg(&mut m_), arg(&mut lda_), arg(&mut j0_), arg(&mut jb), arg(&mut pi), arg(&mut pinfo)],
+                [LU_PANEL_THREADS, 1],
+                [LU_PANEL_THREADS as u32, 1],
+            )?;
+            run(
+                h,
+                c"agx_lu_laswp",
+                &mut [arg(&mut pa), arg(&mut n_), arg(&mut lda_), arg(&mut j0_), arg(&mut jb), arg(&mut pi)],
+                [n_, 1],
+                [64, 1],
+            )?;
+            let (j1, rest) = (j0 + jb, n_ - j0 - jb);
+            if rest <= 0 {
+                continue;
+            }
+            // U12 = L11^-1 A12 (unit lower), then A22 -= A21 U12
+            let a12 = at(j0, j1);
+            let u12 = engine::Trsm { right: false, upper: false, trans: false, unit: true, m: jb, n: rest, alpha: 1.0, a: at(j0, j0), lda: lda_, b: a12, ldb: lda_, double: false };
+            engine::trsm(&u12, h.stream).map_err(status)?;
+            if m_ > j1 {
+                let g = engine::Gemm {
+                    types: agx_libs::Types::S,
+                    ta: false,
+                    tb: false,
+                    m: (m_ - j1) as u64,
+                    n: rest as u64,
+                    k: jb as u64,
+                    alpha: -1.0,
+                    beta: 1.0,
+                    a: at(j1, j0),
+                    lda: lda_ as u64,
+                    stride_a: 0,
+                    b: a12,
+                    ldb: lda_ as u64,
+                    stride_b: 0,
+                    c: at(j1, j1),
+                    ldc: lda_ as u64,
+                    stride_c: 0,
+                    batch: 1,
+                };
+                engine::gemm(&g, h.stream).map_err(status)?;
+            }
+        }
+        return Ok(());
+    }
     for k in 0..mn {
         let mut k_ = k;
         // the end of k's panel: the update stays in it

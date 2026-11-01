@@ -41,8 +41,8 @@ cannot substitute for an independently compiled full-reference-header client ABI
 | Requirement | Current state | Evidence required for completion |
 | --- | --- | --- |
 | Public enums, data layouts and callbacks | Initial subset aligned | Complete version-specific interface audit and independent client tests |
-| Public C factory/version exports | Not implemented | Client resolves documented exports and version negotiation works |
-| Runtime/engine/context dispatch objects | Not implemented | Full applicable public pImpl/vtable contracts, ownership and error behavior verified |
+| Public C factory/version exports | Isolated 1.7.1 configuration prototype | Client resolves documented exports and version negotiation works |
+| Runtime/engine/context dispatch objects | Runtime configuration prefix only; engine/context dispatch absent | Full applicable public pImpl/vtable contracts, ownership and error behavior verified |
 | Builder/network/layer dispatch objects | Source wrapper subset only | Reference-header model construction, configuration and destruction work |
 | Custom engine serialization | Native ZTRTAGX2 works | Roundtrip through public runtime ABI and independent client, without NVIDIA format assumptions |
 | Precision and shape coverage | Primarily static f32 | Required dtypes, shape tensors, profiles and dynamic execution validated |
@@ -55,3 +55,38 @@ methods. Our current own C++ objects do not reproduce these contracts. Merely ex
 renaming libtensorrt_agx.so would be insufficient and must not be used to claim compatibility. The public
 serialized NVIDIA engine format remains a separate unresolved input-format issue; the user-requested custom
 serializer is not a decoder for that format. No opaque vendor engine is used as an oracle.
+
+## Isolated runtime configuration prototype
+
+`runtime.cpp` and `runtime_contract.hpp` implement a separate experimental library named
+`libtensorrt_agx_runtime_abi.so`. It exports `createInferRuntime_INTERNAL` and `getInferLibVersion`, with the
+reviewed RTX 1.7.1 contract number 10701. It accepts only that number; other versions, including 1.6, are rejected.
+This number identifies the prototype's interface target, not a claim that the implementation is NVIDIA TensorRT.
+It is not installed under NVIDIA's library names and is not linked into the main inference library yet.
+
+The wrapper has a virtual destructor and implementation pointer. The dispatch declarations follow the reviewed
+public method order, including getPImpl, configuration, logger and plugin-registry access. Positive thread limits,
+temporary-directory copies and tempfile-control flags are implemented. An empty registry reports no creators.
+Allocator/error-recorder/plugin/DLA/host-code/deferred-loading requests that cannot be supported are rejected
+or logged explicitly. Directory strings remain valid until the next setter; callers must coordinate pointer use
+with mutation and keep the logger alive through runtime destruction.
+
+**All engine deserialization calls return null without inspecting any payload bytes.** Engine validity reports
+INVALID with no inferred diagnostics and the header-size query returns zero. Even our native engine format is
+not exposed through this experimental engine ABI yet: returning native engine objects with an incompatible
+layout would be incorrect. External runtime and plugin loading do not load any files. The existing source API
+and native ZTRT inference library retain their working model execution path.
+
+Build and run the separate dispatch-prefix probe:
+
+```sh
+python3 zluda_tensorrt_agx/tools/build_runtime_abi.py --output-dir /tmp/ztrt-runtime-abi
+python3 zluda_tensorrt_agx/tools/build_runtime_abi.py --output-dir /tmp/ztrt-runtime-abi-asan --sanitize
+```
+
+The probe compiles in another translation unit without including the adapter dispatch header. It checks
+factory/version negotiation, wrapper/dispatch prefix calls, logger callbacks, configuration persistence, empty
+registry behavior, payload-free rejection, and 1000 destruction cycles. Both ordinary and AddressSanitizer runs
+pass on Linux aarch64. This is a targeted binary-prefix test using independently declared call shapes, not a
+complete vendor-reference-header or cross-version ABI conformance test. Plugins, error recorders, complete
+engine/context interfaces, builder factories and reference-header client integration remain required work.

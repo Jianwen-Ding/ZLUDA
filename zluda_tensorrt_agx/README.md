@@ -6,6 +6,8 @@ existing MLIR/AIR GEMM implementation with the other AGX math libraries. No new 
 intrinsics or handwritten AGX instructions are used.
 
 [Public interface alignment and remaining ABI work](abi/README.md) tracks the full compatibility gap.
+A separate, configuration-only runtime ABI prototype is available through `tools/build_runtime_abi.py`; it
+rejects all engine deserialization and does not replace the main library.
 The C++ interface now uses public enum values and a versioned logger; it explicitly translates to our stable
 native C codes. Recompile C++ dependents when adopting the updated headers. This is an interface correction,
 not a complete binary compatibility claim.

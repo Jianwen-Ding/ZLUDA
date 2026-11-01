@@ -293,3 +293,22 @@ Public factories, runtime/engine/context pImpl dispatch contracts, version negot
 remain unimplemented. Full ABI status, primary-source links and completion evidence are tracked in
 [abi/README.md](../abi/README.md). The moving documentation URLs exposed both 1.6.1 and 1.7.1 pages; no exact
 Geekbench RTX 1.6 compatibility claim is made. No NVIDIA engine format support was added.
+
+## Runtime factory/configuration ABI prototype
+
+A separate `libtensorrt_agx_runtime_abi.so` prototype exports the documented runtime factory and library-version
+query, accepts the reviewed 1.7.1 target contract, and creates a wrapper/dispatch object pair for configuration
+calls. It is not registered under an NVIDIA library name or linked into the working native inference library.
+It rejects all engine loading without reading any payload bytes, including our custom format, because engine
+and context dispatch layouts are not yet implemented. Other versions (including Geekbench's 1.6) are rejected.
+
+A separately compiled Linux dispatch-prefix probe does not include the adapter's runtime dispatch header.
+It exercises version negotiation, wrapper lifetime, getPImpl, logger callbacks, thread counts, temporary-path
+copying, tempfile flags, empty plugin registry, rejection paths and 1000 create/destroy cycles. Normal and
+AddressSanitizer builds pass with no diagnostics on Linux aarch64. Compile flags include -Wall -Wextra -Werror.
+The probe deliberately supplies an inaccessible engine pointer to confirm that rejection does not read bytes.
+
+This establishes only the tested prototype prefix, not complete reference-header ABI conformance or engine
+execution through it. No NVIDIA SDK/runtime or proprietary binaries were downloaded, inspected or loaded.
+No Rust inference, PTX or MLIR kernel implementation changed in this checkpoint, and no speedup is claimed.
+Build commands and method scope are in [abi/README.md](../abi/README.md).

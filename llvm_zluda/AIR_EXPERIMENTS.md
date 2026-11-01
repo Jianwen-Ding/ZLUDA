@@ -95,6 +95,10 @@ wall time, peak RSS, object md5).
   3.6e-6) but 7-25% slower (4096^3 6.99 -> 6.49 TFLOPS, 1024^3 5.38 -> 4.05, f16 C 7.18 -> 5.45): half the SIMD-groups
   per workgroup hide less latency than the better load-to-product ratio gains. A larger tile would have to keep
   four SIMD-groups per workgroup (a 128 x 64 or 128 x 128 workgroup tile and a new plan).
+  Tried too: 128 x 64 workgroup tiles, four SIMD-groups of 32 x 64 (the plan cutting M' in 128s): as slow (4096^3
+  6.48, 1024^3 4.02, f16 C 5.39 TFLOPS). So the 32 accumulators per SIMD-group (register pressure, fewer resident
+  SIMD-groups) cost more than the reuse gains, whatever the workgroup shape: 16 accumulators (32 x 32) is the
+  better point for these kernels.
 - Dead end, dp4a: a signed dp4a is 18 AGX instructions (4 imadd; the bytes extracted by bfi + asr pairs, asr 24 for
   byte 3). The free 16-bit sign extension (MOD_SX) exists only on add / multiply-add sources (IADD_I32_FROM16,
   IMADD_*_FROM32), not on shifts, so byte 1 (sext of the low half, then asr 8) is two instructions as now: no

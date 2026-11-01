@@ -27,5 +27,19 @@ fn main() -> std::io::Result<()> {
         }
     }
     println!("all objects of {rounds} rounds read as zeros");
+    // where the time of a large allocation goes: an unbound object (create + mmap, no VM_BIND), then its first
+    // touch of every page, against a bound one
+    for _ in 0..3 {
+        let size = 512u64 << 20;
+        let started = Instant::now();
+        let mut bo = vm.alloc_unbound(size)?;
+        let create = started.elapsed();
+        let started = Instant::now();
+        for page in bo.as_mut_slice().chunks_mut(16384) {
+            page[0] = 1;
+        }
+        let touch = started.elapsed();
+        println!("{size} bytes unbound: created in {:.1} us, every page touched in {:.1} us", create.as_secs_f64() * 1e6, touch.as_secs_f64() * 1e6);
+    }
     Ok(())
 }

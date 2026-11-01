@@ -1642,80 +1642,59 @@ shaders on macOS and through ZLUDA, which separates compiler quality from driver
 
 ## Geekbench validation limits
 
-The saved Geekbench 7.1.0 Linux ARM Preview runs in the Fedora container reached all eleven workload headings and
-recorded GPU launches, including convolution and GEMM kernels for the AI workloads. This establishes execution of
-those paths, but does not independently verify every workload's output or establish TensorRT compatibility.
-The October 24 shared-pipeline record reports 318,836 profiled launches and eleven error-701 tuning rejections;
-its result upload failed. Some scratch launch scripts also stop the application when it starts uploading, so their
-completion marker is not evidence of a published result.
+The successful Geekbench 7.1.0 Linux ARM Preview container runs use **Geekbench's CUDA fallback with the bundled
+TensorRT RTX library moved aside**. The original archive lists `libtensorrt_rtx.so` next to `geekbench7`, but the
+measured container directory has no such file: it was moved to
+`/scratch/geekbench-extract/nvidia-quarantine/libtensorrt_rtx.so`. This additional library-placement difference was
+initially missed when comparing the four matching executable/workload files. These measurements do not establish
+TensorRT compatibility or compatibility with an unchanged Geekbench extraction.
 
-`CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES` (701) occurs when a candidate block size exceeds the kernel's register-based
-threadgroup limit. The driver rejects that launch before submitting it to the GPU. Geekbench's optimizer probes
-multiple block sizes, and the saved container logs contain rejections for `calculate_descriptors`, `miss`, and
-`hit_surface`, among others. A rejected tuning candidate does not by itself establish that the workload failed;
-check that subsequent launches run with a supported size.
-
-A November 1 host run reported `Failed to deserialize TensorRT engine` for Background Blur, Face Tracking, and
-Super Resolution, then continued through the remaining workloads and uploaded a result. Those TensorRT errors
-are absent from the inspected container logs. This repository supplies no TensorRT (`libnvinfer`) replacement,
-and successful PTX compilation or CUDA device detection does not establish support for serialized TensorRT engines.
-The cause of the different application path remains unresolved. Compare the Geekbench version and executable
-hash, launch arguments, environment, and resolved library paths before attributing the difference to containment.
-An uploaded result alone does not prove that every workload succeeded.
-
-A subsequent host/container comparison found identical SHA-256 hashes for `geekbench7`, `geekbench_aarch64`,
-`geekbench.plxr`, and `geekbench-workload.plxr`. Both host CUDA library names hashed to
-`fd28d620831f26440363c6488f178f856feab4991d9afb7920f448159c54834e`, matching the retained
-`/scratch/air-pipeline/lib-fam/libcuda.so`. Running that exact driver in the container with its paired `zoc`
-(`02302f4622e8abd5e354f3b77e0a9a5c24cf4371ffee482d3399c2a94a9aba84`) ran the three AI workloads' kernels
-without the host's TensorRT deserialization errors. Thus neither different Geekbench files nor the driver binary
-alone explains the discrepancy. The host's selected compiler and remaining runtime settings still need comparison;
-the host loader excerpt shows NVML search attempts, not a successful NVML load.
-
-The host subsequently confirmed the same paired `zoc` hash. Its early log contains two missing procedure lookups
-(500), two rejected export tables (1), and an unsupported context limit (215), followed by graph-executable
-destruction errors (400). These calls did not fail in the matching container run. Their order suggests a startup
-compatibility issue worth investigating, but does not establish which call causes engine deserialization to fail.
-With `ZLUDA_AGX_LOG=1`, failed procedure lookups now print the symbol, requested version, flags, and query status;
-unsupported context-limit queries print the numeric limit; unsupported export tables print the requested ID.
-Use these arguments to identify the actual request before changing the API's return behavior.
-
-The diagnostic host run identified the rejected limit as `CU_LIMIT_CIG_ENABLED` (8). This read-only query
-indicates whether a context uses CUDA-in-Graphics; all contexts created by this driver are ordinary contexts.
-`cuCtxGetLimit` now returns success with zero for that query, while attempts to set it remain unsupported.
-This follows the [documented CUlimit definition](https://nvidia.github.io/cuda-python/cuda-bindings/12.8.0/module/driver.html).
-The Asahi regression test covers the zero result, read-only behavior, a null output pointer, and continued
-rejection of unknown limits. The host engine-deserialization result after this correction remains to be checked;
-the preceding missing-function and export-table probes are not established causes of failure.
-
-The host rerun with that correction still failed all three AI engines, so the CIG query was not the root cause.
-Its full log shows cache hits for the two AI modules (53,541 and 69,016 PTX bytes), followed by deserialization
-failure before their first kernel lookup. A cache-bypass run (`ZLUDA_CACHE_DISABLE=1`) is the next comparison;
-cache hits also occur in successful container runs, so cache use alone does not establish corruption.
-Module-parser failures now include their reason, and failures through the existing runtime module-registration
-interface are logged as well. Cache-hit messages include the entry key, identifying its `.o` and `.s` files.
-
-The host cache-bypass run still failed all three engines after successful compiler responses for both AI modules,
-so bypassing the disk cache does not resolve the failure. It uploaded a score of 3,183 despite those failures.
-The container trace loads the two modules with 4 and 30 kernels, then allocates and copies model data.
-For comparing initialization, `ZLUDA_AGX_API_TRACE=N` logs at most N exported API calls and runtime module-loading
-calls, including return codes and exported implemented functions' arguments. Pointer arguments are logged as
-addresses, without reading their contents. Tracing is disabled by default; it is for diagnosis, not performance
-measurement. `ZLUDA_AGX_LOG=1` also reports successfully loaded modules' kernel counts and global-data sizes.
-
-For a comparison run, use the same Geekbench build, the matching ZLUDA driver and `zoc`, and absolute paths:
+[`libtensorrt_rtx.so`](https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/architecture/how-trt-rtx-works.html)
+is NVIDIA's TensorRT RTX inference runtime, separate from the CUDA driver library supplied by ZLUDA. This repository
+supplies no TensorRT replacement. The failing host trace contains additional runtime initialization after both AI
+modules load; the successful container proceeds to model allocations and kernel lookups. To reproduce the tested
+fallback configuration on a host with the bundled library present, move it aside reversibly in the Geekbench folder:
 
 ```bash
+mv -n -- libtensorrt_rtx.so libtensorrt_rtx.so.disabled
 ZLUDA_AGX_ZOC=/absolute/path/to/zoc \
 ZLUDA_AGX_LOG=1 \
 LD_LIBRARY_PATH=/absolute/path/to/zluda-libraries \
 ./geekbench7 --gpu CUDA > geekbench-zluda.log 2>&1
 ```
 
-The library directory must contain `libcuda.so.1` pointing to `libnvcuda_agx.so`. Keep the full log, including
-errors and upload status, and record the selected libraries (for example, with `LD_DEBUG=libs` in a separate
-diagnostic run). Device name and compute capability are driver-reported compatibility properties, not an
-application validation result.
+If the library is already absent, keep it absent. Record its placement with every comparison. The host rerun with
+this matching library placement is still pending; the documented successful fallback runs are from the container.
+The library directory must contain `libcuda.so.1` pointing to the AGX driver. Keep the full log, including errors and
+upload status. Device detection and an uploaded score alone do not establish success for every workload.
+
+The saved container runs reached all eleven workload headings and recorded GPU launches, including convolution and
+GEMM kernels for the AI workloads. This establishes execution of those paths, but does not independently verify every
+workload's output. The October 24 shared-pipeline record reports 318,836 profiled launches and eleven error-701 tuning
+rejections; its upload failed. Some scratch launch scripts also stop at the upload step, so their completion marker
+is not evidence of a published result. A November 1 host run uploaded a score of 3,183 despite failing to deserialize
+the Background Blur, Face Tracking, and Super Resolution engines.
+
+`CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES` (701) occurs in this driver's launch validation when a candidate block size exceeds
+the kernel's register-based threadgroup limit. Geekbench probes multiple sizes while tuning. The saved successful
+container runs also reject candidates for `calculate_descriptors`, `miss`, and `hit_surface`. Check that subsequent
+launches run with a supported size before treating a tuning rejection as failure of the whole workload.
+
+The host/container diagnostic comparison established matching hashes for `geekbench7`, `geekbench_aarch64`,
+`geekbench.plxr`, `geekbench-workload.plxr`, the driver, and its paired compiler. Both sides load the AI modules with
+4 and 30 kernels. Bypassing the host's disk cache did not resolve deserialization failure. The host's error 400 is a
+`cuGraphExecDestroy` call with a null handle during cleanup, rather than evidence of a failed graph launch.
+An unsupported `CU_LIMIT_CIG_ENABLED` (8) query was independently corrected: ordinary AGX contexts report success
+with zero, as specified by the [CUlimit definition](https://nvidia.github.io/cuda-python/cuda-bindings/12.8.0/module/driver.html).
+Its Asahi regression test covers the zero result, read-only behavior, a null output pointer, and unknown limits.
+That correction did not resolve the host engine failures. Missing procedure/export-table probes have not been
+established as their cause and must not be replaced with invented success responses.
+
+`ZLUDA_AGX_LOG=1` reports module-parser failures, runtime module-registration failures, successful loads' kernel counts
+and global-data sizes, cache keys, missing lookup symbols/versions, unsupported limit values, and rejected export IDs.
+`ZLUDA_AGX_API_TRACE=N` additionally logs at most N exported API calls and runtime module-loading calls, including
+return codes and implemented exported functions' arguments. Pointer arguments are addresses without dereferencing
+them. Tracing is disabled by default and is for diagnosis rather than performance measurement.
 
 ## Building a release for Asahi
 

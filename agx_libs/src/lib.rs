@@ -33,6 +33,8 @@ pub static SPARSE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sparse.agxf
 pub static RAND: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rand.agxfat"));
 /// The dense factorizations of zluda_solver_agx (`kernels/solver.mlir`, with f64 copies).
 pub static SOLVER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/solver.agxfat"));
+/// Portable inference primitives compiled from MLIR through AIR, without AGX-specific operations.
+pub static INFERENCE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/inference.agxfat"));
 
 /// Element types of A and B, and of C.
 #[derive(Clone, Copy, Debug, PartialEq)]

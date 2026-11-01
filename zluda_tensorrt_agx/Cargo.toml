@@ -1,0 +1,21 @@
+[package]
+name = "zluda_tensorrt_agx"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Independent MLIR/AIR inference runtime for Apple GPUs"
+
+[lib]
+name = "tensorrt_agx"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+agx_libs = { path = "../agx_libs" }
+cuda_types = { path = "../cuda_types", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libloading = "0.8"
+
+[package.metadata.zluda]
+agx = true
+linux_only = true

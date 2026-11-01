@@ -73,6 +73,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/dnn.mlir");
     println!("cargo:rerun-if-changed=kernels/rand.mlir");
     println!("cargo:rerun-if-changed=kernels/solver.mlir");
+    println!("cargo:rerun-if-changed=kernels/inference.mlir");
     let build = PathBuf::from(env::var_os("ZLUDA_LLVM_BUILD_DIR").expect(
         "agx_libs compiles its MLIR kernels with the LLVM AGX fork: set ZLUDA_LLVM_BUILD_DIR to its build directory",
     ));
@@ -104,14 +105,15 @@ fn main() {
     // conv_i32, dnn_i32: the convolutions and the DNN kernels again with 32-bit indices (names ending in _i32),
     // which zluda_dnn_agx runs when every offset fits: each 64-bit index division costs a run-time 32-bit check
     // and a slow path.
-    for name in ["sgemm", "hgemm", "epilogue", "conv", "conv_i32", "dnn_i32", "fft", "sparse", "blas", "blasc", "dnn", "rand", "solver"] {
+    for name in ["sgemm", "hgemm", "epilogue", "conv", "conv_i32", "dnn_i32", "fft", "sparse", "blas", "blasc", "dnn", "rand", "solver", "inference"] {
         let out = out_dir.join(format!("{name}.agxfat"));
         let src = if matches!(name, "fft" | "blas" | "blasc" | "sparse" | "solver") {
             out_dir.join(format!("{name}.mlir"))
         } else {
             PathBuf::from(format!("kernels/{}.mlir", name.trim_end_matches("_i32")))
         };
-        let narrow: &[&str] = if name.ends_with("_i32") { &["--index-bitwidth=32", "--kernel-suffix=_i32"] } else { &[] };
+        let narrow: &[&str] = if name.ends_with("_i32") { &["--index-bitwidth=32", "--kernel-suffix=_i32"] }
+            else if name == "inference" { &["--index-bitwidth=32"] } else { &[] };
         let child = Command::new("python3")
             .arg(&script)
             .arg("--mlir-opt")

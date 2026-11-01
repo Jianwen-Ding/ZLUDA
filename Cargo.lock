@@ -5444,6 +5444,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "zluda_tensorrt_agx"
+version = "0.1.0"
+dependencies = [
+ "agx_libs",
+ "cuda_types",
+ "libloading",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "zluda_trace"
 version = "0.0.0"
 dependencies = [

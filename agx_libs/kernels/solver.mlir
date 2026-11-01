@@ -696,6 +696,133 @@ gpu.module @agx_solver {
     gpu.return
   }
 
+  // The reflectors of columns j0 .. j0 + jb (single precision only) of an
+  // m-row matrix in one workgroup, as agx_qr_house / agx_qr_apply do column by
+  // column with the reflections kept to the panel: per column a workgroup sum
+  // of squares, thread 0's beta and tau (zero tau and nothing scaled for a
+  // zero column below the diagonal), the scaling of v by all threads, then
+  // each SIMD-group applies the reflector to its columns (c = k + 1 + group,
+  // + groups, ...; its lanes take every 32nd row and sum with a shuffle tree).
+  // Launch one workgroup.
+  gpu.func @agx_qr_panel(%a0: memref<1xf32, 1>, %m_: i64, %lda_: i64, %j0_: i64, %jb_: i64,
+                         %tau0: memref<1xf32, 1>)
+      workgroup(%sw: memref<35xf32, #gpu.address_space<workgroup>>) kernel {
+    %i0 = arith.constant 0 : index
+    %i1 = arith.constant 1 : index
+    %i32 = arith.constant 32 : index
+    %i33 = arith.constant 33 : index
+    %i34 = arith.constant 34 : index
+    %f0 = arith.constant 0.0 : f32
+    %f1 = arith.constant 1.0 : f32
+    %m = arith.index_cast %m_ : i64 to index
+    %lda = arith.index_cast %lda_ : i64 to index
+    %j0 = arith.index_cast %j0_ : i64 to index
+    %jb = arith.index_cast %jb_ : i64 to index
+    %j1 = arith.addi %j0, %jb : index
+    %t = gpu.thread_id x
+    %nt = gpu.block_dim x
+    %nsg = arith.divui %nt, %i32 : index
+    %lane = arith.remui %t, %i32 : index
+    %sg = arith.divui %t, %i32 : index
+    %t0 = arith.cmpi eq, %t, %i0 : index
+    %l0 = arith.cmpi eq, %lane, %i0 : index
+    scf.for %k = %j0 to %j1 step %i1 {
+      %col = arith.muli %k, %lda : index
+      %od = arith.addi %col, %k : index
+      %k1 = arith.addi %k, %i1 : index
+      // the sum of squares below the diagonal
+      %r0 = arith.addi %k1, %t : index
+      %part = scf.for %i = %r0 to %m step %nt iter_args(%acc = %f0) -> f32 {
+        %o = arith.addi %col, %i : index
+        %v = func.call @agx_sv_ld(%a0, %o) : (memref<1xf32, 1>, index) -> f32
+        %a1 = math.fma %v, %v, %acc : f32
+        scf.yield %a1 : f32
+      }
+      %gs = gpu.subgroup_reduce add %part : (f32) -> f32
+      scf.if %l0 {
+        memref.store %gs, %sw[%sg] : memref<35xf32, #gpu.address_space<workgroup>>
+      }
+      gpu.barrier
+      scf.if %t0 {
+        %ss = scf.for %q = %i0 to %nsg step %i1 iter_args(%acc = %f0) -> f32 {
+          %x = memref.load %sw[%q] : memref<35xf32, #gpu.address_space<workgroup>>
+          %a1 = arith.addf %acc, %x : f32
+          scf.yield %a1 : f32
+        }
+        %alpha = func.call @agx_sv_ld(%a0, %od) : (memref<1xf32, 1>, index) -> f32
+        %zero = arith.cmpf oeq, %ss, %f0 : f32
+        %res:2 = scf.if %zero -> (f32, f32) {
+          func.call @agx_sv_st(%tau0, %k, %f0) : (memref<1xf32, 1>, index, f32) -> ()
+          scf.yield %f0, %f0 : f32, f32
+        } else {
+          %all = math.fma %alpha, %alpha, %ss : f32
+          %norm = math.sqrt %all : f32
+          %neg = arith.negf %norm : f32
+          %beta = math.copysign %neg, %alpha : f32
+          %bma = arith.subf %beta, %alpha : f32
+          %tau = arith.divf %bma, %beta : f32
+          %amb = arith.subf %alpha, %beta : f32
+          %scal = arith.divf %f1, %amb : f32
+          func.call @agx_sv_st(%a0, %od, %beta) : (memref<1xf32, 1>, index, f32) -> ()
+          func.call @agx_sv_st(%tau0, %k, %tau) : (memref<1xf32, 1>, index, f32) -> ()
+          scf.yield %tau, %scal : f32, f32
+        }
+        memref.store %res#0, %sw[%i33] : memref<35xf32, #gpu.address_space<workgroup>>
+        memref.store %res#1, %sw[%i34] : memref<35xf32, #gpu.address_space<workgroup>>
+      }
+      gpu.barrier
+      %tau = memref.load %sw[%i33] : memref<35xf32, #gpu.address_space<workgroup>>
+      %scal = memref.load %sw[%i34] : memref<35xf32, #gpu.address_space<workgroup>>
+      %live = arith.cmpf une, %tau, %f0 : f32
+      // v = the column below the diagonal, scaled
+      scf.if %live {
+        scf.for %i = %r0 to %m step %nt {
+          %o = arith.addi %col, %i : index
+          %v = func.call @agx_sv_ld(%a0, %o) : (memref<1xf32, 1>, index) -> f32
+          %sv = arith.mulf %v, %scal : f32
+          func.call @agx_sv_st(%a0, %o, %sv) : (memref<1xf32, 1>, index, f32) -> ()
+        }
+      }
+      gpu.barrier
+      // x -= tau (x[k] + v . x) (e_k + v) for the panel's columns after k, a SIMD-group per column
+      scf.if %live {
+        %c0 = arith.addi %k1, %sg : index
+        %rl = arith.addi %k1, %lane : index
+        scf.for %c = %c0 to %j1 step %nsg {
+          %xc = arith.muli %c, %lda : index
+          %dot = scf.for %i = %rl to %m step %i32 iter_args(%acc = %f0) -> f32 {
+            %ov = arith.addi %col, %i : index
+            %ox = arith.addi %xc, %i : index
+            %v = func.call @agx_sv_ld(%a0, %ov) : (memref<1xf32, 1>, index) -> f32
+            %x = func.call @agx_sv_ld(%a0, %ox) : (memref<1xf32, 1>, index) -> f32
+            %a1 = math.fma %v, %x, %acc : f32
+            scf.yield %a1 : f32
+          }
+          %d = gpu.subgroup_reduce add %dot : (f32) -> f32
+          %oxk = arith.addi %xc, %k : index
+          %xk = func.call @agx_sv_ld(%a0, %oxk) : (memref<1xf32, 1>, index) -> f32
+          %w0 = arith.addf %xk, %d : f32
+          %w = arith.mulf %w0, %tau : f32
+          %nw = arith.negf %w : f32
+          scf.for %i = %rl to %m step %i32 {
+            %ov = arith.addi %col, %i : index
+            %ox = arith.addi %xc, %i : index
+            %v = func.call @agx_sv_ld(%a0, %ov) : (memref<1xf32, 1>, index) -> f32
+            %x = func.call @agx_sv_ld(%a0, %ox) : (memref<1xf32, 1>, index) -> f32
+            %nx = math.fma %nw, %v, %x : f32
+            func.call @agx_sv_st(%a0, %ox, %nx) : (memref<1xf32, 1>, index, f32) -> ()
+          }
+          scf.if %l0 {
+            %nxk = arith.subf %xk, %w : f32
+            func.call @agx_sv_st(%a0, %oxk, %nxk) : (memref<1xf32, 1>, index, f32) -> ()
+          }
+        }
+      }
+      gpu.barrier
+    }
+    gpu.return
+  }
+
   // ---- Householder QR (geqrf), column k of an m x n matrix, LAPACK's
   // storage: v(k) = 1 implicit, v below the diagonal, beta on it, tau[k].
 

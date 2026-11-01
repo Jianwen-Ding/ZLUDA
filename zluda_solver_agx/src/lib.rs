@@ -535,26 +535,43 @@ unsafe fn geqrf(h: &Handle, double: bool, m: c_int, n: c_int, a: *mut c_void, ld
     let block = if need > 0 && !work.is_null() && lwork as i64 >= need { QR_BLOCK } else { i64::MAX };
     let mn = m.min(n) as i64;
     let f = |p: *mut c_void, i: i64| (p as *mut f32).add(i as usize) as *mut c_void;
-    for k in 0..mn {
+    // f32 panels (blocked, QR_BLOCK columns) in one launch each (agx_qr_panel): a column at a time is a reflector on
+    // one thread and an apply (4096 x 256: 373 ms, 1.45 ms a column). ZLUDA_AGX_QR_PANEL=0: a column at a time.
+    let panels = !double && block != i64::MAX && std::env::var("ZLUDA_AGX_QR_PANEL").map_or(true, |v| v != "0");
+    let mut k = 0i64;
+    while k < mn {
         let mut k_ = k;
         // the end of k's panel: the reflections stay in it
         let j0 = if block == i64::MAX { 0 } else { k / block * block };
         let mut j1 = if block == i64::MAX { n_ } else { (j0 + block).min(mn) };
-        run(
-            h,
-            kernel(double, [c"agx_qr_house", c"agx_qr_house_f64"]),
-            &mut [arg(&mut pa), arg(&mut m_), arg(&mut k_), arg(&mut lda_), arg(&mut pt)],
-            [1, 1],
-            [1, 1],
-        )?;
-        run(
-            h,
-            kernel(double, [c"agx_qr_apply", c"agx_qr_apply_f64"]),
-            &mut [arg(&mut pa), arg(&mut m_), arg(&mut j1), arg(&mut k_), arg(&mut lda_), arg(&mut pt)],
-            [j1 - k - 1, 1],
-            [64, 1],
-        )?;
-        if k + 1 != j1 || j1 >= n_ {
+        if panels {
+            let (mut j0_, mut jb) = (j0, j1 - j0);
+            run(
+                h,
+                c"agx_qr_panel",
+                &mut [arg(&mut pa), arg(&mut m_), arg(&mut lda_), arg(&mut j0_), arg(&mut jb), arg(&mut pt)],
+                [LU_PANEL_THREADS, 1],
+                [LU_PANEL_THREADS as u32, 1],
+            )?;
+            k = j1;
+        } else {
+            k += 1;
+            run(
+                h,
+                kernel(double, [c"agx_qr_house", c"agx_qr_house_f64"]),
+                &mut [arg(&mut pa), arg(&mut m_), arg(&mut k_), arg(&mut lda_), arg(&mut pt)],
+                [1, 1],
+                [1, 1],
+            )?;
+            run(
+                h,
+                kernel(double, [c"agx_qr_apply", c"agx_qr_apply_f64"]),
+                &mut [arg(&mut pa), arg(&mut m_), arg(&mut j1), arg(&mut k_), arg(&mut lda_), arg(&mut pt)],
+                [j1 - k_ - 1, 1],
+                [64, 1],
+            )?;
+        }
+        if k != j1 || j1 >= n_ {
             continue;
         }
         let (jb, mv, n2) = (j1 - j0, m_ - j0, n_ - j1);

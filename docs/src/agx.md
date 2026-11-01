@@ -1661,7 +1661,12 @@ with cuBLAS in `agx_libs::engine::trsm`; f64 updates on the generic f64 GEMM), w
 by their own kernel, instead of one thread per right-hand side. The f32 geqrf
 with more than 32 rows and columns works by panels of 32 columns when given the
 workspace its `_bufferSize` now asks for (32 (m + 64 + 2n) elements): the panel
-column by column as above, then the panel's block reflector (compact WY:
+in one launch (`agx_qr_panel`, a workgroup of 512 threads: per column a
+workgroup sum of squares, the reflector, then each SIMD-group applies it to its
+columns; a column at a time was a one-thread reflector and an apply: 4096 x 256
+374 -> 24.6 ms, 2048^2 817 -> 102 ms, 512^2 61.7 -> 13.9 ms, Q^T A against R 1.4-5.7x
+closer, `tools/qrbench.c`; `ZLUDA_AGX_QR_PANEL=0`: a column at a time), then the
+panel's block reflector (compact WY:
 `Q = I - V T V^T`, T built from `V^T V`) applied to the rest of A with GEMMs on
 the tile kernels. A smaller workspace runs the unblocked factorization. The f32
 ormqr and orgqr with Q of order 64 or more and at least 4 reflectors apply Q the

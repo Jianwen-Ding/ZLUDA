@@ -34,7 +34,7 @@ waits for outstanding work before freeing owned buffers. The CUDA context must o
 
 ONNX import supports standard-domain opsets 13–22, IR versions 4–13, static f32 I/O, embedded f32 weights, and
 constant i64 reshape shapes. Supported operators: `MatMul`, `Gemm`, `Conv`, `Relu`, `Sigmoid`, `Tanh`, `Identity`, `Sqrt`, `Exp`, `Log`, `Abs`, `Neg`, `Reciprocal`, `LayerNormalization`,
-`ReduceSum`, `ReduceMean`, `BatchNormalization` (inference with constant parameters), `Add`, `Mul`, `Sub`, `Div`, binary `Max`/`Min`, `Softmax`, `MaxPool`, `AveragePool`, `GlobalAveragePool`, `Flatten`,
+`Gather` (constant int32/int64 indices), `ReduceSum`, `ReduceMean`, `BatchNormalization` (inference with constant parameters), `Add`, `Mul`, `Sub`, `Div`, binary `Max`/`Min`, `Softmax`, `MaxPool`, `AveragePool`, `GlobalAveragePool`, `Flatten`,
 `Reshape`, `Transpose`, `Concat`, and tensor-valued `Constant` nodes. External weights, dynamic shapes, non-f32
 execution, custom operators/plugins, control flow, asymmetric/automatic padding, dilated/ceil pooling, and opaque
 vendor engines return explicit errors. This operator set is not the entire TensorRT API.
@@ -50,6 +50,11 @@ semantics. Dedicated portable MLIR kernels read strided input directly, with sta
 long axes. They need no coefficient vectors or transpose operations. Multiple axes use successive reductions;
 intermediate outputs use the normal liveness-managed workspace. The C API exposes `ztrtBuilderAddReduce`, and
 the source-level C++ subset exposes `addReduce` with `kSUM` and `kAVG`.
+
+Gather supports scalar or multidimensional constant integer indices, negative indices and axes. The importer
+retains index shapes and validates bounds before execution; indices are normalized and packed once per engine
+and CUDA context. The native C builder provides `ztrtBuilderAddGather`. Dynamic/device-produced indices and
+integer data tensors remain unsupported; this is not the complete TensorRT Gather API.
 
 LayerNormalization supports opsets 17–22 with f32 statistics, broadcast scale and optional bias, arbitrary suffix
 axes, and optional mean/inverse-standard-deviation outputs. It currently lowers to a sequence of reductions
@@ -141,7 +146,7 @@ the AGX Performance Simulator:
 
 ```sh
 ZLUDA_AGX_CAPTURE=/tmp/inference-captures \
-ZLUDA_AGX_CAPTURE_KERNELS=agx_infer_layer_norm,agx_infer_layer_norm_simd,agx_infer_reduce,agx_infer_reduce_simd,agx_infer_conv2d,agx_infer_binary,agx_infer_unary,agx_infer_softmax,agx_infer_softmax_simd,agx_infer_pool,agx_infer_transpose,agx_infer_concat \
+ZLUDA_AGX_CAPTURE_KERNELS=agx_infer_gather,agx_infer_layer_norm,agx_infer_layer_norm_simd,agx_infer_reduce,agx_infer_reduce_simd,agx_infer_conv2d,agx_infer_binary,agx_infer_unary,agx_infer_softmax,agx_infer_softmax_simd,agx_infer_pool,agx_infer_transpose,agx_infer_concat \
 ZLUDA_AGX_CAPTURE_MAX=1 python3 zluda_tensorrt_agx/tests/test_gpu.py
 python3 zluda_tensorrt_agx/tests/test_sim.py /tmp/inference-captures --agx-run /path/to/agx_run
 ```

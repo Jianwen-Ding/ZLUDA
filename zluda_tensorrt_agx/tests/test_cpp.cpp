@@ -57,6 +57,13 @@ int main(int argc,char** argv){
     assert(std::unique_ptr<IHostMemory>(builder->buildSerializedNetwork(*normNetwork,*normConfig)));
     norm->setEpsilon(-1.f);assert(!std::unique_ptr<IHostMemory>(builder->buildSerializedNetwork(*normNetwork,*normConfig)));
     norm->setEpsilon(.003f);assert(std::unique_ptr<IHostMemory>(builder->buildSerializedNetwork(*normNetwork,*normConfig)));
+    auto gatherBuilder=ztrtCreateBuilder();assert(gatherBuilder);
+    int64_t gxShape[2]={2,3},giShape[1]={2},gi[2]={-1,0},gyShape[2]={0,0};
+    auto gx=ztrtBuilderAddInput(gatherBuilder,"gather_input",gxShape,2);assert(gx>=0);
+    auto gy=ztrtBuilderAddGather(gatherBuilder,gx,1,gi,2,giShape,1);assert(gy>=0);
+    assert(ztrtBuilderTensorShape(gatherBuilder,gy,gyShape,2)==2&&gyShape[0]==2&&gyShape[1]==2);
+    assert(ztrtBuilderMarkOutput(gatherBuilder,gy)==0);auto ge=ztrtBuilderBuild(gatherBuilder);assert(ge);
+    ztrtDestroyEngine(ge);ztrtDestroyBuilder(gatherBuilder);
     if(argc>1){
         std::ifstream file(argv[1],std::ios::binary);assert(file);
         std::vector<char> model((std::istreambuf_iterator<char>(file)),std::istreambuf_iterator<char>());

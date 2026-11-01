@@ -691,4 +691,33 @@ gpu.module @inference {
     }
     gpu.return
   }
+
+  // Gather static, host-validated indices. All indexing uses standard integer arithmetic.
+  gpu.func @agx_infer_gather(%x0: memref<1xf32, 1>, %y0: memref<1xf32, 1>, %indices0: memref<1xi32, 1>, %n_: i32, %axis_: i32, %count_: i32, %inner_: i32) kernel {
+    %big = arith.constant 2147483647 : index
+    %x = memref.reinterpret_cast %x0 to offset: [0], sizes: [%big], strides: [1] : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %y = memref.reinterpret_cast %y0 to offset: [0], sizes: [%big], strides: [1] : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %indices = memref.reinterpret_cast %indices0 to offset: [0], sizes: [%big], strides: [1] : memref<1xi32, 1> to memref<?xi32, strided<[1]>, 1>
+    %id = gpu.global_id x
+    %n = arith.index_cast %n_ : i32 to index
+    %live = arith.cmpi ult, %id, %n : index
+    scf.if %live {
+      %axis = arith.index_cast %axis_ : i32 to index
+      %count = arith.index_cast %count_ : i32 to index
+      %inner = arith.index_cast %inner_ : i32 to index
+      %item = arith.divui %id, %inner : index
+      %tail = arith.remui %id, %inner : index
+      %outer = arith.divui %item, %count : index
+      %selection = arith.remui %item, %count : index
+      %index_ = memref.load %indices[%selection] : memref<?xi32, strided<[1]>, 1>
+      %index = arith.index_cast %index_ : i32 to index
+      %base = arith.muli %outer, %axis : index
+      %row = arith.addi %base, %index : index
+      %head = arith.muli %row, %inner : index
+      %at = arith.addi %head, %tail : index
+      %v = memref.load %x[%at] : memref<?xf32, strided<[1]>, 1>
+      memref.store %v, %y[%id] : memref<?xf32, strided<[1]>, 1>
+    }
+    gpu.return
+  }
 }

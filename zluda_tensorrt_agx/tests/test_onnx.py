@@ -23,7 +23,7 @@ def info(name,shape):
     ty=var(1,1)+blob(2,dims)
     return text(1,name)+blob(2,blob(1,ty))
 def constant(name,value,dtype=1):
-    value=np.asarray(value,dtype=np.float32 if dtype==1 else np.int64)
+    value=np.asarray(value,dtype=np.float32 if dtype==1 else np.int32 if dtype==6 else np.int64)
     return blob(1,b''.join(vi(d)for d in value.shape))+var(2,dtype)+text(8,name)+blob(9,value.tobytes())
 def attr(name,value):
     if isinstance(value,float):return text(1,name)+var(20,1)+vi((2<<3)|5)+struct.pack('<f',value)
@@ -137,6 +137,18 @@ x=np.full((2,5),4.,dtype='f');scale=np.ones(5,dtype='f');inv=np.full((2,1),1/np.
 execute(model([('x',x.shape)],[('y',x.shape),('inv',inv.shape)],[op('LayerNormalization',['x','scale'],['y','','inv'],epsilon=.003)],[constant('scale',scale)],opset=17),{'x':x},{'y':np.zeros_like(x),'inv':inv})
 for attributes in [{'epsilon':-.01},{'stash_type':10},{'axis':3}]:
     data=model([('x',[2,5])],[('y',[2,5])],[op('LayerNormalization',['x','scale'],'y',**attributes)],[constant('scale',np.ones(5))],opset=17)
+    buf=C.create_string_buffer(data);assert not build_onnx(buf,len(data),1<<30)
+# Gather supports constant initializer or Constant-node indices, including scalar and matrix indices.
+for axis,indices in [(0,[1,0,1]),(1,[[0,-1],[1,0]]),(-1,[-1,0,2]),(1,1)]:
+    x=rng.normal(size=(2,3,5)).astype('f');indices=np.asarray(indices,dtype='int64');ref=np.take(x,indices,axis=axis)
+    execute(model([('x',x.shape)],[('y',ref.shape)],[op('Gather',['x','indices'],'y',axis=axis)],[constant('indices',indices,7)]),{'x':x},{'y':ref})
+    execute(model([('x',x.shape)],[('y',ref.shape)],[op('Gather',['x','indices'],'y',axis=axis)],[constant('indices',indices,6)]),{'x':x},{'y':ref})
+value=constant('',np.array([[0,-1]],dtype='int64'),7)
+constant_indices=text(2,'indices')+text(4,'Constant')+blob(5,text(1,'value')+var(20,4)+blob(5,value))
+x=rng.normal(size=(2,3,5)).astype('f');ref=np.take(x,[[0,-1]],axis=1)
+execute(model([('x',x.shape)],[('y',ref.shape)],[constant_indices,op('Gather',['x','indices'],'y',axis=1)]),{'x':x},{'y':ref})
+for axis,indices in [(1,[3]),(1,[-4]),(3,[0])]:
+    data=model([('x',[2,3,5])],[('y',[2,1,5])],[op('Gather',['x','indices'],'y',axis=axis)],[constant('indices',np.array(indices),7)])
     buf=C.create_string_buffer(data);assert not build_onnx(buf,len(data),1<<30)
 # Malformed metadata and unsupported operators/attributes are explicit failures.
 for bad in [b'\0',b'\x80'*11,b'\x3a\xff\xff\xff\xff\x7f',model([('x',[2,3])],[('y',[2,3])],[op('Relu',['x'],'y',unknown=1)]),model([('x',[2,3])],[('y',[2,3])],[op('Erf',['x'],'y')]),model([('x',[2,3])],[('y',[2,3])],[op('Relu',['x'],'y')],opset=12)]:

@@ -58,7 +58,7 @@ fn nested<'a>(f: &'a [Field<'a>], id: u32) -> impl Iterator<Item=Result<&'a [u8]
 }
 fn dims(v: Vec<i64>) -> Result<Vec<usize>> { v.into_iter().map(|v|usize::try_from(v).map_err(|_|"negative ONNX dimension".into())).collect() }
 #[derive(Clone)]
-enum Constant { Float(Vec<f32>), Int(Vec<i64>) }
+enum Constant { Float(Vec<f32>), Int(Vec<i64>, i64) }
 fn tensor(data: &[u8]) -> Result<(String,Vec<usize>,Constant)> {
     let f=fields(data)?; let name=text(&f,8)?; let shape=dims(integers(&f,1)?)?;
     if !bytes(&f,13)?.is_empty() || integer(&f,14,0)?!=0 { return Err("external ONNX tensor storage is not supported".into()); }
@@ -71,13 +71,17 @@ fn tensor(data: &[u8]) -> Result<(String,Vec<usize>,Constant)> {
             if values.len()!=n || values.iter().any(|v|!v.is_finite()){return Err("ONNX constant size or value is invalid".into());}
             Constant::Float(values)
         }
-        7=>{
+        6|7=>{
             if shape.len()>MAX_RANK{return Err("ONNX integer tensor rank exceeds limit".into());}
             let n=shape.iter().try_fold(1usize,|a,&b|a.checked_mul(b)).ok_or("ONNX integer tensor size overflow")?;
             if n>MAX_ENGINE_BYTES/8{return Err("ONNX integer tensor exceeds size limit".into());}
-            let values=if !raw.is_empty(){if raw.len()!=n*8{return Err("ONNX raw i64 length differs from shape".into());}raw.chunks_exact(8).map(|v|i64::from_le_bytes(v.try_into().unwrap())).collect()}
-            else{integers(&f,7)?};
-            if values.len()!=n{return Err("ONNX integer constant size differs from shape".into());}Constant::Int(values)
+            let width=if ty==6{4}else{8};
+            let values=if !raw.is_empty(){
+                if raw.len()!=n*width{return Err("ONNX raw integer length differs from shape".into());}
+                raw.chunks_exact(width).map(|v|if ty==6{i32::from_le_bytes(v.try_into().unwrap()) as i64}else{i64::from_le_bytes(v.try_into().unwrap())}).collect()
+            }else{let values=integers(&f,if ty==6{5}else{7})?;
+                if ty==6{values.into_iter().map(|v|v as i32 as i64).collect()}else{values}};
+            if values.len()!=n{return Err("ONNX integer constant size differs from shape".into());}Constant::Int(values,ty)
         }
         _=>return Err(format!("unsupported ONNX initializer data type {ty}")),
     };
@@ -139,10 +143,10 @@ pub fn import(data:&[u8])->Result<Graph>{
     if !matches!(opset,Some(13..=22)){return Err("supported ONNX standard opsets are 13 through 22".into());}
     let proto=fields(bytes(&model,7)?)?;
     if proto.iter().any(|f|f.id==15){return Err("sparse ONNX initializers are not supported".into());}
-    let mut g=Graph::default();let mut ids=HashMap::new();let mut ints=HashMap::new();
+    let mut g=Graph::default();let mut ids=HashMap::new();let mut ints=HashMap::new();let mut int_shapes=HashMap::new();let mut int_types=HashMap::new();
     for t in nested(&proto,5){let(name,shape,value)=tensor(t?)?;if name.is_empty()||ids.contains_key(&name)||ints.contains_key(&name){return Err("empty or duplicate ONNX initializer name".into());}match value{
         Constant::Float(v)=>{add_named(&mut g,name,shape,Some(v),&mut ids)?;},
-        Constant::Int(v)=>{if ids.contains_key(&name)||ints.insert(name,v).is_some(){return Err("duplicate ONNX constant".into());}},
+        Constant::Int(v,ty)=>{int_types.insert(name.clone(),ty);if ids.contains_key(&name)||ints.insert(name.clone(),v).is_some(){return Err("duplicate ONNX constant".into());}int_shapes.insert(name,shape);},
     }}
     for input in nested(&proto,11){let input=input?;let f=fields(input)?;let name=text(&f,1)?;
         if ids.contains_key(&name)||ints.contains_key(&name){continue;}
@@ -163,7 +167,7 @@ pub fn import(data:&[u8])->Result<Graph>{
             if !seen.insert(name)||ids.contains_key(name)||ints.contains_key(name){return Err("duplicate ONNX output name".into());}
         }
         let expected = match kind.as_str() {
-            "MatMul"|"Add"|"Mul"|"Sub"|"Div"|"Max"|"Min"|"Reshape" => 2..=2,
+            "MatMul"|"Add"|"Mul"|"Sub"|"Div"|"Max"|"Min"|"Reshape"|"Gather" => 2..=2,
             "ReduceSum" => 1..=2, "ReduceMean" if opset.unwrap()>=18 => 1..=2,
             "LayerNormalization" => 2..=3, "BatchNormalization" => 5..=5, "Gemm"|"Conv" => 2..=3, "Constant" => 0..=0, "Concat" => 1..=MAX_TENSORS,
             _ => 1..=1,
@@ -177,10 +181,16 @@ pub fn import(data:&[u8])->Result<Graph>{
             if !attrs.is_empty(){return Err("unsupported Constant attributes".into());}
             let(_,shape,value)=tensor(&value)?;match value{
                 Constant::Float(v)=>{add_named(&mut g,outputs[0].clone(),shape,Some(v),&mut ids)?;},
-                Constant::Int(v)=>{ints.insert(outputs[0].clone(),v);},
+                Constant::Int(v,ty)=>{int_types.insert(outputs[0].clone(),ty);ints.insert(outputs[0].clone(),v);int_shapes.insert(outputs[0].clone(),shape);},
             }continue;
         }
         let output=match kind.as_str(){
+            "Gather"=>{
+                let input=get(0)?;let name=&inputs[1];
+                let indices=ints.get(name).cloned().ok_or("Gather indices must be a constant int32/int64 tensor")?;
+                let index_shape=int_shapes.get(name).cloned().ok_or("missing Gather index shape")?;
+                g.add_node(Op::Gather{input,axis:take_int(&mut attrs,"axis",0)? as isize,indices,index_shape})?
+            }
             "MatMul"=>{
                 let mut a=get(0)?;let mut b=get(1)?;
                 let av=g.tensors[a].shape.len()==1;let bv=g.tensors[b].shape.len()==1;
@@ -288,7 +298,7 @@ pub fn import(data:&[u8])->Result<Graph>{
             "Flatten"=>{let x=get(0)?;let s=&g.tensors[x].shape;let a=take_int(&mut attrs,"axis",1)?;let a=if a<0{a+s.len() as i64}else{a};if a<0||a as usize>s.len(){return Err("Flatten axis is invalid".into());}g.add_node(Op::Reshape{input:x,shape:vec![s[..a as usize].iter().product(),s[a as usize..].iter().product()]})?}
             "Reshape"=>{
                 let x=get(0)?;if take_int(&mut attrs,"allowzero",0)?!=0{return Err("Reshape allowzero is not supported".into());}
-                let shape_name=inputs.get(1).ok_or("Reshape needs shape input")?;let target=ints.get(shape_name).ok_or("Reshape shape must be a constant i64 tensor")?;
+                let shape_name=inputs.get(1).ok_or("Reshape needs shape input")?;if int_types.get(shape_name)!=Some(&7){return Err("Reshape shape must be i64".into());}let target=ints.get(shape_name).ok_or("Reshape shape must be a constant i64 tensor")?;
                 let mut shape=Vec::new();let mut infer=None;let mut known=1usize;let total=g.tensors[x].elements()?;
                 for(i,&d)in target.iter().enumerate(){let d=if d==0{*g.tensors[x].shape.get(i).ok_or("Reshape zero axis is outside input")? as i64}else{d};
                     if d==-1{if infer.replace(i).is_some(){return Err("multiple inferred Reshape dimensions".into());}shape.push(1);}else{let v=usize::try_from(d).map_err(|_|"negative Reshape dimension")?;if v==0{return Err("empty Reshape dimensions unsupported".into());}known=known.checked_mul(v).ok_or("Reshape size overflow")?;shape.push(v);}}
@@ -303,7 +313,7 @@ pub fn import(data:&[u8])->Result<Graph>{
                 if ![0,1].contains(&keep)||![0,1].contains(&noop){return Err("reduction flags must be zero or one".into());}
                 let axes=if modern{
                     if let Some(name)=inputs.get(1).filter(|s|!s.is_empty()){
-                        ints.get(name).cloned().ok_or("reduction axes must be a constant i64 tensor")?
+                        {if int_types.get(name)!=Some(&7){return Err("reduction axes must be i64".into());}ints.get(name).cloned().ok_or("reduction axes must be a constant i64 tensor")?}
                     }else{Vec::new()}
                 }else{take_ints(&mut attrs,"axes",&[])?};
                 let mut reduce=vec![false;rank];

@@ -110,6 +110,15 @@ unsafe fn copy_shape(s: &[usize], p: *mut i64, capacity: usize) -> Result<i32> {
 #[no_mangle] pub unsafe extern "C" fn ztrtBuilderAddActivation(p: *mut Builder, input: i32, kind: i32) -> i32 {
     boundary(-1, || Ok(object_mut(p)?.graph.add_node(Op::Activation { input: id(input)?, kind: unary(kind)? })? as i32))
 }
+/// Static Gather indices are copied and validated when the model is built.
+#[no_mangle] pub unsafe extern "C" fn ztrtBuilderAddGather(p:*mut Builder,input:i32,axis:i32,indices:*const i64,count:usize,dims:*const i64,rank:usize)->i32 {
+    boundary(-1,||{
+        let index_shape=shape(dims,rank)?;
+        if elements(&index_shape)?!=count{return Err("Gather index shape/count mismatch".into());}
+        let indices=slice(indices,count,MAX_ENGINE_BYTES/8)?.to_vec();
+        Ok(object_mut(p)?.graph.add_node(Op::Gather{input:id(input)?,axis:axis as isize,indices,index_shape})? as i32)
+    })
+}
 /// Fused unscaled suffix normalization; scale and bias can be added as elementwise operations.
 #[no_mangle] pub unsafe extern "C" fn ztrtBuilderAddLayerNorm(p:*mut Builder,input:i32,axis:i32,epsilon:f32)->i32 {
     boundary(-1,||Ok(object_mut(p)?.graph.add_node(Op::LayerNorm{input:id(input)?,axis:axis as isize,epsilon})? as i32))

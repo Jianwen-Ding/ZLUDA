@@ -101,6 +101,11 @@ impl Resources {
                 }
                 Op::Activation { .. } => { get(agx_libs::INFERENCE, c"agx_infer_unary")?; None }
                 Op::Pool2d { .. } => { get(agx_libs::INFERENCE, c"agx_infer_pool")?; None }
+                Op::Gather { input, axis, indices, .. } => {
+                    get(agx_libs::INFERENCE,c"agx_infer_gather")?;
+                    let shape=&plan.graph.tensors[*input].shape;let axis=axis_index(*axis,shape.len())?;
+                    Some(indices.iter().map(|&i|if i<0{(i+shape[axis] as i64) as i32}else{i as i32}).collect())
+                }
                 Op::LayerNorm { input, axis, .. } => {
                     let shape=&plan.graph.tensors[*input].shape;let axis=axis_index(*axis,shape.len())?;
                     let channels:usize=shape[axis..].iter().product();
@@ -257,6 +262,13 @@ impl Context {
                     let mut params = vec![arg(&mut xp), arg(&mut wp), arg(&mut bp), arg(&mut yp)];
                     params.extend(args.iter_mut().map(arg));
                     self.launch(c"agx_infer_conv2d", n, &mut params, stream)?;
+                }
+                Op::Gather { input, axis, indices, .. } => {
+                    let shape=&g.tensors[*input].shape;let axis=axis_index(*axis,shape.len())?;
+                    let mut x=self.pointers[*input];let mut y=self.pointers[yid];let mut meta=self.resources.metadata[at].ok_or("missing Gather indices")?;
+                    let mut count=indices.len() as i32;let mut axis_size=shape[axis] as i32;
+                    let mut inner=shape[axis+1..].iter().product::<usize>() as i32;let mut size=n as i32;
+                    self.launch(c"agx_infer_gather",n,&mut[arg(&mut x),arg(&mut y),arg(&mut meta),arg(&mut size),arg(&mut axis_size),arg(&mut count),arg(&mut inner)],stream)?;
                 }
                 Op::LayerNorm { input, axis, epsilon } => {
                     let shape=&g.tensors[*input].shape;let axis=axis_index(*axis,shape.len())?;

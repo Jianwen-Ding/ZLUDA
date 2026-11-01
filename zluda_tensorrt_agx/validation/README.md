@@ -253,3 +253,22 @@ No target hints, relaxed math flags or proprietary implementation inputs were us
 84.86 us for the fused core plus scale. Workspace was 786,688 versus 262,144 bytes. These are initial uncontrolled
 clock measurements. Scale/bias fusion, saved-statistics fusion, full normalization axis coverage and broader
 precision/ABI support remain open work; this checkpoint does not establish full TensorRT compatibility.
+
+## Static Gather indexing
+
+Added a native Gather graph operation, C builder entry point and original portable MLIR kernel. ONNX accepts
+constant int32/int64 indices from initializers or Constant nodes, preserving scalar and multidimensional index
+shapes. Negative indices normalize before upload. Shape/count, rank/axis and bounds errors are rejected before
+GPU execution. Input data stays f32; dynamic/device-produced indices and other Gather modes remain unsupported.
+
+All 99 GPU graph cases and 109 ONNX models pass. Added fixtures cover repeated selections, negative indices,
+negative axes, matrix/scalar indices, scalar outputs, rank-8 data, both integer index types and Constant-node
+indices. Invalid/out-of-range indices fail. Eleven Rust tests, C builder shape/build tests and lifecycle tests
+pass. All thirteen primitive kernel families replay against NumPy in AGX Performance Simulator. AIR and AGX
+artifacts regenerate from the same standard MLIR. No target hints or proprietary implementation inputs used.
+
+`gather.json` records the initial 1024x512 column-selection benchmark: 78.11 us median enqueue/sync, zero
+activation workspace. Its 512 normalized i32 indices occupy 2,048 metadata bytes in the shared immutable arena
+(plus arena alignment); the benchmark's constant_bytes field counts tensor weights and therefore shows zero,
+not zero total GPU memory. The output is caller-owned. This is an initial absolute measurement, not a speedup
+claim. Public semantics: https://onnx.ai/onnx/operators/onnx__Gather.html

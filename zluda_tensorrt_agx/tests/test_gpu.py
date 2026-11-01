@@ -72,6 +72,12 @@ for sh,axis in [([3,5],1),([3,37],1),([2,3,5],1),([3,1024],1),([2,3,5],0)]:
     g=graph();x=tensor(g,'x',sh);y=node(g,sh,'layer_norm',input=x,axis=axis,epsilon=.003);g['outputs']=[y]
     info=run(g,{'x':value},{f't{y}':ref},roundtrip=True);assert info['workspace']==0
 
+# Gather constant indices retain their multidimensional shape and normalize negatives.
+for sh,axis,indices in [([2,3,5],0,[1,0,1]),([2,3,5],1,[[0,-1],[1,0]]),([2,3,5],-1,[-1,0,2]),([7],0,3),([2,3,5],1,1),([1,1,1,1,2,1,3,4],-1,[3,0])]:
+    value=rng.normal(size=sh).astype('f');indices=np.asarray(indices,dtype='int64');ref=np.take(value,indices,axis=axis)
+    g=graph();x=tensor(g,'x',sh);y=node(g,ref.shape,'gather',input=x,axis=axis,indices=indices.reshape(-1).tolist(),index_shape=list(indices.shape));g['outputs']=[y]
+    info=run(g,{'x':value},{f't{y}':ref},roundtrip=True);assert info['workspace']==0
+
 def conv_ref(x,w,b,stride,pad,dil,groups):
     N,C,H,W=x.shape; K,_,R,S_=w.shape
     P_=(H+2*pad[0]-dil[0]*(R-1)-1)//stride[0]+1

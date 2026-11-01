@@ -29,6 +29,8 @@ int32_t ztrtBuilderMarkOutput(ZtrtBuilder*, int32_t);
 int32_t ztrtBuilderAddMatMul(ZtrtBuilder*, int32_t, int32_t, int32_t, int32_t);
 int32_t ztrtBuilderAddElementWise(ZtrtBuilder*, int32_t, int32_t, int32_t);
 int32_t ztrtBuilderAddActivation(ZtrtBuilder*, int32_t, int32_t);
+/* Static integer indices and their shape; negatives are normalized at build time. */
+int32_t ztrtBuilderAddGather(ZtrtBuilder*, int32_t, int32_t, const int64_t*, size_t, const int64_t*, size_t);
 /* Unscaled suffix normalization; finite nonnegative epsilon. */
 int32_t ztrtBuilderAddLayerNorm(ZtrtBuilder*, int32_t, int32_t, float);
 int32_t ztrtBuilderConfigureLayerNorm(ZtrtBuilder*, int32_t, float);

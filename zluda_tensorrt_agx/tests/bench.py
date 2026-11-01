@@ -20,6 +20,7 @@ mean=node(g,[64,1],'reduce',input=x,axis=1,mean=True,keepdims=True);center=node(
 var=node(g,[64,1],'reduce',input=sq,axis=1,mean=True,keepdims=True);var=node(g,[64,1],'element_wise',a=var,b=eps,kind='add');std=node(g,[64,1],'activation',input=var,kind='sqrt');inv=node(g,[64,1],'activation',input=std,kind='reciprocal')
 y=node(g,[64,1024],'element_wise',a=center,b=inv,kind='mul');y=node(g,[64,1024],'element_wise',a=y,b=scale,kind='mul');g['outputs']=[y];cases.append(('layer_norm_64x1024',g))
 g=graph();x=tensor(g,'x',[64,1024]);scale=tensor(g,'scale',[1024],np.ones(1024,dtype='f'));core=node(g,[64,1024],'layer_norm',input=x,axis=1,epsilon=.003);y=node(g,[64,1024],'element_wise',a=core,b=scale,kind='mul');g['outputs']=[y];cases.append(('fused_layer_norm_64x1024',g))
+g=graph();x=tensor(g,'x',[1024,1024]);indices=list(range(1023,-1,-2));y=node(g,[1024,512],'gather',input=x,axis=1,indices=indices,index_shape=[512]);g['outputs']=[y];cases.append(('gather_columns_1024x512',g))
 results=[]
 for name,g in cases:
     data=json.dumps(g,separators=(',',':')).encode();source=C.create_string_buffer(data);start=time.perf_counter_ns();e=ck(build(source,len(data),1<<30));build_ms=(time.perf_counter_ns()-start)/1e6

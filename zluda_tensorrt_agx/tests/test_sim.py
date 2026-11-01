@@ -52,6 +52,11 @@ for folder in sorted(a.captures.iterdir()):
         x,y,rows,channels,inner,mean=args;n=rows
         value=view(x,rows*channels).reshape(rows//inner,channels,inner)
         reference=(value.mean(axis=1) if mean else value.sum(axis=1)).reshape(-1)
+    elif name=='agx_infer_gather':
+        x,y,indices,n,axis,count,inner=args
+        selection=view(indices,count,np.int32);ids=np.arange(n);item=ids//inner
+        at=((item//count)*axis+selection[item%count])*inner+ids%inner
+        reference=view(x,int(at.max())+1)[at]
     elif name=='agx_infer_transpose':
         x,y,meta,n,rank=args;desc=view(meta,rank*2,np.int32);shape=tuple(desc[:rank]);coords=np.indices(shape).reshape(rank,-1) if rank else np.zeros((0,1),dtype=np.int32)
         indices=np.sum(coords*desc[rank:,None],axis=0,dtype=np.int64);reference=view(x,int(np.max(indices))+1)[indices]
@@ -86,5 +91,5 @@ for folder in sorted(a.captures.iterdir()):
     else:raise AssertionError(name)
     np.testing.assert_allclose(view(y,n,after=True),reference,rtol=5e-4,atol=3e-5,equal_nan=True,err_msg=name)
     passed.append(name);print('PASS',name)
-assert len(set(passed))==12,passed
-print('PASS: twelve portable inference kernels on the simulator')
+assert len(set(passed))==13,passed
+print('PASS: thirteen portable inference kernels on the simulator')

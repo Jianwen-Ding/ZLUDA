@@ -27,8 +27,8 @@ No vendor-generated binary or engine was inspected. The target was agx-g14c (M2 
 
 The strict imported-suite status change is only div_noftz FAIL -> PASS. Default-mode statuses are unchanged.
 Remaining strict outcomes are call_rnd FAIL, const_ident COMPILE-ERROR, ldmatrix SIM-ERROR, and
-bar_red_and_pred UNSUPPORTED. Thus this is progress, not full PTX compliance. Directed rounding across
-function calls still needs work; the generated AIR retains a nearest-rounded add_rp function in that case.
+bar_red_and_pred UNSUPPORTED. Thus this is progress, not full PTX compliance. At that checkpoint directed rounding across function calls still failed; the following change addresses
+the reproduced nonrecursive direct-call case.
 
 Raw comparison results remain in scratch as ptx-pipeline-zluda-{baseline,after,default-baseline,default-after}.json
 and ptx-pipeline-focus-{baseline,after}.json. Baseline compiler: /scratch/air-pipeline/lib-fam/zoc; candidate:
@@ -51,3 +51,53 @@ python3 ptx/tools/agx_ptx_formalization_check.py \
 Set CARGO_HOME, RUSTUP_HOME, CARGO_TARGET_DIR and ZLUDA_LLVM_BUILD_DIR for the local toolchain as needed;
 put LLVM readelf/objcopy tools on PATH. The regression mixes non-FTZ and FTZ division with an FTZ multiply,
 checking preserved subnormal output and explicit flushing independently. TensorRT remains inactive.
+
+
+## Directed rounding across direct calls
+
+Static rounding used to lower a mode-dependent callee independently from its caller. A caller selecting
+round-up could therefore enter a helper that was converted as nearest-even. The AIR preparation now identifies
+dynamic-rounding functions and their transitive callers, and inlines eligible helpers before resolving static
+rounding metadata. It only forces this when the caller explicitly changes FP mode. Recursion is detected and
+excluded, and noinline functions are respected. Inlining preserves the caller's reaching mode even through
+an intermediate wrapper without arithmetic. Default nearest-only callers are not forced to inline. Modules with no explicit mode-setting calls skip
+the added call-graph analysis entirely.
+
+This is a correctness change with possible code-size/compile-time cost in mode-changing functions. No
+application throughput improvement is claimed. Recursive, indirect or noinline calls that require inherited
+mode still need a general interprocedural solution; this is not a claim of complete dynamic FP-environment
+support. No new GPU instruction or target hint is introduced.
+
+Validation on agx-g14c using authored/open-source formalization fixtures and AGX-Performance-Simulator:
+
+| Suite | Previous checkpoint | Candidate |
+| --- | --- | --- |
+| 184 imported ZLUDA tests, strict | 180 PASS, 1 numerical FAIL | 181 PASS, no numerical FAIL |
+| Same tests, default | 178 PASS | 179 PASS |
+| call_rnd, strict/default | FAIL | PASS |
+| New nested-call rounding regression, strict | FAIL with original baseline compiler | PASS |
+| Mixed denormal regression and cvt-0, strict | PASS | PASS |
+
+Only call_rnd changes status in each 184-test suite. Strict remaining outcomes are const_ident COMPILE-ERROR,
+ldmatrix SIM-ERROR and bar_red_and_pred UNSUPPORTED. Those are not counted as passes. Default mode still has
+two numerical failures, as expected for its non-strict floating-point scope. Raw results are in
+/scratch/ptx-call-rounding-{strict,default}.json. The nested fixture retains upstream MIT/Apache provenance
+and adds an authored arithmetic-free wrapper; it is not a vendor-generated artifact.
+
+
+### Broader core-suite comparison
+
+The final candidate was compared with the original saved compiler across 413 top-level PTX-formalization
+fixtures plus the two new local regressions (415 total), strict mode, agx-g14c, four compiler/simulator workers
+and a 30-second per-operation timeout. This comparison includes both denormal and call-rounding fixes:
+
+* Original saved compiler: 396 PASS, 16 FAIL, 2 COMPILE-ERROR, 1 PARTIAL.
+* Final candidate: 407 PASS, 5 FAIL, 2 COMPILE-ERROR, 1 PARTIAL.
+* Eleven FAIL -> PASS transitions and no status regressions. Besides the local regressions, the improved
+  files are cvt-0/1/4/5/8/9 and half-0/2/3.
+
+Remaining numerical failures: fmisc-0/1 (NaN payload canonicalization), shared-per-kernel (shared-memory
+addressing), sub-borrow (borrow results), and transc-edge (one-ULP difference). addr32-generic still fails
+translation; tex-mip hits the compiler timeout; perctamemory is partial after a rejected kernel. None is
+counted as a pass. Raw results: /scratch/ptx-call-rounding-core-{baseline,after}.json.
+This establishes neither full PTX coverage nor representative application performance.

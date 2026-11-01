@@ -2773,6 +2773,76 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
     LLVMContext &Ctx = Mod->getContext();
     Function *Set = Mod->getFunction("__zluda_air.set.fpmode");
     Function *Get = Mod->getFunction("__zluda_air.get.fpmode");
+    // Avoid call-graph work for the common case with no explicit mode changes.
+    if (Set && !Set->use_empty()) {
+        // Lowering a callee independently would restart its dynamic rounding at nearest.
+        // Inline mode-dependent helpers before resolving the caller's mode into static metadata.
+        SmallPtrSet<Function *, 32> dependent;
+        for (Function &F : *Mod)
+            for (Instruction &I : instructions(F))
+                if (auto *C = dyn_cast<ConstrainedFPIntrinsic>(&I);
+                    C && C->getRoundingMode() == RoundingMode::Dynamic)
+                    dependent.insert(&F);
+        for (bool again = true; again;) {
+            again = false;
+            for (Function &F : *Mod)
+                if (!dependent.contains(&F))
+                    for (Instruction &I : instructions(F))
+                        if (auto *C = dyn_cast<CallBase>(&I);
+                            C && dependent.contains(C->getCalledFunction())) {
+                            dependent.insert(&F);
+                            again = true;
+                            break;
+                        }
+        }
+        auto recursive = [&](Function *Root) {
+            SmallPtrSet<Function *, 32> seen;
+            SmallVector<Function *, 16> work{Root};
+            while (!work.empty()) {
+                Function *F = work.pop_back_val();
+                if (!seen.insert(F).second)
+                    continue;
+                for (Instruction &I : instructions(F))
+                    if (auto *C = dyn_cast<CallBase>(&I))
+                        if (Function *Next = C->getCalledFunction(); Next && !Next->isDeclaration()) {
+                            if (Next == Root)
+                                return true;
+                            work.push_back(Next);
+                        }
+            }
+            return false;
+        };
+        DenseMap<Function *, bool> recursion;
+        for (bool again = true; again;) {
+            again = false;
+            SmallVector<CallBase *, 32> calls;
+            for (Function &F : *Mod) {
+                bool changesMode = llvm::any_of(instructions(F), [&](Instruction &I) {
+                    auto *C = dyn_cast<CallBase>(&I);
+                    return C && Set && C->getCalledFunction() == Set;
+                });
+                if (!changesMode)
+                    continue;
+                for (Instruction &I : instructions(F))
+                    if (auto *C = dyn_cast<CallBase>(&I)) {
+                        Function *Callee = C->getCalledFunction();
+                        if (!Callee || !dependent.contains(Callee) || Callee->isDeclaration() ||
+                            Callee->hasFnAttribute(Attribute::NoInline) || Callee->hasFnAttribute("air-kernel"))
+                            continue;
+                        auto [It, Inserted] = recursion.try_emplace(Callee, false);
+                        if (Inserted)
+                            It->second = recursive(Callee);
+                        if (!It->second)
+                            calls.push_back(C);
+                    }
+            }
+            for (CallBase *C : calls) {
+                InlineFunctionInfo Info;
+                if (InlineFunction(*C, Info).isSuccess())
+                    again = true;
+            }
+        }
+    }
     static const char *names[4] = {"round.towardzero", "round.tonearest", "round.upward", "round.downward"};
     int changed = 0;
     // rcp.approx as an afn 1 / x, now that the inlining is done (zluda_ptx_impl_air.ll: inlined as a division,

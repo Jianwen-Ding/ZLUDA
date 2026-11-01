@@ -241,15 +241,15 @@ impl Context {
         if self.plan.workspace!=0 && self.workspace_ptr==0 {return Err("execution workspace is unbound".into());}
         let g = &self.plan.graph;
         if !self.bindings_validated {
-            let io: Vec<usize> = g.inputs.iter().chain(&g.outputs).copied().collect();
-            for &i in &io { if !self.bound[i] { return Err(format!("tensor {} has no device binding", g.tensors[i].name)); } }
-            for &i in &io {
+            let io = g.inputs.iter().chain(&g.outputs);
+            for &i in io.clone() { if !self.bound[i] { return Err(format!("tensor {} has no device binding", g.tensors[i].name)); } }
+            for &i in io.clone() {
                 if self.plan.workspace!=0 && self.pointers[i]<self.workspace_ptr+self.plan.workspace && self.workspace_ptr<self.pointers[i]+g.tensors[i].bytes()? {
                     return Err("input/output binding overlaps workspace".into());
                 }
             }
-            for (at, &i) in io.iter().enumerate() {
-                for &j in &io[..at] {
+            for (at, &i) in io.clone().enumerate() {
+                for &j in io.clone().take(at) {
                     if self.pointers[i] < self.pointers[j] + g.tensors[j].bytes()? && self.pointers[j] < self.pointers[i] + g.tensors[i].bytes()? {
                         return Err("input/output bindings overlap".into());
                     }
@@ -308,13 +308,14 @@ impl Context {
                 }
                 Op::Conv2d { input, weights, bias, stride, padding, dilation, groups } => {
                     let x = &g.tensors[*input].shape; let w = &g.tensors[*weights].shape;
-                    let mut args: Vec<i32> = [x[0], x[1], x[2], x[3], w[0], w[2], w[3], yshape[2], yshape[3],
+                    let mut args: [i32;18] = [x[0], x[1], x[2], x[3], w[0], w[2], w[3], yshape[2], yshape[3],
                         padding[0], padding[1], stride[0], stride[1], dilation[0], dilation[1], *groups,
-                        usize::from(bias.is_some()), usize::from(step.relu)].into_iter().map(|v| v as i32).collect();
+                        usize::from(bias.is_some()), usize::from(step.relu)].map(|v| v as i32);
                     let mut xp = self.pointers[*input]; let mut wp = self.pointers[*weights];
                     let mut bp = bias.map_or(0, |b| self.pointers[b]); let mut yp = self.pointers[yid];
-                    let mut params = vec![arg(&mut xp), arg(&mut wp), arg(&mut bp), arg(&mut yp)];
-                    params.extend(args.iter_mut().map(arg));
+                    let mut params = [std::ptr::null_mut();22];
+                    params[..4].copy_from_slice(&[arg(&mut xp),arg(&mut wp),arg(&mut bp),arg(&mut yp)]);
+                    for (parameter,value) in params[4..].iter_mut().zip(&mut args){*parameter=arg(value);}
                     self.launch(c"agx_infer_conv2d", n, &mut params, stream)?;
                 }
                 Op::Gather { input, axis, indices, .. } => {
@@ -358,10 +359,12 @@ impl Context {
                 }
                 Op::Pool2d { input, window, stride, padding, kind, include_padding } => {
                     let shape = &g.tensors[*input].shape;
-                    let mut args: Vec<i32> = [n, shape[2], shape[3], yshape[2], yshape[3], window[0], window[1], padding[0], padding[1], stride[0], stride[1],
-                        usize::from(*kind == Pool::Average), usize::from(*include_padding)].into_iter().map(|v| v as i32).collect();
+                    let mut args: [i32;13] = [n, shape[2], shape[3], yshape[2], yshape[3], window[0], window[1], padding[0], padding[1], stride[0], stride[1],
+                        usize::from(*kind == Pool::Average), usize::from(*include_padding)].map(|v| v as i32);
                     let mut x = self.pointers[*input]; let mut y = self.pointers[yid];
-                    let mut params = vec![arg(&mut x), arg(&mut y)]; params.extend(args.iter_mut().map(arg));
+                    let mut params = [std::ptr::null_mut();15];
+                    params[..2].copy_from_slice(&[arg(&mut x),arg(&mut y)]);
+                    for (parameter,value) in params[2..].iter_mut().zip(&mut args){*parameter=arg(value);}
                     self.launch(c"agx_infer_pool", n, &mut params, stream)?;
                 }
                 Op::Concat { inputs, axis } => {

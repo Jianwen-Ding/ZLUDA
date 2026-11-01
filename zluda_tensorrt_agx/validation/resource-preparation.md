@@ -59,3 +59,17 @@ python3 zluda_tensorrt_agx/tests/bench_load.py --library /path/to/libtensorrt_ag
 A 1 MiB fixture also passed the preparation benchmark. The restored current release build passes all 101
 GPU graph checks after the comparison. Build artifacts for different checkouts should use separate target
 directories; this experiment rebuilt the current package after using the temporary baseline checkout.
+
+
+## Enqueue argument storage
+
+Convolution and pooling now use compile-time-sized stack arrays for scalar arguments and parameter
+pointers (18+4 and 13+2 respectively), replacing per-enqueue Vec allocations/growth. Binding validation
+iterates input/output slices directly rather than allocating an I/O index vector. This does not change
+MLIR kernels, parameter order, model outputs, synchronization or workspace ownership. It removes those
+executor-local allocations; it does not establish allocation-free behavior inside the driver/math libraries
+or on error-reporting paths. No inference speedup is claimed without a controlled timing comparison.
+
+The current native release passes 101 GPU graph checks, including convolution/groups/dilation/bias/fusion
+and pooling padding variants, 109 ONNX model checks, lifecycle/graph replay and C++ adapter/probe-ASan ABI
+checks. The Rust backend is not ASan-instrumented. Existing native lifetime/stream behavior remains covered.

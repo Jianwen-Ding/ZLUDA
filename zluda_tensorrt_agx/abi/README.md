@@ -331,8 +331,8 @@ native-engine wrapping extension starts without a recorder until one is attached
 Callback routing uses a shared lease, with report callbacks and reference callbacks outside the slot mutex.
 A report can unregister itself without deadlock or premature release. Concurrent reports and recorder
 replacement are supported by the slot; other operations on a single runtime/context follow their existing
-thread-safety rules. In particular, registration changes must not race child creation/inheritance or use of a
-borrowed getter result. The recorder's callbacks must themselves satisfy the public thread-safety contract.
+thread-safety rules. Borrowed getter results still require caller synchronization against replacement; child creation now
+uses an internal pinned lease, as described below. The recorder's callbacks must themselves satisfy the public thread-safety contract.
 
 Existing adapter error-message paths report UNSPECIFIED_ERROR (1) to an attached recorder, otherwise to the
 logger. Descriptions are bounded to 127 bytes plus a null terminator. A true fatal return does not make the
@@ -366,3 +366,20 @@ The context ABI probe checks exactly one recorder event and its numeric classifi
 validation failures, then performs normal GPU execution/graph replay. It also checks that unknown-name query
 fallbacks leave the error count unchanged. Runtime tests check the thread-limit error code. Normal and C++
 adapter/probe-ASan probes pass; this does not instrument the native Rust backend or establish full ABI coverage.
+
+
+## Pin recorder references during inheritance
+
+Runtime-to-engine, engine-to-context (both factory paths) and engine-to-inspector recorder inheritance now
+holds a shared lease until the child has acquired its own registration. Previously these paths used the public
+borrowed getter, leaving a gap where concurrent parent unregistration could release the last reference before
+the child called incRefCount. Inheritance no longer has that gap. Pinning copies the existing lease and does
+not allocate a new control block or invoke recorder callbacks under the slot lock. Public getter semantics
+remain borrowed; this change does not make arbitrary simultaneous object mutations safe.
+
+A deterministic inspector-creation regression pauses the recorder's interface-validation callback before the
+child registration increments its reference, unregisters the parent on the main thread, and verifies that a
+reference remains until the child resumes. Both waits have five-second deadlines. Child registration and
+destruction then balance the final reference. Normal and C++ adapter/probe-ASan runs pass, including existing
+GPU context probes. An isolated source-copy negative control reverting only inspector inheritance to the old
+borrowed getter triggers the expected reference-lifetime assertion. No vendor code or artifact is used.

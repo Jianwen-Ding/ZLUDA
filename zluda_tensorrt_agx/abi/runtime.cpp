@@ -76,7 +76,7 @@ public:
             ztrtDeserializeEngine(runtime.get(),static_cast<uint8_t const*>(data),size,size_t(1)<<30),ztrtDestroyEngine);
         if(!model){error(logger,ztrtGetLastError());return nullptr;}
         auto result=static_cast<ICudaEngine*>(ztrtRtxWrapNativeEngine(model.get(),logger));
-        if(result){model.release();ztrtAbiSetEngineRecorder(result,errors.get());}
+        if(result){auto recorder=errors.pin();model.release();ztrtAbiSetEngineRecorder(result,recorder.get());}
         return result;
     }
     void setDLACore(int32_t core) noexcept override{if(core!=0)error(logger,"ABI prototype: DLA is unavailable");}
@@ -114,7 +114,7 @@ public:
             ztrtDeserializeEngineReader(runtime.get(),&reader,read,size_t(1)<<30),ztrtDestroyEngine);
         if(!model){error(logger,ztrtGetLastError());return nullptr;}
         auto result=static_cast<ICudaEngine*>(ztrtRtxWrapNativeEngine(model.get(),logger));
-        if(result){model.release();ztrtAbiSetEngineRecorder(result,errors.get());}
+        if(result){auto recorder=errors.pin();model.release();ztrtAbiSetEngineRecorder(result,recorder.get());}
         return result;
     }
     int64_t getEngineHeaderSize() const noexcept override{return kHeaderSize;}

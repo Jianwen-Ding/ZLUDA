@@ -4,6 +4,7 @@
 #include <memory>
 #include <mutex>
 #include <cstring>
+#include <utility>
 class ZtrtRecorderSlot {
     struct Lease {
         nvinfer1::IErrorRecorder* value;
@@ -14,6 +15,14 @@ class ZtrtRecorderSlot {
     std::shared_ptr<Lease> snapshot() const {std::lock_guard<std::mutex> lock(mutex);return recorder;}
     static void log(nvinfer1::ILogger* logger,char const* text) noexcept{if(logger)logger->log(nvinfer1::ILogger::Severity::kERROR,text);}
 public:
+    class Pin {
+        std::shared_ptr<Lease> lease;
+        friend class ZtrtRecorderSlot;
+        explicit Pin(std::shared_ptr<Lease> value):lease(std::move(value)){}
+    public:
+        nvinfer1::IErrorRecorder* get() const noexcept{return lease?lease->value:nullptr;}
+    };
+    Pin pin() const noexcept{try{return Pin(snapshot());}catch(...){return Pin(nullptr);}}
     void set(nvinfer1::IErrorRecorder* p,nvinfer1::ILogger* logger) noexcept {
         if(p){auto info=p->getInterfaceInfo();if(p->getAPILanguage()!=nvinfer1::APILanguage::kCPP||!info.kind||std::strcmp(info.kind,"IErrorRecorder")||info.major!=1||info.minor!=0){log(logger,"unsupported error recorder interface");return;}}
         try{

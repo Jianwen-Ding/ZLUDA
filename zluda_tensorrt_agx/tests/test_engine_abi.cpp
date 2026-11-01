@@ -81,6 +81,16 @@ int main(int argc,char** argv){assert(argc==2);void* lib=dlopen(argv[1],RTLD_NOW
         assert(recordedInspector->impl->getErrorRecorder()==&recorder&&recorder.references==2);
         assert(!recordedInspector->impl->getLayerInformation(-1,0)&&recorder.reports==2);
         delete recordedInspector;assert(recorder.references==1);
+        if(iteration==0){
+            // Pause child registration before incRefCount, then remove the parent registration.
+            recorder.pauseValidation=true;probe::Inspector* child=nullptr;
+            std::thread creator([&]{child=static_cast<probe::Inspector*>(e->createEngineInspector());});
+            auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+            while(!recorder.validationEntered.load()){assert(std::chrono::steady_clock::now()<deadline);std::this_thread::yield();}
+            e->setErrorRecorder(nullptr);assert(recorder.references==1);
+            recorder.resumeValidation=true;creator.join();assert(child&&recorder.references==1);
+            assert(child->impl->getErrorRecorder()==&recorder);delete child;assert(recorder.references==0);
+        }
         delete engine;assert(recorder.references==0); // Returned custom bytes outlive the engine wrapper.
         auto h=memory->impl;assert(h->type()==nvinfer1::DataType::kINT8&&h->size()>24&&std::memcmp(h->data(),"ZTRTAGX2",8)==0);
         auto runtime=ztrtCreateRuntime();assert(runtime);auto restored=ztrtDeserializeEngine(runtime,static_cast<uint8_t const*>(h->data()),h->size(),4096);assert(restored);

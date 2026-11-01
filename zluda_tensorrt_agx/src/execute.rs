@@ -10,6 +10,8 @@ struct Driver {
     current: unsafe extern "system" fn(*mut CUcontext) -> CUresult,
     push: unsafe extern "system" fn(CUcontext) -> CUresult,
     pop: unsafe extern "system" fn(*mut CUcontext) -> CUresult,
+    sync_stream: unsafe extern "system" fn(CUstream) -> CUresult,
+    sync_context: unsafe extern "system" fn() -> CUresult,
     _lib: libloading::Library,
 }
 fn driver() -> Result<&'static Driver> {
@@ -19,7 +21,9 @@ fn driver() -> Result<&'static Driver> {
         let lib = libloading::Library::new(name).map_err(|e| e.to_string())?;
         Ok(Driver { current: *lib.get(b"cuCtxGetCurrent\0").map_err(|e| e.to_string())?,
             push: *lib.get(b"cuCtxPushCurrent_v2\0").map_err(|e| e.to_string())?,
-            pop: *lib.get(b"cuCtxPopCurrent_v2\0").map_err(|e| e.to_string())?, _lib: lib })
+            pop: *lib.get(b"cuCtxPopCurrent_v2\0").map_err(|e| e.to_string())?,
+            sync_stream: *lib.get(b"cuStreamSynchronize\0").map_err(|e| e.to_string())?,
+            sync_context: *lib.get(b"cuCtxSynchronize\0").map_err(|e| e.to_string())?, _lib: lib })
     }).as_ref().map_err(Clone::clone)
 }
 fn current() -> Result<usize> {
@@ -27,6 +31,18 @@ fn current() -> Result<usize> {
     unsafe { (driver()?.current)(&mut c) }.map_err(|e| format!("cuCtxGetCurrent: {}", e.0))?;
     if c.0.is_null() { return Err("make a ZLUDA CUDA context current before creating an execution context".into()); }
     Ok(c.0 as usize)
+}
+fn wait_stream(stream: usize) -> Result<()> {
+    let d=driver()?;
+    unsafe {
+        let result=match (d.sync_stream)(CUstream(stream as *mut _)) {
+            // A destroyed stream may still have queued work. Waiting on the owning context preserves
+            // workspace ordering without reusing an invalid handle or masking other GPU failures.
+            Err(e) if e==CUerror::INVALID_HANDLE => (d.sync_context)(),
+            result => result,
+        };
+        result.map_err(|e|format!("CUDA synchronization failed: {}",e.0))
+    }
 }
 struct ContextGuard;
 impl ContextGuard {
@@ -207,7 +223,7 @@ impl Context {
         for (id, &root) in self.plan.aliases.iter().enumerate() {
             if id != root { self.pointers[id] = self.pointers[root]; }
         }
-        if let Some(last) = self.last_stream.filter(|&last| last != stream.0 as usize) { gpu(engine::synchronize(CUstream(last as *mut _)))?; }
+        if let Some(last) = self.last_stream.filter(|&last| last != stream.0 as usize) { wait_stream(last)?; }
         self.last_stream = Some(stream.0 as usize);
         for (at, step) in self.plan.steps.iter().enumerate() {
             let yid = step.node.output; let yshape = &g.tensors[yid].shape; let n = g.tensors[yid].elements()?;
@@ -328,7 +344,7 @@ impl Context {
     }
     pub fn synchronize(&mut self) -> Result<()> {
         let _scope = ContextGuard::push(self.owner)?;
-        if let Some(stream) = self.last_stream.take() { unsafe { gpu(engine::synchronize(CUstream(stream as *mut _)))?; } }
+        if let Some(stream) = self.last_stream { wait_stream(stream)?; self.last_stream=None; }
         Ok(())
     }
 }

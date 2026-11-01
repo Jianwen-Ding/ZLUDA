@@ -1,6 +1,8 @@
 // Original native-engine to public dispatch adapter. No NVIDIA engine decoder or runtime code.
 #include "runtime_contract.hpp"
 #include "extensions.h"
+#include "context.hpp"
+#include <atomic>
 #include <vector>
 #include <cstring>
 #include <stdexcept>
@@ -19,7 +21,7 @@ class HostMemory final:public IHostMemory {
 public:explicit HostMemory(ZtrtEngine* e){mImpl=new MemoryImpl(e);}~HostMemory() noexcept override{delete mImpl;}
 };
 class EngineImpl final:public apiv::VCudaEngine {
-    ICudaEngine* owner;ZtrtEngine* native;ILogger* logger;bool owns=false;
+    ICudaEngine* owner;ZtrtEngine* native;ILogger* logger;bool owns=false;std::atomic<bool> prepared{false};
     bool valid(char const* name) const noexcept{return name&&ztrtGetTensorIOMode(native,name)>=0;}
     Dims invalid() const noexcept{Dims d;d.nbDims=-1;return d;}
 public:
@@ -29,7 +31,7 @@ public:
     ICudaEngine* getPImpl() noexcept override{return owner;}
     int32_t getNbLayers() const noexcept override{return ztrtGetLayerCount(native);}
     IHostMemory* serialize() const noexcept override{try{return new HostMemory(native);}catch(...){error(logger,"native engine serialization failed");return nullptr;}}
-    IExecutionContext* createExecutionContext(ExecutionContextAllocationStrategy) noexcept override{error(logger,"ABI prototype: execution context dispatch is not implemented");return nullptr;}
+    IExecutionContext* createExecutionContext(ExecutionContextAllocationStrategy strategy) noexcept override{if(int32_t(strategy)!=0){error(logger,"only static native context allocation is supported");return nullptr;}auto context=ztrtAbiCreateContext(owner,native,logger);if(context)prepared=true;return context;}
     bool isRefittable() const noexcept override{return false;}
     char const* getName() const noexcept override{return "ZLUDA AGX native engine";}
     int32_t getNbOptimizationProfiles() const noexcept override{return 1;}
@@ -75,7 +77,7 @@ public:
     IRuntimeConfig* createRuntimeConfig() noexcept override{error(logger,"ABI prototype: runtime configuration is unsupported");return nullptr;}
     int64_t getEngineStat(EngineStat) const noexcept override{error(logger,"ABI prototype: engine statistics are unsupported");return -1;}
     char const* getAliasedInputTensor(char const*) const noexcept override{return nullptr;}
-    bool areWeightsLoaded() const noexcept override{return false;}
+    bool areWeightsLoaded() const noexcept override{return prepared.load();}
     bool loadWeights(void const*,int64_t) noexcept override{error(logger,"ABI prototype: weight loading is unsupported");return false;}
     bool loadWeightsAsync(IStreamReaderV2&,CUstream_st*) noexcept override{error(logger,"ABI prototype: weight loading is unsupported");return false;}
     bool unloadWeights() noexcept override{error(logger,"ABI prototype: weight unloading is unsupported");return false;}

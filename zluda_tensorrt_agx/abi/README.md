@@ -95,8 +95,7 @@ engine/context interfaces, builder factories and reference-header client integra
 `engine.cpp` adds the `ztrtRtxWrapNativeEngine` extension declared in `extensions.h`. It accepts an engine handle
 created by our native C API, validates the borrowed versioned logger, and transfers ownership only on success.
 No NVIDIA engine bytes enter this path. The returned wrapper has a public-style engine dispatch object for
-static f32 metadata queries and custom serialization. Context creation and unsupported features return explicit
-failures; this is not yet execution through the public engine/context ABI.
+static f32 metadata queries and custom serialization. Static execution contexts now run native GPU inference through the public-style context dispatch. Unsupported allocation strategies and optional features return explicit failures.
 
 Implemented queries cover I/O names and roles, shapes, static profile 0, f32/device/linear layout, name/layer
 count, workspace and serialization. Unknown-name fallback values follow the reviewed public docs: datatype
@@ -113,6 +112,36 @@ restored serialization is byte-identical. Metadata queries also pass with an una
 wrapping leaves ownership with the caller. Normal and AddressSanitizer builds pass without diagnostics.
 
 These probes still do not compile against a complete independently obtained, version-pinned reference header
-set. Engine/context execution, standard native-format runtime loading, serializer options, refitting, inspection,
+set. Broader engine/context execution coverage, standard native-format runtime loading, serializer options, refitting, inspection,
 weight management and complete version-specific compatibility remain required work. The prototype does not
 alias libtensorrt_rtx.so and does not establish Geekbench support.
+
+
+## Static execution-context dispatch
+
+`context.cpp` bridges static f32 engines to GPU execution through the reviewed context dispatch order.
+Supported calls include named I/O bindings, fixed shapes and contiguous strides, profile 0, synchronous
+`executeV2`, asynchronous `enqueueV3`, and context metadata. The public engine must outlive its contexts.
+External workspace, dynamic shape changes, allocator/profiler callbacks, auxiliary streams and debug
+instrumentation are explicitly unsupported. Standard runtime deserialization remains disabled.
+
+Run the GPU probe with our own driver and compiler:
+
+```sh
+ZLUDA_AGX_LIBCUDA=/path/to/our/libcuda.so ZLUDA_AGX_ZOC=/path/to/our/zoc \
+python3 zluda_tensorrt_agx/tools/build_runtime_abi.py --output-dir /tmp/ztrt-context-abi \
+  --native-library /path/to/libtensorrt_agx.so --gpu
+```
+
+Add `--sanitize` to instrument the C++ adapter and probes; the linked native Rust backend is not
+AddressSanitizer-instrumented. The independent context-prefix probe verifies GPU results, rebinding and
+null unbinding, rejected external workspace, synchronous execution, explicit streams, CUDA graph
+capture/replay with changed inputs, and foreign-context restoration during destruction. Capture capability
+is conservatively reported only for the same explicit stream after successful warmup with complete bindings.
+These tests are not complete version-pinned vendor-header ABI validation or Geekbench compatibility.
+
+A native lifecycle regression also covers a caller synchronizing and destroying a previously used stream
+before reusing the execution context. If synchronizing that old stream returns INVALID_HANDLE, the runtime
+waits on the owning CUDA context before reusing workspace; other synchronization errors propagate.
+The ordinary path still waits only on the previous stream. The full native graph suite passes: 99 GPU graphs,
+109 ONNX models, and the stream/context lifecycle probe. Normal and adapter-ASan context probes pass.

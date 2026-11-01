@@ -50,6 +50,10 @@ assert enqueue(c,None)==0 and enqueue(c2,None)==0 and sync(c)==0 and sync(c2)==0
 out1=np.empty((2,2),dtype='f');out2=np.empty_like(out1)
 dc('cuMemcpyDtoH_v2',P(out1.ctypes.data),yp,S(out1.nbytes));dc('cuMemcpyDtoH_v2',P(out2.ctypes.data),yp2,S(out2.nbytes))
 np.testing.assert_array_equal(out1,out2);close(c2)
+# A caller may synchronize/destroy a stream without clearing the runtime's last-stream tracking.
+s3=P();dc('cuStreamCreate',C.byref(s3),I(1));assert enqueue(c,s3)==0,err()
+dc('cuStreamSynchronize',s3);dc('cuStreamDestroy_v2',s3)
+assert enqueue(c,None)==0 and sync(c)==0,err()
 # A foreign current CUDA context rejects enqueue. Destruction restores that foreign context after freeing ours.
 other=P();dc('cuCtxCreate_v2',C.byref(other),I(0),I(0));assert enqueue(c,None)==-1
 close(c);c=None

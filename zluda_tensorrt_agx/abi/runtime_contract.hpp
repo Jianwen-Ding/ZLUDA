@@ -153,3 +153,69 @@ public:
 class IHostMemory {public:virtual ~IHostMemory() noexcept=default;protected:apiv::VHostMemory* mImpl=nullptr;};
 class ICudaEngine {public:virtual ~ICudaEngine() noexcept=default;protected:apiv::VCudaEngine* mImpl=nullptr;};
 }
+// Public execution-context dispatch declarations, adapted under the same Apache-2.0 provenance.
+struct CUevent_st;
+namespace nvinfer1 {
+namespace v_1_0 {class IProfiler;class IOutputAllocator;class IDebugListener;}
+using IProfiler=v_1_0::IProfiler;
+using IOutputAllocator=v_1_0::IOutputAllocator;
+using IDebugListener=v_1_0::IDebugListener;
+namespace apiv {
+class VExecutionContext:public VRoot {
+public:
+    virtual IExecutionContext* getPImpl() noexcept=0;
+    virtual void setDebugSync(bool) noexcept=0;
+    virtual bool getDebugSync() const noexcept=0;
+    virtual void setProfiler(IProfiler*) noexcept=0;
+    virtual IProfiler* getProfiler() const noexcept=0;
+    virtual ICudaEngine const& getEngine() const noexcept=0;
+    virtual void setName(char const*) noexcept=0;
+    virtual char const* getName() const noexcept=0;
+    virtual void setDeviceMemory(void*) noexcept=0;
+    virtual int32_t getOptimizationProfile() const noexcept=0;
+    virtual bool allInputDimensionsSpecified() const noexcept=0;
+    virtual void setErrorRecorder(IErrorRecorder*) noexcept=0;
+    virtual IErrorRecorder* getErrorRecorder() const noexcept=0;
+    virtual bool executeV2(void* const*) noexcept=0;
+    virtual bool setOptimizationProfileAsync(int32_t,CUstream_st*) noexcept=0;
+    virtual void setEnqueueEmitsProfile(bool) noexcept=0;
+    virtual bool getEnqueueEmitsProfile() const noexcept=0;
+    virtual bool reportToProfiler() const noexcept=0;
+    virtual bool setInputShape(char const*,Dims const&) noexcept=0;
+    virtual Dims getTensorShape(char const*) const noexcept=0;
+    virtual Dims getTensorStrides(char const*) const noexcept=0;
+    virtual bool setTensorAddress(char const*,void*) noexcept=0;
+    virtual void const* getTensorAddress(char const*) const noexcept=0;
+    virtual bool setInputTensorAddress(char const*,void const*) noexcept=0;
+    virtual bool setOutputTensorAddress(char const*,void*) noexcept=0;
+    virtual int32_t inferShapes(int32_t,char const**) noexcept=0;
+    virtual bool setInputConsumedEvent(CUevent_st*) noexcept=0;
+    virtual CUevent_st* getInputConsumedEvent() const noexcept=0;
+    virtual void* getOutputTensorAddress(char const*) const noexcept=0;
+    virtual bool setOutputAllocator(char const*,IOutputAllocator*) noexcept=0;
+    virtual IOutputAllocator* getOutputAllocator(char const*) noexcept=0;
+    virtual int64_t getMaxOutputSize(char const*) const noexcept=0;
+    virtual bool setTemporaryStorageAllocator(IGpuAllocator*) noexcept=0;
+    virtual IGpuAllocator* getTemporaryStorageAllocator() const noexcept=0;
+    virtual bool enqueueV3(CUstream_st*) noexcept=0;
+    virtual void setPersistentCacheLimit(size_t) noexcept=0;
+    virtual size_t getPersistentCacheLimit() const noexcept=0;
+    virtual bool setNvtxVerbosity(ProfilingVerbosity) noexcept=0;
+    virtual ProfilingVerbosity getNvtxVerbosity() const noexcept=0;
+    virtual void setAuxStreams(CUstream_st**,int32_t) noexcept=0;
+    virtual bool setDebugListener(IDebugListener*) noexcept=0;
+    virtual IDebugListener* getDebugListener() noexcept=0;
+    virtual bool setTensorDebugState(char const*,bool) noexcept=0;
+    virtual bool getDebugState(char const*) const noexcept=0;
+    virtual bool setAllTensorsDebugState(bool) noexcept=0;
+    virtual size_t updateDeviceMemorySizeForShapes() noexcept=0;
+    virtual void setDeviceMemoryV2(void*,int64_t) noexcept=0;
+    virtual IRuntimeConfig* getRuntimeConfig() const noexcept=0;
+    virtual bool setUnfusedTensorsDebugState(bool) noexcept=0;
+    virtual bool getUnfusedTensorsDebugState() const noexcept=0;
+    virtual bool isStreamCapturable(CUstream_st*) const noexcept=0;
+    virtual bool setCommunicator(void*) noexcept=0;
+};
+}
+class IExecutionContext {public:virtual ~IExecutionContext() noexcept=default;protected:apiv::VExecutionContext* mImpl=nullptr;};
+}

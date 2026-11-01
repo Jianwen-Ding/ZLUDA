@@ -1066,15 +1066,15 @@ Launches of checked kernels, captured launches and kernels that use the stack or
 `ZLUDA_AGX_GRAPH_BATCH=0` submits one command per launch; with `ZLUDA_AGX_PROFILE`, the launches of a command share
 its time equally.
 
-`ZLUDA_AGX_LAUNCH_BATCH=1` (off by default, not yet measured on hardware) gathers ordinary launches (`cuLaunchKernel`,
-`cuLaunchKernelEx`, `cuLaunchCooperativeKernel`) the same way, but only while the GPU is busy: a launch whose stream's
-queue has finished its work (one syncobj query) is submitted at once, and later launches of the same stream join a
-batch until it is submitted. Every other API call submits the gathered launches before it does anything (as do
-context destruction and device reset), so they keep their order with copies, events, queries, host functions,
-synchronization and other streams. The cost of the policy: launches gathered while the program then only computes
-on the CPU wait for its next API call, and a program that polls host memory a kernel writes, with no API call
-meanwhile, would never see them run. Whether it pays (graph batching traded generation throughput for prompt
-throughput in Qwen) has to be measured on the M2 Max.
+Ordinary launches (`cuLaunchKernel`, `cuLaunchKernelEx`, `cuLaunchCooperativeKernel`) are gathered the same way while
+the GPU is busy (`ZLUDA_AGX_LAUNCH_BATCH=0` turns it off): a launch whose stream's queue has finished its work (one
+syncobj query) is submitted at once, and later launches of the same stream join a batch until it is submitted. Every
+other API call submits the gathered launches before it does anything (as do context destruction and device reset), so
+they keep their order with copies, events, queries, host functions, synchronization and other streams; and a flusher
+thread, running only while launches are gathered, submits them within ~30 us of their queue going idle, so a program
+that meanwhile only computes on the CPU, or polls host memory a kernel writes, does not keep them waiting. M2 Max:
+2000 back-to-back launches of a small kernel 17.9 -> 3.2 us each (a 1520-workgroup one 22.9 -> 10.0 us); llama.cpp
+pp128 547-551 -> 562-567 t/s, generation equal; Blender's images the same.
 
 Graph replay borrows its stored operation list rather than copying every node and its argument bytes on each replay.
 In a Geekbench 7 GPU run on the M2 Max, `cuGraphLaunch` accumulated 2.12 s over 8,854 calls (0.239 ms/call), versus

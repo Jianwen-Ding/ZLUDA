@@ -275,15 +275,53 @@ fn graph_batching_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("ZLUDA_AGX_GRAPH_BATCH").map_or(true, |v| v != "0"))
 }
 
-/// `ZLUDA_AGX_LAUNCH_BATCH=1`: ordinary kernel launches (outside graphs) are gathered into one command while the GPU
-/// is busy with the stream's earlier work, as graph launches are (`Batch`). A launch to an idle GPU is submitted at
-/// once; every API call other than a launch submits the gathered launches first, so they keep their order with
-/// copies, events, synchronizations and other streams. Off by default until measured on hardware: launches held while
-/// the program only computes on the CPU wait for its next API call (a program polling host memory a kernel writes,
-/// with no API call, would wait for ever).
+/// Ordinary kernel launches (outside graphs) are gathered into one command while the GPU is busy with the stream's
+/// earlier work, as graph launches are (`Batch`). A launch to an idle GPU is submitted at once; every API call other
+/// than a launch submits the gathered launches first, so they keep their order with copies, events, synchronizations
+/// and other streams; and the flusher thread (`ensure_flusher`) submits them when their queue goes idle, so that a
+/// program that only computes on the CPU meanwhile (or polls host memory a kernel writes) does not keep them waiting.
+/// `ZLUDA_AGX_LAUNCH_BATCH=0` submits every launch at once.
 fn launch_batching_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ZLUDA_AGX_LAUNCH_BATCH").is_ok_and(|v| !v.is_empty() && v != "0"))
+    *ON.get_or_init(|| std::env::var("ZLUDA_AGX_LAUNCH_BATCH").map_or(true, |v| v != "0"))
+}
+
+/// Whether the flusher thread runs; changed only with the driver's lock held, so that a launch that gathers (with the
+/// lock) either sees it running or starts it.
+static FLUSHER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Starts the flusher thread if it is not running: every ~30 us it submits the gathered launches of each context
+/// whose queue has finished its earlier work (the GPU would otherwise idle until the program's next API call), and it
+/// ends when no launches are gathered. Called with the driver's lock held.
+fn ensure_flusher() {
+    use std::sync::atomic::Ordering::SeqCst;
+    if FLUSHER.swap(true, SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| loop {
+        std::thread::sleep(std::time::Duration::from_micros(30));
+        let mut g = DRIVER.lock().unwrap_or_else(|p| p.into_inner());
+        let mut pending = false;
+        if let Some(contexts) = g.as_mut() {
+            for d in contexts.states_mut() {
+                let Some(stream) = d.batch.as_ref().map(|b| b.stream) else { continue };
+                let idle = match queue_of(&mut d.ctx, &mut d.streams, stream) {
+                    Ok(q) => q.is_done(q.last()).unwrap_or(true),
+                    Err(_) => true,
+                };
+                if idle {
+                    // (an error here is the stream's: it reaches the program at its next call on it)
+                    let _ = d.flush_batch();
+                } else {
+                    pending = true;
+                }
+            }
+        }
+        if !pending {
+            FLUSHER.store(false, SeqCst);
+            return;
+        }
+    });
 }
 
 /// Whether a launch goes into the batch: always while a graph runs (`graph`); for ordinary launches with
@@ -519,6 +557,10 @@ impl Driver {
             }
         }
         let fence = if batchable {
+            // (ordinary launches gathered: submitted when the queue goes idle if no API call comes first)
+            if ordinary {
+                ensure_flusher();
+            }
             // a batch of another stream, or one that this launch's waits would delay, goes first
             if batch.as_ref().is_some_and(|b| b.stream != sh || has_waits) {
                 let b = batch.take().unwrap();

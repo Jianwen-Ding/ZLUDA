@@ -83,3 +83,20 @@ Expanded strict-fp AIR/simulator check of all 184 `tests/zluda/*.ptx` files: 179
 These were run with the same existing compiler used for the earlier smoke check, without PTX compiler edits.
 They remain unresolved; this run alone does not classify their historical regression status. The unsupported
 initializer is a harness limitation rather than a numerical pass or failure. No proprietary code was inspected.
+
+## Follow-up: coalesced broadcast indexing
+
+Broadcast metadata now removes unit axes and merges adjacent axes when both operands retain a linear address
+map. Runtime dispatch passes the reduced metadata rank to the unchanged portable MLIR kernel. This cuts loop
+iterations and integer quotient/remainder work, while preserving broadcasting and scalar semantics. No math
+precision changes or target hints were added.
+
+An exhaustive unit check compares every element address for all compatible pairs among 81 four-dimensional
+shapes with axis extents 1, 2 or 3. All 8 Rust tests, 42 GPU graphs, 17 ONNX models and lifecycle tests pass.
+The eight unchanged kernels also pass replay of existing simulator captures; those captures predate this metadata
+optimization, so the new host-generated indexing is validated by the exhaustive address check and GPU tests.
+
+`broadcast-before.json` and `broadcast-after.json` record 30-sample comparisons. Equal-shape addition of 65,536
+values (shape 16x16x16x16) measured 52.26 us before and 44.02 us after. The four-axis address loop becomes one axis.
+Other workloads varied substantially (including unchanged softmax); these are preliminary uncontrolled-clock
+measurements, not a general speedup claim. The new benchmark remains available for repeat measurements.

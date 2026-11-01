@@ -166,7 +166,21 @@ pub fn broadcast_metadata(out: &[usize], a: &[usize], b: &[usize]) -> Vec<i32> {
             });
         }
     }
-    m
+    // Collapse adjacent axes only when both input address maps remain linear.
+    let rank = out.len();
+    let mut axes: Vec<(i32, i32, i32)> = Vec::with_capacity(rank);
+    for i in 0..rank {
+        let (dim, sa, sb) = (m[i], m[rank+i], m[2*rank+i]);
+        if dim == 1 { continue; }
+        if let Some(last) = axes.last_mut() {
+            if i64::from(last.1) == i64::from(sa) * i64::from(dim)
+                && i64::from(last.2) == i64::from(sb) * i64::from(dim) {
+                last.0 *= dim; last.1 = sa; last.2 = sb; continue;
+            }
+        }
+        axes.push((dim, sa, sb));
+    }
+    axes.iter().map(|a| a.0).chain(axes.iter().map(|a| a.1)).chain(axes.iter().map(|a| a.2)).collect()
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Node { pub output: usize, #[serde(flatten)] pub operation: Op }
@@ -369,6 +383,30 @@ mod tests {
         assert!(broadcast(&[2, 3], &[2]).is_err());
         assert_eq!(broadcast(&[2, 3], &[3]).unwrap(), vec![2, 3]);
         assert_eq!(spatial(5, 3, 1, 2, 1).unwrap(), 3);
+    }
+    #[test] fn collapsed_broadcast_preserves_every_address() {
+        let shapes: Vec<Vec<usize>> = (0..81usize).map(|mut n| {
+            (0..4).map(|_| { let d = n % 3 + 1; n /= 3; d }).collect()
+        }).collect();
+        for a in &shapes { for b in &shapes {
+            let Ok(out) = broadcast(a, b) else { continue; };
+            let meta = broadcast_metadata(&out, a, b); let rank = meta.len()/3;
+            for id in 0..elements(&out).unwrap() {
+                let mut expected = [0usize; 2]; let mut q = id;
+                for axis in (0..4).rev() {
+                    let coordinate = q % out[axis]; q /= out[axis];
+                    for (j, shape) in [a, b].iter().enumerate() {
+                        if shape[axis] != 1 { expected[j] += coordinate * strides(shape)[axis]; }
+                    }
+                }
+                let mut actual = [0usize; 2]; let mut q = id;
+                for axis in (0..rank).rev() {
+                    let coordinate = q % meta[axis] as usize; q /= meta[axis] as usize;
+                    for j in 0..2 { actual[j] += coordinate * meta[(j+1)*rank+axis] as usize; }
+                }
+                assert_eq!(actual, expected, "a={a:?} b={b:?} id={id}");
+            }
+        }}
     }
     #[test] fn fuses_only_single_use_relu() {
         let mut g = graph(); let a = g.outputs.pop().unwrap();

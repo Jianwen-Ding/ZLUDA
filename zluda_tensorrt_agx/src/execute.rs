@@ -57,6 +57,7 @@ impl Drop for Buffer {
 pub(crate) struct Resources {
     pointers: Vec<usize>,
     metadata: Vec<Option<usize>>,
+    binary_ranks: Vec<i32>,
     _constants: Buffer,
     functions: HashMap<&'static CStr, CUfunction>,
 }
@@ -81,6 +82,7 @@ impl Resources {
             }
         }
         let mut metadata = Vec::new();
+        let mut binary_ranks = Vec::new();
         let mut functions = HashMap::new();
         let mut get = |image, name| -> Result<()> { functions.insert(name, unsafe { gpu(engine::function(image, name))? }); Ok(()) };
         for step in &plan.steps {
@@ -107,12 +109,13 @@ impl Resources {
                 Op::Concat { .. } => { get(agx_libs::INFERENCE, c"agx_infer_concat")?; None }
                 _ => None,
             };
+            binary_ranks.push(meta.as_ref().map_or(0, |m| (m.len() / 3) as i32));
             metadata.push(meta.as_deref().map(|v| pack(&mut constant_data, v)));
         }
         let constants = Buffer::upload(&constant_data, owner)?;
         for (i, offset) in constant_offsets { pointers[i] = constants.ptr.checked_add(offset).ok_or("constant address overflow")?; }
         for offset in metadata.iter_mut().flatten() { *offset = constants.ptr.checked_add(*offset).ok_or("metadata address overflow")?; }
-        Ok(Self { pointers, metadata, _constants: constants, functions })
+        Ok(Self { pointers, metadata, binary_ranks, _constants: constants, functions })
     }
 }
 pub struct Context {
@@ -160,7 +163,7 @@ impl Context {
         let mut a = self.pointers[a]; let mut b = self.pointers[b]; let mut yptr = self.pointers[y];
         let mut meta = self.resources.metadata[at].ok_or("binary metadata is absent")?;
         let mut n = self.plan.graph.tensors[y].elements()? as i32;
-        let mut rank = self.plan.graph.tensors[y].shape.len() as i32;
+        let mut rank = self.resources.binary_ranks[at];
         let mut op = match kind { Binary::Add => 0i32, Binary::Mul => 1, Binary::Sub => 2, Binary::Div => 3, Binary::Max => 4, Binary::Min => 5 };
         let mut relu = i32::from(relu);
         self.launch(c"agx_infer_binary", n as usize, &mut [arg(&mut a), arg(&mut b), arg(&mut yptr), arg(&mut meta), arg(&mut n), arg(&mut rank), arg(&mut op), arg(&mut relu)], stream)

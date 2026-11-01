@@ -19,7 +19,7 @@ use crate::utils::{Context, Message, Module, PassBuilderOptions, TargetMachine};
 use crate::{
     LLVMZludaAgxKeepGlobals, LLVMZludaAgxLowerAddressSpaces, LLVMZludaAgxLowerClusters, LLVMZludaAgxSpillClusterShared,
     LLVMZludaAirFunctionPointers, LLVMZludaSetAirPrimitives, LLVMZludaAirGlobalsToBuffer, LLVMZludaAirInlineGlobalUsers,
-    LLVMZludaAirRemapAddressSpaces, LLVMZludaAirSharedLayout, LLVMZludaAirStaticRounding, LLVMZludaAirDropCompareFlushes, LLVMZludaAirDropMinMaxFixups, LLVMZludaAirExpandDivisions, LLVMZludaAirCanonicalNaNs, LLVMZludaAirTextureSampleHint, LLVMZludaAirCompareFloatBits, LLVMZludaAirRangeReport, LLVMZludaAirKernelModule, LLVMZludaAirSaltKernels, LLVMZludaAgxCanonicalizeFoldedNaNs, LLVMZludaLinkUsedDefinitions,
+    LLVMZludaAirRemapAddressSpaces, LLVMZludaAirSharedLayout, LLVMZludaAirStaticRounding, LLVMZludaAirDropCompareFlushes, LLVMZludaAirDropMinMaxFixups, LLVMZludaAirExpandDivisions, LLVMZludaAirCanonicalNaNs, LLVMZludaAirTextureSampleHint, LLVMZludaAirCompareFloatBits, LLVMZludaAirRangeReport, LLVMZludaAirKernelModule, LLVMZludaPromoteDynamicPrivateLoads, LLVMZludaAirSaltKernels, LLVMZludaAgxCanonicalizeFoldedNaNs, LLVMZludaLinkUsedDefinitions,
     LLVMZludaUpgradeFunctionAttributes,
 };
 use llvm_sys::target_machine::{
@@ -196,6 +196,13 @@ pub fn compile_air(
     let lowered = (|| -> Result<(), String> {
         run(&linked, first_pipeline, &air, &options)?;
         stage("first pipeline");
+        // small private arrays read at run-time offsets kept in registers (LLVMZludaPromoteDynamicPrivateLoads):
+        // SROA again for them. ZLUDA_AIR_PROMOTE_PRIVATE=0 keeps them in memory.
+        if std::env::var("ZLUDA_AIR_PROMOTE_PRIVATE").map_or(true, |v| v != "0")
+            && unsafe { LLVMZludaPromoteDynamicPrivateLoads(linked.get()) } > 0
+        {
+            run(&linked, c"function(sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg)", &air, &options)?;
+        }
         let mut err = std::ptr::null_mut();
         let clusters = unsafe { LLVMZludaAgxLowerClusters(linked.get(), &mut err) };
         if clusters < 0 {

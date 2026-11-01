@@ -3711,3 +3711,128 @@ int LLVMZludaAirRangeReport(LLVMModuleRef M)
 }
 
 LLVM_C_EXTERN_C_END
+
+LLVM_C_EXTERN_C_BEGIN
+
+// Loads from a small private array at a run-time offset, `inttoptr(ptrtoint(array) + offset)` as ZLUDA's front end
+// writes PTX's `ld.local [%depot + %r]`, as a select over the loads at each element's constant offset: then every
+// access of the array has a constant offset and SROA keeps it in registers, where the AGX backend put it on the stack
+// (stack_load / stack_store, and ~7.5 us of stack setup at each launch: playground 2026-11-01-stack-launch). Only for
+// arrays of at most 64 bytes whose other uses are loads and stores at constant offsets, and loads of a type that
+// divides the array's size into at most 16 elements. An offset that is not a multiple of the element's size, or past
+// the array, reads an undefined value in PTX; here it reads the last element. Returns the loads rewritten.
+int LLVMZludaPromoteDynamicPrivateLoads(LLVMModuleRef M)
+{
+    Module *Mod = unwrap(M);
+    const DataLayout &DL = Mod->getDataLayout();
+    int rewritten = 0;
+    for (Function &F : *Mod)
+    {
+        SmallVector<AllocaInst *, 4> Allocas;
+        for (Instruction &I : instructions(F))
+            if (auto *AI = dyn_cast<AllocaInst>(&I))
+                if (AI->isStaticAlloca() && AI->getAllocatedType()->isArrayTy())
+                    Allocas.push_back(AI);
+        for (AllocaInst *AI : Allocas)
+        {
+            std::optional<TypeSize> Size = AI->getAllocationSize(DL);
+            if (!Size || Size->isScalable() || Size->getFixedValue() > 64 || Size->getFixedValue() == 0)
+                continue;
+            uint64_t Bytes = Size->getFixedValue();
+            // the dynamic loads (load, offset) and whether every other use is a constant-offset load or store
+            SmallVector<std::pair<LoadInst *, Value *>, 4> Dynamic;
+            bool ok = true;
+            std::function<void(Value *)> constantUses = [&](Value *P) {
+                for (User *U : P->users())
+                {
+                    if (!ok)
+                        return;
+                    if (auto *L = dyn_cast<LoadInst>(U))
+                        ok = L->isSimple();
+                    else if (auto *S = dyn_cast<StoreInst>(U))
+                        ok = S->isSimple() && S->getValueOperand() != P;
+                    else if (auto *G = dyn_cast<GetElementPtrInst>(U))
+                    {
+                        APInt Off(DL.getIndexTypeSizeInBits(G->getType()), 0);
+                        if (G->accumulateConstantOffset(DL, Off))
+                            constantUses(G);
+                        else
+                            ok = false;
+                    }
+                    else if (auto *PI = dyn_cast<PtrToIntInst>(U); PI && P == AI)
+                    {
+                        // ptrtoint(array) + offset -> inttoptr -> loads
+                        for (User *A : PI->users())
+                        {
+                            auto *Add = dyn_cast<BinaryOperator>(A);
+                            if (!Add || Add->getOpcode() != Instruction::Add)
+                            {
+                                ok = false;
+                                return;
+                            }
+                            Value *Offset = Add->getOperand(0) == PI ? Add->getOperand(1) : Add->getOperand(0);
+                            for (User *T : Add->users())
+                            {
+                                auto *IP = dyn_cast<IntToPtrInst>(T);
+                                if (!IP || IP->getType() != AI->getType())
+                                {
+                                    ok = false;
+                                    return;
+                                }
+                                for (User *LU : IP->users())
+                                {
+                                    auto *L = dyn_cast<LoadInst>(LU);
+                                    if (!L || !L->isSimple() || L->getPointerOperand() != IP)
+                                    {
+                                        ok = false;
+                                        return;
+                                    }
+                                    Dynamic.push_back({L, Offset});
+                                }
+                            }
+                        }
+                    }
+                    else
+                        ok = false;
+                }
+            };
+            constantUses(AI);
+            if (!ok || Dynamic.empty())
+                continue;
+            // every dynamic load's type divides the array into at most 16 elements
+            for (auto &[L, Offset] : Dynamic)
+            {
+                uint64_t Elem = DL.getTypeStoreSize(L->getType()).getFixedValue();
+                if (Elem == 0 || Bytes % Elem != 0 || Bytes / Elem > 16 || !L->getType()->isSingleValueType())
+                    ok = false;
+            }
+            if (!ok)
+                continue;
+            for (auto &[L, Offset] : Dynamic)
+            {
+                IRBuilder<> B(L);
+                Type *T = L->getType();
+                uint64_t Elem = DL.getTypeStoreSize(T).getFixedValue();
+                uint64_t N = Bytes / Elem;
+                Type *I8 = B.getInt8Ty();
+                auto at = [&](uint64_t k) {
+                    Value *P = B.CreateInBoundsGEP(I8, AI, B.getInt32(k * Elem));
+                    return B.CreateAlignedLoad(T, P, commonAlignment(AI->getAlign(), k * Elem));
+                };
+                Value *R = at(N - 1);
+                for (uint64_t k = N - 1; k-- > 0;)
+                {
+                    Value *Is = B.CreateICmpEQ(Offset, ConstantInt::get(Offset->getType(), k * Elem));
+                    R = B.CreateSelect(Is, at(k), R);
+                }
+                R->takeName(L);
+                L->replaceAllUsesWith(R);
+                L->eraseFromParent();
+                rewritten++;
+            }
+        }
+    }
+    return rewritten;
+}
+
+LLVM_C_EXTERN_C_END

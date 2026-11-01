@@ -66,7 +66,7 @@ int main(int argc,char** argv){assert(argc==2);void* lib=dlopen(argv[1],RTLD_NOW
             assert(!publicRuntime->impl->deserializeCudaEngineV2(&incompatible)&&incompatible.reads==0);
             auto trailing=copy;trailing.resize(copy.size()+17,255);probe::BytesReader reader(trailing.data(),trailing.size(),7);
             auto streamed=static_cast<probe::Engine*>(publicRuntime->impl->deserializeCudaEngineV2(&reader));assert(streamed&&reader.position==copy.size());delete streamed;
-            auto bad=copy;bad[0]='?';probe::BytesReader unknown(bad.data(),bad.size(),7);assert(!publicRuntime->impl->deserializeCudaEngineV2(&unknown)&&unknown.position==24);
+            auto bad=copy;bad[0]='?';probe::BytesReader unknown(bad.data(),bad.size(),7);assert(!publicRuntime->impl->deserializeCudaEngineV2(&unknown)&&unknown.position==16);
         }
         delete publicRuntime;auto encoded=loaded->impl->serialize();assert(encoded&&encoded->impl->size()==copy.size());
         assert(std::memcmp(encoded->impl->data(),copy.data(),copy.size())==0);delete loaded;delete encoded;

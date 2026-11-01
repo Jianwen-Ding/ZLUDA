@@ -254,6 +254,28 @@ fn modify(g: &mut Graph, output: usize, f: impl FnOnce(&mut Op) -> Result<()>) -
         Ok(Box::into_raw(Box::new(Engine::build(graph, workspace_limit)?)))
     })
 }
+/// Borrowed host reader callback. Returns bytes read, zero for EOF, negative for error.
+/// The callback must not unwind and must not write beyond the requested destination size.
+#[no_mangle] pub unsafe extern "C" fn ztrtDeserializeEngineReader(
+    p:*const Runtime, user:*mut c_void,
+    read:Option<unsafe extern "C" fn(*mut c_void,*mut u8,usize)->isize>, workspace_limit:usize,
+) -> *mut Engine {
+    boundary(std::ptr::null_mut(),||{
+        object(p)?;let callback=read.ok_or("null engine reader callback")?;
+        struct Reader { user:*mut c_void, callback:unsafe extern "C" fn(*mut c_void,*mut u8,usize)->isize }
+        impl std::io::Read for Reader {
+            fn read(&mut self,buffer:&mut [u8])->std::io::Result<usize>{
+                let count=buffer.len().min(1<<20);
+                if count==0{return Ok(0);}
+                let n=unsafe{(self.callback)(self.user,buffer.as_mut_ptr(),count)};
+                if n<0 || n as usize>count {return Err(std::io::Error::new(std::io::ErrorKind::Other,"engine reader returned invalid count"));}
+                Ok(n as usize)
+            }
+        }
+        let graph=Graph::deserialize_reader(&mut Reader{user,callback})?;
+        Ok(Box::into_raw(Box::new(Engine::build(graph,workspace_limit)?)))
+    })
+}
 #[no_mangle] pub unsafe extern "C" fn ztrtDestroyEngine(p: *mut Engine) { boundary((), || { if !p.is_null() { drop(Box::from_raw(p)); } Ok(()) }); }
 #[no_mangle] pub unsafe extern "C" fn ztrtSerializeEngine(p: *const Engine, data: *mut u8, capacity: usize) -> usize {
     boundary(0, || { let e = object(p)?; if data.is_null() && capacity == 0 { return Ok(e.serialized.len()); }

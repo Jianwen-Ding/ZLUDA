@@ -2,8 +2,6 @@
 #include "runtime_contract.hpp"
 #include "extensions.h"
 #include <memory>
-#include <vector>
-#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <mutex>
@@ -97,30 +95,20 @@ public:
         if(reader.getAPILanguage()!=APILanguage::kCPP||!info.kind||std::strcmp(info.kind,"IStreamReaderV2")||info.major!=1||info.minor!=0){
             error(logger,"unsupported stream reader interface");return nullptr;
         }
-        // Host staging only. The reader remains borrowed and starts at its current position.
-        auto readExact=[&](unsigned char* output,size_t count){
-            while(count){
-                auto requested=std::min(count,size_t(1)<<20);
-                auto received=reader.read(output,static_cast<int64_t>(requested),nullptr);
-                if(received<=0||static_cast<uint64_t>(received)>requested)return false;
-                output+=size_t(received);count-=size_t(received);
-            }
-            return true;
+        auto read=[](void* user,uint8_t* destination,size_t count)->ptrdiff_t {
+            auto& source=*static_cast<IStreamReaderV2*>(user);
+            auto received=source.read(destination,static_cast<int64_t>(count),nullptr);
+            if(received<0||static_cast<uint64_t>(received)>count)return -1;
+            return static_cast<ptrdiff_t>(received);
         };
-        unsigned char header[24];
-        if(!readExact(header,sizeof(header))||!validCustomHeader(header,sizeof(header))){
-            error(logger,"invalid or truncated custom engine stream header");return nullptr;
-        }
-        try{
-            size_t total=static_cast<size_t>(readLE64(header+8))+16;
-            if(total<sizeof(header)){error(logger,"truncated custom engine stream");return nullptr;}
-            std::vector<unsigned char> bytes(total);
-            std::memcpy(bytes.data(),header,sizeof(header));
-            if(!readExact(bytes.data()+sizeof(header),total-sizeof(header))){
-                error(logger,"custom engine stream read failed");return nullptr;
-            }
-            return deserializeCudaEngine(bytes.data(),bytes.size());
-        }catch(...){error(logger,"custom engine stream allocation failed");return nullptr;}
+        std::unique_ptr<ZtrtRuntime,decltype(&ztrtDestroyRuntime)> runtime(ztrtCreateRuntime(),ztrtDestroyRuntime);
+        if(!runtime){error(logger,ztrtGetLastError());return nullptr;}
+        std::unique_ptr<ZtrtEngine,decltype(&ztrtDestroyEngine)> model(
+            ztrtDeserializeEngineReader(runtime.get(),&reader,read,size_t(1)<<30),ztrtDestroyEngine);
+        if(!model){error(logger,ztrtGetLastError());return nullptr;}
+        auto result=static_cast<ICudaEngine*>(ztrtRtxWrapNativeEngine(model.get(),logger));
+        if(result){model.release();}
+        return result;
     }
     int64_t getEngineHeaderSize() const noexcept override{return kHeaderSize;}
     EngineValidity getEngineValidity(void const* data,int64_t size,uint64_t* diagnostics) const noexcept override{

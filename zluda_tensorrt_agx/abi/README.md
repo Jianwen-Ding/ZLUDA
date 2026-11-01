@@ -187,17 +187,25 @@ metadata and GPU context probes pass ordinarily and with C++ adapter/probe Addre
 `deserializeCudaEngineV2` now accepts the reviewed version 1.0 C++ `IStreamReaderV2` interface.
 The reader is borrowed, starts at its current position and is never destroyed or rewound. Only host buffers
 and a null CUDA stream are passed to `read`. Requests are capped at 1 MiB; short positive reads are retried.
-Zero, negative and over-reported read counts fail. The 24-byte custom header is validated before allocating
-the payload buffer, and its declared payload remains bounded to 256 MiB. The loader consumes exactly one
+Zero, negative and over-reported read counts fail. The format tag and declared payload limit are checked before decoding metadata/weights, and the payload remains bounded to 256 MiB. The loader consumes exactly one
 engine, leaving trailing stream bytes untouched. Invalid interfaces are rejected before reads.
 
-This implementation stages the complete bounded serialized engine in host memory before invoking the native
-decoder. It is not incremental weight decoding, GPUDirect, deferred loading or a peak-memory improvement.
-Those remain optimization/feature work. No NVIDIA engine format is decoded.
+The native reader decoder now parses bounded metadata and reads each binary weight record directly into its
+final host vector. It avoids staging the full serialized engine. The native engine still retains a serialized
+cache as well as graph weights; eliminating that persistent duplication remains optimization work. GPUDirect
+and deferred device loading remain unsupported. No NVIDIA engine format is decoded.
 The adapted interface declarations follow the Apache-2.0 [public reader declarations](https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/_static/c-api/_nv_infer_runtime_8h_source.html).
 
 The independently declared reader probe checks 1-byte/7-byte/large reads, every truncated prefix of a real
-custom fixture, reader errors and invalid counts, unknown format tags, version rejection before reading,
+custom fixture, reader errors and invalid counts, unknown format tags rejected after the 16-byte prefix, version rejection before reading,
 trailing bytes, and a real weight payload larger than 1 MiB. Serialization remains byte-identical after stream
 loading. The GPU context probe now loads through seven-byte reader calls and still checks inference, streams
 and CUDA graph replay after caller data is overwritten. Normal and adapter/probe-ASan checks pass.
+
+
+`ztrtDeserializeEngineReader` exposes the same incremental decoder through the independent native C ABI.
+Callbacks are synchronous and borrowed, must not unwind or write beyond the destination, and return bytes
+read (zero EOF, negative error). Metadata parsing uses a bounded buffered reader; the payload limiter prevents
+consuming trailing bytes. Binary float weights preserve their little-endian bit patterns, with byte swapping on
+big-endian targets. The current platform is little-endian; the big-endian path is not hardware-tested.
+See [stream loading measurements](../validation/stream-loading.md) for the memory benchmark and limits.

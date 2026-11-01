@@ -56,6 +56,11 @@ size_t ztrtBuilderTensorName(const ZtrtBuilder*, int32_t, char*, size_t);
 ZtrtRuntime* ztrtCreateRuntime(void);
 void ztrtDestroyRuntime(ZtrtRuntime*);
 ZtrtEngine* ztrtDeserializeEngine(const ZtrtRuntime*, const uint8_t*, size_t, size_t);
+/* Borrowed synchronous host reader, starting at current position. No seek or ownership transfer.
+ * Returns bytes read, zero at EOF, negative on error. Never write past count or unwind.
+ * Requests are capped at 1 MiB. Binary weights decode directly into their final host vectors. */
+typedef ptrdiff_t (*ZtrtReadCallback)(void* user, uint8_t* destination, size_t count);
+ZtrtEngine* ztrtDeserializeEngineReader(const ZtrtRuntime*, void* user, ZtrtReadCallback, size_t workspace_limit);
 void ztrtDestroyEngine(ZtrtEngine*);
 /* With NULL data and zero capacity, returns required bytes. Never partially writes. */
 size_t ztrtSerializeEngine(const ZtrtEngine*, uint8_t*, size_t);

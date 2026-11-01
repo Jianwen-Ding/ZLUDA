@@ -1431,7 +1431,11 @@ for one group and dense dy planes: dw = sum over n of dy[n] col^T, the
 images after the first added with beta 1. `cudnnConvolutionBackwardData`
 (one group, dense dy planes) forms col = w^T dy[n] in f32 on the GEMM path
 and gathers dx[n] from it (`agx_conv2d_col2im_*`, each element of dx written
-once, rounded once for f16). Convolutions of backend-API operation graphs
+once, rounded once for f16), a chunk of images (up to 64 MiB of col) per
+batched GEMM and per gather launch: warm, fp32 3x3, bit-identical and equal to
+a CPU reference (`convbench ... bd`), 64 x 32 x 8 x 8 2.37 -> 0.12 ms, 32 x 64 x
+14 x 14 1.60 -> 0.26 ms, 16 x 128 x 28 x 28 1.42 -> 0.88 ms, 8 x 64 x 56 x 56
+0.73 -> 0.53 ms (it was a GEMM and a gather per image). Convolutions of backend-API operation graphs
 take the same paths.
 
 The other common legacy operations run on `agx_libs/kernels/dnn.mlir`, for

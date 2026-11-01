@@ -1192,7 +1192,8 @@ mod imp {
 
     /// The data gradient of a convolution with one group and dense dy planes, large enough for the matrix unit: per
     /// image, col (C R S x P Q, f32) = w^T (C R S x K) dy[n] (K x PQ) on agx_libs' GEMM (column-major col^T =
-    /// dy[n]^T w, B transposed), then `agx_conv2d_col2im_*` gathers dx[n] from col. None when it does not apply.
+    /// dy[n]^T w, B transposed; batched over a chunk of images), then `agx_conv2d_col2im_*` gathers dx[n] from col
+    /// (the chunk in one launch). None when it does not apply.
     #[allow(clippy::too_many_arguments)]
     unsafe fn col2im_gemm(
         h: &Handle,
@@ -1214,11 +1215,15 @@ mod imp {
         let groups = u32::try_from((ch as u64 * hh as u64 * wd as u64).div_ceil(256)).ok()?;
         let size = if half { 2 } else { 4 };
         Some((|| {
-            let col = temp(h, crs * pq * 4)?;
+            // the images in chunks of up to 64 MiB of col (f32): one batched GEMM and one gather per chunk
+            let elements = crs * pq;
+            let chunk = ((64i64 << 20) / (elements * 4)).clamp(1, n as i64) as i32;
+            let col = temp(h, elements * 4 * chunk as i64)?;
             let name = if half { c"agx_conv2d_col2im_f16" } else { c"agx_conv2d_col2im_f32" };
-            let f = conv_function(name, index32(s, crs * pq))?;
+            let f = conv_function(name, index32(s, elements * chunk as i64))?;
             let (mut alpha, mut beta) = (*(alpha as *const f32), *(beta as *const f32));
-            for image in 0..n {
+            for first in (0..n).step_by(chunk as usize) {
+                let count = chunk.min(n - first);
                 let g = engine::Gemm {
                     types: if half { agx_libs::Types::HtoS } else { agx_libs::Types::S },
                     ta: false,
@@ -1228,25 +1233,25 @@ mod imp {
                     k: k as u64,
                     alpha: 1.0,
                     beta: 0.0,
-                    a: dy.byte_offset(image as isize * ys0 as isize * size),
+                    a: dy.byte_offset(first as isize * ys0 as isize * size),
                     lda: pq as u64,
-                    stride_a: 0,
+                    stride_a: ys0 as i64,
                     b: w,
                     ldb: crs as u64,
                     stride_b: 0,
                     c: col.0,
                     ldc: pq as u64,
-                    stride_c: 0,
-                    batch: 1,
+                    stride_c: elements,
+                    batch: count as u64,
                 };
                 engine::gemm(&g, h.stream).map_err(status)?;
                 let mut colp = col.0;
-                let mut shape: [i32; 22] = std::array::from_fn(|i| if i < 21 { s[i] } else { image });
+                let mut shape: [i32; 22] = std::array::from_fn(|i| if i < 21 { s[i] } else { first });
                 let mut params: Vec<*mut c_void> = vec![&mut colp as *mut _ as *mut c_void, &mut dx as *mut _ as *mut c_void];
                 params.extend(shape.iter_mut().map(|v| v as *mut i32 as *mut c_void));
                 params.push(&mut alpha as *mut f32 as *mut c_void);
                 params.push(&mut beta as *mut f32 as *mut c_void);
-                engine::launch_kernel(f, [groups, 1], [256, 1], &mut params, h.stream).map_err(status)?;
+                engine::launch_kernel(f, [groups, count as u32], [256, 1], &mut params, h.stream).map_err(status)?;
             }
             Ok(())
         })())

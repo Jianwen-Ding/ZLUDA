@@ -1672,6 +1672,14 @@ without the host's TensorRT deserialization errors. Thus neither different Geekb
 alone explains the discrepancy. The host's selected compiler and remaining runtime settings still need comparison;
 the host loader excerpt shows NVML search attempts, not a successful NVML load.
 
+The host subsequently confirmed the same paired `zoc` hash. Its early log contains two missing procedure lookups
+(500), two rejected export tables (1), and an unsupported context limit (215), followed by graph-executable
+destruction errors (400). These calls did not fail in the matching container run. Their order suggests a startup
+compatibility issue worth investigating, but does not establish which call causes engine deserialization to fail.
+With `ZLUDA_AGX_LOG=1`, failed procedure lookups now print the symbol, requested version, flags, and query status;
+unsupported context-limit queries print the numeric limit; unsupported export tables print the requested ID.
+Use these arguments to identify the actual request before changing the API's return behavior.
+
 For a comparison run, use the same Geekbench build, the matching ZLUDA driver and `zoc`, and absolute paths:
 
 ```bash

@@ -2600,6 +2600,12 @@ pub(crate) unsafe fn cuGetProcAddress_v2(
         usize::MAX => (Err(CUerror::NOT_FOUND), CUdriverProcAddressQueryResult::CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT),
         _ => (Ok(()), CUdriverProcAddressQueryResult::CU_GET_PROC_ADDRESS_SUCCESS),
     };
+    if r.is_err() && crate::log_enabled() {
+        eprintln!(
+            "[zluda_agx] cuGetProcAddress_v2: symbol={:?}, version={version}, flags={flags:#x}, status={}",
+            CStr::from_ptr(symbol), st.0
+        );
+    }
     *pfn = if r.is_ok() { f } else { std::ptr::null_mut() };
     if !status.is_null() {
         *status = st;
@@ -2802,7 +2808,12 @@ pub(crate) unsafe fn cuCtxGetLimit(pvalue: *mut usize, limit: CUlimit) -> CUresu
         CUlimit_enum::CU_LIMIT_STACK_SIZE => DEFAULT_STACK_SIZE,
         CUlimit_enum::CU_LIMIT_PRINTF_FIFO_SIZE => 65536,
         CUlimit_enum::CU_LIMIT_MALLOC_HEAP_SIZE => DEFAULT_HEAP_SIZE,
-        _ => return Err(CUerror::UNSUPPORTED_LIMIT),
+        _ => {
+            if crate::log_enabled() {
+                eprintln!("[zluda_agx] cuCtxGetLimit: unsupported limit={}", limit.0);
+            }
+            return Err(CUerror::UNSUPPORTED_LIMIT);
+        }
     };
     let v = with(|d| Ok(d.limits.get(&limit.0).copied().unwrap_or(default)))?;
     out(pvalue, v)

@@ -171,6 +171,11 @@ pub(crate) unsafe fn cuGetExportTable(table: *mut *const c_void, id: *const CUuu
             *table = t.start();
             Ok(())
         }
-        None => Err(CUerror::INVALID_VALUE),
+        None => {
+            if crate::log_enabled() {
+                eprintln!("[zluda_agx] cuGetExportTable: unsupported id={:02x?}", id.bytes);
+            }
+            Err(CUerror::INVALID_VALUE)
+        }
     }
 }

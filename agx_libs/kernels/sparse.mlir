@@ -154,6 +154,106 @@ gpu.module @agx_sparse {
     }
     gpu.return
   }
+
+  // agx_csr_spmv_i32 with `lanes` lanes per row, 4 to 32 (single precision only:
+  // no f64 copy, agx_libs/build.rs): the lanes take every lanes-th entry of the
+  // row, so neighbouring lanes read neighbouring entries, sum them with
+  // shuffles within their group and its first lane writes y[i]. For rows of 8
+  // or more entries on average, where a thread per row reads each lane's own
+  // run. Launch rows x lanes threads (whole SIMD-groups: all lanes shuffle).
+  gpu.func @agx_csr_spmv_vec_i32(%rowptr0: memref<1xi32, 1>, %col0: memref<1xi32, 1>,
+                                 %val0: memref<1xf32, 1>, %x0: memref<1xf32, 1>,
+                                 %y0: memref<1xf32, 1>, %rows_: i64, %base_: i64,
+                                 %lanes_: i64, %alpha: f32, %beta: f32) kernel {
+    %i0 = arith.constant 0 : index
+    %i1 = arith.constant 1 : index
+    %f0 = arith.constant 0.0 : f32
+    %big = arith.constant 4611686018427387904 : index
+    %rows = arith.index_cast %rows_ : i64 to index
+    %lanes = arith.index_cast %lanes_ : i64 to index
+    %base32 = arith.trunci %base_ : i64 to i32
+    %rowptr = memref.reinterpret_cast %rowptr0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xi32, 1> to memref<?xi32, strided<[1]>, 1>
+    %col = memref.reinterpret_cast %col0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xi32, 1> to memref<?xi32, strided<[1]>, 1>
+    %val = memref.reinterpret_cast %val0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %x = memref.reinterpret_cast %x0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %y = memref.reinterpret_cast %y0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %g = gpu.global_id x
+    %i = arith.divui %g, %lanes : index
+    %lane = arith.remui %g, %lanes : index
+    %live = arith.cmpi ult, %i, %rows : index
+    %part = scf.if %live -> f32 {
+      %lo_r = memref.load %rowptr[%i] : memref<?xi32, strided<[1]>, 1>
+      %i_1 = arith.addi %i, %i1 : index
+      %hi_r = memref.load %rowptr[%i_1] : memref<?xi32, strided<[1]>, 1>
+      %lo32 = arith.subi %lo_r, %base32 : i32
+      %hi32 = arith.subi %hi_r, %base32 : i32
+      %lane32 = arith.index_cast %lane : index to i32
+      %start = arith.addi %lo32, %lane32 : i32
+      %step = arith.trunci %lanes_ : i64 to i32
+      %p = scf.for %k32 = %start to %hi32 step %step iter_args(%a = %f0) -> f32 : i32 {
+        %k = arith.index_cast %k32 : i32 to index
+        %c_r = memref.load %col[%k] : memref<?xi32, strided<[1]>, 1>
+        %c_s = arith.subi %c_r, %base32 : i32
+        %c = arith.index_cast %c_s : i32 to index
+        %v = memref.load %val[%k] : memref<?xf32, strided<[1]>, 1>
+        %xv = memref.load %x[%c] : memref<?xf32, strided<[1]>, 1>
+        %a1 = math.fma %v, %xv, %a : f32
+        scf.yield %a1 : f32
+      }
+      scf.yield %p : f32
+    } else {
+      scf.yield %f0 : f32
+    }
+    // the sum over the row's lanes: xor steps below `lanes`
+    %w32 = arith.constant 32 : i32
+    %ln32 = arith.trunci %lanes_ : i64 to i32
+    %o0 = arith.constant 16 : i32
+    %t0, %ok0 = gpu.shuffle xor %part, %o0, %w32 : f32
+    %in0 = arith.cmpi ult, %o0, %ln32 : i32
+    %d0 = arith.select %in0, %t0, %f0 : f32
+    %s0 = arith.addf %part, %d0 : f32
+    %o1 = arith.constant 8 : i32
+    %t1, %ok1 = gpu.shuffle xor %s0, %o1, %w32 : f32
+    %in1 = arith.cmpi ult, %o1, %ln32 : i32
+    %d1 = arith.select %in1, %t1, %f0 : f32
+    %s1 = arith.addf %s0, %d1 : f32
+    %o2 = arith.constant 4 : i32
+    %t2, %ok2 = gpu.shuffle xor %s1, %o2, %w32 : f32
+    %in2 = arith.cmpi ult, %o2, %ln32 : i32
+    %d2 = arith.select %in2, %t2, %f0 : f32
+    %s2 = arith.addf %s1, %d2 : f32
+    %o3 = arith.constant 2 : i32
+    %t3, %ok3 = gpu.shuffle xor %s2, %o3, %w32 : f32
+    %in3 = arith.cmpi ult, %o3, %ln32 : i32
+    %d3 = arith.select %in3, %t3, %f0 : f32
+    %s3 = arith.addf %s2, %d3 : f32
+    %o4 = arith.constant 1 : i32
+    %t4, %ok4 = gpu.shuffle xor %s3, %o4, %w32 : f32
+    %in4 = arith.cmpi ult, %o4, %ln32 : i32
+    %d4 = arith.select %in4, %t4, %f0 : f32
+    %s4 = arith.addf %s3, %d4 : f32
+    %first = arith.cmpi eq, %lane, %i0 : index
+    %write = arith.andi %first, %live : i1
+    scf.if %write {
+      %scaled = arith.mulf %s4, %alpha : f32
+      %no_old = arith.cmpf oeq, %beta, %f0 : f32
+      %res = scf.if %no_old -> f32 {
+        scf.yield %scaled : f32
+      } else {
+        %old = memref.load %y[%i] : memref<?xf32, strided<[1]>, 1>
+        %ep = math.fma %old, %beta, %scaled : f32
+        scf.yield %ep : f32
+      }
+      memref.store %res, %y[%i] : memref<?xf32, strided<[1]>, 1>
+    }
+    gpu.return
+  }
+
   // y[dst[k]] += alpha * val[k] x[src[k]] with f32 atomic adds, for COO
   // entries k < nnz (row and column indices, from base): src is the column
   // and dst the row, or the other way round for the transposed product

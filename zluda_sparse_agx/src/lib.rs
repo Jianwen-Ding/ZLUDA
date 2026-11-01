@@ -258,6 +258,8 @@ pub enum Launch {
     Scale { n: i64, stride: i64 },
     /// y = alpha A x + beta y, one thread per row.
     CsrSpmv,
+    /// The same with a SIMD-group per row (f32 values, 32-bit indices, 8 or more entries per row on average).
+    CsrSpmvVec,
     /// y += alpha A^T x, one thread per row (atomic).
     CsrSpmvT,
     /// y += alpha op(A) x, one thread per entry (atomic).
@@ -302,6 +304,9 @@ pub fn spmv_plan(op: cusparseOperation_t, a: &SpMat, x: &DnVec, y: &DnVec, compu
         return Ok(vec![]);
     }
     Ok(match (a.format, trans) {
+        // several lanes per row from 8 entries per row on average: a thread per row reads each lane's own run of the
+        // row (1M rows x 16: 1084 us, 136 GB/s, where 4 per row run at 335 GB/s); ZLUDA_AGX_SPMV_VEC=0: a thread per row
+        (Format::Csr, false) if !a.wide && !a.double && a.nnz >= 8 * a.rows && spmv_vec_enabled() => vec![Launch::CsrSpmvVec],
         (Format::Csr, false) => vec![Launch::CsrSpmv],
         (Format::Csr, true) if a.rows == 0 || a.nnz == 0 => {
             vec![Launch::Scale { n: yn, stride: 1 }]
@@ -312,6 +317,10 @@ pub fn spmv_plan(op: cusparseOperation_t, a: &SpMat, x: &DnVec, y: &DnVec, compu
         // callers pass CSC matrices through SpMat::csr
         (Format::Csc, _) => return Err(cusparseError_t::NOT_SUPPORTED),
     })
+}
+
+fn spmv_vec_enabled() -> bool {
+    std::env::var("ZLUDA_AGX_SPMV_VEC").map_or(true, |v| v != "0")
 }
 
 /// The launch of `C = alpha op(A) op(B) + beta C`.
@@ -933,6 +942,20 @@ mod imp {
                     [rows, 1],
                     [64, 1],
                 )?,
+                // `lanes` threads per row: one per 8 entries of the mean row, a power of two from 4 to 32 (M2 Max, 1M
+                // rows x 16: 4 lanes 453 us, 32 lanes 1808; 64K x 256: 4 to 32 lanes 379-386 us)
+                Launch::CsrSpmvVec => {
+                    let mean = (a.nnz + a.rows.max(1) - 1) / a.rows.max(1);
+                    let mut lanes = ((mean as u64).div_ceil(8).next_power_of_two().clamp(4, 32)) as i64;
+                    let threads = (rows * lanes + 31) / 32 * 32;
+                    run(
+                        h,
+                        c"agx_csr_spmv_vec_i32",
+                        &mut [arg(&mut pa), arg(&mut pc), arg(&mut pv), arg(&mut px), arg(&mut py), arg(&mut rows), arg(&mut base), arg(&mut lanes), alpha, beta],
+                        [threads, 1],
+                        [128, 1],
+                    )?
+                }
                 Launch::CsrSpmvT => run(
                     h,
                     pick(c"agx_csr_spmv_t_i32", c"agx_csr_spmv_t_i64", c"agx_csr_spmv_t_i32_f64", c"agx_csr_spmv_t_i64_f64"),
@@ -2264,7 +2287,7 @@ mod tests {
                         y[o] = if beta == 0.0 { 0.0 } else { y[o] * beta };
                     }
                 }
-                Launch::CsrSpmv => {
+                Launch::CsrSpmv | Launch::CsrSpmvVec => {
                     for i in 0..a.rows {
                         let s: f32 = (a.rowptr[i]..a.rowptr[i + 1]).map(|k| a.val[k as usize] * x[a.col[k as usize] as usize]).sum();
                         y[i] = alpha * s + if beta == 0.0 { 0.0 } else { beta * y[i] };

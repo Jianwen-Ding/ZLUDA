@@ -1565,7 +1565,14 @@ of their transpose:
   `cusparseSpMM` on CSR matrices with `opA` non-transposed and `opB` either
   way, on column- or row-major dense matrices. Non-transposed CSR SpMV and
   SpMM use one thread per output element; the transposed and COO products
-  scale `y` by `beta` first and then add with atomic adds.
+  scale `y` by `beta` first and then add with atomic adds. f32 CSR SpMV with
+  32-bit indices and 8 or more entries per row on average gives each row a
+  group of lanes instead (`agx_csr_spmv_vec_i32`: one lane per 8 entries of
+  the mean row, a power of two from 4 to 32, summed with shuffles), so
+  neighbouring lanes read neighbouring entries: warm, `tools/spmvbench.c`
+  (exact against the CPU), 1M rows x 16 entries 1082 -> 453 us, 256K x 64
+  1152 -> 384, 64K x 256 1170 -> 380, 4K x 2048 836 -> 217 us, 300-360 GB/s
+  (`ZLUDA_AGX_SPMV_VEC=0`: a thread per row).
 - Sparse vectors (`cusparseCreateSpVec`): `cusparseSpVV` (256 partial sums in
   its workspace, added in order, so the result is deterministic),
   `cusparseAxpby`, `cusparseGather`, `cusparseScatter` and `cusparseRot`.

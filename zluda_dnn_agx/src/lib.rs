@@ -1122,19 +1122,26 @@ mod imp {
         let elements = crs * pq;
         let groups = u32::try_from((elements as u64).div_ceil(256)).ok()?;
         let size = if half { 2 } else { 4 };
+        // a forward convolution's images in chunks: each image's columns at its place in one buffer, then one strided
+        // batched GEMM for the chunk (a GEMM per image left most of the GPU idle for small images: 16 x 128 x 28 x 28,
+        // 3x3, 3.48 ms); the buffer at most 64 MiB (or one image's)
+        let chunk = if filter { 1 } else { ((64i64 << 20) / (elements * size)).clamp(1, n as i64) as i32 };
         Some((|| {
-            let col = temp(h, elements * size)?;
+            let col = temp(h, elements * size * chunk as i64)?;
             let name = if half { c"agx_conv2d_im2col_f16" } else { c"agx_conv2d_im2col_f32" };
             let f = conv_function(name, index32(s, elements))?;
             let (alpha, beta) = (*(alpha as *const f32) as f64, *(beta as *const f32) as f64);
-            for image in 0..n {
-                let mut colp = col.0;
-                let mut shape: [i32; 22] = std::array::from_fn(|i| if i < 21 { s[i] } else { image });
-                let mut params: Vec<*mut c_void> = vec![&mut x as *mut _ as *mut c_void, &mut colp as *mut _ as *mut c_void];
-                params.extend(shape.iter_mut().map(|v| v as *mut i32 as *mut c_void));
-                engine::launch_kernel(f, [groups, 1], [256, 1], &mut params, h.stream).map_err(status)?;
-                let y_n = y.byte_offset(image as isize * s[21] as isize * size as isize);
-                let types = if half { agx_libs::Types::H } else { agx_libs::Types::S };
+            let types = if half { agx_libs::Types::H } else { agx_libs::Types::S };
+            for first in (0..n).step_by(chunk as usize) {
+                let count = chunk.min(n - first);
+                for image in first..first + count {
+                    let mut colp = col.0.byte_offset(((image - first) as i64 * elements * size) as isize);
+                    let mut shape: [i32; 22] = std::array::from_fn(|i| if i < 21 { s[i] } else { image });
+                    let mut params: Vec<*mut c_void> = vec![&mut x as *mut _ as *mut c_void, &mut colp as *mut _ as *mut c_void];
+                    params.extend(shape.iter_mut().map(|v| v as *mut i32 as *mut c_void));
+                    engine::launch_kernel(f, [groups, 1], [256, 1], &mut params, h.stream).map_err(status)?;
+                }
+                let y_n = y.byte_offset(first as isize * s[21] as isize * size as isize);
                 let g = if filter {
                     engine::Gemm {
                         types,
@@ -1144,7 +1151,7 @@ mod imp {
                         n: k as u64,
                         k: pq as u64,
                         alpha,
-                        beta: if image == 0 { beta } else { 1.0 },
+                        beta: if first == 0 { beta } else { 1.0 },
                         a: col.0,
                         lda: pq as u64,
                         stride_a: 0,
@@ -1168,14 +1175,14 @@ mod imp {
                         beta,
                         a: col.0,
                         lda: pq as u64,
-                        stride_a: 0,
+                        stride_a: elements,
                         b: w,
                         ldb: crs as u64,
                         stride_b: 0,
                         c: y_n,
                         ldc: pq as u64,
-                        stride_c: 0,
-                        batch: 1,
+                        stride_c: s[21] as i64,
+                        batch: count as u64,
                     }
                 };
                 engine::gemm(&g, h.stream).map_err(status)?;

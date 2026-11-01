@@ -1663,6 +1663,15 @@ The cause of the different application path remains unresolved. Compare the Geek
 hash, launch arguments, environment, and resolved library paths before attributing the difference to containment.
 An uploaded result alone does not prove that every workload succeeded.
 
+A subsequent host/container comparison found identical SHA-256 hashes for `geekbench7`, `geekbench_aarch64`,
+`geekbench.plxr`, and `geekbench-workload.plxr`. Both host CUDA library names hashed to
+`fd28d620831f26440363c6488f178f856feab4991d9afb7920f448159c54834e`, matching the retained
+`/scratch/air-pipeline/lib-fam/libcuda.so`. Running that exact driver in the container with its paired `zoc`
+(`02302f4622e8abd5e354f3b77e0a9a5c24cf4371ffee482d3399c2a94a9aba84`) ran the three AI workloads' kernels
+without the host's TensorRT deserialization errors. Thus neither different Geekbench files nor the driver binary
+alone explains the discrepancy. The host's selected compiler and remaining runtime settings still need comparison;
+the host loader excerpt shows NVML search attempts, not a successful NVML load.
+
 For a comparison run, use the same Geekbench build, the matching ZLUDA driver and `zoc`, and absolute paths:
 
 ```bash

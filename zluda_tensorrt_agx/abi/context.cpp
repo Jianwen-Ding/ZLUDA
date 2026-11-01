@@ -1,5 +1,6 @@
 // Original static-f32 execution adapter. Unsupported features fail without borrowing unchecked native objects.
 #include "context.hpp"
+#include "errors.hpp"
 #include "config.hpp"
 #include <memory>
 #include <string>
@@ -10,6 +11,9 @@ using namespace nvinfer1;
 void error(ILogger* l,char const* text) noexcept{if(l)l->log(ILogger::Severity::kERROR,text);}
 struct Tensor {std::string name;Dims shape;size_t bytes;int mode;void* address=nullptr;};
 class ContextImpl final:public apiv::VExecutionContext {
+    ZtrtRecorderSlot errors;
+    void error(ILogger* l,char const* text) const noexcept{errors.report(l,text);}
+
     IExecutionContext* owner;ICudaEngine* engine;ZtrtContext* native;ILogger* logger;
     std::unique_ptr<IRuntimeConfig> config;
     std::vector<Tensor> tensors;std::string name;size_t workspace;bool debug=false,emitsProfile=true,externalMemory=false,warmed=false;CUstream_st* lastStream=nullptr;
@@ -19,7 +23,8 @@ class ContextImpl final:public apiv::VExecutionContext {
     bool ready() noexcept{if(externalMemory){error(logger,"context workspace configuration is invalid");return false;}for(auto const& t:tensors)if(!t.address){error(logger,"I/O tensor is unbound");return false;}return true;}
     bool status(int32_t rc) noexcept{if(rc!=0){error(logger,ztrtGetLastError());return false;}return true;}
 public:
-    ContextImpl(IExecutionContext* o,ICudaEngine* e,ZtrtContext* c,ZtrtEngine* model,ILogger* l,IRuntimeConfig* settings):owner(o),engine(e),native(c),logger(l),workspace(ztrtGetWorkspaceSize(model)){
+    ContextImpl(IExecutionContext* o,ICudaEngine* e,ZtrtContext* c,ZtrtEngine* model,ILogger* l,IRuntimeConfig* settings,IErrorRecorder* recorder):owner(o),engine(e),native(c),logger(l),workspace(ztrtGetWorkspaceSize(model)){
+        errors.set(recorder,l);
         config.reset(settings?ztrtAbiCloneConfig(settings,e,l):nullptr);
         if(settings&&!config)throw std::runtime_error("runtime config snapshot failed");
         int n=ztrtGetNbIOTensors(model);if(n<0)throw std::runtime_error("invalid native engine I/O");tensors.reserve(size_t(n));
@@ -37,8 +42,8 @@ public:
     void setDeviceMemory(void* p) noexcept override{setDeviceMemoryV2(p,p?int64_t(workspace):0);}
     int32_t getOptimizationProfile() const noexcept override{return 0;}
     bool allInputDimensionsSpecified() const noexcept override{return true;}
-    void setErrorRecorder(IErrorRecorder* p) noexcept override{if(p)error(logger,"ABI prototype: error recorders are unsupported");}
-    IErrorRecorder* getErrorRecorder() const noexcept override{return nullptr;}
+    void setErrorRecorder(IErrorRecorder* p) noexcept override{errors.set(p,logger);}
+    IErrorRecorder* getErrorRecorder() const noexcept override{return errors.get();}
     bool executeV2(void* const* bindings) noexcept override{if(!bindings)return false;for(size_t i=0;i<tensors.size();++i)if(!setTensorAddress(tensors[i].name.c_str(),bindings[i]))return false;return enqueueV3(nullptr)&&status(ztrtSynchronize(native));}
     bool setOptimizationProfileAsync(int32_t p,CUstream_st*) noexcept override{if(p!=0){error(logger,"only static optimization profile 0 is supported");return false;}return true;}
     void setEnqueueEmitsProfile(bool enabled) noexcept override{emitsProfile=enabled;}
@@ -86,17 +91,17 @@ public:
 };
 class Context final:public IExecutionContext {
 public:
-    Context(ICudaEngine* engine,ZtrtEngine* model,ILogger* logger,bool managed,IRuntimeConfig* settings){
+    Context(ICudaEngine* engine,ZtrtEngine* model,ILogger* logger,bool managed,IRuntimeConfig* settings,IErrorRecorder* recorder){
         std::unique_ptr<ZtrtContext,decltype(&ztrtDestroyExecutionContext)> native(managed?ztrtCreateExecutionContextWithoutDeviceMemory(model):ztrtCreateExecutionContext(model),ztrtDestroyExecutionContext);
         if(!native)throw std::runtime_error(ztrtGetLastError());
-        mImpl=new ContextImpl(this,engine,native.get(),model,logger,settings);native.release();
+        mImpl=new ContextImpl(this,engine,native.get(),model,logger,settings,recorder);native.release();
     }
     ~Context() noexcept override{delete mImpl;}
     bool matches(ICudaEngine const* engine) const noexcept{return &mImpl->getEngine()==engine;}
 };
 }
-nvinfer1::IExecutionContext* ztrtAbiCreateContext(nvinfer1::ICudaEngine* engine,ZtrtEngine* model,nvinfer1::ILogger* logger,bool managed,nvinfer1::IRuntimeConfig* settings) noexcept{
-    try{return new Context(engine,model,logger,managed,settings);}catch(std::exception const& e){error(logger,e.what());return nullptr;}catch(...){error(logger,"context adapter allocation failed");return nullptr;}
+nvinfer1::IExecutionContext* ztrtAbiCreateContext(nvinfer1::ICudaEngine* engine,ZtrtEngine* model,nvinfer1::ILogger* logger,bool managed,nvinfer1::IRuntimeConfig* settings,nvinfer1::IErrorRecorder* recorder) noexcept{
+    try{return new Context(engine,model,logger,managed,settings,recorder);}catch(std::exception const& e){error(logger,e.what());return nullptr;}catch(...){error(logger,"context adapter allocation failed");return nullptr;}
 }
 
 bool ztrtAbiContextMatches(nvinfer1::IExecutionContext const* context,nvinfer1::ICudaEngine const* engine) noexcept{

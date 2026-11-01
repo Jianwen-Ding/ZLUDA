@@ -67,7 +67,7 @@ It is not installed under NVIDIA's library names and is not linked into the main
 The wrapper has a virtual destructor and implementation pointer. The dispatch declarations follow the reviewed
 public method order, including getPImpl, configuration, logger and plugin-registry access. Positive thread limits,
 temporary-directory copies and tempfile-control flags are implemented. An empty registry reports no creators.
-Allocator/error-recorder/plugin/DLA/host-code/deferred-loading requests that cannot be supported are rejected
+Allocator/plugin/DLA/host-code/deferred-loading requests that cannot be supported are rejected
 or logged explicitly. Directory strings remain valid until the next setter; callers must coordinate pointer use
 with mutation and keep the logger alive through runtime destruction.
 
@@ -89,7 +89,7 @@ The probe compiles in another translation unit without including the adapter dis
 factory/version negotiation, wrapper/dispatch prefix calls, logger callbacks, configuration persistence, empty
 registry behavior, unknown-format rejection, and 1000 destruction cycles. Both ordinary and AddressSanitizer runs
 pass on Linux aarch64. This is a targeted binary-prefix test using independently declared call shapes, not a
-complete vendor-reference-header or cross-version ABI conformance test. Plugins, error recorders, complete
+complete vendor-reference-header or cross-version ABI conformance test. Plugins, complete error-path routing, complete
 engine/context interfaces, builder factories and reference-header client integration remain required work.
 
 ## Native engine metadata and serialization adapter
@@ -307,11 +307,42 @@ information query on that inspector or its destruction. Inspectors are not concu
 
 An inspector can borrow a context from the same public engine, or detach with null. Unknown implementations
 and other-engine contexts are rejected without changing the previous attachment. The engine and any attached
-context must outlive the inspector/attachment; detach before destroying an attached context. Error recorders
-remain unsupported. The public dispatch declarations follow the Apache-2.0
+context must outlive the inspector/attachment; detach before destroying an attached context. Error recorders are supported as described below. The public dispatch declarations follow the Apache-2.0
 [interface source](https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/_static/c-api/_nv_infer_impl_8h_source.html).
 
 Independent ABI-prefix tests cover names/text/JSON, invalid indices/formats, output escaping, getPImpl,
 unknown context rejection, GPU-context attachment/detachment and cross-engine rejection. The native lifecycle
 probe checks fused-step name selection and null/negative/out-of-range access. Normal and C++ adapter/probe-ASan
 runs pass, including 100 engine ownership/serialization cycles. No proprietary artifact is used as a test oracle.
+
+
+## Versioned error recorders and callback ownership
+
+The public runtime-base subset now declares the reviewed ErrorCode values and version-1.0 IErrorRecorder
+callback order. Runtime, engine, execution context, inspector and empty plugin registry support recorder
+registration/getters. Unknown interface language/kind/version is rejected before taking a reference.
+Each registration takes an incRefCount reference; replacement, unregistration and object destruction release
+it with decRefCount. Re-registering the same pointer remains balanced. The application owns the recorder
+and must keep it alive while references remain outstanding.
+
+Successfully loaded engines inherit the runtime's recorder; new contexts and inspectors inherit the engine's
+recorder. Children retain their own registration if the parent changes or is destroyed. The independent
+native-engine wrapping extension starts without a recorder until one is attached explicitly.
+Callback routing uses a shared lease, with report callbacks and reference callbacks outside the slot mutex.
+A report can unregister itself without deadlock or premature release. Concurrent reports and recorder
+replacement are supported by the slot; other operations on a single runtime/context follow their existing
+thread-safety rules. In particular, registration changes must not race child creation/inheritance or use of a
+borrowed getter result. The recorder's callbacks must themselves satisfy the public thread-safety contract.
+
+Existing adapter error-message paths report UNSPECIFIED_ERROR (1) to an attached recorder, otherwise to the
+logger. Descriptions are bounded to 127 bytes plus a null terminator. A true fatal return does not make the
+failing operation succeed or retry it. Granular per-error classification, every currently silent false/null
+return path, configuration-object failures and some construction/destruction failures still require routing
+work; complete error-reporting compatibility is not claimed. No asynchronous driver polling was added.
+
+The declarations follow the Apache-2.0 [public recorder source](https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/_static/c-api/_nv_infer_runtime_base_8h_source.html).
+Probes verify inherited registration through GPU execution, replacement and destruction reference balance,
+unknown-version rejection, logger fallback, reentrant self-unregistration, fatal-return behavior, 127-byte
+truncation, registry registration, 4000 concurrent reports during 1000 same-recorder replacements, and engine/
+inspector lifetime cycles. Ordinary and C++ adapter/probe-ASan runs pass. This is not a ThreadSanitizer result
+or a full independently pinned reference-header ABI proof; the native backend remains uninstrumented.

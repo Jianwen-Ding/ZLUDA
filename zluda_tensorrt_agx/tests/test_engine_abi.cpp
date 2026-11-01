@@ -10,6 +10,7 @@
 #include "abi_probe.hpp"
 #include "runtime_probe.hpp"
 #include "stream_probe.hpp"
+#include "recorder_probe.hpp"
 
 struct Logger final:nvinfer1::ILogger{int errors=0;void log(Severity,char const*)noexcept override{++errors;}};
 int main(int argc,char** argv){assert(argc==2);void* lib=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL);if(!lib)throw std::runtime_error(dlerror());
@@ -73,7 +74,14 @@ int main(int argc,char** argv){assert(argc==2);void* lib=dlopen(argv[1],RTLD_NOW
         for(auto result:{configured,defaultConfigured}){
             assert(result->impl->size()==memory->impl->size()&&std::memcmp(result->impl->data(),memory->impl->data(),memory->impl->size())==0);delete result;
         }
-        delete serialization;delete engine; // Returned custom bytes outlive the engine wrapper.
+        delete serialization;
+        Recorder recorder;e->setErrorRecorder(&recorder);assert(e->getErrorRecorder()==&recorder&&recorder.references==1);
+        assert(!e->setWeightStreamingBudgetV2(1)&&recorder.reports==1);
+        auto recordedInspector=static_cast<probe::Inspector*>(e->createEngineInspector());assert(recordedInspector);
+        assert(recordedInspector->impl->getErrorRecorder()==&recorder&&recorder.references==2);
+        assert(!recordedInspector->impl->getLayerInformation(-1,0)&&recorder.reports==2);
+        delete recordedInspector;assert(recorder.references==1);
+        delete engine;assert(recorder.references==0); // Returned custom bytes outlive the engine wrapper.
         auto h=memory->impl;assert(h->type()==nvinfer1::DataType::kINT8&&h->size()>24&&std::memcmp(h->data(),"ZTRTAGX2",8)==0);
         auto runtime=ztrtCreateRuntime();assert(runtime);auto restored=ztrtDeserializeEngine(runtime,static_cast<uint8_t const*>(h->data()),h->size(),4096);assert(restored);
         assert(ztrtGetConstantBytes(restored)==24);std::vector<uint8_t> copy(h->size());

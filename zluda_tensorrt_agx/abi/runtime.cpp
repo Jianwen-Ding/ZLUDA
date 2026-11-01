@@ -1,6 +1,8 @@
 // Original runtime adapter. Only independently serialized ZTRT engines are supported.
 #include "runtime_contract.hpp"
+#include "errors.hpp"
 #include "extensions.h"
+#include "engine.hpp"
 #include <memory>
 #include <atomic>
 #include <cstring>
@@ -31,11 +33,13 @@ bool validCustomHeader(void const* data,int64_t size) noexcept{
 }
 void error(ILogger* logger,char const* message) noexcept {if(logger)logger->log(ILogger::Severity::kERROR,message);}
 class EmptyRegistry final:public IPluginRegistry {
+    ZtrtRecorderSlot errors;
+    void error(ILogger* l,char const* text) const noexcept{errors.report(l,text);}
     ILogger* logger;std::atomic<bool> search{true};
 public:
     explicit EmptyRegistry(ILogger* p):logger(p){}
-    void setErrorRecorder(IErrorRecorder* const p) noexcept override{if(p)error(logger,"ABI prototype: error recorders are unsupported");}
-    IErrorRecorder* getErrorRecorder() const noexcept override{return nullptr;}
+    void setErrorRecorder(IErrorRecorder* const p) noexcept override{errors.set(p,logger);}
+    IErrorRecorder* getErrorRecorder() const noexcept override{return errors.get();}
     bool isParentSearchEnabled() const override{return search.load();}
     void setParentSearchEnabled(bool const enabled) override{search=enabled;}
     PluginLibraryHandle loadLibrary(AsciiChar const*) noexcept override{error(logger,"ABI prototype: plugin loading is unsupported");return nullptr;}
@@ -49,6 +53,9 @@ public:
     IPluginCreatorInterface* const* getAllCreatorsRecursive(int32_t* const count) noexcept override{if(count)*count=0;return nullptr;}
 };
 class RuntimeImpl final:public apiv::VRuntime {
+    ZtrtRecorderSlot errors;
+    void error(ILogger* l,char const* text) const noexcept{errors.report(l,text);}
+
     IRuntime* owner;ILogger* logger;EmptyRegistry registry;
     std::atomic<int32_t> threads{1};std::atomic<uint32_t> flags{3};
     mutable std::mutex directoryMutex;std::string directory;
@@ -69,15 +76,15 @@ public:
             ztrtDeserializeEngine(runtime.get(),static_cast<uint8_t const*>(data),size,size_t(1)<<30),ztrtDestroyEngine);
         if(!model){error(logger,ztrtGetLastError());return nullptr;}
         auto result=static_cast<ICudaEngine*>(ztrtRtxWrapNativeEngine(model.get(),logger));
-        if(result){model.release();}
+        if(result){model.release();ztrtAbiSetEngineRecorder(result,errors.get());}
         return result;
     }
     void setDLACore(int32_t core) noexcept override{if(core!=0)error(logger,"ABI prototype: DLA is unavailable");}
     int32_t getDLACore() const noexcept override{return 0;}
     int32_t getNbDLACores() const noexcept override{return 0;}
     void setGpuAllocator(IGpuAllocator* p) noexcept override{if(p)error(logger,"ABI prototype: custom allocators are unsupported");}
-    void setErrorRecorder(IErrorRecorder* p) noexcept override{if(p)error(logger,"ABI prototype: error recorders are unsupported");}
-    IErrorRecorder* getErrorRecorder() const noexcept override{return nullptr;}
+    void setErrorRecorder(IErrorRecorder* p) noexcept override{errors.set(p,logger);}
+    IErrorRecorder* getErrorRecorder() const noexcept override{return errors.get();}
     ILogger* getLogger() const noexcept override{return logger;}
     bool setMaxThreads(int32_t n) noexcept override{if(n<=0){error(logger,"maxThreads must be positive");return false;}threads=n;return true;}
     int32_t getMaxThreads() const noexcept override{return threads.load();}
@@ -107,7 +114,7 @@ public:
             ztrtDeserializeEngineReader(runtime.get(),&reader,read,size_t(1)<<30),ztrtDestroyEngine);
         if(!model){error(logger,ztrtGetLastError());return nullptr;}
         auto result=static_cast<ICudaEngine*>(ztrtRtxWrapNativeEngine(model.get(),logger));
-        if(result){model.release();}
+        if(result){model.release();ztrtAbiSetEngineRecorder(result,errors.get());}
         return result;
     }
     int64_t getEngineHeaderSize() const noexcept override{return kHeaderSize;}

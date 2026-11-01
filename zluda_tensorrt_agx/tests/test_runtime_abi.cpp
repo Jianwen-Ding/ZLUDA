@@ -10,7 +10,11 @@
 #include <stdexcept>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <thread>
+#include <vector>
+#include <string>
 #include "runtime_probe.hpp"
+#include "recorder_probe.hpp"
 
 struct Logger final:nvinfer1::ILogger {int count=0;void log(Severity,char const*) noexcept override{++count;}};
 template<class T>T symbol(void* lib,char const* name){auto p=dlsym(lib,name);if(!p)throw std::runtime_error(name);return reinterpret_cast<T>(p);}
@@ -49,5 +53,27 @@ int main(int argc,char** argv){assert(argc==2);void* lib=dlopen(argv[1],RTLD_NOW
     header[7]='1';assert(p->getEngineValidity(header,24,&diagnostics)==0&&diagnostics==0);
     header[7]='9';assert(p->getEngineValidity(header,24,&diagnostics)==2&&diagnostics==(1ULL<<5));
     assert(munmap(mapping,page*2)==0);delete object;
+    Recorder recorder,invalid;invalid.supported=false;
+    object=static_cast<probe::Runtime*>(create(&logger,10701));p=object->impl;
+    p->setErrorRecorder(&recorder);assert(p->getErrorRecorder()==&recorder&&recorder.references==1);
+    p->setErrorRecorder(&invalid);assert(p->getErrorRecorder()==&recorder&&invalid.references==0);
+    auto logged=logger.count;assert(!p->setMaxThreads(0));assert(recorder.reports==1&&logger.count==logged);
+    recorder.fatal=true;recorder.user=p;
+    recorder.callback=[](void* value){static_cast<probe::Dispatch*>(value)->setErrorRecorder(nullptr);};
+    assert(!p->setMaxThreads(0));assert(!p->getErrorRecorder()&&recorder.references==0&&recorder.reports==2);
+    recorder.callback=nullptr;p->setErrorRecorder(&recorder);p->setErrorRecorder(&recorder);assert(recorder.references==1);
+    auto& registry=p->getPluginRegistry();registry.setErrorRecorder(&recorder);
+    assert(registry.getErrorRecorder()==&recorder&&recorder.references==2);assert(!registry.loadLibrary("not-loaded"));
+    registry.setErrorRecorder(nullptr);assert(recorder.references==1);
+    std::string payload="{\""+std::string(256,'x')+"\":0}";
+    std::string malformed="ZTRTAGX1";for(unsigned i=0;i<8;++i){malformed+=char(uint64_t(payload.size())>>(8*i));}malformed+=payload;
+    assert(!p->deserializeCudaEngine(malformed.data(),malformed.size()));
+    assert(std::strlen(recorder.getErrorDesc(0))==127&&recorder.getErrorCode(0)==nvinfer1::ErrorCode::kUNSPECIFIED_ERROR);
+    auto before=recorder.reports.load();std::vector<std::thread> workers;
+    for(int i=0;i<4;++i){workers.emplace_back([&]{for(int j=0;j<1000;++j){assert(!p->setMaxThreads(0));}});}
+    for(int i=0;i<1000;++i){p->setErrorRecorder(&recorder);}
+    for(auto& worker:workers){worker.join();}
+    assert(recorder.reports==before+4000&&recorder.references==1);
+    delete object;assert(recorder.references==0);
     assert(logger.count>1000);dlclose(lib);std::cout<<"PASS: runtime factory/configuration prefix, callbacks, rejection paths and 1000 destruction cycles\n";
 }

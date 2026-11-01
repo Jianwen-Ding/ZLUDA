@@ -1,6 +1,7 @@
 // Inspector for our own graph metadata only. No weight or serialized vendor payload is inspected.
 #include "inspector.hpp"
 #include "context.hpp"
+#include "errors.hpp"
 #include <vector>
 #include <string>
 #include <stdexcept>
@@ -16,12 +17,14 @@ std::string quote(std::string const& value){
     result+='"';return result;
 }
 class InspectorImpl final:public apiv::VEngineInspector {
+    ZtrtRecorderSlot errors;
     IEngineInspector* owner;ICudaEngine* engine;ILogger* logger;
     IExecutionContext const* context=nullptr;std::vector<std::string> names;mutable std::string result;
-    void error(char const* message) const noexcept{if(logger)logger->log(ILogger::Severity::kERROR,message);}
+    void error(char const* message) const noexcept{errors.report(logger,message);}
     bool format(LayerInformationFormat f) const noexcept{return int32_t(f)==0||int32_t(f)==1;}
 public:
-    InspectorImpl(IEngineInspector* o,ICudaEngine* e,ZtrtEngine* native,ILogger* l):owner(o),engine(e),logger(l){
+    InspectorImpl(IEngineInspector* o,ICudaEngine* e,ZtrtEngine* native,ILogger* l,IErrorRecorder* recorder):owner(o),engine(e),logger(l){
+        errors.set(recorder,l);
         auto count=ztrtGetLayerCount(native);if(count<0)throw std::runtime_error("invalid layer count");names.reserve(size_t(count));
         for(int i=0;i<count;++i){auto name=ztrtGetLayerName(native,i);if(!name)throw std::runtime_error("missing layer name");names.emplace_back(name);}
     }
@@ -46,15 +49,15 @@ public:
             if(int32_t(f)==1){result+="]}";}return result.c_str();
         }catch(...){error("inspector string allocation failed");return nullptr;}
     }
-    void setErrorRecorder(IErrorRecorder* p) noexcept override{if(p)error("inspector error recorders are unsupported");}
-    IErrorRecorder* getErrorRecorder() const noexcept override{return nullptr;}
+    void setErrorRecorder(IErrorRecorder* p) noexcept override{errors.set(p,logger);}
+    IErrorRecorder* getErrorRecorder() const noexcept override{return errors.get();}
 };
 class Inspector final:public IEngineInspector {
 public:
-    Inspector(ICudaEngine* engine,ZtrtEngine* native,ILogger* logger){mImpl=new InspectorImpl(this,engine,native,logger);}
+    Inspector(ICudaEngine* engine,ZtrtEngine* native,ILogger* logger,IErrorRecorder* recorder){mImpl=new InspectorImpl(this,engine,native,logger,recorder);}
     ~Inspector() noexcept override{delete mImpl;}
 };
 }
-nvinfer1::IEngineInspector* ztrtAbiCreateInspector(nvinfer1::ICudaEngine* engine,ZtrtEngine* native,nvinfer1::ILogger* logger) noexcept{
-    try{return new Inspector(engine,native,logger);}catch(...){if(logger)logger->log(nvinfer1::ILogger::Severity::kERROR,"inspector allocation failed");return nullptr;}
+nvinfer1::IEngineInspector* ztrtAbiCreateInspector(nvinfer1::ICudaEngine* engine,ZtrtEngine* native,nvinfer1::ILogger* logger,nvinfer1::IErrorRecorder* recorder) noexcept{
+    try{return new Inspector(engine,native,logger,recorder);}catch(...){if(logger)logger->log(nvinfer1::ILogger::Severity::kERROR,"inspector allocation failed");return nullptr;}
 }

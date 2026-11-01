@@ -6,6 +6,7 @@
 #ifndef ZLUDA_AGX_NVINFER_RUNTIME_BASE_H
 #define ZLUDA_AGX_NVINFER_RUNTIME_BASE_H
 #include <cstdint>
+#include <cstddef>
 namespace nvinfer1 {
 using char_t=char;
 using AsciiChar=char_t;
@@ -26,7 +27,27 @@ protected:
     IVersionedInterface& operator=(IVersionedInterface const&) & = default;
     IVersionedInterface& operator=(IVersionedInterface&&) & = default;
 };
+enum class ErrorCode:int32_t { kSUCCESS=0,kUNSPECIFIED_ERROR=1,kINTERNAL_ERROR=2,kINVALID_ARGUMENT=3,kINVALID_CONFIG=4,kFAILED_ALLOCATION=5,kFAILED_INITIALIZATION=6,kFAILED_EXECUTION=7,kFAILED_COMPUTATION=8,kINVALID_STATE=9,kUNSUPPORTED_STATE=10 };
 namespace v_1_0 {
+class IErrorRecorder:public IVersionedInterface {
+public:
+    InterfaceInfo getInterfaceInfo() const noexcept override{return {"IErrorRecorder",1,0};}
+    using ErrorDesc=char const*;using RefCount=int32_t;
+    static constexpr size_t kMAX_DESC_LENGTH=127;
+    IErrorRecorder()=default;~IErrorRecorder() noexcept override=default;
+    virtual int32_t getNbErrors() const noexcept=0;
+    virtual ErrorCode getErrorCode(int32_t) const noexcept=0;
+    virtual ErrorDesc getErrorDesc(int32_t) const noexcept=0;
+    virtual bool hasOverflowed() const noexcept=0;
+    virtual void clear() noexcept=0;
+    virtual bool reportError(ErrorCode,ErrorDesc) noexcept=0;
+    virtual RefCount incRefCount() noexcept=0;
+    virtual RefCount decRefCount() noexcept=0;
+protected:
+    IErrorRecorder(IErrorRecorder const&)=default;IErrorRecorder(IErrorRecorder&&)=default;
+    IErrorRecorder& operator=(IErrorRecorder const&) & =default;
+    IErrorRecorder& operator=(IErrorRecorder&&) & =default;
+};
 class ILogger : public IVersionedInterface {
 public:
     InterfaceInfo getInterfaceInfo() const noexcept override {return {"ILogger",1,0};}
@@ -37,6 +58,7 @@ public:
 };
 }
 using ILogger=v_1_0::ILogger;
+using IErrorRecorder=v_1_0::IErrorRecorder;
 struct Dims64 { static constexpr int32_t MAX_DIMS=8; int32_t nbDims=0; int64_t d[MAX_DIMS]{}; };
 using Dims=Dims64;
 }

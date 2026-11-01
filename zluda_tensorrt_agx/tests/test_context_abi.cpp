@@ -2,6 +2,7 @@
 #include "abi_probe.hpp"
 #include "runtime_probe.hpp"
 #include "stream_probe.hpp"
+#include "recorder_probe.hpp"
 #include <vector>
 #include "zluda_tensorrt.h"
 #include <cassert>
@@ -23,11 +24,12 @@ int main(int argc,char** argv){assert(argc==2);auto path=std::getenv("ZLUDA_AGX_
     size_t bytes=ztrtSerializeEngine(native,nullptr,0);assert(bytes);std::vector<uint8_t> serialized(bytes);
     assert(ztrtSerializeEngine(native,serialized.data(),bytes)==bytes);ztrtDestroyEngine(native);
     auto runtime=static_cast<probe::Runtime*>(createRuntime(&logger,10701));assert(runtime);
+    Recorder recorder;runtime->impl->setErrorRecorder(&recorder);assert(recorder.references==1);
     assert(!runtime->impl->deserializeCudaEngine(serialized.data(),bytes-1));
     probe::BytesReader reader(serialized.data(),bytes,7);
     auto engine=static_cast<probe::Engine*>(runtime->impl->deserializeCudaEngineV2(&reader));assert(engine&&reader.position==bytes);
     delete runtime; // Our engine owns its plan independently; caller bytes are no longer needed.
-    std::fill(serialized.begin(),serialized.end(),0);auto object=static_cast<probe::Context*>(engine->impl->createExecutionContext(0));assert(object);auto c=object->impl;assert(c&&c->getPImpl()==object&& &c->getEngine()==engine);
+    std::fill(serialized.begin(),serialized.end(),0);auto object=static_cast<probe::Context*>(engine->impl->createExecutionContext(0));assert(object);auto c=object->impl;assert(recorder.references==2&&c->getErrorRecorder()==&recorder);assert(c&&c->getPImpl()==object&& &c->getEngine()==engine);
     assert(c->getOptimizationProfile()==0&&c->allInputDimensionsSpecified()&&c->inferShapes(0,nullptr)==0);
     auto shape=c->getTensorShape("input");assert(shape.nbDims==2&&shape.d[0]==2&&shape.d[1]==3);assert(c->setInputShape("input",shape));shape.d[0]=3;assert(!c->setInputShape("input",shape));
     auto strides=c->getTensorStrides("input");assert(strides.nbDims==2&&strides.d[0]==3&&strides.d[1]==1);assert(c->getTensorShape("missing").nbDims==-1);
@@ -93,7 +95,7 @@ int main(int argc,char** argv){assert(argc==2);auto path=std::getenv("ZLUDA_AGX_
     assert(c->executeV2(bindings));check(download(output,dy,sizeof(output)));
     for(int i=0;i<6;++i){assert(std::abs(output[i]-(input[i]+float(i+1)))<1e-5f);}
     void* other=nullptr;check(symbol<int(*)(void**,unsigned,int)>(driver,"cuCtxCreate_v2")(&other,0,0));assert(!c->enqueueV3(nullptr));
-    delete object;delete engine;void* current=nullptr;check(symbol<int(*)(void**)>(driver,"cuCtxGetCurrent")(&current));assert(current==other);
+    delete object;delete engine;assert(recorder.references==0);void* current=nullptr;check(symbol<int(*)(void**)>(driver,"cuCtxGetCurrent")(&current));assert(current==other);
     check(symbol<int(*)(void*)>(driver,"cuCtxSetCurrent")(primary));check(symbol<int(*)(void*)>(driver,"cuCtxDestroy_v2")(other));auto free=symbol<int(*)(void*)>(driver,"cuMemFree_v2");check(free(scratch));check(free(dx));check(free(dy));
-    assert(logger.errors>=5);dlclose(library);dlclose(driver);std::cout<<"PASS: public-style context dispatch GPU execution, bindings, shapes, streams and context restoration\n";
+    assert(recorder.reports>=5);dlclose(library);dlclose(driver);std::cout<<"PASS: public-style context dispatch GPU execution, bindings, shapes, streams and context restoration\n";
 }

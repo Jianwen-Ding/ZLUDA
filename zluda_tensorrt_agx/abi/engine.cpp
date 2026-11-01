@@ -1,5 +1,6 @@
 // Original native-engine to public dispatch adapter. No NVIDIA engine decoder or runtime code.
 #include "runtime_contract.hpp"
+#include "errors.hpp"
 #include "extensions.h"
 #include "context.hpp"
 #include "config.hpp"
@@ -24,6 +25,9 @@ class HostMemory final:public IHostMemory {
 public:explicit HostMemory(ZtrtEngine* e){mImpl=new MemoryImpl(e);}~HostMemory() noexcept override{delete mImpl;}
 };
 class EngineImpl final:public apiv::VCudaEngine {
+    ZtrtRecorderSlot errors;
+    void error(ILogger* l,char const* text) const noexcept{errors.report(l,text);}
+
     ICudaEngine* owner;ZtrtEngine* native;ILogger* logger;bool owns=false;std::atomic<bool> prepared{false};
     bool valid(char const* name) const noexcept{return name&&ztrtGetTensorIOMode(native,name)>=0;}
     Dims invalid() const noexcept{Dims d;d.nbDims=-1;return d;}
@@ -34,16 +38,16 @@ public:
     ICudaEngine* getPImpl() noexcept override{return owner;}
     int32_t getNbLayers() const noexcept override{return ztrtGetLayerCount(native);}
     IHostMemory* serialize() const noexcept override{try{return new HostMemory(native);}catch(...){error(logger,"native engine serialization failed");return nullptr;}}
-    IExecutionContext* createExecutionContext(ExecutionContextAllocationStrategy strategy) noexcept override{if(int32_t(strategy)!=0&&int32_t(strategy)!=2){error(logger,"only static and user-managed context allocation are supported");return nullptr;}auto context=ztrtAbiCreateContext(owner,native,logger,int32_t(strategy)==2);if(context)prepared=true;return context;}
+    IExecutionContext* createExecutionContext(ExecutionContextAllocationStrategy strategy) noexcept override{if(int32_t(strategy)!=0&&int32_t(strategy)!=2){error(logger,"only static and user-managed context allocation are supported");return nullptr;}auto context=ztrtAbiCreateContext(owner,native,logger,int32_t(strategy)==2,nullptr,errors.get());if(context)prepared=true;return context;}
     bool isRefittable() const noexcept override{return false;}
     char const* getName() const noexcept override{return "ZLUDA AGX native engine";}
     int32_t getNbOptimizationProfiles() const noexcept override{return 1;}
     EngineCapability getEngineCapability() const noexcept override{return static_cast<EngineCapability>(0);}
-    void setErrorRecorder(IErrorRecorder* p) noexcept override{if(p)error(logger,"ABI prototype: error recorders are unsupported");}
-    IErrorRecorder* getErrorRecorder() const noexcept override{return nullptr;}
+    void setErrorRecorder(IErrorRecorder* p) noexcept override{errors.set(p,logger);}
+    IErrorRecorder* getErrorRecorder() const noexcept override{return errors.get();}
     uint32_t getTacticSources() const noexcept override{return 0;}
     ProfilingVerbosity getProfilingVerbosity() const noexcept override{return static_cast<ProfilingVerbosity>(0);}
-    IEngineInspector* createEngineInspector() const noexcept override{return ztrtAbiCreateInspector(owner,native,logger);}
+    IEngineInspector* createEngineInspector() const noexcept override{return ztrtAbiCreateInspector(owner,native,logger,errors.get());}
     Dims getTensorShape(char const* name) const noexcept override{if(!valid(name))return invalid();Dims d;d.nbDims=ztrtGetTensorShape(native,name,d.d,8);return d;}
     DataType getTensorDataType(char const*) const noexcept override{return DataType::kFLOAT;}
     TensorLocation getTensorLocation(char const*) const noexcept override{return static_cast<TensorLocation>(0);}
@@ -84,7 +88,7 @@ public:
     IExecutionContext* createExecutionContextWithRuntimeConfig(IRuntimeConfig* config) noexcept override{
         std::unique_ptr<IRuntimeConfig> copy(ztrtAbiCloneConfig(config,owner,logger));if(!copy)return nullptr;
         bool managed=int32_t(copy->mImpl->getExecutionContextAllocationStrategy())==2;
-        auto context=ztrtAbiCreateContext(owner,native,logger,managed,copy.get());if(context)prepared=true;return context;
+        auto context=ztrtAbiCreateContext(owner,native,logger,managed,copy.get(),errors.get());if(context)prepared=true;return context;
     }
     IRuntimeConfig* createRuntimeConfig() noexcept override{return ztrtAbiCreateConfig(owner,logger);}
     int64_t getEngineStat(EngineStat) const noexcept override{error(logger,"ABI prototype: engine statistics are unsupported");return -1;}
@@ -99,6 +103,7 @@ class Engine final:public ICudaEngine {
 public:
     Engine(ZtrtEngine* e,ILogger* l){mImpl=new EngineImpl(this,e,l);}
     void claim() noexcept{static_cast<EngineImpl*>(mImpl)->claim();}
+    void setRecorder(IErrorRecorder* p) noexcept{mImpl->setErrorRecorder(p);}
     ~Engine() noexcept override{delete mImpl;}
 };
 }
@@ -109,4 +114,8 @@ extern "C" __attribute__((visibility("default"))) void* ztrtRtxWrapNativeEngine(
     if(logger->getAPILanguage()!=nvinfer1::APILanguage::kCPP||!info.kind||std::strcmp(info.kind,"ILogger")||info.major!=1||info.minor!=0)return nullptr;
     try{auto e=new Engine(static_cast<ZtrtEngine*>(native),static_cast<nvinfer1::ILogger*>(opaqueLogger));e->claim();return e;}
     catch(...){error(static_cast<nvinfer1::ILogger*>(opaqueLogger),"engine adapter allocation failed");return nullptr;}
+}
+
+void ztrtAbiSetEngineRecorder(nvinfer1::ICudaEngine* engine,nvinfer1::IErrorRecorder* recorder) noexcept{
+    auto own=dynamic_cast<Engine*>(engine);if(own)own->setRecorder(recorder);
 }

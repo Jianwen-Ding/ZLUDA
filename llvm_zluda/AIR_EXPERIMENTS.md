@@ -78,6 +78,11 @@ wall time, peak RSS, object md5).
   three times): mul_mat_vec_q<Q5_K> 121.7-122.6 -> 117.1-117.5 us (-4%), mul_mat_vec_q<Q5_1> 26.0 -> 26.2 us. But
   Blender Cycles (75 kernels sharing many functions, each kernel's O3 repeating them) gains nothing: 43.4-49.7 ->
   49.5-57.3 s, peak up to 6.9 GB. Left opt-in: it suits modules of independent kernels (llama.cpp's), not Cycles'.
+- Dead end: compiling a lazily loaded library in the background when the runtime registers it (cuLibraryLoadData),
+  to overlap llama.cpp's 17 module compilations on an empty cache (41.6 s): the same 41.6 s. The CUDA runtime that
+  llama-app links asks for each library's module (cuLibraryGetModule) right after registering it, before it registers
+  the next, so the compilations stay one after the other. Overlapping them would need module and kernel handles
+  before compiling (compilation at the first launch), a change of the driver's module model. Reverted.
 - Dead end: reading each kernel's module lazily from the portable AIR (getLazyBitcodeModule, materializing only the
   functions the kernel reaches, instead of parsing all 13 MB of Cycles per kernel): the same object, peak 6.1-6.3 GB
   against 6.3-6.7, the AGX stage 30.6-32.6 s against 26.6-32.1 (two runs each): within noise. Cycles' peak is the

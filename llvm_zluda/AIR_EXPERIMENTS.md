@@ -81,6 +81,8 @@ wall time, peak RSS, object md5).
   aligned array's address plus an offset, and phis of pointers of one offset (GVN's PRE): Geekbench's blend kernel
   loses its 64-byte stack; of the corpus' 589 kernels 3 keep one (trace_bvh / trace_bvh_shadow: BVH traversal stacks;
   calculate_descriptors: a 256-byte array). (The commit message of 59957a9 says 1,774 kernels: wrong, 589.)
+  Geekbench with it: blend 725.5 -> 702.4 us per launch (-3%), summed GPU time 26.94 -> 26.87 s, the same 10 expected
+  errors.
   Geekbench (2 of its modules change): every workload completes, the same 10 expected errors, summed GPU time 27.13
   -> 26.94 s; its changed modules' kernels within their run-to-run spread (keypoint kernels are data-dependent).
 - Geekbench 7 GPU with all of the above: every workload completes (the block-size search's out-of-resources answers

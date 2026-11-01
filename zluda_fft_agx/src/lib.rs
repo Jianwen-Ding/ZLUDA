@@ -94,6 +94,9 @@ pub enum Buf {
     W0,
     W1,
     A,
+    /// Bluestein's work buffer: the length-m sequences of its convolution.
+    B,
+    /// Table `k` of `tables`.
     Tw(usize),
 }
 
@@ -102,10 +105,17 @@ pub enum Buf {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Step {
     /// A Stockham pass of radix `r` with span `ns` (agx_fft_radix2 / agx_fft_radix4, other radices agx_fft_radixr).
-    Radix { r: usize, src: Buf, dst: Buf, tw: usize, n: usize, ns: usize, count: usize, stride: usize, dist: usize, offset: usize },
+    /// `inverse`: the direction, when not the transform's (the convolutions of Bluestein's algorithm).
+    Radix { r: usize, src: Buf, dst: Buf, tw: usize, n: usize, ns: usize, count: usize, stride: usize, dist: usize, offset: usize, inverse: Option<bool> },
     /// A whole power-of-two transform in threadgroup memory (agx_fft_shared), `per` sequences per workgroup; src may
     /// be dst.
-    Shared { src: Buf, dst: Buf, tw: usize, n: usize, per: usize, count: usize, stride: usize, dist: usize, offset: usize },
+    Shared { src: Buf, dst: Buf, tw: usize, n: usize, per: usize, count: usize, stride: usize, dist: usize, offset: usize, inverse: Option<bool> },
+    /// Bluestein's algorithm (agx_fft_chirp_in, agx_fft_pointwise, agx_fft_chirp_out): src times the chirp (table
+    /// `chirp`) into B, padded with zeros to m; B times the kernel's transform (table `kern`); B times the chirp, over
+    /// m, into dst.
+    ChirpIn { src: Buf, dst: Buf, chirp: usize, n: usize, m: usize, count: usize, stride: usize, dist: usize, offset: usize },
+    Pointwise { buf: Buf, kern: usize, m: usize, count: usize },
+    ChirpOut { src: Buf, dst: Buf, chirp: usize, n: usize, m: usize, count: usize, stride: usize, dist: usize, offset: usize },
     Copy { src: Buf, dst: Buf, m: usize, count: usize, istride: usize, idist: usize, ostride: usize, odist: usize, ioffset: usize, ooffset: usize },
     RealToComplex { src: Buf, dst: Buf, n: usize, count: usize, idist: usize },
     Hermitian { src: Buf, dst: Buf, n: usize, count: usize, idist: usize },
@@ -159,6 +169,28 @@ impl Shape {
         }
     }
 
+    /// The size of Bluestein's work buffer (B), in complex elements: m times the most sequences one dimension's
+    /// transform runs at once (as `steps` splits them); 0 without a length that uses it.
+    pub fn blue_elements(&self) -> usize {
+        let r = self.dims.len();
+        (0..r)
+            .filter(|&k| bluestein(self.dims[k]))
+            .map(|k| {
+                let inner: usize = self.dims[k + 1..].iter().product();
+                let outer: usize = self.dims[..k].iter().product();
+                let count = if inner == 1 { outer * self.batch } else { inner };
+                blue_m(self.dims[k]) * count
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The bytes of the plan's work buffers: W0, W1 (which the convolutions' passes use too), A and B.
+    pub fn work_bytes(&self) -> [usize; 4] {
+        let (w, b) = (self.work_elements(), self.blue_elements());
+        [w.max(b), w.max(b), w, b].map(|e| e * self.complex_bytes())
+    }
+
     pub fn check(&self) -> Result<(), cufftError_t> {
         if self.dims.is_empty() || self.dims.len() > 3 || self.dims.iter().any(|&n| n == 0) || self.batch == 0 {
             return Err(cufftError_t::INVALID_SIZE);
@@ -179,9 +211,10 @@ impl Shape {
 
 /// A 1-D complex transform of `count` sequences of length n (element `i` of sequence `c` at offset + c dist + i
 /// stride) from src to dst, which may be the same buffer. `tw` names the twiddles of length n; power-of-two lengths
-/// from 4 to `shared_max` run in threadgroup memory.
+/// from 4 to `shared_max` run in threadgroup memory. Lengths with a large prime factor (`bluestein`) use the three
+/// tables from `blue` on (`tables`); `inverse` overrides the transform's direction.
 #[allow(clippy::too_many_arguments)]
-fn c2c_1d(out: &mut Vec<Step>, shared_max: usize, src: Buf, dst: Buf, tw: usize, n: usize, count: usize, stride: usize, dist: usize, offset: usize) {
+fn c2c_1d(out: &mut Vec<Step>, shared_max: usize, src: Buf, dst: Buf, tw: usize, blue: usize, n: usize, count: usize, stride: usize, dist: usize, offset: usize, inverse: Option<bool>) {
     let copy = |src, dst| Step::Copy {
         src,
         dst,
@@ -200,10 +233,19 @@ fn c2c_1d(out: &mut Vec<Step>, shared_max: usize, src: Buf, dst: Buf, tw: usize,
         }
         return;
     }
+    if bluestein(n) {
+        let m = blue_m(n);
+        out.push(Step::ChirpIn { src, dst: Buf::B, chirp: blue + 1, n, m, count, stride, dist, offset });
+        c2c_1d(out, shared_max, Buf::B, Buf::B, blue, 0, m, count, 1, m, 0, Some(false));
+        out.push(Step::Pointwise { buf: Buf::B, kern: blue + 2, m, count });
+        c2c_1d(out, shared_max, Buf::B, Buf::B, blue, 0, m, count, 1, m, 0, Some(true));
+        out.push(Step::ChirpOut { src: Buf::B, dst, chirp: blue + 1, n, m, count, stride, dist, offset });
+        return;
+    }
     if n.is_power_of_two() && (4..=shared_max).contains(&n) {
         // 256 threads per workgroup (measured best from 64 to 1024 for n = 16 to 1024)
         let per = (256 / (n / 4)).clamp(1, shared_max / n).min(count);
-        out.push(Step::Shared { src, dst, tw, n, per, count, stride, dist, offset });
+        out.push(Step::Shared { src, dst, tw, n, per, count, stride, dist, offset, inverse });
         return;
     }
     let radices = radices(n);
@@ -213,13 +255,110 @@ fn c2c_1d(out: &mut Vec<Step>, shared_max: usize, src: Buf, dst: Buf, tw: usize,
         let last = p + 1 == radices.len();
         // a pass cannot run in place, so a single in-place pass goes through W0
         let to = if last && from != dst { dst } else if p % 2 == 0 { Buf::W0 } else { Buf::W1 };
-        out.push(Step::Radix { r, src: from, dst: to, tw, n, ns, count, stride, dist, offset });
+        out.push(Step::Radix { r, src: from, dst: to, tw, n, ns, count, stride, dist, offset, inverse });
         from = to;
         ns *= r;
     }
     if from != dst {
         out.push(copy(from, dst));
     }
+}
+
+/// Bluestein's algorithm for lengths whose largest prime factor exceeds BLUESTEIN_MIN: a radix-p pass costs p
+/// complex multiply-adds per element, the convolution about two power-of-two transforms of 2 n to 4 n points. On the
+/// M2 Max (tools/fftbench.c) the radix-p pass is faster for p = 37 and 67, Bluestein's from 131 (8191 x 8: 15969 ->
+/// 268 us, 1009 x 64: 965 -> 210 us).
+/// ZLUDA_AGX_FFT_BLUESTEIN_MIN overrides it.
+fn bluestein(n: usize) -> bool {
+    let min = std::env::var("ZLUDA_AGX_FFT_BLUESTEIN_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(BLUESTEIN_MIN);
+    radices(n).last().is_some_and(|&p| p > min)
+}
+const BLUESTEIN_MIN: usize = 100;
+
+/// The length of Bluestein's convolution: a power of two of at least 2 n - 1.
+fn blue_m(n: usize) -> usize {
+    (2 * n - 1).next_power_of_two()
+}
+
+/// A plan's tables, uploaded with it: the twiddles of each dimension (table k for dimension k), then for each
+/// dimension with Bluestein's algorithm the twiddles of its m, its chirp and its kernel's transform.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Table {
+    Twiddles(usize),
+    Chirp(usize),
+    Kernel(usize),
+}
+
+pub fn tables(s: &Shape) -> Vec<Table> {
+    let blue = s.dims.iter().filter(|&&n| bluestein(n)).flat_map(|&n| [Table::Twiddles(blue_m(n)), Table::Chirp(n), Table::Kernel(n)]);
+    s.dims.iter().map(|&n| Table::Twiddles(n)).chain(blue).collect()
+}
+
+/// The first of dimension k's Bluestein tables in `tables`.
+fn blue_table(s: &Shape, k: usize) -> usize {
+    s.dims.len() + 3 * s.dims[..k].iter().filter(|&&n| bluestein(n)).count()
+}
+
+/// A table's values, interleaved complex numbers in double precision.
+pub fn table_values(t: Table) -> Vec<f64> {
+    // exp(-pi i j^2 / n), with j^2 reduced modulo 2 n first (exactly)
+    let chirp = |n: usize| -> Vec<(f64, f64)> {
+        (0..n)
+            .map(|j| {
+                let a = -std::f64::consts::PI * ((j as u128 * j as u128) % (2 * n as u128)) as f64 / n as f64;
+                (a.cos(), a.sin())
+            })
+            .collect()
+    };
+    let flat = |v: Vec<(f64, f64)>| v.into_iter().flat_map(|(r, i)| [r, i]).collect();
+    match t {
+        Table::Twiddles(n) => twiddles_f64(n),
+        Table::Chirp(n) => flat(chirp(n)),
+        Table::Kernel(n) => {
+            let m = blue_m(n);
+            let c = chirp(n);
+            let mut b = vec![(0.0, 0.0); m];
+            for j in 0..n {
+                b[j] = (c[j].0, -c[j].1);
+                if j > 0 {
+                    b[m - j] = b[j];
+                }
+            }
+            flat(fft_f64(b))
+        }
+    }
+}
+
+/// The forward transform of a power-of-two length on the host (iterative radix 2).
+fn fft_f64(mut x: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
+    let n = x.len();
+    let mut j = 0;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j |= bit;
+        if i < j {
+            x.swap(i, j);
+        }
+    }
+    let mut len = 2;
+    while len <= n {
+        for start in (0..n).step_by(len) {
+            for k in 0..len / 2 {
+                let a = -2.0 * std::f64::consts::PI * k as f64 / len as f64;
+                let w = (a.cos(), a.sin());
+                let (u, v) = (x[start + k], x[start + k + len / 2]);
+                let t = (v.0 * w.0 - v.1 * w.1, v.0 * w.1 + v.1 * w.0);
+                x[start + k] = (u.0 + t.0, u.1 + t.1);
+                x[start + k + len / 2] = (u.0 - t.0, u.1 - t.1);
+            }
+        }
+        len *= 2;
+    }
+    x
 }
 
 /// The radices of the passes of a transform of length n: for the power of two, radix-4 passes (two radix-2 stages
@@ -255,7 +394,7 @@ pub fn steps(s: &Shape, in_place: bool) -> Vec<Step> {
         Kind::C2C => {
             let r = s.dims.len();
             if r == 1 {
-                c2c_1d(&mut out, sm, input, Buf::Out, 0, s.dims[0], s.batch, s.istride, s.idist, 0);
+                c2c_1d(&mut out, sm, input, Buf::Out, 0, blue_table(s, 0), s.dims[0], s.batch, s.istride, s.idist, 0, None);
                 return out;
             }
             let total = s.total();
@@ -265,11 +404,11 @@ pub fn steps(s: &Shape, in_place: bool) -> Vec<Step> {
                 let inner: usize = s.dims[k + 1..].iter().product();
                 let outer: usize = s.dims[..k].iter().product();
                 if inner == 1 {
-                    c2c_1d(&mut out, sm, src, Buf::Out, k, n, outer * s.batch, 1, n, 0);
+                    c2c_1d(&mut out, sm, src, Buf::Out, k, blue_table(s, k), n, outer * s.batch, 1, n, 0, None);
                 } else {
                     for b in 0..s.batch {
                         for o in 0..outer {
-                            c2c_1d(&mut out, sm, src, Buf::Out, k, n, inner, inner, 1, b * total + o * n * inner);
+                            c2c_1d(&mut out, sm, src, Buf::Out, k, blue_table(s, k), n, inner, inner, 1, b * total + o * n * inner, None);
                         }
                     }
                 }
@@ -278,7 +417,7 @@ pub fn steps(s: &Shape, in_place: bool) -> Vec<Step> {
         Kind::R2C => {
             let n = s.dims[0];
             out.push(Step::RealToComplex { src: Buf::In, dst: Buf::A, n, count: s.batch, idist: s.idist });
-            c2c_1d(&mut out, sm, Buf::A, Buf::A, 0, n, s.batch, 1, n, 0);
+            c2c_1d(&mut out, sm, Buf::A, Buf::A, 0, blue_table(s, 0), n, s.batch, 1, n, 0, None);
             out.push(Step::Copy {
                 src: Buf::A,
                 dst: Buf::Out,
@@ -295,7 +434,7 @@ pub fn steps(s: &Shape, in_place: bool) -> Vec<Step> {
         Kind::C2R => {
             let n = s.dims[0];
             out.push(Step::Hermitian { src: Buf::In, dst: Buf::A, n, count: s.batch, idist: s.idist });
-            c2c_1d(&mut out, sm, Buf::A, Buf::A, 0, n, s.batch, 1, n, 0);
+            c2c_1d(&mut out, sm, Buf::A, Buf::A, 0, blue_table(s, 0), n, s.batch, 1, n, 0, None);
             out.push(Step::RealPart { src: Buf::A, dst: Buf::Out, n, count: s.batch, odist: s.odist });
         }
     }
@@ -331,18 +470,18 @@ mod imp {
     struct Plan {
         shape: Option<Shape>,
         stream: cudaStream_t,
-        /// Device buffers: W0, W1, A (complex work buffers) and one twiddle table per dimension.
-        work: [*mut c_void; 3],
+        /// Device buffers: W0, W1, A, B (complex work buffers; B only with Bluestein's algorithm) and the tables.
+        work: [*mut c_void; 4],
         tw: Vec<*mut c_void>,
     }
     unsafe impl Send for Plan {}
 
     impl Plan {
         unsafe fn release(&mut self) {
-            for p in self.work.iter().chain(&self.tw) {
+            for p in self.work.iter().chain(&self.tw).filter(|p| !p.is_null()) {
                 let _ = engine::free(*p);
             }
-            self.work = [std::ptr::null_mut(); 3];
+            self.work = [std::ptr::null_mut(); 4];
             self.tw.clear();
             self.shape = None;
         }
@@ -399,7 +538,7 @@ mod imp {
         *next += 1;
         plans.insert(
             id,
-            Plan { shape: None, stream: cuda_types::cuda::CUstream(std::ptr::null_mut()), work: [std::ptr::null_mut(); 3], tw: Vec::new() },
+            Plan { shape: None, stream: cuda_types::cuda::CUstream(std::ptr::null_mut()), work: [std::ptr::null_mut(); 4], tw: Vec::new() },
         );
         *h.as_mut().ok_or(cufftError_t::INVALID_VALUE)? = cufftHandle(id);
         Ok(())
@@ -415,19 +554,21 @@ mod imp {
 
     unsafe fn make(h: cufftHandle, s: Shape, work: *mut usize) -> cufftResult {
         s.check()?;
-        let bytes = s.complex_bytes() * s.work_elements();
+        let bytes = s.work_bytes();
         with(h, |p| {
             p.release();
-            for w in &mut p.work {
-                *w = engine::alloc(bytes).map_err(|_| cufftError_t::ALLOC_FAILED)?;
+            for (w, &b) in p.work.iter_mut().zip(&bytes) {
+                if b > 0 {
+                    *w = engine::alloc(b).map_err(|_| cufftError_t::ALLOC_FAILED)?;
+                }
             }
-            for &n in &s.dims {
-                let (t32, t64);
+            for t in tables(&s) {
+                let t64 = table_values(t);
+                let t32: Vec<f32>;
                 let (ptr, len) = if s.double {
-                    t64 = twiddles_f64(n);
                     (t64.as_ptr() as *const c_void, 8 * t64.len())
                 } else {
-                    t32 = twiddles(n);
+                    t32 = t64.iter().map(|&v| v as f32).collect();
                     (t32.as_ptr() as *const c_void, 4 * t32.len())
                 };
                 let d = engine::alloc(len).map_err(|_| cufftError_t::ALLOC_FAILED)?;
@@ -437,7 +578,7 @@ mod imp {
             p.shape = Some(s);
             Ok(())
         })?;
-        out(work, 3 * bytes)
+        out(work, bytes.iter().sum())
     }
 
     fn shape_many(rank: c_int, n: *mut c_int, inembed: *mut c_int, istride: c_int, idist: c_int, onembed: *mut c_int, ostride: c_int, odist: c_int, t: cufftType, batch: c_int) -> Result<Shape, cufftError_t> {
@@ -533,10 +674,10 @@ mod imp {
         plan(h, |h| cufftMakePlanMany(h, rank, n, inembed, istride, idist, onembed, ostride, odist, t, batch, std::ptr::null_mut()))
     }
 
-    // Workspace sizes: three complex buffers of the output's extent.
+    // Workspace sizes: the work buffers.
     fn work_of(s: Shape, work: *mut usize) -> cufftResult {
         s.check()?;
-        unsafe { out(work, 3 * s.complex_bytes() * s.work_elements()) }
+        unsafe { out(work, s.work_bytes().iter().sum()) }
     }
 
     pub(crate) unsafe fn cufftEstimate1d(nx: c_int, t: cufftType, batch: c_int, work: *mut usize) -> cufftResult {
@@ -648,6 +789,7 @@ mod imp {
                 Buf::W0 => work[0],
                 Buf::W1 => work[1],
                 Buf::A => work[2],
+                Buf::B => work[3],
                 Buf::Tw(k) => tw[k],
             }
         };
@@ -669,38 +811,62 @@ mod imp {
             let rb = cb / 2;
             #[allow(clippy::type_complexity)]
             let (f, ptrs, ints, grid, block, split): (_, Vec<*mut c_void>, Vec<i32>, [u32; 2], [u32; 2], Option<(usize, usize, usize)>) = match step {
-                Step::Radix { r: r @ (2 | 4), src, dst, tw, n, ns, count, stride, dist, offset } => {
+                Step::Radix { r: r @ (2 | 4), src, dst, tw, n, ns, count, stride, dist, offset, inverse } => {
                     let bx = (n / r).clamp(1, 64) as u32;
                     let (f32_name, f64_name) =
                         if r == 4 { (c"agx_fft_radix4", c"agx_fft_radix4_f64") } else { (c"agx_fft_radix2", c"agx_fft_radix2_f64") };
                     (
                         func(f32_name, f64_name)?,
                         vec![ptr(src).byte_add(cb * offset), ptr(dst).byte_add(cb * offset), ptr(Buf::Tw(tw))],
-                        vec![n as i32, ns as i32, count as i32, stride as i32, dist as i32, inv],
+                        vec![n as i32, ns as i32, count as i32, stride as i32, dist as i32, inverse.map_or(inv, i32::from)],
                         [groups(n / r, bx), count as u32],
                         [bx, 1],
                         Some((2, cb * dist, cb * dist)),
                     )
                 }
-                Step::Shared { src, dst, tw, n, per, count, stride, dist, offset } => (
+                Step::Shared { src, dst, tw, n, per, count, stride, dist, offset, inverse } => (
                     func(c"agx_fft_shared", c"agx_fft_shared_f64")?,
                     vec![ptr(src).byte_add(cb * offset), ptr(dst).byte_add(cb * offset), ptr(Buf::Tw(tw))],
-                    vec![n as i32, count as i32, stride as i32, dist as i32, inv],
+                    vec![n as i32, count as i32, stride as i32, dist as i32, inverse.map_or(inv, i32::from)],
                     [groups(count, per as u32), 1],
                     [(n / 4) as u32, per as u32],
                     None,
                 ),
-                Step::Radix { r, src, dst, tw, n, ns, count, stride, dist, offset } => {
+                Step::Radix { r, src, dst, tw, n, ns, count, stride, dist, offset, inverse } => {
                     let bx = n.clamp(1, 64) as u32;
                     (
                         func(c"agx_fft_radixr", c"agx_fft_radixr_f64")?,
                         vec![ptr(src).byte_add(cb * offset), ptr(dst).byte_add(cb * offset), ptr(Buf::Tw(tw))],
-                        vec![n as i32, ns as i32, r as i32, (n / r) as i32, (n / (r * ns)) as i32, count as i32, stride as i32, dist as i32, inv],
+                        vec![n as i32, ns as i32, r as i32, (n / r) as i32, (n / (r * ns)) as i32, count as i32, stride as i32, dist as i32, inverse.map_or(inv, i32::from)],
                         [groups(n, bx), count as u32],
                         [bx, 1],
                         Some((5, cb * dist, cb * dist)),
                     )
                 }
+                Step::ChirpIn { src, dst, chirp, n, m, count, stride, dist, offset } => (
+                    func(c"agx_fft_chirp_in", c"agx_fft_chirp_in_f64")?,
+                    vec![ptr(src).byte_add(cb * offset), ptr(dst), ptr(Buf::Tw(chirp))],
+                    vec![n as i32, m as i32, count as i32, stride as i32, dist as i32, inv],
+                    [groups(m, 64), count as u32],
+                    [64, 1],
+                    Some((2, cb * dist, cb * m)),
+                ),
+                Step::Pointwise { buf, kern, m, count } => (
+                    func(c"agx_fft_pointwise", c"agx_fft_pointwise_f64")?,
+                    vec![ptr(buf), ptr(Buf::Tw(kern))],
+                    vec![m as i32, count as i32, inv],
+                    [groups(m, 64), count as u32],
+                    [64, 1],
+                    Some((1, cb * m, 0)),
+                ),
+                Step::ChirpOut { src, dst, chirp, n, m, count, stride, dist, offset } => (
+                    func(c"agx_fft_chirp_out", c"agx_fft_chirp_out_f64")?,
+                    vec![ptr(src), ptr(dst).byte_add(cb * offset), ptr(Buf::Tw(chirp))],
+                    vec![n as i32, m as i32, count as i32, stride as i32, dist as i32, inv],
+                    [groups(n, 64), count as u32],
+                    [64, 1],
+                    Some((2, cb * m, cb * dist)),
+                ),
                 Step::Copy { src, dst, m, count, istride, idist, ostride, odist, ioffset, ooffset } => (
                     func(c"agx_fft_copy", c"agx_fft_copy_f64")?,
                     vec![ptr(src).byte_add(cb * ioffset), ptr(dst).byte_add(cb * ooffset)],
@@ -828,6 +994,15 @@ mod tests {
         out
     }
 
+    fn mul(a: C, b: C) -> C {
+        (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0)
+    }
+
+    /// Entry j of a table, conjugated when inverse.
+    fn conj(t: &[f64], j: usize, inverse: bool) -> C {
+        (t[2 * j], if inverse { -t[2 * j + 1] } else { t[2 * j + 1] })
+    }
+
     /// agx_fft_shared: the radix-2 / radix-4 passes of a power of two, in threadgroup memory.
     fn shared_fft(x: &[C], tw: &[f64], inverse: bool) -> Vec<C> {
         let mut x = x.to_vec();
@@ -851,11 +1026,13 @@ mod tests {
 
     /// Runs the steps on the CPU with the semantics the kernels document.
     fn emulate(s: &Shape, inverse: bool, in_place: bool, bufs: &mut HashMap<Buf, Vec<f64>>) {
-        let tw: Vec<Vec<f64>> = s.dims.iter().map(|&n| twiddles(n).iter().map(|&v| v as f64).collect()).collect();
+        // the tables as uploaded in single precision
+        let tw: Vec<Vec<f64>> = tables(s).into_iter().map(|t| table_values(t).iter().map(|&v| v as f32 as f64).collect()).collect();
         let get = |b: &HashMap<Buf, Vec<f64>>, buf: Buf, i: usize| -> C { (b[&buf][2 * i], b[&buf][2 * i + 1]) };
         for st in steps(s, in_place) {
             match st {
-                Step::Shared { src, dst, tw: t, n, count, stride, dist, offset, .. } => {
+                Step::Shared { src, dst, tw: t, n, count, stride, dist, offset, inverse: dir, .. } => {
+                    let inverse = dir.unwrap_or(inverse);
                     let mut writes = Vec::new();
                     for c in 0..count {
                         let base = offset + c * dist;
@@ -868,7 +1045,8 @@ mod tests {
                         d[2 * i + 1] = v.1;
                     }
                 }
-                Step::Radix { r, src, dst, tw: t, n, ns, count, stride, dist, offset } => {
+                Step::Radix { r, src, dst, tw: t, n, ns, count, stride, dist, offset, inverse: dir } => {
+                    let inverse = dir.unwrap_or(inverse);
                     let mut writes = Vec::new();
                     for c in 0..count {
                         let base = offset + c * dist;
@@ -880,6 +1058,34 @@ mod tests {
                     for (i, v) in writes {
                         d[2 * i] = v.0;
                         d[2 * i + 1] = v.1;
+                    }
+                }
+                Step::ChirpIn { src, dst, chirp, n, m, count, stride, dist, offset } => {
+                    for c in 0..count {
+                        for j in 0..m {
+                            let v = if j < n { mul(get(bufs, src, offset + c * dist + j * stride), conj(&tw[chirp], j, inverse)) } else { (0.0, 0.0) };
+                            let d = bufs.get_mut(&dst).unwrap();
+                            (d[2 * (c * m + j)], d[2 * (c * m + j) + 1]) = v;
+                        }
+                    }
+                }
+                Step::Pointwise { buf, kern, m, count } => {
+                    for c in 0..count {
+                        for j in 0..m {
+                            let v = mul(get(bufs, buf, c * m + j), conj(&tw[kern], j, inverse));
+                            let d = bufs.get_mut(&buf).unwrap();
+                            (d[2 * (c * m + j)], d[2 * (c * m + j) + 1]) = v;
+                        }
+                    }
+                }
+                Step::ChirpOut { src, dst, chirp, n, m, count, stride, dist, offset } => {
+                    for c in 0..count {
+                        for k in 0..n {
+                            let v = mul(get(bufs, src, c * m + k), conj(&tw[chirp], k, inverse));
+                            let o = offset + c * dist + k * stride;
+                            let d = bufs.get_mut(&dst).unwrap();
+                            (d[2 * o], d[2 * o + 1]) = (v.0 / m as f64, v.1 / m as f64);
+                        }
                     }
                 }
                 Step::Copy { src, dst, m, count, istride, idist, ostride, odist, ioffset, ooffset } => {
@@ -967,8 +1173,8 @@ mod tests {
         let n = s.total() * batch;
         let input: Vec<f64> = (0..2 * n).map(|_| rnd(&mut seed)).collect();
         let mut bufs: HashMap<Buf, Vec<f64>> = HashMap::new();
-        for b in [Buf::In, Buf::Out, Buf::W0, Buf::W1, Buf::A] {
-            bufs.insert(b, vec![f64::NAN; 2 * s.work_elements()]);
+        for b in [Buf::In, Buf::Out, Buf::W0, Buf::W1, Buf::A, Buf::B] {
+            bufs.insert(b, vec![f64::NAN; 2 * s.work_elements().max(s.blue_elements())]);
         }
         bufs.insert(Buf::In, input.clone());
         if in_place {
@@ -1001,6 +1207,11 @@ mod tests {
             run_c2c(&[5], 2, inverse, true);
             run_c2c(&[4, 8], 2, inverse, true);
             run_c2c(&[3, 2, 2], 1, inverse, true);
+            // Bluestein's algorithm: a prime, twice a prime, and in a 2-D transform
+            run_c2c(&[101], 2, inverse, false);
+            run_c2c(&[2 * 103], 1, inverse, true);
+            run_c2c(&[101, 4], 1, inverse, false);
+            run_c2c(&[3, 107], 2, inverse, false);
         }
     }
 
@@ -1141,6 +1352,9 @@ mod tests {
         assert_eq!(super::radices(1536), [2, 4, 4, 4, 4, 3]);
         assert_eq!(super::radices(2 * 1009), [2, 1009]);
         assert_eq!(super::radices(45), [3, 3, 5]);
+        assert!(bluestein(1009) && bluestein(2 * 101) && !bluestein(2 * 97) && !bluestein(1000));
+        assert_eq!(blue_m(1009), 2048);
+        assert_eq!(blue_m(1024 + 1), 4096);
         assert_eq!(Shape::contiguous(Kind::R2C, &[10], 2).odist, 6);
         assert_eq!(Shape::contiguous(Kind::C2R, &[10], 2).idist, 6);
         assert_eq!(Shape::contiguous(Kind::R2C, &[4, 6], 1).check(), Err(cufftError_t::NOT_SUPPORTED));

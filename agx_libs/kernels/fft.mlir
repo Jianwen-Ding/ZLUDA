@@ -724,6 +724,184 @@ gpu.module @agx_fft {
     gpu.return
   }
 
+  // Bluestein's algorithm for lengths with a large prime factor (zluda_fft_agx
+  // Step::ChirpIn, Pointwise, ChirpOut): the transform of length n as a
+  // convolution of length m (a power of two >= 2 n - 1) on power-of-two
+  // transforms. chirp holds c_j = exp(-pi i j^2 / n), j < n, kern the m-point
+  // transform of b (b_j = b_(m - j) = conj(c_j), j < n, 0 elsewhere), both from
+  // the host in double precision; inverse transforms use their conjugates.
+  // Sequence s of the work buffer is at s m. Launch m x batch grids
+  // (chirp_out: n x batch).
+  //
+  // work[s m + j] = src[s dist + j stride] c_j for j < n, 0 up to m.
+  gpu.func @agx_fft_chirp_in(%src0: memref<1xf32, 1>, %dst0: memref<1xf32, 1>,
+                            %chirp0: memref<1xf32, 1>, %n_: i32, %m_: i32,
+                            %batch_: i32, %stride_: i32, %dist_: i32,
+                            %inverse_: i32) kernel {
+    %i0 = arith.constant 0 : index
+    %i1 = arith.constant 1 : index
+    %i2 = arith.constant 2 : index
+    %big = arith.constant 4611686018427387904 : index
+    %n = arith.index_cast %n_ : i32 to index
+    %m = arith.index_cast %m_ : i32 to index
+    %batch = arith.index_cast %batch_ : i32 to index
+    %stride = arith.index_cast %stride_ : i32 to index
+    %dist = arith.index_cast %dist_ : i32 to index
+    %inverse = arith.index_cast %inverse_ : i32 to index
+    %Src = memref.reinterpret_cast %src0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %Dst = memref.reinterpret_cast %dst0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %Ch = memref.reinterpret_cast %chirp0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %j = gpu.global_id x
+    %b = gpu.global_id y
+    %in_j = arith.cmpi ult, %j, %m : index
+    %in_b = arith.cmpi ult, %b, %batch : index
+    %live = arith.andi %in_j, %in_b : i1
+    scf.if %live {
+      %is_inv = arith.cmpi ne, %inverse, %i0 : index
+      %bm = arith.muli %b, %m : index
+      %w = arith.addi %bm, %j : index
+      %wo = arith.muli %w, %i2 : index
+      %woi = arith.addi %wo, %i1 : index
+      %data = arith.cmpi ult, %j, %n : index
+      %v:2 = scf.if %data -> (f32, f32) {
+        %base = arith.muli %b, %dist : index
+        %e0 = arith.muli %j, %stride : index
+        %e = arith.addi %base, %e0 : index
+      %xo = arith.muli %e, %i2 : index
+      %xoi = arith.addi %xo, %i1 : index
+      %xr = memref.load %Src[%xo] : memref<?xf32, strided<[1]>, 1>
+      %xi = memref.load %Src[%xoi] : memref<?xf32, strided<[1]>, 1>
+      %c0o = arith.muli %j, %i2 : index
+      %c0oi = arith.addi %c0o, %i1 : index
+      %c0r = memref.load %Ch[%c0o] : memref<?xf32, strided<[1]>, 1>
+      %c0i = memref.load %Ch[%c0oi] : memref<?xf32, strided<[1]>, 1>
+      %cin = arith.negf %c0i : f32
+      %ci = arith.select %is_inv, %cin, %c0i : f32
+      %pa = arith.mulf %xr, %c0r : f32
+      %pb = arith.mulf %xi, %ci : f32
+      %pr = arith.subf %pa, %pb : f32
+      %pc = arith.mulf %xr, %ci : f32
+      %pi = math.fma %xi, %c0r, %pc : f32
+        scf.yield %pr, %pi : f32, f32
+      } else {
+        %z = arith.constant 0.0 : f32
+        scf.yield %z, %z : f32, f32
+      }
+      memref.store %v#0, %Dst[%wo] : memref<?xf32, strided<[1]>, 1>
+      memref.store %v#1, %Dst[%woi] : memref<?xf32, strided<[1]>, 1>
+    }
+    gpu.return
+  }
+
+  // work[s m + j] *= kern[j].
+  gpu.func @agx_fft_pointwise(%buf0: memref<1xf32, 1>, %kern0: memref<1xf32, 1>,
+                              %m_: i32, %batch_: i32, %inverse_: i32) kernel {
+    %i0 = arith.constant 0 : index
+    %i1 = arith.constant 1 : index
+    %i2 = arith.constant 2 : index
+    %big = arith.constant 4611686018427387904 : index
+    %m = arith.index_cast %m_ : i32 to index
+    %batch = arith.index_cast %batch_ : i32 to index
+    %inverse = arith.index_cast %inverse_ : i32 to index
+    %Buf = memref.reinterpret_cast %buf0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %Kn = memref.reinterpret_cast %kern0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %j = gpu.global_id x
+    %b = gpu.global_id y
+    %in_j = arith.cmpi ult, %j, %m : index
+    %in_b = arith.cmpi ult, %b, %batch : index
+    %live = arith.andi %in_j, %in_b : i1
+    scf.if %live {
+      %is_inv = arith.cmpi ne, %inverse, %i0 : index
+      %bm = arith.muli %b, %m : index
+      %w = arith.addi %bm, %j : index
+      %xo = arith.muli %w, %i2 : index
+      %xoi = arith.addi %xo, %i1 : index
+      %xr = memref.load %Buf[%xo] : memref<?xf32, strided<[1]>, 1>
+      %xi = memref.load %Buf[%xoi] : memref<?xf32, strided<[1]>, 1>
+      %c0o = arith.muli %j, %i2 : index
+      %c0oi = arith.addi %c0o, %i1 : index
+      %c0r = memref.load %Kn[%c0o] : memref<?xf32, strided<[1]>, 1>
+      %c0i = memref.load %Kn[%c0oi] : memref<?xf32, strided<[1]>, 1>
+      %cin = arith.negf %c0i : f32
+      %ci = arith.select %is_inv, %cin, %c0i : f32
+      %pa = arith.mulf %xr, %c0r : f32
+      %pb = arith.mulf %xi, %ci : f32
+      %pr = arith.subf %pa, %pb : f32
+      %pc = arith.mulf %xr, %ci : f32
+      %pi = math.fma %xi, %c0r, %pc : f32
+      memref.store %pr, %Buf[%xo] : memref<?xf32, strided<[1]>, 1>
+      memref.store %pi, %Buf[%xoi] : memref<?xf32, strided<[1]>, 1>
+    }
+    gpu.return
+  }
+
+  // dst[s dist + k stride] = work[s m + k] c_k / m, k < n.
+  gpu.func @agx_fft_chirp_out(%src0: memref<1xf32, 1>, %dst0: memref<1xf32, 1>,
+                             %chirp0: memref<1xf32, 1>, %n_: i32, %m_: i32,
+                             %batch_: i32, %stride_: i32, %dist_: i32,
+                             %inverse_: i32) kernel {
+    %i0 = arith.constant 0 : index
+    %i1 = arith.constant 1 : index
+    %i2 = arith.constant 2 : index
+    %big = arith.constant 4611686018427387904 : index
+    %n = arith.index_cast %n_ : i32 to index
+    %m = arith.index_cast %m_ : i32 to index
+    %batch = arith.index_cast %batch_ : i32 to index
+    %stride = arith.index_cast %stride_ : i32 to index
+    %dist = arith.index_cast %dist_ : i32 to index
+    %inverse = arith.index_cast %inverse_ : i32 to index
+    %Src = memref.reinterpret_cast %src0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %Dst = memref.reinterpret_cast %dst0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %Ch = memref.reinterpret_cast %chirp0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %j = gpu.global_id x
+    %b = gpu.global_id y
+    %in_j = arith.cmpi ult, %j, %n : index
+    %in_b = arith.cmpi ult, %b, %batch : index
+    %live = arith.andi %in_j, %in_b : i1
+    scf.if %live {
+      %is_inv = arith.cmpi ne, %inverse, %i0 : index
+      %bm = arith.muli %b, %m : index
+      %w = arith.addi %bm, %j : index
+      %xo = arith.muli %w, %i2 : index
+      %xoi = arith.addi %xo, %i1 : index
+      %xr = memref.load %Src[%xo] : memref<?xf32, strided<[1]>, 1>
+      %xi = memref.load %Src[%xoi] : memref<?xf32, strided<[1]>, 1>
+      %c0o = arith.muli %j, %i2 : index
+      %c0oi = arith.addi %c0o, %i1 : index
+      %c0r = memref.load %Ch[%c0o] : memref<?xf32, strided<[1]>, 1>
+      %c0i = memref.load %Ch[%c0oi] : memref<?xf32, strided<[1]>, 1>
+      %cin = arith.negf %c0i : f32
+      %ci = arith.select %is_inv, %cin, %c0i : f32
+      %pa = arith.mulf %xr, %c0r : f32
+      %pb = arith.mulf %xi, %ci : f32
+      %pr = arith.subf %pa, %pb : f32
+      %pc = arith.mulf %xr, %ci : f32
+      %pi = math.fma %xi, %c0r, %pc : f32
+      %mi = arith.index_cast %m : index to i32
+      %mf = arith.uitofp %mi : i32 to f32
+      %one = arith.constant 1.0 : f32
+      %scale = arith.divf %one, %mf : f32
+      %sr = arith.mulf %pr, %scale : f32
+      %si = arith.mulf %pi, %scale : f32
+      %base = arith.muli %b, %dist : index
+      %e0 = arith.muli %j, %stride : index
+      %e = arith.addi %base, %e0 : index
+      %eo = arith.muli %e, %i2 : index
+      %eoi = arith.addi %eo, %i1 : index
+      memref.store %sr, %Dst[%eo] : memref<?xf32, strided<[1]>, 1>
+      memref.store %si, %Dst[%eoi] : memref<?xf32, strided<[1]>, 1>
+    }
+    gpu.return
+  }
+
   // Real to complex input: dst (complex, n per sequence, contiguous) =
   // src (real, n per sequence, idist apart) with zero imaginary parts.
   // Launch an n x batch grid.

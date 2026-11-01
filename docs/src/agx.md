@@ -1468,8 +1468,13 @@ strided and batched through `cufftPlanMany`, with the same input and output
 layout), and real to complex / complex to real transforms of rank 1,
 batched, in or out of place. Power-of-two lengths use radix-4 Stockham passes
 (after one radix-2 pass when log2 n is odd), alternating two work buffers; each odd prime factor adds a pass of
-its radix (`agx_fft_radixr`, one thread per output, r complex multiply-adds each), so a prime length is one direct
-transform. On the M2 Max (`zluda_fft_agx/tools/fftbench.c`, batched C2C): n = 1000 x 256 5038 -> 253 us (1024: 125 us),
+its radix (`agx_fft_radixr`, one thread per output, r complex multiply-adds each). Lengths whose largest prime
+factor is above 100 use Bluestein's algorithm instead: the transform as a convolution of length m (a power of two of
+at least 2 n - 1) on two power-of-two transforms, with the chirp and the kernel's transform computed on the host in
+double precision (`agx_fft_chirp_in`, `agx_fft_pointwise`, `agx_fft_chirp_out`, work buffer B of m per sequence);
+radix-p passes are faster up to p = 67, Bluestein from 131. Batched C2C: 1009 x 64 965 -> 142-220 us, 8191 x 8
+15969 -> 268 us, 4099 x 16 7047 -> 330 us, errors 1e-6 -> 1e-7; Z2Z 1009 x 64 30.8 -> 1.7 ms
+(`ZLUDA_AGX_FFT_BLUESTEIN_MIN` sets the factor). On the M2 Max (`zluda_fft_agx/tools/fftbench.c`, batched C2C): n = 1000 x 256 5038 -> 253 us (1024: 125 us),
 3000 x 64 12913 -> 284 us, 1536 x 128 5936 -> 148 us, with 10x smaller errors than the direct transform. Single
 precision powers of two from 4 to 2048 run as one kernel in threadgroup memory instead (`agx_fft_shared`: n / 4 threads
 per sequence, 256 threads per workgroup, the first radix-2 stage done on the loaded values, the last radix-4 pass

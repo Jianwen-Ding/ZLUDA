@@ -70,6 +70,9 @@ wall time, peak RSS, object md5).
   llama.cpp's 10 MB module +0.9 s (26.5 -> 27.4 s, the stage runs in parallel), same peak memory; llama.cpp
   tg64 133.1 -> 134.5 t/s (two runs each, run-to-run spread +-1.3), pp128 equal. Within noise: left off (Cycles' compile
   paid 31 -> 44 s for it before).
+- Geekbench 7 GPU with all of the above: every workload completes (the block-size search's out-of-resources answers
+  as before), summed GPU time 27.13 s against 25.93-26.85 s of earlier AIR-route runs; its largest difference,
+  particle 2.39 s, is inside those runs' 2.04-2.42 s.
 - Blender default cube (1024x1024, 128 spp) with all of the above: first render (compiling Cycles) 52.1 -> 45.2 s,
   second 1.67 -> 1.63 s, the image the same (max difference 1/255, none over 2).
 - **A module of independent kernels compiled in parts** (zoc, `parts`): llama.cpp's 10 MB module has 317 kernels and

@@ -85,6 +85,10 @@ wall time, peak RSS, object md5).
   errors.
   Geekbench (2 of its modules change): every workload completes, the same 10 expected errors, summed GPU time 27.13
   -> 26.94 s; its changed modules' kernels within their run-to-run spread (keypoint kernels are data-dependent).
+- Dead end, dp4a: a signed dp4a is 18 AGX instructions (4 imadd; the bytes extracted by bfi + asr pairs, asr 24 for
+  byte 3). The free 16-bit sign extension (MOD_SX) exists only on add / multiply-add sources (IADD_I32_FROM16,
+  IMADD_*_FROM32), not on shifts, so byte 1 (sext of the low half, then asr 8) is two instructions as now: no
+  saving there. A real gain needs packed 8-bit arithmetic, which AGX does not have (see 2026-10-31 above).
 - Geekbench 7 GPU with all of the above: every workload completes (the block-size search's out-of-resources answers
   as before), summed GPU time 27.13 s against 25.93-26.85 s of earlier AIR-route runs; its largest difference,
   particle 2.39 s, is inside those runs' 2.04-2.42 s.

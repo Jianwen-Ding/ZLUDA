@@ -1680,6 +1680,14 @@ With `ZLUDA_AGX_LOG=1`, failed procedure lookups now print the symbol, requested
 unsupported context-limit queries print the numeric limit; unsupported export tables print the requested ID.
 Use these arguments to identify the actual request before changing the API's return behavior.
 
+The diagnostic host run identified the rejected limit as `CU_LIMIT_CIG_ENABLED` (8). This read-only query
+indicates whether a context uses CUDA-in-Graphics; all contexts created by this driver are ordinary contexts.
+`cuCtxGetLimit` now returns success with zero for that query, while attempts to set it remain unsupported.
+This follows the [documented CUlimit definition](https://nvidia.github.io/cuda-python/cuda-bindings/12.8.0/module/driver.html).
+The Asahi regression test covers the zero result, read-only behavior, a null output pointer, and continued
+rejection of unknown limits. The host engine-deserialization result after this correction remains to be checked;
+the preceding missing-function and export-table probes are not established causes of failure.
+
 For a comparison run, use the same Geekbench build, the matching ZLUDA driver and `zoc`, and absolute paths:
 
 ```bash

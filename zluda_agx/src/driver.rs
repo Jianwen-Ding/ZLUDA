@@ -2808,6 +2808,9 @@ pub(crate) unsafe fn cuCtxGetLimit(pvalue: *mut usize, limit: CUlimit) -> CUresu
         CUlimit_enum::CU_LIMIT_STACK_SIZE => DEFAULT_STACK_SIZE,
         CUlimit_enum::CU_LIMIT_PRINTF_FIFO_SIZE => 65536,
         CUlimit_enum::CU_LIMIT_MALLOC_HEAP_SIZE => DEFAULT_HEAP_SIZE,
+        // All Asahi contexts are ordinary contexts, never CUDA-in-Graphics contexts.
+        // This is a read-only boolean query, not a request to enable CIG.
+        CUlimit_enum::CU_LIMIT_CIG_ENABLED => 0,
         _ => {
             if crate::log_enabled() {
                 eprintln!("[zluda_agx] cuCtxGetLimit: unsupported limit={}", limit.0);
@@ -4303,6 +4306,25 @@ pub(crate) unsafe fn cuTensorMapReplaceAddress(tensor_map: *mut CUtensorMap, add
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an Asahi render node"]
+    fn cig_context_limit_reports_disabled_and_is_read_only() {
+        unsafe {
+            cuInit(0).unwrap();
+            let mut value = usize::MAX;
+            cuCtxGetLimit(&mut value, CUlimit_enum::CU_LIMIT_CIG_ENABLED).unwrap();
+            assert_eq!(value, 0);
+            for requested in [0, 1] {
+                assert_eq!(cuCtxSetLimit(CUlimit_enum::CU_LIMIT_CIG_ENABLED, requested), Err(CUerror::UNSUPPORTED_LIMIT));
+            }
+            assert_eq!(cuCtxGetLimit(std::ptr::null_mut(), CUlimit_enum::CU_LIMIT_CIG_ENABLED), Err(CUerror::INVALID_VALUE));
+            value = usize::MAX;
+            cuCtxGetLimit(&mut value, CUlimit_enum::CU_LIMIT_CIG_ENABLED).unwrap();
+            assert_eq!(value, 0);
+            assert_eq!(cuCtxGetLimit(&mut value, CUlimit_enum(u32::MAX)), Err(CUerror::UNSUPPORTED_LIMIT));
+        }
+    }
 
     #[test]
     fn reported_versions_match_runtime_compatibility_version() {

@@ -40,18 +40,19 @@ fn binary(v: i32) -> Result<Binary> { match v { 0 => Ok(Binary::Add), 1 => Ok(Bi
 
 pub struct Builder { graph: Graph, workspace_limit: usize }
 pub struct Runtime;
-pub struct Engine { plan: Arc<Plan>, names: Vec<CString>, serialized: Vec<u8> }
+pub struct Engine { plan: Arc<Plan>, names: Vec<CString>, serialized: Vec<u8>, resources: execute::ResourceCache }
 impl Engine {
     fn build(mut graph: Graph, workspace_limit: usize) -> Result<Self> {
         let workspace_limit = graph.workspace_limit.unwrap_or(workspace_limit).min(workspace_limit);
         graph.workspace_limit = Some(workspace_limit);
         graph.refresh_shapes()?; graph.validate()?;
+        graph.normalize_constant_outputs()?;
         let graph = graph.eliminate_dead_nodes();
         let serialized = graph.serialize()?;
         let names = graph.tensors.iter().map(|t| CString::new(t.name.as_str()).map_err(|e| e.to_string())).collect::<Result<Vec<_>>>()?;
         let plan = Plan::build(graph)?;
         if plan.workspace > workspace_limit { return Err(format!("workspace {} exceeds limit {workspace_limit}", plan.workspace)); }
-        Ok(Self { plan: Arc::new(plan), names, serialized })
+        Ok(Self { plan: Arc::new(plan), names, serialized, resources: Default::default() })
     }
     fn tensor(&self, name: &str) -> Result<usize> { self.plan.graph.tensors.iter().position(|t| t.name == name).ok_or_else(|| format!("unknown tensor {name}")) }
 }
@@ -243,7 +244,7 @@ fn modify(g: &mut Graph, output: usize, f: impl FnOnce(&mut Op) -> Result<()>) -
 #[no_mangle] pub unsafe extern "C" fn ztrtGetConstantBytes(p: *const Engine) -> usize { boundary(0, || Ok(object(p)?.plan.constant_bytes)) }
 #[no_mangle] pub unsafe extern "C" fn ztrtGetFusedActivationCount(p: *const Engine) -> usize { boundary(0, || Ok(object(p)?.plan.fused_activations)) }
 #[no_mangle] pub unsafe extern "C" fn ztrtCreateExecutionContext(p: *const Engine) -> *mut execute::Context {
-    boundary(std::ptr::null_mut(), || Ok(Box::into_raw(Box::new(execute::Context::new(object(p)?.plan.clone())?))))
+    boundary(std::ptr::null_mut(), || Ok(Box::into_raw(Box::new(execute::Context::new(object(p)?.plan.clone(), &object(p)?.resources)?))))
 }
 #[no_mangle] pub unsafe extern "C" fn ztrtDestroyExecutionContext(p: *mut execute::Context) { boundary((), || { if !p.is_null() { drop(Box::from_raw(p)); } Ok(()) }); }
 #[no_mangle] pub unsafe extern "C" fn ztrtSetTensorAddress(p: *mut execute::Context, name: *const c_char, data: *mut c_void, bytes: usize) -> i32 {

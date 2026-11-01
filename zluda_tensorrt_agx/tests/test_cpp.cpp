@@ -3,9 +3,11 @@
 #include <cassert>
 #include <cstring>
 #include <iostream>
+#include <fstream>
+#include <iterator>
 #include <memory>
 struct Logger final:nvinfer1::ILogger{int errors=0;void log(Severity,char const*)noexcept override{++errors;}};
-int main(){
+int main(int argc,char** argv){
     using namespace nvinfer1;Logger logger;
     std::unique_ptr<IBuilder> builder(createInferBuilder(logger));
     std::unique_ptr<INetworkDefinition> network(builder->createNetworkV2(0));
@@ -33,5 +35,14 @@ int main(){
     char bad[]="not an independently generated engine";assert(!std::unique_ptr<ICudaEngine>(runtime->deserializeCudaEngine(bad,sizeof(bad))));
     std::unique_ptr<INetworkDefinition> other(builder->createNetworkV2(0));
     std::unique_ptr<nvonnxparser::IParser> parser(nvonnxparser::createParser(*other,logger));assert(!parser->parse(bad,sizeof(bad)));assert(parser->getNbErrors()==1&&parser->getError(0));
+    if(argc>1){
+        std::ifstream file(argv[1],std::ios::binary);assert(file);
+        std::vector<char> model((std::istreambuf_iterator<char>(file)),std::istreambuf_iterator<char>());
+        parser->clearErrors();assert(parser->parse(model.data(),model.size())&&parser->getNbErrors()==0);
+        std::unique_ptr<IBuilderConfig> importedConfig(builder->createBuilderConfig());
+        std::unique_ptr<IHostMemory> imported(builder->buildSerializedNetwork(*other,*importedConfig));assert(imported);
+        std::unique_ptr<ICudaEngine> importedEngine(runtime->deserializeCudaEngine(imported->data(),imported->size()));assert(importedEngine);
+        auto dims=importedEngine->getTensorShape("y");assert(dims.nbDims==2&&dims.d[0]==2&&dims.d[1]==4);
+    }
     std::cout<<"PASS: C++ builder, configuration, shape refresh, serialization, runtime and error paths\n";
 }

@@ -2,7 +2,7 @@
 use crate::graph::*;
 use agx_libs::engine;
 use cuda_types::cuda::*;
-use std::{collections::HashMap, ffi::{c_void, CStr}, sync::{Arc, OnceLock}};
+use std::{collections::HashMap, ffi::{c_void, CStr}, sync::{Arc, Mutex, OnceLock}};
 
 fn gpu<T>(r: std::result::Result<T, engine::Error>) -> Result<T> { r.map_err(|e| format!("AGX inference driver: {e:?}")) }
 fn arg<T>(v: &mut T) -> *mut c_void { (v as *mut T).cast() }
@@ -53,21 +53,20 @@ impl Drop for Buffer {
     }
 }
 
-pub struct Context {
-    pub plan: Arc<Plan>,
-    owner: usize,
+// Immutable GPU state is shared only within the CUDA context that owns it.
+pub(crate) struct Resources {
     pointers: Vec<usize>,
-    bound: Vec<bool>,
     metadata: Vec<Option<usize>>,
-    _workspace: Buffer,
     _constants: Buffer,
     functions: HashMap<&'static CStr, CUfunction>,
-    last_stream: Option<usize>,
 }
-impl Context {
-    pub fn new(plan: Arc<Plan>) -> Result<Self> {
-        let owner = current()?;
-        let workspace = Buffer::new(plan.workspace, owner)?;
+// Function handles are immutable; launches validate the current CUDA context.
+// Buffer destruction pushes its owning context before freeing device memory.
+unsafe impl Send for Resources {}
+unsafe impl Sync for Resources {}
+pub(crate) type ResourceCache = Mutex<HashMap<usize, Arc<Resources>>>;
+impl Resources {
+    fn new(plan: &Plan, owner: usize) -> Result<Self> {
         let mut pointers = vec![0usize; plan.graph.tensors.len()];
         let mut constant_data = Vec::with_capacity(plan.constant_bytes);
         let mut constant_offsets = Vec::new();
@@ -79,7 +78,7 @@ impl Context {
         for (i, t) in plan.graph.tensors.iter().enumerate() {
             if let Some(data) = &t.data {
                 let offset = pack(&mut constant_data, data); constant_offsets.push((i, offset));
-            } else if let Some(o) = plan.offsets[i] { pointers[i] = workspace.ptr.checked_add(o).ok_or("workspace address overflow")?; }
+            }
         }
         let mut metadata = Vec::new();
         let mut functions = HashMap::new();
@@ -91,12 +90,7 @@ impl Context {
                     get(agx_libs::INFERENCE, c"agx_infer_binary")?;
                     Some(broadcast_metadata(out, &plan.graph.tensors[*a].shape, &plan.graph.tensors[*b].shape))
                 }
-                Op::Conv2d { bias, .. } => {
-                    get(agx_libs::CONV_I32, c"agx_conv2d_fwd_f32_i32")?;
-                    if bias.is_some() { get(agx_libs::INFERENCE, c"agx_infer_binary")?;
-                        Some(broadcast_metadata(out, out, &[1, out[1], 1, 1]))
-                    } else { if step.relu { get(agx_libs::INFERENCE, c"agx_infer_unary")?; } None }
-                }
+                Op::Conv2d { .. } => { get(agx_libs::INFERENCE, c"agx_infer_conv2d")?; None }
                 Op::Transpose { input, permutation } => {
                     get(agx_libs::INFERENCE, c"agx_infer_transpose")?;
                     let strides = strides(&plan.graph.tensors[*input].shape);
@@ -118,8 +112,36 @@ impl Context {
         let constants = Buffer::upload(&constant_data, owner)?;
         for (i, offset) in constant_offsets { pointers[i] = constants.ptr.checked_add(offset).ok_or("constant address overflow")?; }
         for offset in metadata.iter_mut().flatten() { *offset = constants.ptr.checked_add(*offset).ok_or("metadata address overflow")?; }
+        Ok(Self { pointers, metadata, _constants: constants, functions })
+    }
+}
+pub struct Context {
+    pub plan: Arc<Plan>,
+    owner: usize,
+    pointers: Vec<usize>,
+    bound: Vec<bool>,
+    _workspace: Buffer,
+    resources: Arc<Resources>,
+    last_stream: Option<usize>,
+}
+impl Context {
+    pub(crate) fn new(plan: Arc<Plan>, cache: &ResourceCache) -> Result<Self> {
+        let owner = current()?;
+        let resources = {
+            let mut cache = cache.lock().map_err(|_| "GPU resource cache lock poisoned")?;
+            if let Some(resources) = cache.get(&owner) { resources.clone() }
+            else {
+                let resources = Arc::new(Resources::new(&plan, owner)?);
+                cache.insert(owner, resources.clone()); resources
+            }
+        };
+        let workspace = Buffer::new(plan.workspace, owner)?;
+        let mut pointers = resources.pointers.clone();
+        for (i, offset) in plan.offsets.iter().enumerate() {
+            if let Some(offset) = offset { pointers[i] = workspace.ptr.checked_add(*offset).ok_or("workspace address overflow")?; }
+        }
         let count = pointers.len();
-        Ok(Self { plan, owner, pointers, bound: vec![false; count], metadata, _workspace: workspace, _constants: constants, functions, last_stream: None })
+        Ok(Self { plan, owner, pointers, bound: vec![false; count], _workspace: workspace, resources, last_stream: None })
     }
     pub fn bind(&mut self, name: &str, pointer: usize, bytes: usize) -> Result<()> {
         let g = &self.plan.graph;
@@ -130,12 +152,12 @@ impl Context {
         self.pointers[i] = pointer; self.bound[i] = true; Ok(())
     }
     unsafe fn launch(&self, name: &'static CStr, threads: usize, params: &mut [*mut c_void], stream: CUstream) -> Result<()> {
-        let f = *self.functions.get(name).ok_or("inference kernel was not prepared")?;
+        let f = *self.resources.functions.get(name).ok_or("inference kernel was not prepared")?;
         gpu(engine::launch_kernel(f, [threads.div_ceil(128) as u32, 1], [128, 1], params, stream))
     }
     unsafe fn binary(&self, at: usize, a: usize, b: usize, y: usize, kind: Binary, relu: bool, stream: CUstream) -> Result<()> {
         let mut a = self.pointers[a]; let mut b = self.pointers[b]; let mut yptr = self.pointers[y];
-        let mut meta = self.metadata[at].ok_or("binary metadata is absent")?;
+        let mut meta = self.resources.metadata[at].ok_or("binary metadata is absent")?;
         let mut n = self.plan.graph.tensors[y].elements()? as i32;
         let mut rank = self.plan.graph.tensors[y].shape.len() as i32;
         let mut op = match kind { Binary::Add => 0i32, Binary::Mul => 1, Binary::Sub => 2, Binary::Div => 3, Binary::Max => 4, Binary::Min => 5 };
@@ -180,16 +202,13 @@ impl Context {
                 Op::Conv2d { input, weights, bias, stride, padding, dilation, groups } => {
                     let x = &g.tensors[*input].shape; let w = &g.tensors[*weights].shape;
                     let mut args: Vec<i32> = [x[0], x[1], x[2], x[3], w[0], w[2], w[3], yshape[2], yshape[3],
-                        padding[0], padding[1], stride[0], stride[1], dilation[0], dilation[1], *groups, 0,
-                        x[1]*x[2]*x[3], x[2]*x[3], x[3], 1, yshape[1]*yshape[2]*yshape[3], yshape[2]*yshape[3], yshape[3], 1]
-                        .into_iter().map(|v| v as i32).collect();
-                    let mut xp = self.pointers[*input]; let mut wp = self.pointers[*weights]; let mut yp = self.pointers[yid];
-                    let mut alpha = 1f32; let mut beta = 0f32;
-                    let mut params = vec![arg(&mut xp), arg(&mut wp), arg(&mut yp)];
-                    params.extend(args.iter_mut().map(arg)); params.extend([arg(&mut alpha), arg(&mut beta)]);
-                    self.launch(c"agx_conv2d_fwd_f32_i32", n, &mut params, stream)?;
-                    if let Some(b) = bias { self.binary(at, yid, *b, yid, Binary::Add, step.relu, stream)?; }
-                    else if step.relu { self.unary(yid, yid, Unary::Relu, stream)?; }
+                        padding[0], padding[1], stride[0], stride[1], dilation[0], dilation[1], *groups,
+                        usize::from(bias.is_some()), usize::from(step.relu)].into_iter().map(|v| v as i32).collect();
+                    let mut xp = self.pointers[*input]; let mut wp = self.pointers[*weights];
+                    let mut bp = bias.map_or(0, |b| self.pointers[b]); let mut yp = self.pointers[yid];
+                    let mut params = vec![arg(&mut xp), arg(&mut wp), arg(&mut bp), arg(&mut yp)];
+                    params.extend(args.iter_mut().map(arg));
+                    self.launch(c"agx_infer_conv2d", n, &mut params, stream)?;
                 }
                 Op::Softmax { input, axis } => {
                     let axis = axis_index(*axis, yshape.len())?;
@@ -203,7 +222,7 @@ impl Context {
                     }
                 }
                 Op::Transpose { input, .. } => {
-                    let mut x = self.pointers[*input]; let mut y = self.pointers[yid]; let mut meta = self.metadata[at].unwrap();
+                    let mut x = self.pointers[*input]; let mut y = self.pointers[yid]; let mut meta = self.resources.metadata[at].unwrap();
                     let mut size = n as i32; let mut rank = yshape.len() as i32;
                     self.launch(c"agx_infer_transpose", n, &mut [arg(&mut x), arg(&mut y), arg(&mut meta), arg(&mut size), arg(&mut rank)], stream)?;
                 }

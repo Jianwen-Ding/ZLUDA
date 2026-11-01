@@ -1,0 +1,64 @@
+# Independent inference validation — 2026-11-01
+
+Tested on the project's Asahi Linux / Apple M2 Max environment using our ZLUDA AGX driver.
+No NVIDIA runtime, SDK, vendor engine, binary inspection or vendor numerical oracle was used.
+The library's scope and supported formats are described in [the crate README](../README.md).
+
+## Correctness and lifecycle
+
+| Check | Result |
+| --- | --- |
+| Rust graph/ONNX/serialization tests | 7 passed |
+| GPU graph tests | 42 passed; maximum absolute error 1.90735e-6 against NumPy |
+| Independently encoded ONNX models | 17 passed; maximum absolute error 5.96047e-8 against NumPy |
+| AGX Performance Simulator | All 8 new inference primitive kernels replayed and matched NumPy references |
+| C++ source interface | Builder/configuration, shapes, native engine roundtrip, valid ONNX import, rejection paths passed |
+| CUDA execution lifetime | Graph capture/replay with changed input, stream changes, shared resources, foreign-context rejection/restoration, engine-before-context destruction passed |
+| CPU-only compiler | Public-schema ONNX compiled to our format; 642-byte MLP engine, 256-byte workspace |
+| Packaged C++ example | `[11, 11, 0, 0]` after native engine serialization/deserialization |
+| Kernel packaging | Same portable MLIR emitted upstream AIR bitcode/text and AGX fat object |
+
+The optional official ONNX Python checker was unavailable. Fixtures follow the public protobuf schema and were
+validated by our reader and numerical references; no claim of official-checker validation is made.
+Simulator replay uses our own captured primitive launches, including subgroup softmax and fused convolution.
+It does not independently replay the entire graph scheduler or claim full PTX compliance.
+
+## Performance and memory
+
+`baseline.json` and `optimized.json` contain 12 samples, 4 enqueues per sample, median end-to-end enqueue/sync
+latency. Clocks and system load were not controlled. These small measurements are indicative, not a comparative
+benchmark against NVIDIA TensorRT or Metal.
+
+| Case | Initial latency (us) | Optimized latency (us) |
+| --- | ---: | ---: |
+| Softmax 64 x 4096 | 1855.13 | 235.37 |
+| Bias + ReLU, 1M elements | 85.98 | 133.46 |
+| MatMul 256 x 256 | 63.68 | 57.77 |
+| Conv 8 -> 16, 32 x 32 | 86.58 | 62.51 |
+
+The pointwise kernel was unchanged; its measured timing varied between runs. Softmax's standard MLIR subgroup
+reduction and convolution's fused bias/ReLU account for the targeted changes. Approximate-exp hints were tried,
+but the incremental gain did not justify keeping them. No new target-specific hints are present.
+
+GPU weights/metadata use one packed immutable allocation per engine and CUDA context, shared by execution
+contexts. Each context owns private liveness-reused activations. The benchmark's second context creation took
+14–22 us versus 33–129 us for first preparation. Peak benchmark process RSS was 54,880 KiB. Serialization bounds
+writes while constructing one header/payload allocation, avoiding a second full payload copy. These figures are
+for the small synthetic workloads; they do not establish memory use for large production models.
+
+## PTX smoke check and known failure
+
+`ptx-smoke.json`: `addr32`, `barrier`, `launch-ok`, `fma`, and `mov` passed through AIR and the simulator.
+`cvt-0.ptx` failed: `O22[15] expected 0xffff, got 0x0`. The exact failure also appears in existing scratch baseline
+records `air12-strict.txt`, `air17-strict.txt`, and `air27-strict.txt`. This work does not change the PTX compiler
+and does not resolve that existing conversion issue. The smoke check is not the full PTX-formalization suite.
+
+## Application limits
+
+Geekbench's opaque TensorRT engines remain unsupported: this is an independent source API and native format,
+not a binary-compatible drop-in for `libtensorrt_rtx.so`. Existing Geekbench CUDA fallback runs do not validate
+this inference implementation. No llama.cpp or Blender integration/performance claim is made. The embedded
+C++ MLP and a complete ONNX convolution/pooling/dense/softmax classifier exercise the new API directly.
+
+Reproduction commands are in [the crate README](../README.md). Generated libraries, executables, AIR and AGX
+objects, simulator captures and the packaged SDK remain in scratch; this directory records source and results.

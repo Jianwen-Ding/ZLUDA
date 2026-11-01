@@ -178,6 +178,20 @@ pub struct Graph {
     pub workspace_limit: Option<usize>,
 }
 impl Graph {
+    /// Constant outputs get an ordinary output-producing operation and a separate caller binding.
+    pub fn normalize_constant_outputs(&mut self) -> Result<()> {
+        for at in 0..self.outputs.len() {
+            let input = self.outputs[at];
+            if self.tensors.get(input).ok_or("unknown output tensor")?.data.is_none() { continue; }
+            let name = self.tensors[input].name.clone();
+            let mut internal = format!("__ztrt_constant_output_{input}");
+            while self.tensors.iter().any(|t| t.name == internal) { internal.push('_'); }
+            self.tensors[input].name = internal;
+            let output = self.add_node(Op::Activation { input, kind: Unary::Identity })?;
+            self.tensors[output].name = name; self.outputs[at] = output;
+        }
+        Ok(())
+    }
     /// Remove unreachable operations and constants while retaining the declared input interface.
     pub fn eliminate_dead_nodes(self) -> Self {
         let mut live: HashSet<usize> = self.outputs.iter().chain(&self.inputs).copied().collect();
@@ -194,12 +208,17 @@ impl Graph {
     pub fn add_input(&mut self, name: String, shape: Vec<usize>, data: Option<Vec<f32>>) -> Result<usize> {
         elements(&shape)?;
         if self.tensors.len() >= MAX_TENSORS { return Err("too many tensors".into()); }
+        if let Some(values) = &data {
+            let count = self.tensors.iter().filter_map(|t| t.data.as_ref()).try_fold(values.len(), |a, v| a.checked_add(v.len())).ok_or("constant size overflow")?;
+            if count > MAX_ENGINE_BYTES / 4 { return Err("constant data exceeds engine size budget".into()); }
+        }
         let id = self.tensors.len();
         if data.is_none() { self.inputs.push(id); }
         self.tensors.push(Tensor { name, shape, data });
         Ok(id)
     }
     pub fn add_node(&mut self, operation: Op) -> Result<usize> {
+        if self.tensors.len() >= MAX_TENSORS || self.nodes.len() >= MAX_TENSORS { return Err("too many tensors or operations".into()); }
         let shape = operation.shape(&self.tensors)?;
         let id = self.tensors.len();
         self.tensors.push(Tensor { name: format!("tensor_{id}"), shape, data: None });
@@ -207,12 +226,15 @@ impl Graph {
         Ok(id)
     }
     pub fn refresh_shapes(&mut self) -> Result<()> {
-        for n in &self.nodes { self.tensors[n.output].shape = n.operation.shape(&self.tensors)?; }
+        for n in &self.nodes {
+            let shape = n.operation.shape(&self.tensors)?;
+            self.tensors.get_mut(n.output).ok_or("unknown node output tensor")?.shape = shape;
+        }
         Ok(())
     }
     pub fn validate(&self) -> Result<()> {
-        if self.tensors.len() > MAX_TENSORS || self.nodes.len() > MAX_TENSORS || self.inputs.is_empty() || self.outputs.is_empty() {
-            return Err("graph needs inputs and outputs within the tensor/node limit".into());
+        if self.tensors.len() > MAX_TENSORS || self.nodes.len() > MAX_TENSORS || self.outputs.is_empty() {
+            return Err("graph needs outputs within the tensor/node limit".into());
         }
         let mut names = HashSet::new();
         for t in &self.tensors {
@@ -235,15 +257,32 @@ impl Graph {
             available.insert(n.output);
         }
         seen.clear();
-        for &i in &self.outputs { if !available.contains(&i) || !seen.insert(i) || !self.nodes.iter().any(|n| n.output == i) { return Err("output must be a unique operation result".into()); } }
+        for &i in &self.outputs { if !available.contains(&i) || !seen.insert(i) || self.inputs.contains(&i) { return Err("output must be a unique operation result or constant, separate from graph inputs".into()); } }
         if available.len() != self.tensors.len() { return Err("graph has tensors without producers".into()); }
         Ok(())
     }
     pub fn serialize(&self) -> Result<Vec<u8>> {
         self.validate()?;
-        let data = serde_json::to_vec(self).map_err(|e| e.to_string())?;
-        if data.len() > MAX_ENGINE_BYTES { return Err("engine exceeds size limit".into()); }
-        let mut out = MAGIC.to_vec(); out.extend((data.len() as u64).to_le_bytes()); out.extend(data); Ok(out)
+        // Bound writes during serialization rather than allocating an unbounded JSON copy first.
+        // The header shares the allocation with the payload, avoiding another full-sized copy.
+        struct Writer(Vec<u8>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let size = self.0.len().checked_add(bytes.len()).filter(|&n| n <= MAX_ENGINE_BYTES + 16)
+                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "engine exceeds size limit"))?;
+                if size > self.0.capacity() {
+                    let capacity = size.max(self.0.capacity().saturating_mul(2)).min(MAX_ENGINE_BYTES + 16);
+                    self.0.reserve_exact(capacity - self.0.len());
+                }
+                self.0.extend_from_slice(bytes); Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let mut writer = Writer(Vec::with_capacity(4096));
+        writer.0.extend(MAGIC); writer.0.extend(0u64.to_le_bytes());
+        serde_json::to_writer(&mut writer, self).map_err(|e| e.to_string())?;
+        let size = (writer.0.len() - 16) as u64;
+        writer.0[8..16].copy_from_slice(&size.to_le_bytes()); Ok(writer.0)
     }
     pub fn deserialize(data: &[u8]) -> Result<Self> {
         if data.len() < 16 || data.get(..8) != Some(MAGIC) { return Err("unsupported engine format: expected independently generated ZTRTAGX1 engine; NVIDIA engines are not supported".into()); }
@@ -324,6 +363,7 @@ mod tests {
     }
     #[test] fn rejects_bad_graphs() {
         let mut g = graph(); g.nodes[0].output = 0; assert!(g.validate().is_err());
+        let mut g = graph(); g.nodes[0].output = usize::MAX; assert!(g.refresh_shapes().is_err());
         let mut g = graph(); g.tensors[2].shape = vec![3, 2]; assert!(g.validate().is_err());
         assert!(elements(&[usize::MAX, 2]).is_err());
         assert!(broadcast(&[2, 3], &[2]).is_err());

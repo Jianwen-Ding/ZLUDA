@@ -82,6 +82,12 @@ run(g,{'x':xv},{f't{u}':np.tanh(tr),f't{v}':np.concatenate([tr,np.tanh(tr)],axis
 g=graph(); x=tensor(g,'x',[257]); out=x; value=rng.normal(size=[257]).astype('f'); ref=value.copy()
 for i in range(8): out=node(g,[257],'activation',input=out,kind='tanh'); ref=np.tanh(ref)
 g['outputs']=[out]; info=run(g,{'x':value},{f't{out}':ref}); assert info['workspace']<=2*1280,info
+# Scalar broadcasts, rank-8 metadata and constant-only graphs have distinct output bindings.
+for ash,bsh in [([],[]),([2,3],[]),([1,1,2,1,1,1,1,3],[1,1,1,1,1,1,1,3])]:
+    g=graph();av=np.asarray(rng.normal(size=ash),dtype='f');bv=np.asarray(rng.normal(size=bsh),dtype='f')
+    a=tensor(g,'a',ash);b=tensor(g,'b',bsh,bv);ref=av+bv;y=node(g,ref.shape,'element_wise',a=a,b=b,kind='add');g['outputs']=[y]
+    run(g,{'a':av},{f't{y}':ref},roundtrip=True)
+g=graph();v=np.arange(7,dtype='f');y=tensor(g,'constant_output',[7],v);g['outputs']=[y];run(g,{}, {'constant_output':v},roundtrip=True)
 # Missing, undersized, overlapping bindings and foreign serialization fail explicitly.
 g=graph(); x=tensor(g,'x',[4]); out=node(g,[4],'activation',input=x,kind='identity'); g['outputs']=[out]
 data=json.dumps(g).encode(); storage=C.create_string_buffer(data); e=ck(build(storage,len(data),1024)); c=ck(create(e)); p=alloc(np.zeros(4,dtype='f'))

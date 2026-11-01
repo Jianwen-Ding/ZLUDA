@@ -352,4 +352,107 @@ gpu.module @inference {
     }
     gpu.return
   }
+
+  // Packed NCHW grouped cross-correlation with bias and ReLU fused into the output store.
+  gpu.func @agx_infer_conv2d(%x0: memref<1xf32, 1>, %w0: memref<1xf32, 1>, %b0: memref<1xf32, 1>, %y0: memref<1xf32, 1>,
+      %N_: i32, %C_: i32, %H_: i32, %W_: i32, %K_: i32, %R_: i32, %S_: i32, %P_: i32, %Q_: i32,
+      %ph_: i32, %pw_: i32, %sh_: i32, %sw_: i32, %dh_: i32, %dw_: i32, %G_: i32, %bias_: i32, %relu_: i32) kernel {
+    %big = arith.constant 2147483647 : index
+    %x = memref.reinterpret_cast %x0 to offset: [0], sizes: [%big], strides: [1] : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %w = memref.reinterpret_cast %w0 to offset: [0], sizes: [%big], strides: [1] : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %b = memref.reinterpret_cast %b0 to offset: [0], sizes: [%big], strides: [1] : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %y = memref.reinterpret_cast %y0 to offset: [0], sizes: [%big], strides: [1] : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %N = arith.index_cast %N_ : i32 to index
+    %C = arith.index_cast %C_ : i32 to index
+    %H = arith.index_cast %H_ : i32 to index
+    %W = arith.index_cast %W_ : i32 to index
+    %K = arith.index_cast %K_ : i32 to index
+    %R = arith.index_cast %R_ : i32 to index
+    %S = arith.index_cast %S_ : i32 to index
+    %P = arith.index_cast %P_ : i32 to index
+    %Q = arith.index_cast %Q_ : i32 to index
+    %ph = arith.index_cast %ph_ : i32 to index
+    %pw = arith.index_cast %pw_ : i32 to index
+    %sh = arith.index_cast %sh_ : i32 to index
+    %sw = arith.index_cast %sw_ : i32 to index
+    %dh = arith.index_cast %dh_ : i32 to index
+    %dw = arith.index_cast %dw_ : i32 to index
+    %G = arith.index_cast %G_ : i32 to index
+    %zero = arith.constant 0 : index
+    %one = arith.constant 1 : index
+    %i0 = arith.constant 0 : i32
+    %f0 = arith.constant 0.0 : f32
+    %id = gpu.global_id x
+    %q = arith.remui %id, %Q : index
+    %t1 = arith.divui %id, %Q : index
+    %p = arith.remui %t1, %P : index
+    %t2 = arith.divui %t1, %P : index
+    %k = arith.remui %t2, %K : index
+    %n = arith.divui %t2, %K : index
+    %live = arith.cmpi ult, %n, %N : index
+    scf.if %live {
+      %cpg = arith.divui %C, %G : index
+      %kpg = arith.divui %K, %G : index
+      %group = arith.divui %k, %kpg : index
+      %cb = arith.muli %group, %cpg : index
+      %hp = arith.muli %p, %sh : index
+      %wp = arith.muli %q, %sw : index
+      %h0 = arith.subi %hp, %ph : index
+      %w_0 = arith.subi %wp, %pw : index
+      %nh0 = arith.subi %zero, %h0 : index
+      %hh0 = arith.subi %H, %h0 : index
+      %rlo0 = arith.ceildivsi %nh0, %dh : index
+      %rhi0 = arith.ceildivsi %hh0, %dh : index
+      %rlo = arith.maxsi %rlo0, %zero : index
+      %rhi = arith.minsi %rhi0, %R : index
+      %nw0 = arith.subi %zero, %w_0 : index
+      %ww0 = arith.subi %W, %w_0 : index
+      %slo0 = arith.ceildivsi %nw0, %dw : index
+      %shi0 = arith.ceildivsi %ww0, %dw : index
+      %slo = arith.maxsi %slo0, %zero : index
+      %shi = arith.minsi %shi0, %S : index
+      %nc = arith.muli %n, %C : index
+      %wkc = arith.muli %k, %cpg : index
+      %acc = scf.for %cc = %zero to %cpg step %one iter_args(%acc0 = %f0) -> f32 {
+        %c = arith.addi %cb, %cc : index
+        %xc = arith.addi %nc, %c : index
+        %xch = arith.muli %xc, %H : index
+        %wc = arith.addi %wkc, %cc : index
+        %wcr = arith.muli %wc, %R : index
+        %acc1 = scf.for %r = %rlo to %rhi step %one iter_args(%acc2 = %acc0) -> f32 {
+          %rdh = arith.muli %r, %dh : index
+          %h = arith.addi %h0, %rdh : index
+          %xh = arith.addi %xch, %h : index
+          %xhw = arith.muli %xh, %W : index
+          %wr = arith.addi %wcr, %r : index
+          %wrs = arith.muli %wr, %S : index
+          %acc3 = scf.for %ss = %slo to %shi step %one iter_args(%acc4 = %acc2) -> f32 {
+            %sdw = arith.muli %ss, %dw : index
+            %ww = arith.addi %w_0, %sdw : index
+            %xi = arith.addi %xhw, %ww : index
+            %wi = arith.addi %wrs, %ss : index
+            %xv = memref.load %x[%xi] : memref<?xf32, strided<[1]>, 1>
+            %wv = memref.load %w[%wi] : memref<?xf32, strided<[1]>, 1>
+            %v = math.fma %xv, %wv, %acc4 : f32
+            scf.yield %v : f32
+          }
+          scf.yield %acc3 : f32
+        }
+        scf.yield %acc1 : f32
+      }
+      %bias = arith.cmpi ne, %bias_, %i0 : i32
+      %biased = scf.if %bias -> f32 {
+        %bv = memref.load %b[%k] : memref<?xf32, strided<[1]>, 1>
+        %v = arith.addf %acc, %bv : f32
+        scf.yield %v : f32
+      } else {
+        scf.yield %acc : f32
+      }
+      %relu = arith.cmpi ne, %relu_, %i0 : i32
+      %r = arith.maxnumf %biased, %f0 : f32
+      %out = arith.select %relu, %r, %biased : f32
+      memref.store %out, %y[%id] : memref<?xf32, strided<[1]>, 1>
+    }
+    gpu.return
+  }
 }

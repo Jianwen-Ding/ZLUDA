@@ -15,6 +15,7 @@ results=[]
 for name,g in cases:
     data=json.dumps(g,separators=(',',':')).encode();source=C.create_string_buffer(data);start=time.perf_counter_ns();e=ck(build(source,len(data),1<<30));build_ms=(time.perf_counter_ns()-start)/1e6
     start=time.perf_counter_ns();c=ck(create(e));prepare_ms=(time.perf_counter_ns()-start)/1e6
+    start=time.perf_counter_ns();shared_context=ck(create(e));shared_prepare_ms=(time.perf_counter_ns()-start)/1e6;close(shared_context)
     count=len(allocations);outs=[]
     try:
         for i in g['inputs']+g['outputs']:
@@ -30,7 +31,7 @@ for name,g in cases:
             assert sync(c)==0,err();samples.append((time.perf_counter_ns()-start)/args.batch/1e3)
         for p,v in outs:
             dc('cuMemcpyDtoH_v2',P(v.ctypes.data),p,S(v.nbytes));assert np.isfinite(v).all(),name
-        results.append({'case':name,'build_ms':build_ms,'prepare_ms':prepare_ms,'first_enqueue_ms':cold_ms,'median_enqueue_sync_us':statistics.median(samples),'workspace_bytes':workspace(e),'constant_bytes':api('ztrtGetConstantBytes',S,P)(e),'fused_activations':fused(e)})
+        results.append({'case':name,'build_ms':build_ms,'prepare_ms':prepare_ms,'shared_prepare_ms':shared_prepare_ms,'first_enqueue_ms':cold_ms,'median_enqueue_sync_us':statistics.median(samples),'workspace_bytes':workspace(e),'constant_bytes':api('ztrtGetConstantBytes',S,P)(e),'fused_activations':fused(e)})
     finally:
         close(c);destroy(e)
         while len(allocations)>count:dc('cuMemFree_v2',allocations.pop())

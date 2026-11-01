@@ -50,6 +50,24 @@ for folder in sorted(a.captures.iterdir()):
         x,y,n,chunk,span,offset=args;source=view(x,n);indices=(np.arange(n)//chunk)*span+offset+np.arange(n)%chunk
         # Only this concat input was launched in the capture, so other slices keep their initial values.
         n=int(np.max(indices))+1;reference=view(y,n);reference[indices]=source
+    elif name=='agx_infer_conv2d':
+        x,w,b,y,N,Ch,H,W,K,R,S_,PP,QQ,ph,pw,sh,sw,dh,dw,G,hasbias,relu=args;n=N*K*PP*QQ
+        xv=view(x,N*Ch*H*W).reshape(N,Ch,H,W);wv=view(w,K*(Ch//G)*R*S_).reshape(K,Ch//G,R,S_)
+        bv=view(b,K) if hasbias else np.zeros(K,dtype=np.float32);reference=np.empty((N,K,PP,QQ),dtype=np.float32)
+        for nn in range(N):
+         for k in range(K):
+          group=k//(K//G)
+          for pp in range(PP):
+           for qq in range(QQ):
+            acc=np.float32(0)
+            for cc in range(Ch//G):
+             for rr in range(R):
+              for ss in range(S_):
+               hh=pp*sh-ph+rr*dh;ww=qq*sw-pw+ss*dw
+               if 0<=hh<H and 0<=ww<W:acc=np.float32(acc+xv[nn,group*(Ch//G)+cc,hh,ww]*wv[k,cc,rr,ss])
+            reference[nn,k,pp,qq]=acc+bv[k]
+        if relu:reference=np.maximum(reference,0)
+        reference=reference.reshape(-1)
     elif name=='agx_infer_pool':
         x,y,n,H,W,P,Q,R,S,ph,pw,sh,sw,kind,include=args;nc=n//(P*Q);v=view(x,nc*H*W).reshape(nc,H,W);reference=np.empty(n,dtype=np.float32)
         for i in range(n):
@@ -59,5 +77,5 @@ for folder in sorted(a.captures.iterdir()):
     else:raise AssertionError(name)
     np.testing.assert_allclose(view(y,n,after=True),reference,rtol=5e-4,atol=3e-5,equal_nan=True,err_msg=name)
     passed.append(name);print('PASS',name)
-assert len(set(passed))==7,passed
-print('PASS: seven portable inference kernels on the simulator')
+assert len(set(passed))==8,passed
+print('PASS: eight portable inference kernels on the simulator')

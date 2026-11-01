@@ -2,7 +2,7 @@
 
 `zluda_tensorrt_agx` builds `libtensorrt_agx.so`: an independent graph builder and inference runtime for Apple GPUs
 on Asahi Linux. Its math kernels are portable MLIR, lowered to upstream AIR and then by LLVM to AGX. It shares the
-existing MLIR/AIR GEMM and convolution implementation with the other AGX math libraries. No new AGX-specific
+existing MLIR/AIR GEMM implementation with the other AGX math libraries. No new AGX-specific
 intrinsics or handwritten AGX instructions are used.
 
 The library has an independent C ABI (`include/zluda_tensorrt.h`) and a **source-level subset** of the documented
@@ -28,9 +28,9 @@ In particular, do not install `libcudart.so` for this implementation. CUDA Drive
 The graph front end and dispatch/memory planner are Rust. GPU math is implemented in MLIR/AIR. Kernels compile
 when the library is built; model building does not need a running GPU or a compiler subprocess. Unreachable nodes
 and constants are removed, single-use elementwise/convolution + ReLU is fused, activation slots are reused by
-liveness, and weights and immutable metadata are packed into one device allocation per execution context.
-Bindings cannot overlap. A context serializes reuse of its workspace across different streams, and its destructor
-waits for outstanding work before freeing owned buffers. The CUDA context must outlive its execution contexts.
+liveness, and weights and immutable metadata are packed into one shared device allocation per engine and CUDA context.
+Convolution, bias and a single-use ReLU share one output kernel. Bindings cannot overlap. A context serializes reuse of its workspace across different streams, and its destructor
+waits for outstanding work before freeing owned buffers. The CUDA context must outlive its prepared engines and execution contexts.
 
 ONNX import supports standard-domain opsets 13–22, IR versions 4–13, static f32 I/O, embedded f32 weights, and
 constant i64 reshape shapes. Supported operators: `MatMul`, `Gemm`, `Conv`, `Relu`, `Sigmoid`, `Tanh`, `Identity`,
@@ -86,6 +86,16 @@ python3 zluda_tensorrt_agx/tools/build_kernels.py --llvm-build /path/to/llvm-bui
 The same MLIR source produces `inference.air`, `inference.air.ll`, and `inference.agxfat`. `--emit air` and `--emit agx`
 select individual outputs. These are upstream AIR artifacts; macOS packaging/downgrading is a separate toolchain step.
 
+To package a relocatable SDK containing only our own library, headers, compiler, example and kernel artifacts:
+
+```sh
+python3 zluda_tensorrt_agx/tools/package_sdk.py --target-dir target/release \
+    --kernels-dir /tmp/inference-kernels --output-dir /tmp/zluda-inference-sdk
+```
+
+The package includes a runnable C++ example with a relative rpath, licenses and a checksum manifest.
+It uses the existing ZLUDA AGX driver selected by `ZLUDA_AGX_LIBCUDA`.
+
 ## Verification
 
 ```sh
@@ -94,6 +104,7 @@ export ZTRT_LIBRARY=/absolute/path/to/libtensorrt_agx.so
 export ZLUDA_AGX_LIBCUDA=/absolute/path/to/our/libcuda.so
 python3 zluda_tensorrt_agx/tests/test_gpu.py
 python3 zluda_tensorrt_agx/tests/test_onnx.py
+python3 zluda_tensorrt_agx/tests/test_lifecycle.py
 ```
 
 The Python numerical tests require NumPy. The ONNX fixtures are independently generated from the public schema;
@@ -105,7 +116,7 @@ the AGX Performance Simulator:
 
 ```sh
 ZLUDA_AGX_CAPTURE=/tmp/inference-captures \
-ZLUDA_AGX_CAPTURE_KERNELS=agx_infer_binary,agx_infer_unary,agx_infer_softmax,agx_infer_softmax_simd,agx_infer_pool,agx_infer_transpose,agx_infer_concat \
+ZLUDA_AGX_CAPTURE_KERNELS=agx_infer_conv2d,agx_infer_binary,agx_infer_unary,agx_infer_softmax,agx_infer_softmax_simd,agx_infer_pool,agx_infer_transpose,agx_infer_concat \
 ZLUDA_AGX_CAPTURE_MAX=1 python3 zluda_tensorrt_agx/tests/test_gpu.py
 python3 zluda_tensorrt_agx/tests/test_sim.py /tmp/inference-captures --agx-run /path/to/agx_run
 ```
@@ -114,6 +125,11 @@ python3 zluda_tensorrt_agx/tests/test_sim.py /tmp/inference-captures --agx-run /
 reports model-build time, context preparation, end-to-end enqueue/synchronization latency and owned workspace.
 It is not a comparison with NVIDIA TensorRT, nor a Geekbench score. Geekbench/llama.cpp/Blender runs that do not
 call this new API do not validate this runtime's model importer or engine format.
+
+Immutable weights and kernel metadata are uploaded once per engine and CUDA context, then shared across its
+execution contexts. Activation workspace remains private to each execution context. Keep the owning CUDA context
+alive until its engines and execution contexts have been destroyed. An execution context retains its plan and
+resources if the engine handle is released first.
 
 ## Public sources and provenance
 

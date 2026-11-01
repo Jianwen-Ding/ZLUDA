@@ -46,6 +46,9 @@ rng=np.random.default_rng(4321)
 x=rng.normal(size=(2,3)).astype('f');w=rng.normal(size=(3,4)).astype('f');b=rng.normal(size=(4,)).astype('f')
 data=model([('x',[2,3])],[('y',[2,4])],[op('MatMul',['x','w'],'mm'),op('Add',['mm','b'],'sum'),op('Relu',['sum'],'y')],[constant('w',w),constant('b',b)])
 execute(data,{'x':x},{'y':np.maximum(x@w+b,0)})
+if os.environ.get('ZTRT_ONNX_FIXTURE'):
+    from pathlib import Path
+    Path(os.environ['ZTRT_ONNX_FIXTURE']).write_bytes(data)
 # Gemm transposition, scaling, broadcast bias.
 x=rng.normal(size=(3,2)).astype('f');w=rng.normal(size=(4,3)).astype('f');b=rng.normal(size=(4,)).astype('f')
 data=model([('x',[3,2])],[('y',[2,4])],[op('Gemm',['x','w','b'],'y',transA=1,transB=1,alpha=0.5,beta=0.25)],[constant('w',w),constant('b',b)])
@@ -56,6 +59,11 @@ c=np.array([x[0,0,i:i+2,j:j+2].sum()+.5 for i in range(3)for j in range(3)],dtyp
 r=np.maximum(c,0);pooled=np.array([r[0,0,i:i+2,j:j+2].mean()for i in range(2)for j in range(2)],dtype='f').reshape(1,4)
 data=model([('x',[1,1,4,4])],[('y',[1,4])],[op('Conv',['x','w','b'],'c'),op('Relu',['c'],'r'),op('AveragePool',['r'],'p',kernel_shape=[2,2]),op('Reshape',['p','shape'],'y')],[constant('w',w),constant('b',b),constant('shape',np.array([1,-1]),7)])
 execute(data,{'x':x},{'y':pooled})
+# Complete image classifier: convolution -> ReLU -> pooling -> reshape -> dense -> softmax.
+dense=rng.normal(size=(4,5)).astype('f');dense_bias=rng.normal(size=(5,)).astype('f')
+logits=pooled@dense+dense_bias;probs=np.exp(logits-logits.max(axis=1,keepdims=True));probs/=probs.sum(axis=1,keepdims=True)
+classifier=model([('x',[1,1,4,4])],[('probabilities',[1,5])],[op('Conv',['x','w','b'],'c'),op('Relu',['c'],'r'),op('AveragePool',['r'],'p',kernel_shape=[2,2]),op('Reshape',['p','shape'],'flat'),op('Gemm',['flat','dense','dense_bias'],'logits'),op('Softmax',['logits'],'probabilities',axis=-1)],[constant('w',w),constant('b',b),constant('shape',np.array([1,-1]),7),constant('dense',dense),constant('dense_bias',dense_bias)])
+execute(classifier,{'x':x},{'probabilities':probs})
 # Every activation, elementwise and softmax path with multidimensional broadcast.
 for kind in ['Sigmoid','Tanh','Identity']:
     x=rng.normal(size=(2,5)).astype('f')
@@ -71,6 +79,10 @@ x=rng.normal(size=(2,3,4)).astype('f');tr=x.transpose(1,0,2).reshape(3,8)
 execute(model([('x',[2,3,4])],[('y',[3,16])],[op('Transpose',['x'],'t',perm=[1,0,2]),op('Flatten',['t'],'f',axis=1),op('Concat',['f','f'],'y',axis=1)]),{'x':x},{'y':np.concatenate([tr,tr],axis=1)})
 x=rng.normal(size=(2,3,4,5)).astype('f')
 execute(model([('x',[2,3,4,5])],[('y',[2,3,1,1])],[op('GlobalAveragePool',['x'],'y')]),{'x':x},{'y':x.mean(axis=(2,3),keepdims=True)})
+# Constant-only models use our normal output binding path.
+value=constant('',np.array([1.,2.,3.],dtype='f'))
+constant_node=text(2,'y')+text(4,'Constant')+blob(5,text(1,'value')+var(20,4)+blob(5,value))
+execute(model([],[('y',[3])],[constant_node]),{}, {'y':np.array([1.,2.,3.],dtype='f')})
 # Malformed metadata and unsupported operators/attributes are explicit failures.
 for bad in [b'\0',b'\x80'*11,b'\x3a\xff\xff\xff\xff\x7f',model([('x',[2,3])],[('y',[2,3])],[op('Relu',['x'],'y',unknown=1)]),model([('x',[2,3])],[('y',[2,3])],[op('Erf',['x'],'y')]),model([('x',[2,3])],[('y',[2,3])],[op('Relu',['x'],'y')],opset=12)]:
     buf=C.create_string_buffer(bad);assert not build_onnx(buf,len(bad),1<<30),bad

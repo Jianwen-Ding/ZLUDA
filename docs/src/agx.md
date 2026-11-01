@@ -1645,13 +1645,15 @@ shaders on macOS and through ZLUDA, which separates compiler quality from driver
 The successful Geekbench 7.1.0 Linux ARM Preview container runs use **Geekbench's CUDA fallback with the bundled
 TensorRT RTX library moved aside**. The original archive lists `libtensorrt_rtx.so` next to `geekbench7`, but the
 measured container directory has no such file: it was moved to
-`/scratch/geekbench-extract/nvidia-quarantine/libtensorrt_rtx.so`. This additional library-placement difference was
+`/scratch/geekbench-extract/nvidia-quarantine/libtensorrt_rtx.so` (that extracted proprietary file was subsequently deleted). This additional library-placement difference was
 initially missed when comparing the four matching executable/workload files. These measurements do not establish
 TensorRT compatibility or compatibility with an unchanged Geekbench extraction.
 
 [`libtensorrt_rtx.so`](https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/architecture/how-trt-rtx-works.html)
 is NVIDIA's TensorRT RTX inference runtime, separate from the CUDA driver library supplied by ZLUDA. This repository
-supplies no TensorRT replacement. The failing host trace contains additional runtime initialization after both AI
+now supplies an [independent MLIR/AIR inference builder and runtime](../../zluda_tensorrt_agx/README.md) with a
+source-level API subset and its own engine format. It is not binary-compatible with TensorRT RTX and cannot load
+Geekbench's opaque NVIDIA engines. The failing host trace contains additional runtime initialization after both AI
 modules load; the successful container proceeds to model allocations and kernel lookups. To reproduce the tested
 fallback configuration on a host with the bundled library present, move it aside reversibly in the Geekbench folder:
 
@@ -1721,7 +1723,7 @@ or point `ZLUDA_AGX_ZOC` at it, and run the application with `LD_LIBRARY_PATH=ta
 | Driver API | devices, contexts, memory, copies, modules (PTX, fat binaries, AGX objects), linking (`cuLink*`), CUDA arrays, launches, streams, events, graphs (stream capture), occupancy, `cuGetProcAddress`, export tables. Other functions return `CUDA_ERROR_NOT_SUPPORTED` (see `ZLUDA_AGX_LOG`). |
 | Device code features | `printf`, `assert` (`CUDA_ERROR_ASSERT`) |
 | Checked mode | `zoc --agx-checked` / `ZLUDA_AGX_CHECKED=1`: every memory access bounds- and alignment-checked, the first bad one reported with its thread and launch (see "Checked mode"); faulted launches saved for `agx_run` with `ZLUDA_AGX_DUMP` |
-| Libraries | cuBLAS: f32, f16 and f64 GEMM (f64 in software), f32 and f64 level 1, gemv / ger, geam / dgmm / syrk / syr2k / symm / trmm / trsm and batched GEMM, and complex (C / Z) level 1, gemv / hemv / ger / her / her2, gemm / hemm / symm / herk / her2k / syrk / syr2k (`zluda_blas_agx`); cuBLASLt matmul with bias / ReLU / GELU epilogues (`zluda_blaslt_agx`); cuDNN 2-D convolutions, activations, softmax, pooling and batch normalization (`zluda_dnn_agx`); cuFFT single and double precision (`zluda_fft_agx`); cuSPARSE SpMV, SpMM, SpGEMM, sparse vectors, conversions, SDDMM, SpSV and SpSM in f32 and f64 (`zluda_sparse_agx`); cuRAND's host API on Philox (`zluda_rand_agx`); cuSOLVER dense LU, Cholesky, QR, SVD and symmetric eigenvalues (`zluda_solver_agx`); NVRTC on clang and nvJitLink (`zluda_rtc_agx`); single-rank NCCL (`zluda_nccl_agx`) |
+| Libraries | cuBLAS: f32, f16 and f64 GEMM (f64 in software), f32 and f64 level 1, gemv / ger, geam / dgmm / syrk / syr2k / symm / trmm / trsm and batched GEMM, and complex (C / Z) level 1, gemv / hemv / ger / her / her2, gemm / hemm / symm / herk / her2k / syrk / syr2k (`zluda_blas_agx`); cuBLASLt matmul with bias / ReLU / GELU epilogues (`zluda_blaslt_agx`); cuDNN 2-D convolutions, activations, softmax, pooling and batch normalization (`zluda_dnn_agx`); cuFFT single and double precision (`zluda_fft_agx`); cuSPARSE SpMV, SpMM, SpGEMM, sparse vectors, conversions, SDDMM, SpSV and SpSM in f32 and f64 (`zluda_sparse_agx`); cuRAND's host API on Philox (`zluda_rand_agx`); cuSOLVER dense LU, Cholesky, QR, SVD and symmetric eigenvalues (`zluda_solver_agx`); NVRTC on clang and nvJitLink (`zluda_rtc_agx`); single-rank NCCL (`zluda_nccl_agx`); independent static-f32 MLIR/AIR inference builder, ONNX subset and runtime (`zluda_tensorrt_agx`, own ABI/engine format) |
 | Not yet | peer access, IPC events, multicast objects, cuSPARSE's blocked formats, cuRAND's quasi-random generators |
 | NVML | device count, name, UUID, memory, compute capability; the maximum clock (`nvmlDeviceGetMaxClockInfo`, 1,398 MHz on the M2 Max) and GPU utilisation (`nvmlDeviceGetUtilizationRates`: the share of time since the last call this process's kernels ran, from the firmware's command timestamps; other processes are not seen). Asahi exposes no current clock, temperature or power without root (B25), so those return `NVML_ERROR_NOT_SUPPORTED` |
 | Strict instruction mode | `zoc --agx-strict` / `ZLUDA_AGX_STRICT=1`: only the instructions Mesa's asahi compiler emits, on M1 and M2 (see "Strict instruction mode"); PTX-formalization results identical, library kernels built for it |

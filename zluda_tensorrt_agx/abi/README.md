@@ -114,7 +114,7 @@ restored serialization is byte-identical. Metadata queries also pass with an una
 wrapping leaves ownership with the caller. Normal and AddressSanitizer builds pass without diagnostics.
 
 These probes still do not compile against a complete independently obtained, version-pinned reference header
-set. Broader engine/context execution coverage, stream loading, serializer options, refitting, inspection,
+set. Broader engine/context execution coverage, incremental decoding/device streaming, serializer options, refitting, inspection,
 weight management and complete version-specific compatibility remain required work. The prototype does not
 alias libtensorrt_rtx.so and does not establish Geekbench support.
 
@@ -180,3 +180,24 @@ both exact-header and larger declared sizes without touching the body. Tests cov
 negative/short/null inputs, unknown versions, oversized payloads and impossible metadata lengths. A real
 serialized fixture also proves that a valid header with a corrupt body fails full deserialization. Runtime,
 metadata and GPU context probes pass ordinarily and with C++ adapter/probe AddressSanitizer instrumentation.
+
+
+## Reader-based custom engine loading
+
+`deserializeCudaEngineV2` now accepts the reviewed version 1.0 C++ `IStreamReaderV2` interface.
+The reader is borrowed, starts at its current position and is never destroyed or rewound. Only host buffers
+and a null CUDA stream are passed to `read`. Requests are capped at 1 MiB; short positive reads are retried.
+Zero, negative and over-reported read counts fail. The 24-byte custom header is validated before allocating
+the payload buffer, and its declared payload remains bounded to 256 MiB. The loader consumes exactly one
+engine, leaving trailing stream bytes untouched. Invalid interfaces are rejected before reads.
+
+This implementation stages the complete bounded serialized engine in host memory before invoking the native
+decoder. It is not incremental weight decoding, GPUDirect, deferred loading or a peak-memory improvement.
+Those remain optimization/feature work. No NVIDIA engine format is decoded.
+The adapted interface declarations follow the Apache-2.0 [public reader declarations](https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/_static/c-api/_nv_infer_runtime_8h_source.html).
+
+The independently declared reader probe checks 1-byte/7-byte/large reads, every truncated prefix of a real
+custom fixture, reader errors and invalid counts, unknown format tags, version rejection before reading,
+trailing bytes, and a real weight payload larger than 1 MiB. Serialization remains byte-identical after stream
+loading. The GPU context probe now loads through seven-byte reader calls and still checks inference, streams
+and CUDA graph replay after caller data is overwritten. Normal and adapter/probe-ASan checks pass.

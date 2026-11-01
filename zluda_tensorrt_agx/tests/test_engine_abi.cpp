@@ -9,6 +9,7 @@
 #include <vector>
 #include "abi_probe.hpp"
 #include "runtime_probe.hpp"
+#include "stream_probe.hpp"
 
 struct Logger final:nvinfer1::ILogger{int errors=0;void log(Severity,char const*)noexcept override{++errors;}};
 int main(int argc,char** argv){assert(argc==2);void* lib=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL);if(!lib)throw std::runtime_error(dlerror());
@@ -51,9 +52,36 @@ int main(int argc,char** argv){assert(argc==2);void* lib=dlopen(argv[1],RTLD_NOW
             assert(!publicRuntime->impl->deserializeCudaEngine(copy.data(),(size_t(256)<<20)+17));
         }
         auto loaded=static_cast<probe::Engine*>(publicRuntime->impl->deserializeCudaEngine(copy.data(),copy.size()));assert(loaded);
+        if(iteration==0){
+            for(size_t chunk:{size_t(1),size_t(7),size_t(1024*1024)}){
+                probe::BytesReader reader(copy.data(),copy.size(),chunk);
+                auto streamed=static_cast<probe::Engine*>(publicRuntime->impl->deserializeCudaEngineV2(&reader));assert(streamed);
+                assert(reader.position==copy.size()&&reader.seeks==0);auto encodedStream=streamed->impl->serialize();assert(encodedStream);
+                assert(encodedStream->impl->size()==copy.size()&&std::memcmp(encodedStream->impl->data(),copy.data(),copy.size())==0);
+                delete encodedStream;delete streamed;
+            }
+            for(size_t end=0;end<copy.size();++end){probe::BytesReader reader(copy.data(),end,7);assert(!publicRuntime->impl->deserializeCudaEngineV2(&reader));}
+            for(int failure:{1,2}){probe::BytesReader reader(copy.data(),copy.size(),7);reader.failure=failure;assert(!publicRuntime->impl->deserializeCudaEngineV2(&reader));}
+            probe::BytesReader incompatible(copy.data(),copy.size(),7);incompatible.supported=false;
+            assert(!publicRuntime->impl->deserializeCudaEngineV2(&incompatible)&&incompatible.reads==0);
+            auto trailing=copy;trailing.resize(copy.size()+17,255);probe::BytesReader reader(trailing.data(),trailing.size(),7);
+            auto streamed=static_cast<probe::Engine*>(publicRuntime->impl->deserializeCudaEngineV2(&reader));assert(streamed&&reader.position==copy.size());delete streamed;
+            auto bad=copy;bad[0]='?';probe::BytesReader unknown(bad.data(),bad.size(),7);assert(!publicRuntime->impl->deserializeCudaEngineV2(&unknown)&&unknown.position==24);
+        }
         delete publicRuntime;auto encoded=loaded->impl->serialize();assert(encoded&&encoded->impl->size()==copy.size());
         assert(std::memcmp(encoded->impl->data(),copy.data(),copy.size())==0);delete loaded;delete encoded;
         ztrtDestroyRuntime(runtime);auto again=static_cast<probe::Engine*>(wrap(restored,&logger));assert(again&&again->impl->getNbIOTensors()==2);delete again;delete memory;
     }
+    // Exercise the 1 MiB read limit with real independently generated weight records.
+    auto builder=ztrtCreateBuilder();assert(builder);int64_t dims[1]={262145};std::vector<float> weights(size_t(dims[0]),1.25f);
+    int x=ztrtBuilderAddInput(builder,"large_input",dims,1);int w=ztrtBuilderAddConstant(builder,"large_weights",dims,1,weights.data(),weights.size());
+    assert(x>=0&&w>=0);int y=ztrtBuilderAddElementWise(builder,x,w,0);assert(y>=0&&ztrtBuilderMarkOutput(builder,y)==0);
+    auto native=ztrtBuilderBuild(builder);assert(native);ztrtDestroyBuilder(builder);
+    size_t size=ztrtSerializeEngine(native,nullptr,0);assert(size>(1<<20));std::vector<uint8_t> bytes(size);assert(ztrtSerializeEngine(native,bytes.data(),size)==size);ztrtDestroyEngine(native);
+    auto runtime=static_cast<probe::Runtime*>(createRuntime(&logger,10701));assert(runtime);
+    probe::BytesReader reader(bytes.data(),bytes.size(),size_t(1)<<20);
+    auto loaded=static_cast<probe::Engine*>(runtime->impl->deserializeCudaEngineV2(&reader));assert(loaded&&reader.reads>=3&&reader.position==size);
+    auto memory=loaded->impl->serialize();assert(memory&&memory->impl->size()==size&&std::memcmp(memory->impl->data(),bytes.data(),size)==0);
+    delete memory;delete loaded;delete runtime;
     assert(logger.errors>=300);dlclose(lib);std::cout<<"PASS: engine metadata dispatch, native serialization ownership, rejected paths and 100 roundtrips\n";
 }

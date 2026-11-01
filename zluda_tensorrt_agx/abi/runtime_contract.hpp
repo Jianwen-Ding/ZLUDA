@@ -14,6 +14,22 @@ using IErrorRecorder=v_1_0::IErrorRecorder;
 using IStreamReaderV2=v_1_0::IStreamReaderV2;
 using IPluginCreatorInterface=v_1_0::IPluginCreatorInterface;
 using IPluginResource=v_1_0::IPluginResource;
+enum class SeekPosition:int32_t { kSET=0,kCUR=1,kEND=2 };
+namespace v_1_0 {
+class IStreamReaderV2:public IVersionedInterface {
+public:
+    ~IStreamReaderV2() override=default;
+    IStreamReaderV2()=default;
+    InterfaceInfo getInterfaceInfo() const noexcept override{return {"IStreamReaderV2",1,0};}
+    virtual int64_t read(void*,int64_t,CUstream_st*) noexcept=0;
+    virtual bool seek(int64_t,SeekPosition) noexcept=0;
+protected:
+    IStreamReaderV2(IStreamReaderV2 const&)=default;
+    IStreamReaderV2(IStreamReaderV2&&)=default;
+    IStreamReaderV2& operator=(IStreamReaderV2 const&) & =default;
+    IStreamReaderV2& operator=(IStreamReaderV2&&) & =default;
+};
+}
 enum class EngineValidity:int32_t { kVALID=0,kSUBOPTIMAL=1,kINVALID=2 };
 enum class EngineInvalidityDiagnostics:uint64_t { kMALFORMED_ENGINE=1ULL<<5 };
 enum class DLAWorkspaceAllocationStrategy:int32_t;

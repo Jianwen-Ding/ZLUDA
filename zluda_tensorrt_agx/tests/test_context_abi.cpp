@@ -1,6 +1,7 @@
 // GPU execution through independently declared engine/context dispatch prefixes.
 #include "abi_probe.hpp"
 #include "runtime_probe.hpp"
+#include "stream_probe.hpp"
 #include <vector>
 #include "zluda_tensorrt.h"
 #include <cassert>
@@ -23,7 +24,8 @@ int main(int argc,char** argv){assert(argc==2);auto path=std::getenv("ZLUDA_AGX_
     assert(ztrtSerializeEngine(native,serialized.data(),bytes)==bytes);ztrtDestroyEngine(native);
     auto runtime=static_cast<probe::Runtime*>(createRuntime(&logger,10701));assert(runtime);
     assert(!runtime->impl->deserializeCudaEngine(serialized.data(),bytes-1));
-    auto engine=static_cast<probe::Engine*>(runtime->impl->deserializeCudaEngine(serialized.data(),bytes));assert(engine);
+    probe::BytesReader reader(serialized.data(),bytes,7);
+    auto engine=static_cast<probe::Engine*>(runtime->impl->deserializeCudaEngineV2(&reader));assert(engine&&reader.position==bytes);
     delete runtime; // Our engine owns its plan independently; caller bytes are no longer needed.
     std::fill(serialized.begin(),serialized.end(),0);auto object=static_cast<probe::Context*>(engine->impl->createExecutionContext(0));assert(object);auto c=object->impl;assert(c&&c->getPImpl()==object&& &c->getEngine()==engine);
     assert(c->getOptimizationProfile()==0&&c->allInputDimensionsSpecified()&&c->inferShapes(0,nullptr)==0);

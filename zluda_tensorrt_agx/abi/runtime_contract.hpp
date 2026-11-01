@@ -236,3 +236,30 @@ public:
 }
 class IExecutionContext {public:virtual ~IExecutionContext() noexcept=default;protected:apiv::VExecutionContext* mImpl=nullptr;};
 }
+
+namespace nvinfer1 {
+class IRuntimeCache;
+enum class DynamicShapesKernelSpecializationStrategy:int32_t { kLAZY=0,kEAGER=1,kNONE=2 };
+enum class CudaGraphStrategy:int32_t { kDISABLED=0,kWHOLE_GRAPH_CAPTURE=1 };
+namespace apiv {
+class VRuntimeConfig {
+public:
+    virtual ~VRuntimeConfig() noexcept=default;
+    virtual IRuntimeConfig* getPImpl() noexcept=0;
+    virtual void setExecutionContextAllocationStrategy(ExecutionContextAllocationStrategy) noexcept=0;
+    virtual ExecutionContextAllocationStrategy getExecutionContextAllocationStrategy() const noexcept=0;
+    virtual IRuntimeCache* createRuntimeCache() const noexcept=0;
+    virtual bool setRuntimeCache(IRuntimeCache const&) noexcept=0;
+    virtual IRuntimeCache* getRuntimeCache() const noexcept=0;
+    virtual void setDynamicShapesKernelSpecializationStrategy(DynamicShapesKernelSpecializationStrategy) noexcept=0;
+    virtual DynamicShapesKernelSpecializationStrategy getDynamicShapesKernelSpecializationStrategy() const noexcept=0;
+    virtual bool setCudaGraphStrategy(CudaGraphStrategy) noexcept=0;
+    virtual CudaGraphStrategy getCudaGraphStrategy() const noexcept=0;
+};
+}
+class IRuntimeConfig {
+public:
+    virtual ~IRuntimeConfig() noexcept=default;
+    apiv::VRuntimeConfig* mImpl=nullptr;
+};
+}

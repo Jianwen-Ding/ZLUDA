@@ -65,8 +65,18 @@ int main(int argc,char** argv){assert(argc==2);auto path=std::getenv("ZLUDA_AGX_
     c->setDeviceMemoryV2(dy,24);assert(!c->enqueueV3(nullptr));c->setDeviceMemoryV2(scratch,256);
     assert(c->enqueueV3(nullptr));check(symbol<int(*)()>(driver,"cuCtxSynchronize")());
     assert(!c->setInputConsumedEvent(reinterpret_cast<void*>(uintptr_t(1)))&&!c->getInputConsumedEvent());assert(c->setOutputAllocator("output",nullptr)&&!c->setOutputAllocator("output",reinterpret_cast<void*>(uintptr_t(1))));
+    // Null runtime config selects defaults and produces an owned settings snapshot.
+    auto defaults=static_cast<probe::Context*>(engine->impl->createExecutionContextWithRuntimeConfig(nullptr));assert(defaults);
+    auto defaultSettings=static_cast<probe::Config*>(defaults->impl->getRuntimeConfig());assert(defaultSettings&&defaultSettings->impl->getExecutionContextAllocationStrategy()==0);delete defaults;
     // A user-managed context has no activation allocation until memory is supplied.
-    auto managed=static_cast<probe::Context*>(engine->impl->createExecutionContext(2));assert(managed);
+    auto config=static_cast<probe::Config*>(engine->impl->createRuntimeConfig());assert(config);
+    config->impl->setExecutionContextAllocationStrategy(2);
+    config->impl->setDynamicShapesKernelSpecializationStrategy(2);
+    auto managed=static_cast<probe::Context*>(engine->impl->createExecutionContextWithRuntimeConfig(config));assert(managed);
+    auto snapshot=static_cast<probe::Config*>(managed->impl->getRuntimeConfig());assert(snapshot&&snapshot!=config);
+    assert(snapshot->impl->getExecutionContextAllocationStrategy()==2&&snapshot->impl->getDynamicShapesKernelSpecializationStrategy()==2);
+    config->impl->setExecutionContextAllocationStrategy(0);delete config;
+    assert(snapshot->impl->getExecutionContextAllocationStrategy()==2);
     auto m=managed->impl;assert(m->setInputTensorAddress("input",dx)&&m->setOutputTensorAddress("output",dy));
     assert(!m->enqueueV3(nullptr));m->setDeviceMemoryV2(scratch,256);assert(m->executeV2(bindings));
     delete managed; // Borrowed scratch must remain alive and usable by the first context.

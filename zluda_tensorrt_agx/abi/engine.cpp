@@ -2,10 +2,12 @@
 #include "runtime_contract.hpp"
 #include "extensions.h"
 #include "context.hpp"
+#include "config.hpp"
 #include <atomic>
 #include <vector>
 #include <cstring>
 #include <stdexcept>
+#include <memory>
 namespace {
 using namespace nvinfer1;
 void error(ILogger* l,char const* text) noexcept{if(l)l->log(ILogger::Severity::kERROR,text);}
@@ -73,8 +75,12 @@ public:
     int64_t getDeviceMemorySizeV2() const noexcept override{return int64_t(ztrtGetWorkspaceSize(native));}
     int64_t getDeviceMemorySizeForProfileV2(int32_t p) const noexcept override{return p==0?getDeviceMemorySizeV2():-1;}
     int64_t const* getProfileTensorValuesV2(char const*,int32_t,OptProfileSelector) const noexcept override{return nullptr;}
-    IExecutionContext* createExecutionContextWithRuntimeConfig(IRuntimeConfig*) noexcept override{error(logger,"ABI prototype: runtime configuration is unsupported");return nullptr;}
-    IRuntimeConfig* createRuntimeConfig() noexcept override{error(logger,"ABI prototype: runtime configuration is unsupported");return nullptr;}
+    IExecutionContext* createExecutionContextWithRuntimeConfig(IRuntimeConfig* config) noexcept override{
+        std::unique_ptr<IRuntimeConfig> copy(ztrtAbiCloneConfig(config,owner,logger));if(!copy)return nullptr;
+        bool managed=int32_t(copy->mImpl->getExecutionContextAllocationStrategy())==2;
+        auto context=ztrtAbiCreateContext(owner,native,logger,managed,copy.get());if(context)prepared=true;return context;
+    }
+    IRuntimeConfig* createRuntimeConfig() noexcept override{return ztrtAbiCreateConfig(owner,logger);}
     int64_t getEngineStat(EngineStat) const noexcept override{error(logger,"ABI prototype: engine statistics are unsupported");return -1;}
     char const* getAliasedInputTensor(char const*) const noexcept override{return nullptr;}
     bool areWeightsLoaded() const noexcept override{return prepared.load();}

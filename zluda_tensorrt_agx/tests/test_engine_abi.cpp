@@ -32,6 +32,22 @@ int main(int argc,char** argv){assert(argc==2);void* lib=dlopen(argv[1],RTLD_NOW
         assert(e->getTensorBytesPerComponentV2("input",0)==-1&&e->getTensorBytesPerComponentV2("input",1)==-1);
         assert(e->getTensorFormatDesc("input")&&e->getDeviceMemorySizeV2()==256&&e->getDeviceMemorySizeForProfileV2(1)==-1);
         assert(!e->createExecutionContext(1)&&!e->createSerializationConfig()&&!e->setWeightStreamingBudgetV2(1));
+        auto config=static_cast<probe::Config*>(e->createRuntimeConfig());assert(config&&config->impl->getPImpl()==config);
+        auto settings=config->impl;assert(settings->getExecutionContextAllocationStrategy()==0);
+        settings->setExecutionContextAllocationStrategy(2);assert(settings->getExecutionContextAllocationStrategy()==2);
+        settings->setExecutionContextAllocationStrategy(99);assert(settings->getExecutionContextAllocationStrategy()==2);
+        assert(!e->createExecutionContextWithRuntimeConfig(config));settings->setExecutionContextAllocationStrategy(0);
+        for(int value:{0,1,2}){settings->setDynamicShapesKernelSpecializationStrategy(value);assert(settings->getDynamicShapesKernelSpecializationStrategy()==value);}
+        settings->setDynamicShapesKernelSpecializationStrategy(99);assert(!e->createExecutionContextWithRuntimeConfig(config));
+        assert(!settings->createRuntimeCache()&&!settings->getRuntimeCache());
+        assert(settings->getCudaGraphStrategy()==0&&settings->setCudaGraphStrategy(0)&&!settings->setCudaGraphStrategy(1)&&!settings->setCudaGraphStrategy(99));
+        if(iteration==0){
+            settings->setDynamicShapesKernelSpecializationStrategy(0);
+            auto otherNative=ztrtBuildJson(reinterpret_cast<uint8_t const*>(json),sizeof(json)-1,4096);assert(otherNative);
+            auto other=static_cast<probe::Engine*>(wrap(otherNative,&logger));assert(other);
+            assert(!other->impl->createExecutionContextWithRuntimeConfig(config));delete other;
+        }
+        delete config;
         auto memory=e->serialize();assert(memory);delete engine; // Returned custom bytes outlive the engine wrapper.
         auto h=memory->impl;assert(h->type()==nvinfer1::DataType::kINT8&&h->size()>24&&std::memcmp(h->data(),"ZTRTAGX2",8)==0);
         auto runtime=ztrtCreateRuntime();assert(runtime);auto restored=ztrtDeserializeEngine(runtime,static_cast<uint8_t const*>(h->data()),h->size(),4096);assert(restored);

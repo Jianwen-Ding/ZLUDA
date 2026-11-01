@@ -54,6 +54,9 @@ public:
     virtual int64_t getWeightStreamingScratchMemorySize() const noexcept=0;
     virtual int64_t getDeviceMemorySizeV2() const noexcept=0;
     virtual int64_t getDeviceMemorySizeForProfileV2(int32_t) const noexcept=0;
+    virtual int64_t const* getProfileTensorValuesV2(char const*,int32_t,int32_t) const noexcept=0;
+    virtual void* createExecutionContextWithRuntimeConfig(void*) noexcept=0;
+    virtual void* createRuntimeConfig() noexcept=0;
 };
 struct Engine {virtual ~Engine() noexcept=default;EngineDispatch* impl;};
 }
@@ -117,4 +120,23 @@ public:
     virtual bool setCommunicator(void*) noexcept=0;
 };
 struct Context {virtual ~Context() noexcept=default;ContextDispatch* impl;};
+}
+
+namespace probe {
+struct Config;
+class ConfigDispatch {
+public:
+    virtual ~ConfigDispatch() noexcept=default;
+    virtual Config* getPImpl() noexcept=0;
+    virtual void setExecutionContextAllocationStrategy(int32_t) noexcept=0;
+    virtual int32_t getExecutionContextAllocationStrategy() const noexcept=0;
+    virtual void* createRuntimeCache() const noexcept=0;
+    virtual bool setRuntimeCache(void const*) noexcept=0;
+    virtual void* getRuntimeCache() const noexcept=0;
+    virtual void setDynamicShapesKernelSpecializationStrategy(int32_t) noexcept=0;
+    virtual int32_t getDynamicShapesKernelSpecializationStrategy() const noexcept=0;
+    virtual bool setCudaGraphStrategy(int32_t) noexcept=0;
+    virtual int32_t getCudaGraphStrategy() const noexcept=0;
+};
+struct Config {virtual ~Config() noexcept=default;ConfigDispatch* impl;};
 }

@@ -215,7 +215,7 @@ See [stream loading measurements](../validation/stream-loading.md) for the memor
 
 Static strategy 0 and user-managed strategy 2 now create GPU execution contexts. Strategy 2 omits activation
 workspace allocation; its immutable kernel/constant resources are still prepared and shared per engine/CUDA
-context. Strategy 1 remains unsupported. The runtime-config factory path remains incomplete.
+context. Strategy 1 remains unsupported. The runtime-config factory path now supports those same two strategies; cache/graph controls remain incomplete.
 `setDeviceMemoryV2` connects caller scratch storage to the native context. Legacy `setDeviceMemory` uses the
 engine's required size, so the caller must ensure the actual allocation is large enough. Scratch must be
 256-byte aligned and at least the reported workspace size. Negative sizes, invalid alignment and insufficient
@@ -234,3 +234,34 @@ The adapter probe tests undersized/unaligned storage, overlap rejection, null un
 with borrowed scratch, strategy-2 creation, and sequential scratch reuse after destroying one context.
 Final caller `cuMemFree` succeeds, checking that borrowed scratch was not freed by context destruction.
 Normal and C++ adapter/probe-ASan tests pass, as do native lifecycle, 99 GPU graph and 109 ONNX model checks.
+
+
+## Runtime configuration objects
+
+`config.cpp` implements the reviewed `VRuntimeConfig` method order, from getPImpl through graph strategy.
+`createRuntimeConfig()` returns a caller-owned object associated with its engine. Allocation defaults to
+STATIC (0); STATIC and USER_MANAGED (2) are supported. Unsupported/invalid values passed to the void
+allocation setter preserve the last reported value but invalidate creation until a supported value is set.
+The engine rejects configs belonging to a different engine, unknown implementations, or invalid settings.
+
+`createExecutionContextWithRuntimeConfig()` copies valid settings into a context-owned snapshot. A null config
+selects defaults. The caller can change/delete the source config after creation. `getRuntimeConfig()` returns
+a borrowed snapshot, which must not be deleted by the caller; creation settings are not live allocation
+controls, and changing them after creation does not reallocate context memory. Direct strategy-based creation
+still returns no runtime-config object. This explicit snapshot behavior is our current subset contract;
+complete reference-header/version-specific behavioral validation remains outstanding.
+
+Dynamic specialization enum values LAZY=0, EAGER=1 and NONE=2 are stored for static-engine configuration
+round trips. There are no dynamic profiles or dynamically specialized kernels yet, so this does not add
+dynamic-shape execution. Invalid specialization values block subsequent creation until corrected.
+Automatic graph capture accepts only DISABLED=0; WHOLE_GRAPH_CAPTURE and unknown values return false.
+This does not disable caller-controlled explicit graph capture. Runtime cache creation/attachment is
+unsupported and returns null/false with a logger message.
+
+Declarations follow the Apache-2.0 [public dispatch source](https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/_static/c-api/_nv_infer_impl_8h_source.html)
+and [runtime config enums](https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/_static/c-api/_nv_infer_runtime_8h_source.html).
+Independent prefix probes exercise config metadata/getPImpl, allocation changes, invalid configuration
+rejection before GPU access, specialization values, cache/graph rejection, cross-engine rejection and 100
+ownership cycles. The GPU probe checks default creation, config-selected caller scratch, source-config
+mutation/destruction, snapshot persistence, inference results and sequential shared-scratch execution.
+Normal and C++ adapter/probe-ASan builds pass. The native backend is not ASan-instrumented.

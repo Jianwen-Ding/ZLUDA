@@ -282,6 +282,17 @@ pub fn compile_air(
     // AGX code, the Metal pipeline optimizes the portable module itself, which the Metal copy is taken from (one
     // optimization for both, and portable AIR optimized as the Metal AIR is)
     let metal_source = metal_pipeline.filter(|_| agx_cpu.is_some() && !agx_only).map(|_| linked.clone());
+    // A module compiled a kernel at a time (ZLUDA_AGX_PER_KERNEL=1, as zluda_agx compiles large modules) whose kernels
+    // share few functions: the cleanup of light+ here and O3 in each kernel's module, in parallel, instead of O3 on
+    // the whole module (llama.cpp's 10 MB module, 317 kernels and 15 other functions: 26.5 -> 22.1 s, its Q5_K
+    // matrix-vector kernel 4% faster, the Q5_1 one the same). Not for kernels sharing much (Blender Cycles: each
+    // kernel's O3 repeats the shared functions, 43-50 -> 50-57 s). ZLUDA_AIR_AS_PIPELINE: o3 or light+ to choose.
+    let kernels_own_o3 = agx_cpu.is_some()
+        && match std::env::var("ZLUDA_AIR_AS_PIPELINE").as_deref() {
+            Ok("light+") => true,
+            Ok("o3") => false,
+            _ => std::env::var("ZLUDA_AGX_PER_KERNEL").is_ok_and(|v| v == "1") && independent_kernels(&linked),
+        };
     // O3 again in AIR's address spaces: a lighter cleanup (inlining, SROA, EarlyCSE, InstCombine, SimplifyCFG,
     // GVN) gives the tensor-core PTX tests 18-23% more AGX code (their loops are unrolled differently)
     match metal_pipeline {
@@ -292,11 +303,8 @@ pub fn compile_air(
             stage("the Metal pipeline in AIR's address spaces");
         }
         _ => {
-            // ZLUDA_AIR_AS_PIPELINE=light+ (experiment): the cleanup of light+ instead of O3 here, the kernels' O3 left
-            // to the AGX pipeline (a large module's runs a kernel at a time, in parallel: ZLUDA_AIR_AGX_PIPELINE=o3)
-            let light = std::env::var("ZLUDA_AIR_AS_PIPELINE").is_ok_and(|v| v == "light+");
-            run(&linked, if light { LIGHT_PLUS } else { c"default<O3>" }, &air, &options)?;
-            stage("O3 in AIR's address spaces");
+            run(&linked, if kernels_own_o3 { LIGHT_PLUS } else { c"default<O3>" }, &air, &options)?;
+            stage(if kernels_own_o3 { "light+ in AIR's address spaces (O3 a kernel at a time)" } else { "O3 in AIR's address spaces" });
         }
     }
     // (AGX code from it: AGX's f32 compares flush as .ftz ones do; Metal-only: all on the bits)
@@ -332,7 +340,8 @@ pub fn compile_air(
     };
     let per_kernel_pipeline = match agx_pipeline_env.as_deref() {
         Ok("o3") => agx_pipeline,
-        _ => None,
+        Ok("none") => None,
+        _ => agx_pipeline.filter(|_| kernels_own_o3),
     };
     let agx_object = match agx_cpu {
         None => None,
@@ -601,6 +610,23 @@ fn default_jobs() -> usize {
         Some(kb) => cores.min((kb * 1024 / JOB_BYTES) as usize).max(1),
         None => cores.min(4),
     }
+}
+
+/// Whether `module`'s kernels share few other functions: at most one defined non-kernel function per 8 kernels.
+fn independent_kernels(module: &Module) -> bool {
+    let kernels = kernel_names(module).len();
+    let mut others = 0;
+    unsafe {
+        let mut f = llvm_sys::core::LLVMGetFirstFunction(module.get());
+        while !f.is_null() {
+            let kernel = !llvm_sys::core::LLVMGetStringAttributeAtIndex(f, llvm_sys::LLVMAttributeFunctionIndex, c"air-kernel".as_ptr(), 10).is_null();
+            if llvm_sys::core::LLVMIsDeclaration(f) == 0 && !kernel {
+                others += 1;
+            }
+            f = llvm_sys::core::LLVMGetNextFunction(f);
+        }
+    }
+    kernels > 1 && others * 8 <= kernels
 }
 
 /// The names of the kernels (functions with the air-kernel attribute) of `module`.

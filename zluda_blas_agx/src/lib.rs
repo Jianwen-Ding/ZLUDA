@@ -456,18 +456,27 @@ mod imp {
     /// The smallest n for which sgemm with op(A) = A^T transposes A first (see gemm).
     const PRETRANSPOSE_MIN_N: c_int = 256;
 
-    /// Slices of K for a single f32 product (1: no split): with at most 16 output tiles of 64 x 64 and K >= 1024,
-    /// enough slices for ~64 workgroups, each at least 256 of K, at most 16.
-    fn split_k(m: u64, n: u64, k: u64) -> u64 {
+    /// Slices of K for a single product with f32 C (f32 or f16 A and B; 1: no split): with at most 16 output tiles of
+    /// 64 x 64 and K >= `min_k`, enough slices for ~64 workgroups, each at least 256 of K, at most 16.
+    fn split_k(m: u64, n: u64, k: u64, min_k: u64) -> u64 {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var("ZLUDA_AGX_GEMM_SPLITK").map_or(true, |v| v != "0")) {
             return 1;
         }
         let tiles = (m / 64) * (n / 64);
-        if tiles == 0 || tiles > 16 || k < 1024 {
+        if tiles == 0 || tiles > 16 || k < min_k {
             return 1;
         }
         (64 / tiles).min(k / 256).min(16).max(1)
+    }
+
+    /// The shortest K that split_k splits for `types` (ZLUDA_AGX_GEMM_SPLITK_MIN_K for both): 1024 for f32 A and B;
+    /// 512 for f16 A and B with f32 C (cublasGemmEx as ggml calls it, M2 Max: 896 x 64 x 896 116 -> 81 us,
+    /// 128 x 512 x 896 99 -> 82 us; 256 gains nothing more).
+    fn split_k_min_k(types: Types) -> u64 {
+        static K: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        let set = *K.get_or_init(|| std::env::var("ZLUDA_AGX_GEMM_SPLITK_MIN_K").ok().and_then(|v| v.parse().ok()));
+        set.unwrap_or(if types == Types::S { 1024 } else { 512 })
     }
 
     fn pretranspose_enabled() -> bool {
@@ -516,7 +525,8 @@ mod imp {
         let (mut a, mut lda, mut ta) = (a, lda, ta);
         let pre = types == Types::S && ta && batch == 1 && n >= PRETRANSPOSE_MIN_N && m >= 64 && k >= 64
             && pretranspose_enabled();
-        let slices = if types == Types::S && batch == 1 { split_k(m as u64, n as u64, k as u64) } else { 1 };
+        // (the partial products are f32 for f32 and f16 A and B, which agx_ssum_slices adds to C when it is f32 too)
+        let slices = if matches!(types, Types::S | Types::HtoS) && batch == 1 { split_k(m as u64, n as u64, k as u64, split_k_min_k(types)) } else { 1 };
         let pre_bytes = if pre { m as usize * k as usize * 4 } else { 0 };
         let part_bytes = if slices > 1 { slices as usize * m as usize * n as usize * 4 } else { 0 };
         let base = if pre_bytes + part_bytes > 0 { scratch(h, pre_bytes + part_bytes)? } else { std::ptr::null_mut() };
@@ -561,8 +571,9 @@ mod imp {
                 g.k = k - done;
                 g.beta = 1.0;
                 g.batch = 1;
-                g.a = a.cast::<f32>().add(step_a(done) as usize).cast();
-                g.b = b.cast::<f32>().add(step_b(done) as usize).cast();
+                let elem = if types == Types::S { 4 } else { 2 };
+                g.a = a.byte_add(step_a(done) as usize * elem);
+                g.b = b.byte_add(step_b(done) as usize * elem);
                 engine::gemm(&g, h.stream).map_err(status)?;
             }
             let (mut p, mut cc) = (part as *const c_void, c);

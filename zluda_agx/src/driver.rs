@@ -293,6 +293,12 @@ fn gathers(graph: bool, ordinary: bool, batch_of_stream: bool, queue_busy: bool)
     graph || (ordinary && (batch_of_stream || queue_busy))
 }
 
+/// ZLUDA_AGX_GPU_COPIES=0: asynchronous device-to-device copies always wait for the GPU and copy on the CPU.
+fn gpu_async_copies() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ZLUDA_AGX_GPU_COPIES").map_or(true, |v| v != "0"))
+}
+
 /// ZLUDA_AGX_SPECIALIZE=0 turns launch-time specialization off.
 fn specialize_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -929,7 +935,34 @@ impl Driver {
     /// their barriers), instead of waiting for the GPU and copying on the CPU; false when it cannot be (no batch,
     /// a module's global data, which the CPU writes, or the copy kernels not compiling).
     fn copy_in_batch(&mut self, dst: u64, src: u64, n: u64, sh: usize) -> Result<bool, CUerror> {
-        if !self.batching || n == 0 || self.module_global(dst, n).is_some() || self.module_global(src, n).is_some() {
+        if !self.batching {
+            return Ok(false);
+        }
+        self.copy_kernel(dst, src, n, sh)
+    }
+
+    /// An asynchronous device-to-device copy as a copy kernel on stream `sh` while the stream's queue still has work
+    /// (or it waits for events): in order with its other work, without waiting for the GPU, instead of waiting for
+    /// every stream and copying on the CPU (cudaMemcpyAsync of the runtime, the libraries' copies). An idle stream
+    /// copies on the CPU at once, as before (sooner than a launch). False when not done this way.
+    fn copy_async(&mut self, dst: u64, src: u64, n: u64, sh: usize) -> Result<bool, CUerror> {
+        if !gpu_async_copies() || n == 0 || !self.is_device(dst) || !self.is_device(src) {
+            return Ok(false);
+        }
+        let busy = {
+            let (q, waits) = self.queue(sh)?;
+            !waits.is_empty() || !q.is_done(q.last()).unwrap_or(true)
+        };
+        if !busy && self.batch.as_ref().is_none_or(|b| b.stream != sh) {
+            return Ok(false);
+        }
+        self.copy_kernel(dst, src, n, sh)
+    }
+
+    /// The copy as a launch of the copy kernels on stream `sh`; false for module globals (which the CPU writes) or
+    /// when the copy kernels do not load.
+    fn copy_kernel(&mut self, dst: u64, src: u64, n: u64, sh: usize) -> Result<bool, CUerror> {
+        if n == 0 || self.module_global(dst, n).is_some() || self.module_global(src, n).is_some() {
             return Ok(false);
         }
         if self.copy_kernels.is_none() {
@@ -3115,6 +3148,9 @@ pub(crate) unsafe fn cuMemcpyAsync(dst: CUdeviceptr, src: CUdeviceptr, n: usize,
     if with(|d| Ok(d.captured(s, || Op::Copy { dst: dst.0 as u64, src: src.0 as u64, n })))? {
         return Ok(());
     }
+    if with(|d| d.copy_async(dst.0 as u64, src.0 as u64, n as u64, s.0 as usize))? {
+        return Ok(());
+    }
     cuMemcpy(dst, src, n)
 }
 
@@ -3134,6 +3170,9 @@ pub(crate) unsafe fn cuMemcpyDtoHAsync_v2(dst: *mut c_void, src: CUdeviceptr, n:
 
 pub(crate) unsafe fn cuMemcpyDtoDAsync_v2(dst: CUdeviceptr, src: CUdeviceptr, n: usize, s: CUstream) -> CUresult {
     if with(|d| Ok(d.captured(s, || Op::Copy { dst: dst.0 as u64, src: src.0 as u64, n })))? {
+        return Ok(());
+    }
+    if with(|d| d.copy_async(dst.0 as u64, src.0 as u64, n as u64, s.0 as usize))? {
         return Ok(());
     }
     cuMemcpyDtoD_v2(dst, src, n)

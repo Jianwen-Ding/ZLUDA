@@ -995,6 +995,110 @@ gpu.module @agx_blas {
     gpu.return
   }
 
+  // agx_strsm with a SIMD-group per vector (single precision only), for
+  // systems of at most 64 (the blocks of the blocked trsm): lane l keeps
+  // elements l and l + 32 in registers, each solved element is shuffled to
+  // all lanes and every lane updates its own. Launch 32 threads per vector.
+  gpu.func @agx_strsm_sg(%a0: memref<1xf32, 1>, %b0: memref<1xf32, 1>,
+                         %m: index, %n: index, %lda: index, %ldb: index,
+                         %right_: i64, %upper_: i64, %trans_: i64, %unit_: i64, %lower_: i64,
+                         %alpha: f32) kernel {
+    %big = arith.constant 4611686018427387904 : index
+    %z = arith.constant 0 : i64
+    %i0 = arith.constant 0 : index
+    %i1 = arith.constant 1 : index
+    %i32 = arith.constant 32 : index
+    %w32 = arith.constant 32 : i32
+    %f0 = arith.constant 0.0 : f32
+    %b = memref.reinterpret_cast %b0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %right = arith.cmpi ne, %right_, %z : i64
+    %upper = arith.cmpi ne, %upper_, %z : i64
+    %trans = arith.cmpi ne, %trans_, %z : i64
+    %unit = arith.cmpi ne, %unit_, %z : i64
+    %lower = arith.cmpi ne, %lower_, %z : i64
+    %gid = gpu.global_id x
+    %t = arith.divui %gid, %i32 : index
+    %lane = arith.remui %gid, %i32 : index
+    %e1 = arith.addi %lane, %i32 : index
+    %count = arith.select %right, %m, %n : index
+    %len = arith.select %right, %n, %m : index
+    %live = arith.cmpi ult, %t, %count : index
+    scf.if %live {
+      // element e of this SIMD-group's vector: B(e, t) (left) or B(t, e) (right)
+      %vs = arith.select %right, %ldb, %i1 : index
+      %bs0 = arith.muli %t, %ldb : index
+      %base = arith.select %right, %t, %bs0 : index
+      %in0 = arith.cmpi ult, %lane, %len : index
+      %in1 = arith.cmpi ult, %e1, %len : index
+      %o0a = arith.muli %lane, %vs : index
+      %p0 = arith.addi %base, %o0a : index
+      %o1a = arith.muli %e1, %vs : index
+      %p1 = arith.addi %base, %o1a : index
+      %v0 = scf.if %in0 -> f32 {
+        %v = memref.load %b[%p0] : memref<?xf32, strided<[1]>, 1>
+        %s = arith.mulf %v, %alpha : f32
+        scf.yield %s : f32
+      } else {
+        scf.yield %f0 : f32
+      }
+      %v1 = scf.if %in1 -> f32 {
+        %v = memref.load %b[%p1] : memref<?xf32, strided<[1]>, 1>
+        %s = arith.mulf %v, %alpha : f32
+        scf.yield %s : f32
+      } else {
+        scf.yield %f0 : f32
+      }
+      %lm1 = arith.subi %len, %i1 : index
+      %res:2 = scf.for %step = %i0 to %len step %i1 iter_args(%x0 = %v0, %x1 = %v1) -> (f32, f32) {
+        // forward for lower M, backward for upper
+        %back = arith.subi %lm1, %step : index
+        %r = arith.select %lower, %step, %back : index
+        %hi = arith.cmpi uge, %r, %i32 : index
+        %src = arith.select %hi, %x1, %x0 : f32
+        %rl = arith.remui %r, %i32 : index
+        %rl32 = arith.index_cast %rl : index to i32
+        %br, %ok = gpu.shuffle idx %src, %rl32, %w32 : f32
+        %d = func.call @agx_strsm_m(%a0, %r, %r, %lda, %right, %upper, %trans, %unit) : (memref<1xf32, 1>, index, index, index, i1, i1, i1, i1) -> f32
+        %x = arith.divf %br, %d : f32
+        %y0 = func.call @agx_strsm_sg_upd(%a0, %lane, %x0, %r, %x, %len, %lda, %right, %upper, %trans, %unit, %lower) : (memref<1xf32, 1>, index, f32, index, f32, index, index, i1, i1, i1, i1, i1) -> f32
+        %y1 = func.call @agx_strsm_sg_upd(%a0, %e1, %x1, %r, %x, %len, %lda, %right, %upper, %trans, %unit, %lower) : (memref<1xf32, 1>, index, f32, index, f32, index, index, i1, i1, i1, i1, i1) -> f32
+        scf.yield %y0, %y1 : f32, f32
+      }
+      scf.if %in0 {
+        memref.store %res#0, %b[%p0] : memref<?xf32, strided<[1]>, 1>
+      }
+      scf.if %in1 {
+        memref.store %res#1, %b[%p1] : memref<?xf32, strided<[1]>, 1>
+      }
+    }
+    gpu.return
+  }
+
+  // Element e (value v) of agx_strsm_sg's vector after solving element r as
+  // x: x for e = r, v - M(e, r) x for the elements still to solve (after r
+  // for lower M, before r for upper), else v (single precision only).
+  func.func private @agx_strsm_sg_upd(%a0: memref<1xf32, 1>, %e: index, %v: f32, %r: index, %x: f32,
+                                      %len: index, %lda: index, %right: i1, %upper: i1, %trans: i1,
+                                      %unit: i1, %lower: i1) -> f32 {
+    %is_r = arith.cmpi eq, %e, %r : index
+    %after = arith.cmpi ugt, %e, %r : index
+    %before = arith.cmpi ult, %e, %r : index
+    %side = arith.select %lower, %after, %before : i1
+    %inl = arith.cmpi ult, %e, %len : index
+    %todo = arith.andi %side, %inl : i1
+    %res = scf.if %todo -> f32 {
+      %mv = func.call @agx_strsm_m(%a0, %e, %r, %lda, %right, %upper, %trans, %unit) : (memref<1xf32, 1>, index, index, index, i1, i1, i1, i1) -> f32
+      %nx = arith.negf %x : f32
+      %nv = math.fma %mv, %nx, %v : f32
+      scf.yield %nv : f32
+    } else {
+      %w = arith.select %is_r, %x, %v : f32
+      scf.yield %w : f32
+    }
+    return %res : f32
+  }
+
   func.func private @agx_strsm_m(%a0: memref<1xf32, 1>, %r: index, %c: index, %lda: index,
                                  %right: i1, %upper: i1, %trans: i1, %unit: i1) -> f32 {
     %false = arith.constant false

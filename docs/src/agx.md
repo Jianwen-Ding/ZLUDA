@@ -1376,7 +1376,10 @@ it), as NVIDIA's does.
   boundaries, and one launch does the 64 x 64 diagonal blocks), `Ssymm` and `Strmm` (in place when C is B, through a
   copy; with A of 64 rows or more and C of at least 64 x 64 elements, A is made full in a scratch buffer the handle
   keeps, symmetric or with zeros outside the triangle, and one GEMM on the tile kernels does the product) and `Strsm`
-  (one thread per column of B, or per row for the right side, solving by substitution; with A above 64 rows, by blocks
+  (a SIMD-group per column of B, or per row for the right side, solving by substitution with the vector in registers,
+  each solved element shuffled to the lanes, `agx_strsm_sg`; one thread per vector walking it in memory took 68 of
+  82 ms of a 4096 x 64 solve, now 30.0 -> 6.3 ms at 4096, 7.7 -> 2.4 ms at 1024, all 16 variants checked by
+  `tools/trsmcheck.c`; `ZLUDA_AGX_TRSM_SG=0`: a thread per vector, which `Dtrsm` keeps; with A above 64 rows, by blocks
   of 64 rows of op(A), each solved that way and then taken out of the rest of B with a GEMM on the tile kernels, the
   first of which also applies alpha; `Dtrsm` the same way on the generic f64 GEMM), and `cublasSgemmBatched` (the pointer arrays are read back once the stream is
   idle, then one GEMM per entry).

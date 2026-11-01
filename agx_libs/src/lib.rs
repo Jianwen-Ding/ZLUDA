@@ -596,7 +596,12 @@ pub mod engine {
         if t.m == 0 || t.n == 0 {
             return Ok(());
         }
-        let f = function(BLAS, if t.double { c"agx_strsm_f64" } else { c"agx_strsm" })?;
+        // f32: a SIMD-group per vector with it in registers (agx_strsm_sg, systems of at most TRSM_BLOCK); a thread
+        // per vector walked it in memory (4096 x 64 left: 68 of 82 ms in the diagonal blocks). ZLUDA_AGX_TRSM_SG=0: a
+        // thread per vector.
+        let sg = !t.double && std::env::var("ZLUDA_AGX_TRSM_SG").map_or(true, |v| v != "0");
+        let f = function(BLAS, if t.double { c"agx_strsm_f64" } else if sg { c"agx_strsm_sg" } else { c"agx_strsm" })?;
+        let per = if sg { 32 } else { 1 };
         // element bytes
         let e = if t.double { 8 } else { 4 };
         // the per-thread system is lower triangular when an even number of the stored lower triangle, the
@@ -607,7 +612,7 @@ pub mod engine {
             let (mut a, mut b, mut m, mut n, mut alpha32, mut alpha64) = (a, b, m, n, alpha as f32, alpha);
             let (mut lda, mut ldb, mut lower) = (t.lda, t.ldb, lower);
             let (mut right, mut upper, mut trans, mut unit) = (t.right as i64, t.upper as i64, t.trans as i64, t.unit as i64);
-            let threads = if t.right { m } else { n } as u64;
+            let threads = if t.right { m } else { n } as u64 * per;
             let mut params = [&mut a as *mut _ as *mut c_void, &mut b as *mut _ as *mut c_void, &mut m as *mut _ as *mut c_void,
                               &mut n as *mut _ as *mut c_void, &mut lda as *mut _ as *mut c_void, &mut ldb as *mut _ as *mut c_void,
                               &mut right as *mut _ as *mut c_void, &mut upper as *mut _ as *mut c_void,

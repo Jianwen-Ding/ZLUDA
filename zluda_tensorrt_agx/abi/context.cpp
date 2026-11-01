@@ -92,8 +92,13 @@ public:
         mImpl=new ContextImpl(this,engine,native.get(),model,logger,settings);native.release();
     }
     ~Context() noexcept override{delete mImpl;}
+    bool matches(ICudaEngine const* engine) const noexcept{return &mImpl->getEngine()==engine;}
 };
 }
 nvinfer1::IExecutionContext* ztrtAbiCreateContext(nvinfer1::ICudaEngine* engine,ZtrtEngine* model,nvinfer1::ILogger* logger,bool managed,nvinfer1::IRuntimeConfig* settings) noexcept{
     try{return new Context(engine,model,logger,managed,settings);}catch(std::exception const& e){error(logger,e.what());return nullptr;}catch(...){error(logger,"context adapter allocation failed");return nullptr;}
+}
+
+bool ztrtAbiContextMatches(nvinfer1::IExecutionContext const* context,nvinfer1::ICudaEngine const* engine) noexcept{
+    auto own=dynamic_cast<Context const*>(context);return own&&own->matches(engine);
 }

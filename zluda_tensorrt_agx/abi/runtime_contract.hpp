@@ -284,3 +284,24 @@ public:
     apiv::VSerializationConfig* mImpl=nullptr;
 };
 }
+
+namespace nvinfer1 {
+enum class LayerInformationFormat:int32_t { kONELINE=0,kJSON=1 };
+namespace apiv {
+class VEngineInspector {
+public:
+    virtual ~VEngineInspector() noexcept=default;
+    virtual IEngineInspector* getPImpl() noexcept=0;
+    virtual bool setExecutionContext(IExecutionContext const*) noexcept=0;
+    virtual IExecutionContext const* getExecutionContext() const noexcept=0;
+    virtual char const* getLayerInformation(int32_t,LayerInformationFormat) const noexcept=0;
+    virtual char const* getEngineInformation(LayerInformationFormat) const noexcept=0;
+    virtual void setErrorRecorder(IErrorRecorder*) noexcept=0;
+    virtual IErrorRecorder* getErrorRecorder() const noexcept=0;
+};
+}
+class IEngineInspector {
+public:virtual ~IEngineInspector() noexcept=default;
+protected:apiv::VEngineInspector* mImpl=nullptr;
+};
+}

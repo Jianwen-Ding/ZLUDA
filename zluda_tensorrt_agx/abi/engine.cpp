@@ -3,6 +3,7 @@
 #include "extensions.h"
 #include "context.hpp"
 #include "config.hpp"
+#include "inspector.hpp"
 #include <atomic>
 #include <vector>
 #include <cstring>
@@ -41,8 +42,8 @@ public:
     void setErrorRecorder(IErrorRecorder* p) noexcept override{if(p)error(logger,"ABI prototype: error recorders are unsupported");}
     IErrorRecorder* getErrorRecorder() const noexcept override{return nullptr;}
     uint32_t getTacticSources() const noexcept override{return 0;}
-    ProfilingVerbosity getProfilingVerbosity() const noexcept override{return static_cast<ProfilingVerbosity>(1);}
-    IEngineInspector* createEngineInspector() const noexcept override{error(logger,"ABI prototype: engine inspector is unsupported");return nullptr;}
+    ProfilingVerbosity getProfilingVerbosity() const noexcept override{return static_cast<ProfilingVerbosity>(0);}
+    IEngineInspector* createEngineInspector() const noexcept override{return ztrtAbiCreateInspector(owner,native,logger);}
     Dims getTensorShape(char const* name) const noexcept override{if(!valid(name))return invalid();Dims d;d.nbDims=ztrtGetTensorShape(native,name,d.d,8);return d;}
     DataType getTensorDataType(char const*) const noexcept override{return DataType::kFLOAT;}
     TensorLocation getTensorLocation(char const*) const noexcept override{return static_cast<TensorLocation>(0);}

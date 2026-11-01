@@ -18,7 +18,7 @@ if not native.is_file():p.error(f'missing native inference library: {native}; bu
 flags=['-std=c++17','-Wall','-Wextra','-Werror','-I',str(crate/'include')]
 if a.sanitize:flags+=['-fsanitize=address','-fno-omit-frame-pointer','-g']
 library=out/'libtensorrt_agx_runtime_abi.so';probe=out/'ztrt-runtime-abi-probe'
-subprocess.run([a.cxx,*flags,'-fPIC','-fvisibility=hidden','-shared',str(crate/'abi/runtime.cpp'),str(crate/'abi/engine.cpp'),str(crate/'abi/context.cpp'),str(crate/'abi/config.cpp'),str(native),'-Wl,-rpath,'+str(native.parent),'-o',str(library)],check=True)
+subprocess.run([a.cxx,*flags,'-fPIC','-fvisibility=hidden','-shared',str(crate/'abi/runtime.cpp'),str(crate/'abi/engine.cpp'),str(crate/'abi/context.cpp'),str(crate/'abi/config.cpp'),str(crate/'abi/inspector.cpp'),str(native),'-Wl,-rpath,'+str(native.parent),'-o',str(library)],check=True)
 subprocess.run([a.cxx,*flags,str(crate/'tests/test_runtime_abi.cpp'),'-ldl','-o',str(probe)],check=True)
 subprocess.run([str(probe),str(library)],check=True)
 engine_probe=out/'ztrt-engine-abi-probe'

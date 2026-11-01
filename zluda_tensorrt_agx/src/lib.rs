@@ -285,6 +285,10 @@ fn modify(g: &mut Graph, output: usize, f: impl FnOnce(&mut Op) -> Result<()>) -
         e.plan.graph.serialize_to(&e.serialization_header,output)?; Ok(e.serialized_size)
     })
 }
+/// Planned-step name is its output tensor name, including fused-step output renaming.
+#[no_mangle] pub unsafe extern "C" fn ztrtGetLayerName(p:*const Engine,index:i32)->*const c_char {
+    boundary(std::ptr::null(),||{let e=object(p)?;let step=e.plan.steps.get(id(index)?).ok_or("layer index out of range")?;Ok(e.names[step.node.output].as_ptr())})
+}
 #[no_mangle] pub unsafe extern "C" fn ztrtGetLayerCount(p: *const Engine) -> i32 { boundary(-1, || Ok(object(p)?.plan.steps.len() as i32)) }
 #[no_mangle] pub unsafe extern "C" fn ztrtGetNbIOTensors(p: *const Engine) -> i32 { boundary(-1, || { let e = object(p)?; Ok((e.plan.graph.inputs.len() + e.plan.graph.outputs.len()) as i32) }) }
 #[no_mangle] pub unsafe extern "C" fn ztrtGetIOTensorName(p: *const Engine, index: i32) -> *const c_char {

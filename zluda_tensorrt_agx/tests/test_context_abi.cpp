@@ -65,6 +65,16 @@ int main(int argc,char** argv){assert(argc==2);auto path=std::getenv("ZLUDA_AGX_
     c->setDeviceMemoryV2(dy,24);assert(!c->enqueueV3(nullptr));c->setDeviceMemoryV2(scratch,256);
     assert(c->enqueueV3(nullptr));check(symbol<int(*)()>(driver,"cuCtxSynchronize")());
     assert(!c->setInputConsumedEvent(reinterpret_cast<void*>(uintptr_t(1)))&&!c->getInputConsumedEvent());assert(c->setOutputAllocator("output",nullptr)&&!c->setOutputAllocator("output",reinterpret_cast<void*>(uintptr_t(1))));
+    auto inspector=static_cast<probe::Inspector*>(engine->impl->createEngineInspector());assert(inspector);
+    assert(inspector->impl->setExecutionContext(object)&&inspector->impl->getExecutionContext()==object);
+    assert(std::strcmp(inspector->impl->getLayerInformation(0,0),"middle")==0);
+    auto otherNative=ztrtBuildJson(reinterpret_cast<uint8_t const*>(source),sizeof(source)-1,4096);assert(otherNative);
+    auto wrap=symbol<void*(*)(void*,void*)>(library,"ztrtRtxWrapNativeEngine");
+    auto otherEngine=static_cast<probe::Engine*>(wrap(otherNative,&logger));assert(otherEngine);
+    auto otherContext=static_cast<probe::Context*>(otherEngine->impl->createExecutionContext(0));assert(otherContext);
+    assert(!inspector->impl->setExecutionContext(otherContext)&&inspector->impl->getExecutionContext()==object);
+    delete otherContext;delete otherEngine;
+    assert(inspector->impl->setExecutionContext(nullptr));delete inspector;
     // Null runtime config selects defaults and produces an owned settings snapshot.
     auto defaults=static_cast<probe::Context*>(engine->impl->createExecutionContextWithRuntimeConfig(nullptr));assert(defaults);
     auto defaultSettings=static_cast<probe::Config*>(defaults->impl->getRuntimeConfig());assert(defaultSettings&&defaultSettings->impl->getExecutionContextAllocationStrategy()==0);delete defaults;

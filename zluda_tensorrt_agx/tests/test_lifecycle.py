@@ -12,6 +12,10 @@ assert decode_engine(bytes(payload))['workspace_limit']==256
 r=ck(runtime())
 assert not restore(r,payload,size,128)
 restored=ck(restore(r,payload,size,512));destroy(restored);free_runtime(r)
+layer_name=api('ztrtGetLayerName',C.c_char_p,P,I)
+layer_count=api('ztrtGetLayerCount',I,P)
+assert not layer_name(e,-1) and not layer_name(e,layer_count(e))
+assert layer_name(e,layer_count(e)-1)==f't{y}'.encode()
 c=ck(create(e))
 xv=np.array([[1,-2,3],[4,5,-6]],dtype='f');xp=alloc(xv);yp=alloc(np.full((2,2),np.nan,dtype='f'))
 assert bind(c,b'x',xp,xv.nbytes)==0 and bind(c,f't{y}'.encode(),yp,16)==0
@@ -67,5 +71,6 @@ while allocations:dc('cuMemFree_v2',allocations.pop())
 # Null object errors stay on the C boundary, without panics or device accesses.
 assert api('ztrtGetNbIOTensors',I,P)(None)==-1
 assert api('ztrtGetLayerCount',I,P)(None)==-1
+assert not layer_name(None,0)
 assert serialize(None,None,0)==0
 print('PASS: CUDA graph replay, cross-stream workspace ordering, context restoration, shared resources, engine lifetime, budget persistence and null handles')

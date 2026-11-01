@@ -153,3 +153,19 @@ public:
 };
 struct SerializationConfig {virtual ~SerializationConfig() noexcept=default;SerializationDispatch* impl;};
 }
+
+namespace probe {
+struct Inspector;
+class InspectorDispatch {
+public:
+    virtual ~InspectorDispatch() noexcept=default;
+    virtual Inspector* getPImpl() noexcept=0;
+    virtual bool setExecutionContext(Context const*) noexcept=0;
+    virtual Context const* getExecutionContext() const noexcept=0;
+    virtual char const* getLayerInformation(int32_t,int32_t) const noexcept=0;
+    virtual char const* getEngineInformation(int32_t) const noexcept=0;
+    virtual void setErrorRecorder(void*) noexcept=0;
+    virtual void* getErrorRecorder() const noexcept=0;
+};
+struct Inspector {virtual ~Inspector() noexcept=default;InspectorDispatch* impl;};
+}

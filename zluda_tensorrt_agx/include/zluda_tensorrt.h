@@ -66,6 +66,8 @@ void ztrtDestroyEngine(ZtrtEngine*);
 size_t ztrtSerializeEngine(const ZtrtEngine*, uint8_t*, size_t);
 /* Planned graph steps, including view descriptors; not a physical GPU launch count. */
 int32_t ztrtGetLayerCount(const ZtrtEngine*);
+/* Borrowed output-tensor name of the planned (possibly fused) step. */
+const char* ztrtGetLayerName(const ZtrtEngine*, int32_t index);
 int32_t ztrtGetNbIOTensors(const ZtrtEngine*);
 const char* ztrtGetIOTensorName(const ZtrtEngine*, int32_t);
 int32_t ztrtGetTensorIOMode(const ZtrtEngine*, const char*);

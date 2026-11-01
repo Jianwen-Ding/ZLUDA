@@ -114,7 +114,7 @@ restored serialization is byte-identical. Metadata queries also pass with an una
 wrapping leaves ownership with the caller. Normal and AddressSanitizer builds pass without diagnostics.
 
 These probes still do not compile against a complete independently obtained, version-pinned reference header
-set. Broader engine/context execution coverage, incremental decoding/device streaming, weight-stripped/refit serialization options, refitting, inspection,
+set. Broader engine/context execution coverage, incremental decoding/device streaming, weight-stripped/refit serialization options, refitting, detailed inspection,
 weight management and complete version-specific compatibility remain required work. The prototype does not
 alias libtensorrt_rtx.so and does not establish Geekbench support.
 
@@ -288,3 +288,30 @@ and high bit masks, rejected-state preservation, unknown config rejection, indiv
 and byte-identical default/exclude-runtime serialization across 100 native-engine round trips. Normal and
 C++ adapter/probe-ASan runs pass, including the existing GPU context probe. Full independently pinned
 reference-header ABI validation remains incomplete.
+
+
+## Inspector for independent compiled graphs
+
+`createEngineInspector()` now returns the reviewed seven-method inspector dispatch wrapper. It inspects only
+our in-memory planned graph names, using the independent native `ztrtGetLayerName` accessor. It does not open
+or inspect binaries, serialized vendor engines, weight bytes or generated GPU code. Planned-step names are
+their output tensor names; a fused step uses its final output name. Metadata lookup requires no GPU access.
+
+Engine profiling verbosity is now LAYER_NAMES_ONLY (0), matching the inspector's actual output. ONELINE (0)
+returns names separated by newlines. JSON (1) returns `{"Name":"..."}` per layer or
+`{"Layers":[{"Name":"..."},...]}` for the engine. Quote, backslash and control characters are escaped;
+UTF-8 names remain UTF-8. This is our names-only schema, not a claim of complete detailed NVIDIA tooling
+schema compatibility. Layer names can contain line breaks, so JSON is the unambiguous representation.
+Invalid layer indices/formats return null and log an error. Returned strings are borrowed until the next
+information query on that inspector or its destruction. Inspectors are not concurrently queried/mutated.
+
+An inspector can borrow a context from the same public engine, or detach with null. Unknown implementations
+and other-engine contexts are rejected without changing the previous attachment. The engine and any attached
+context must outlive the inspector/attachment; detach before destroying an attached context. Error recorders
+remain unsupported. The public dispatch declarations follow the Apache-2.0
+[interface source](https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/_static/c-api/_nv_infer_impl_8h_source.html).
+
+Independent ABI-prefix tests cover names/text/JSON, invalid indices/formats, output escaping, getPImpl,
+unknown context rejection, GPU-context attachment/detachment and cross-engine rejection. The native lifecycle
+probe checks fused-step name selection and null/negative/out-of-range access. Normal and C++ adapter/probe-ASan
+runs pass, including 100 engine ownership/serialization cycles. No proprietary artifact is used as a test oracle.

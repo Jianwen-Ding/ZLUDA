@@ -1,5 +1,8 @@
 # Public interface alignment and unfinished ABI work
 
+> **Development status: inactive.** TensorRT development is paused at the user’s request.
+> The existing implementation is incomplete and is not actively being developed.
+
 The requested end state remains a complete independent TensorRT implementation backed by portable MLIR/AIR,
 with our custom serializer, performance validation and no proprietary binary inspection. The current library
 is not that complete end state. More operators alone do not establish ABI compatibility.

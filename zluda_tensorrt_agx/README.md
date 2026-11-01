@@ -1,5 +1,8 @@
 # Independent MLIR/AIR inference runtime
 
+> **Development status: inactive.** TensorRT development is paused at the user’s request.
+> The existing implementation is incomplete and is not actively being developed.
+
 `zluda_tensorrt_agx` builds `libtensorrt_agx.so`: an independent graph builder and inference runtime for Apple GPUs
 on Asahi Linux. Its math kernels are portable MLIR, lowered to upstream AIR and then by LLVM to AGX. It shares the
 existing MLIR/AIR GEMM implementation with the other AGX math libraries. No new AGX-specific

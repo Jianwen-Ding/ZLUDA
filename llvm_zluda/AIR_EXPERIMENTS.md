@@ -85,6 +85,11 @@ wall time, peak RSS, object md5).
   errors.
   Geekbench (2 of its modules change): every workload completes, the same 10 expected errors, summed GPU time 27.13
   -> 26.94 s; its changed modules' kernels within their run-to-run spread (keypoint kernels are data-dependent).
+- Dead end, software-pipelined tile GEMM: loading the next k-step's 8 fragments before this step's 16 products
+  (gen_tile_gemm.py, the variants that load all fragments first, and the f16 `_tb` one) passes the kernel tests
+  but is 9-14% slower on the M2 Max (gemmbench, f16 A/B: 4096^3 6.99 -> 6.35 TFLOPS, f16 C 7.18 -> 6.20, 4096 x
+  512 x 4096 6.26 -> 5.66): 8 more fragments live per SIMD-group, while AGX already overlaps the loads with the
+  products. Large GEMMs run at ~7 TFLOPS (about half the FMA peak); more needs a different tile, not pipelining.
 - Dead end, dp4a: a signed dp4a is 18 AGX instructions (4 imadd; the bytes extracted by bfi + asr pairs, asr 24 for
   byte 3). The free 16-bit sign extension (MOD_SX) exists only on add / multiply-add sources (IADD_I32_FROM16,
   IMADD_*_FROM32), not on shifts, so byte 1 (sext of the low half, then asr 8) is two instructions as now: no

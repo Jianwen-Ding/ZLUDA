@@ -77,6 +77,8 @@ wall time, peak RSS, object md5).
   registers: 46.1 -> 14.6 us and 53.8 -> 25.3 us per launch, llama.cpp pp128 445.6 -> 566.0 t/s, tg64 131.9 -> 133.9;
   completions exact, formalization suite unchanged. Found from the simulator's worst capture (-72%), whose gap
   turned out to be the stack.
+  Geekbench (2 of its modules change): every workload completes, the same 10 expected errors, summed GPU time 27.13
+  -> 26.94 s; its changed modules' kernels within their run-to-run spread (keypoint kernels are data-dependent).
 - Geekbench 7 GPU with all of the above: every workload completes (the block-size search's out-of-resources answers
   as before), summed GPU time 27.13 s against 25.93-26.85 s of earlier AIR-route runs; its largest difference,
   particle 2.39 s, is inside those runs' 2.04-2.42 s.

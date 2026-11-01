@@ -1041,7 +1041,11 @@ unsafe fn jacobi(
     ldv: i64,
     count: *mut c_void,
 ) -> Result<bool, cusolverStatus_t> {
-    let round = kernel(double, [c"agx_jacobi_round", c"agx_jacobi_round_f64"]);
+    // f32: a SIMD-group per column pair (agx_jacobi_round_sg), whose lanes read neighbouring rows; a thread per pair
+    // read each pair's columns alone (n 512 gesvd: 1.29 s). ZLUDA_AGX_JACOBI_SG=0: a thread per pair.
+    let sg = !double && std::env::var("ZLUDA_AGX_JACOBI_SG").map_or(true, |v| v != "0");
+    let round = if sg { c"agx_jacobi_round_sg" } else { kernel(double, [c"agx_jacobi_round", c"agx_jacobi_round_f64"]) };
+    let (per_pair, block) = if sg { (32, 128) } else { (1, 32) };
     let tol = jacobi_tol(double);
     for _ in 0..60 {
         set_info(h, count.cast(), 0)?;
@@ -1064,8 +1068,8 @@ unsafe fn jacobi(
                     arg(&mut pc),
                     tol.arg(double),
                 ],
-                [(n + 1) / 2, 1],
-                [32, 1],
+                [(n + 1) / 2 * per_pair, 1],
+                [block, 1],
             )?;
         }
         engine::synchronize(h.stream).map_err(status)?;

@@ -1674,7 +1674,11 @@ same way, by blocks of 32 reflectors (in the order Q, Q^T and the side need),
 in the workspace their `_bufferSize` now asks for (orgqr: its reflector copy
 plus that); before, one thread per column or row of C applied every reflector. `devInfo` reports the first zero pivot (getrf) or the first
 non-positive leading minor (potrf) as LAPACK does. `gesvd` and `syevd` use
-one-sided Jacobi: each round rotates disjoint column pairs in parallel, and
+one-sided Jacobi: each round rotates disjoint column pairs in parallel (in f32
+a SIMD-group per pair, `agx_jacobi_round_sg`, its lanes over the rows; a thread
+per pair read each pair's columns alone: n 64 / 256 / 512 gesvd 24.4 / 311 /
+1287 -> 7.8 / 57 / 207 ms, syevd 19.0 / 270 / 1117 -> 7.2 / 65 / 240 ms, same
+accuracy, `tools/eigbench.c`; `ZLUDA_AGX_JACOBI_SG=0`: a thread per pair), and
 sweeps repeat until one rotates nothing (`devInfo` 1 if 60 sweeps do not get
 there); `syevd` runs it on `A + |A|_F I`, whose singular vectors are A's
 eigenvectors, and takes the eigenvalues as Rayleigh quotients. The columns of U

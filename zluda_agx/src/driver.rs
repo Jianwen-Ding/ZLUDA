@@ -1535,7 +1535,7 @@ fn compile_or_cached(sources: &[&[u8]], cpu: &str, cached_only: bool) -> Result<
         None => compile().map(Some),
     };
     if !cached_only && !compiled.get() && crate::log_enabled() && result.is_ok() {
-        eprintln!("[zluda_agx] PTX cache hit: modules={}, bytes={}, elapsed={:.3}s", sources.len(), source.len(), started.elapsed().as_secs_f64());
+        eprintln!("[zluda_agx] PTX cache hit: modules={}, bytes={}, key={}, elapsed={:.3}s", sources.len(), source.len(), key.digest(), started.elapsed().as_secs_f64());
     }
     result
 }
@@ -1640,13 +1640,23 @@ mod zoc_server {
 /// The module in an image: an AGX object, or PTX text (NUL-terminated).
 pub(crate) fn load_image(image: &[u8], cpu: &str) -> Result<module::Module, CUerror> {
     if image.starts_with(b"\x7fELF") {
-        return module::Module::load_object(image).map_err(|_| CUerror::INVALID_IMAGE);
+        return module::Module::load_object(image).map_err(|e| {
+            if crate::log_enabled() {
+                eprintln!("[zluda_agx] module object rejected: {}", e.0);
+            }
+            CUerror::INVALID_IMAGE
+        });
     }
     let (object, asm) = compile_ptx(image, cpu).map_err(|e| {
         eprintln!("zluda_agx: {e}");
         CUerror::INVALID_PTX
     })?;
-    module::Module::load(&object, &asm).map_err(|_| CUerror::INVALID_IMAGE)
+    module::Module::load(&object, &asm).map_err(|e| {
+        if crate::log_enabled() {
+            eprintln!("[zluda_agx] compiled module rejected: {}", e.0);
+        }
+        CUerror::INVALID_IMAGE
+    })
 }
 
 /// Whether PTX targets an architecture-specific or family-specific variant (`.target sm_90a`, `sm_100f`), whose

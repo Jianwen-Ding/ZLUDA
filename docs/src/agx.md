@@ -1688,6 +1688,13 @@ The Asahi regression test covers the zero result, read-only behavior, a null out
 rejection of unknown limits. The host engine-deserialization result after this correction remains to be checked;
 the preceding missing-function and export-table probes are not established causes of failure.
 
+The host rerun with that correction still failed all three AI engines, so the CIG query was not the root cause.
+Its full log shows cache hits for the two AI modules (53,541 and 69,016 PTX bytes), followed by deserialization
+failure before their first kernel lookup. A cache-bypass run (`ZLUDA_CACHE_DISABLE=1`) is the next comparison;
+cache hits also occur in successful container runs, so cache use alone does not establish corruption.
+Module-parser failures now include their reason, and failures through the existing runtime module-registration
+interface are logged as well. Cache-hit messages include the entry key, identifying its `.o` and `.s` files.
+
 For a comparison run, use the same Geekbench build, the matching ZLUDA driver and `zoc`, and absolute paths:
 
 ```bash

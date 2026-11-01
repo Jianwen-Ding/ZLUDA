@@ -28,9 +28,17 @@ extern "C" {
 
 struct DarkApi {}
 
+unsafe fn load_runtime_module(api: &str, result: *mut CUmodule, image: *const c_void) -> CUresult {
+    driver::cuModuleLoadData(result, image).inspect_err(|e| {
+        if crate::log_enabled() {
+            eprintln!("[zluda_agx] {api}: runtime module registration failed with CUDA error {}", e.0);
+        }
+    })
+}
+
 impl ::dark_api::cuda::CudaDarkApi for DarkApi {
     unsafe extern "system" fn get_module_from_cubin(result: *mut CUmodule, fatbinc_wrapper: *const cuda_types::dark_api::FatbincWrapper) -> CUresult {
-        driver::cuModuleLoadData(result, fatbinc_wrapper as *const c_void)
+        load_runtime_module("get_module_from_cubin", result, fatbinc_wrapper as *const c_void)
     }
 
     unsafe extern "system" fn cudart_interface_fn2(pctx: *mut CUcontext, dev: CUdevice) -> CUresult {
@@ -45,9 +53,12 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         arg5: u32,
     ) -> CUresult {
         if !arg3.is_null() || !arg4.is_null() || arg5 != 0 {
+            if crate::log_enabled() {
+                eprintln!("[zluda_agx] get_module_from_cubin_ext1: unsupported arguments arg3={arg3:p}, arg4={arg4:p}, arg5={arg5}");
+            }
             return Err(CUerror::NOT_SUPPORTED);
         }
-        driver::cuModuleLoadData(result, fatbinc_wrapper as *const c_void)
+        load_runtime_module("get_module_from_cubin_ext1", result, fatbinc_wrapper as *const c_void)
     }
 
     unsafe extern "system" fn cudart_interface_fn7(_arg1: usize) {}
@@ -60,9 +71,12 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         arg5: u32,
     ) -> CUresult {
         if !arg3.is_null() || !arg4.is_null() || arg5 != 0 {
+            if crate::log_enabled() {
+                eprintln!("[zluda_agx] get_module_from_cubin_ext2: unsupported arguments arg3={arg3:p}, arg4={arg4:p}, arg5={arg5}");
+            }
             return Err(CUerror::NOT_SUPPORTED);
         }
-        driver::cuModuleLoadData(result, fatbin_header as *const c_void)
+        load_runtime_module("get_module_from_cubin_ext2", result, fatbin_header as *const c_void)
     }
 
     unsafe extern "system" fn load_compilers() -> CUresult {

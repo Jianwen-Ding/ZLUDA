@@ -1075,7 +1075,11 @@ A queue remembers the last timeline point it successfully waited on and checked 
 same point again needs no DRM wait or status query. On the M2 Max, 50,000 empty `cuCtxSynchronize` calls after one
 completed launch take 122 ns each instead of 2,076 ns; a new launch still advances the point and is waited on.
 
-Memory operations are on the CPU, through the mapping of each allocation (unified memory): a memset fills a slice
+Asynchronous device-to-device copies and memsets (`cuMemcpyDtoDAsync`, `cuMemcpyAsync` between device memory,
+`cuMemsetD8/16/32Async`) whose stream still has work run as built-in copy and fill kernels on that stream, in its
+order, without waiting for the GPU (llama.cpp's device copies 220 -> 9 us of host time each; `ZLUDA_AGX_GPU_COPIES=0`
+turns it off). On an idle stream, and for the synchronous forms, memory operations are on the CPU, through the
+mapping of each allocation (unified memory): a memset fills a slice
 of bytes, 16-bit halves or 32-bit words (a fill a pattern copy at a time, its length known only at run time, ran at
 ~0.45 GB/s: llama.cpp's start-up spent 1.75 of 2.5 s in two 384 MiB `cudaMemsetAsync` of its KV cache; now ~50 GB/s,
 start-up 0.72 s); device-to-device copies are one `memmove`. New allocations are not filled on the CPU: the kernel's

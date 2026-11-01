@@ -583,10 +583,30 @@ def case_fft(a, obj, tmp, n, batch, stride, dist, inverse, radix2, rnd, t="f"):
                          (n // r, batch), (min(n // r, 64), 1), tmp)
             ns *= r
     else:
-        (buf,) = run(a, obj, "agx_dft" + sfx,
-                     [("buf", buf), ("buf", pack([0.0] * (2 * total), t), True), ("buf", tw), ("i32", n), ("i32", batch),
-                      ("i32", stride), ("i32", dist), ("i32", inverse)],
-                     (-(-n // 16) * 16, batch), (16, 1), tmp)
+        # zluda_fft_agx's mixed radices: the power of two as above, then each odd prime factor on agx_fft_radixr
+        # (a prime n: one pass, the direct transform)
+        stages = (n & -n).bit_length() - 1
+        radices = [2] * (stages % 2) + [4] * (stages // 2)
+        rest, p = n >> stages, 3
+        while rest > 1:
+            p = rest if p * p > rest else p
+            while rest % p == 0:
+                radices.append(p)
+                rest //= p
+            p += 2
+        ns = 1
+        for r in radices:
+            out = ("buf", pack([0.0] * (2 * total), t), True)
+            if r in (2, 4):
+                (buf,) = run(a, obj, "agx_fft_radix%d" % r + sfx,
+                             [("buf", buf), out, ("buf", tw), ("i32", n), ("i32", ns), ("i32", batch), ("i32", stride),
+                              ("i32", dist), ("i32", inverse)], (n // r, batch), (min(n // r, 64), 1), tmp)
+            else:
+                (buf,) = run(a, obj, "agx_fft_radixr" + sfx,
+                             [("buf", buf), out, ("buf", tw), ("i32", n), ("i32", ns), ("i32", r), ("i32", batch),
+                              ("i32", stride), ("i32", dist), ("i32", inverse)],
+                             (-(-n // 64) * 64, batch), (64, 1), tmp)
+            ns *= r
     got = unpack(buf, t)
     bad = []
     for b in range(batch):
@@ -2565,6 +2585,8 @@ def main():
                             ("fft%s n=32 columns of 32x3 inverse=%d" % (p, inv), lambda inv=inv, t=t: case_fft(a, obj, tmp, 32, 3, 3, 1, inv, True, rnd, t)),
                             ("dft%s n=12 x2 inverse=%d" % (p, inv), lambda inv=inv, t=t: case_fft(a, obj, tmp, 12, 2, 1, 12, inv, False, rnd, t)),
                             ("dft%s n=7 columns of 7x3 inverse=%d" % (p, inv), lambda inv=inv, t=t: case_fft(a, obj, tmp, 7, 3, 3, 1, inv, False, rnd, t)),
+                            ("mixed radix fft%s n=360 x2 inverse=%d" % (p, inv), lambda inv=inv, t=t: case_fft(a, obj, tmp, 360, 2, 1, 360, inv, False, rnd, t)),
+                            ("mixed radix fft%s n=75 columns of 75x2 inverse=%d" % (p, inv), lambda inv=inv, t=t: case_fft(a, obj, tmp, 75, 2, 2, 1, inv, False, rnd, t)),
                         ]
                     cases += [("fft%s packing n=10 x2" % p, lambda t=t: case_fft_packing(a, obj, tmp, 10, 2, rnd, t)),
                               ("fft%s packing n=9 x1" % p, lambda t=t: case_fft_packing(a, obj, tmp, 9, 1, rnd, t))]

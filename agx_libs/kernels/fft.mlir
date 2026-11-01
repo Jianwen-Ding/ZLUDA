@@ -271,18 +271,25 @@ gpu.module @agx_fft {
     gpu.return
   }
 
-  // The direct transform for any n: dst[k] = sum over j of src[j] tw[(j k) mod
-  // n] (conjugated when inverse). Launch an n x batch grid; src and dst must
-  // not overlap.
-  gpu.func @agx_dft(%src0: memref<1xf32, 1>, %dst0: memref<1xf32, 1>,
-                    %tw0: memref<1xf32, 1>, %n_: i32, %batch_: i32,
-                    %stride_: i32, %dist_: i32, %inverse_: i32) kernel {
+  // One Stockham pass of any radix r (n / ns a multiple of r), one thread per
+  // output: thread g of n, with m = g / (n / r) and j = g mod (n / r), q = j mod
+  // ns, writes dst[(j / ns) r ns + q + m ns] = sum over k < r of
+  // src[j + k n / r] tw[(k (q n / (r ns) + m n / r)) mod n] (conjugated when
+  // inverse): the twiddle of the pass times that of the r-point transform. With
+  // r = n and ns = 1 it is the direct transform. Launch an n x batch grid; src
+  // and dst must not overlap.
+  gpu.func @agx_fft_radixr(%src0: memref<1xf32, 1>, %dst0: memref<1xf32, 1>,
+                           %tw0: memref<1xf32, 1>, %n_: i32, %ns_: i32, %r_: i32,
+                           %batch_: i32, %stride_: i32, %dist_: i32,
+                           %inverse_: i32) kernel {
     %i0 = arith.constant 0 : index
     %i1 = arith.constant 1 : index
     %i2 = arith.constant 2 : index
     %f0 = arith.constant 0.0 : f32
     %big = arith.constant 4611686018427387904 : index
     %n = arith.index_cast %n_ : i32 to index
+    %ns = arith.index_cast %ns_ : i32 to index
+    %r = arith.index_cast %r_ : i32 to index
     %batch = arith.index_cast %batch_ : i32 to index
     %stride = arith.index_cast %stride_ : i32 to index
     %dist = arith.index_cast %dist_ : i32 to index
@@ -293,16 +300,26 @@ gpu.module @agx_fft {
         : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
     %Tw = memref.reinterpret_cast %tw0 to offset: [0], sizes: [%big], strides: [1]
         : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
-    %k = gpu.global_id x
+    %g = gpu.global_id x
     %b = gpu.global_id y
-    %in_k = arith.cmpi ult, %k, %n : index
+    %in_g = arith.cmpi ult, %g, %n : index
     %in_b = arith.cmpi ult, %b, %batch : index
-    %live = arith.andi %in_k, %in_b : i1
+    %live = arith.andi %in_g, %in_b : i1
     scf.if %live {
       %base = arith.muli %b, %dist : index
       %is_inv = arith.cmpi ne, %inverse, %i0 : index
-      %sum:3 = scf.for %j = %i0 to %n step %i1 iter_args(%sr = %f0, %si = %f0, %t = %i0) -> (f32, f32, index) {
-        %ij0 = arith.muli %j, %stride : index
+      %nr = arith.divui %n, %r : index
+      %m = arith.divui %g, %nr : index
+      %j = arith.remui %g, %nr : index
+      %q = arith.remui %j, %ns : index
+      %rns = arith.muli %r, %ns : index
+      %step = arith.divui %n, %rns : index
+      %qs = arith.muli %q, %step : index
+      %mn = arith.muli %m, %nr : index
+      // below n: q step < n / r and m n / r <= n - n / r
+      %inc = arith.addi %qs, %mn : index
+      %sum:4 = scf.for %k = %i0 to %r step %i1 iter_args(%sr = %f0, %si = %f0, %t = %i0, %jk = %j) -> (f32, f32, index, index) {
+        %ij0 = arith.muli %jk, %stride : index
         %ij1 = arith.addi %base, %ij0 : index
         %ij = arith.muli %ij1, %i2 : index
         %ij_im = arith.addi %ij, %i1 : index
@@ -320,14 +337,20 @@ gpu.module @agx_fft {
         %sr1 = math.fma %ni, %wi, %p0 : f32
         %q0 = math.fma %xr, %wi, %si : f32
         %si1 = math.fma %xi, %wr, %q0 : f32
-        // next twiddle index (j + 1) k mod n
-        %t_n0 = arith.addi %t, %k : index
+        // next twiddle index (k + 1) inc mod n, next element j + (k + 1) n / r
+        %t_n0 = arith.addi %t, %inc : index
         %wrap = arith.cmpi uge, %t_n0, %n : index
         %t_n1 = arith.subi %t_n0, %n : index
         %t_n = arith.select %wrap, %t_n1, %t_n0 : index
-        scf.yield %sr1, %si1, %t_n : f32, f32, index
+        %jk_n = arith.addi %jk, %nr : index
+        scf.yield %sr1, %si1, %t_n, %jk_n : f32, f32, index, index
       }
-      %ok0 = arith.muli %k, %stride : index
+      %jd0 = arith.divui %j, %ns : index
+      %jd1 = arith.muli %jd0, %rns : index
+      %jd2 = arith.addi %jd1, %q : index
+      %mns = arith.muli %m, %ns : index
+      %jd = arith.addi %jd2, %mns : index
+      %ok0 = arith.muli %jd, %stride : index
       %ok1 = arith.addi %base, %ok0 : index
       %ok = arith.muli %ok1, %i2 : index
       %ok_im = arith.addi %ok, %i1 : index

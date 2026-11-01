@@ -3,7 +3,8 @@
 //!
 //! Single and double precision: complex to complex transforms (C2C, Z2Z) of rank 1, 2 and 3 (strided and batched for
 //! rank 1), and real to complex / complex to real transforms (R2C, C2R, D2Z, Z2D) of rank 1. Power-of-two lengths run
-//! on radix-2 Stockham passes, others on a direct transform; the twiddles are computed on the host in double precision.
+//! on radix-2 / radix-4 Stockham passes, other factors on passes of their radix (a direct transform for a prime
+//! length); the twiddles are computed on the host in double precision.
 //! Double precision runs the same kernels built for f64 (`<kernel>_f64`, in the backend's software double precision).
 //! Like cuFFT, inverse transforms are not normalized. Multi-GPU (Xt) functions return `CUFFT_NOT_SUPPORTED`.
 
@@ -100,9 +101,8 @@ pub enum Buf {
 /// pointers.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Step {
-    /// A Stockham pass of radix `r` (2 or 4) with span `ns`.
+    /// A Stockham pass of radix `r` with span `ns` (agx_fft_radix2 / agx_fft_radix4, other radices agx_fft_radixr).
     Radix { r: usize, src: Buf, dst: Buf, tw: usize, n: usize, ns: usize, count: usize, stride: usize, dist: usize, offset: usize },
-    Dft { src: Buf, dst: Buf, tw: usize, n: usize, count: usize, stride: usize, dist: usize, offset: usize },
     Copy { src: Buf, dst: Buf, m: usize, count: usize, istride: usize, idist: usize, ostride: usize, odist: usize, ioffset: usize, ooffset: usize },
     RealToComplex { src: Buf, dst: Buf, n: usize, count: usize, idist: usize },
     Hermitian { src: Buf, dst: Buf, n: usize, count: usize, idist: usize },
@@ -196,17 +196,7 @@ fn c2c_1d(out: &mut Vec<Step>, src: Buf, dst: Buf, tw: usize, n: usize, count: u
         }
         return;
     }
-    if !n.is_power_of_two() {
-        let to = if src == dst { Buf::W0 } else { dst };
-        out.push(Step::Dft { src, dst: to, tw, n, count, stride, dist, offset });
-        if to != dst {
-            out.push(copy(Buf::W0, dst));
-        }
-        return;
-    }
-    // radix-4 passes (two radix-2 stages each, half the memory traffic), after one radix-2 pass when log2(n) is odd
-    let stages = n.trailing_zeros() as usize;
-    let radices: Vec<usize> = std::iter::repeat_n(2, stages % 2).chain(std::iter::repeat_n(4, stages / 2)).collect();
+    let radices = radices(n);
     let mut from = src;
     let mut ns = 1;
     for (p, &r) in radices.iter().enumerate() {
@@ -220,6 +210,27 @@ fn c2c_1d(out: &mut Vec<Step>, src: Buf, dst: Buf, tw: usize, n: usize, count: u
     if from != dst {
         out.push(copy(from, dst));
     }
+}
+
+/// The radices of the passes of a transform of length n: for the power of two, radix-4 passes (two radix-2 stages
+/// each, half the memory traffic) after one radix-2 pass when its log2 is odd, then the odd prime factors. A pass of
+/// radix r costs r complex multiply-adds per element, so a large prime factor costs up to the direct transform.
+fn radices(n: usize) -> Vec<usize> {
+    let stages = n.trailing_zeros() as usize;
+    let mut out: Vec<usize> = std::iter::repeat_n(2, stages % 2).chain(std::iter::repeat_n(4, stages / 2)).collect();
+    let mut rest = n >> stages;
+    let mut p = 3;
+    while rest > 1 {
+        if p * p > rest {
+            p = rest;
+        }
+        while rest % p == 0 {
+            out.push(p);
+            rest /= p;
+        }
+        p += 2;
+    }
+    out
 }
 
 /// The launches of a transform; `in_place` when the input and output are the same buffer (the passes then never
@@ -636,7 +647,7 @@ mod imp {
         for step in steps(&shape, input == output) {
             // arguments: pointers, then i32 values
             let (f, ptrs, ints, grid, block): (_, Vec<*mut c_void>, Vec<i32>, [u32; 2], [u32; 2]) = match step {
-                Step::Radix { r, src, dst, tw, n, ns, count, stride, dist, offset } => {
+                Step::Radix { r: r @ (2 | 4), src, dst, tw, n, ns, count, stride, dist, offset } => {
                     let bx = (n / r).clamp(1, 64) as u32;
                     let (f32_name, f64_name) =
                         if r == 4 { (c"agx_fft_radix4", c"agx_fft_radix4_f64") } else { (c"agx_fft_radix2", c"agx_fft_radix2_f64") };
@@ -648,13 +659,16 @@ mod imp {
                         [bx, 1],
                     )
                 }
-                Step::Dft { src, dst, tw, n, count, stride, dist, offset } => (
-                    func(c"agx_dft", c"agx_dft_f64")?,
-                    vec![ptr(src).byte_add(cb * offset), ptr(dst).byte_add(cb * offset), ptr(Buf::Tw(tw))],
-                    vec![n as i32, count as i32, stride as i32, dist as i32, inv],
-                    [groups(n, 16), count as u32],
-                    [16, 1],
-                ),
+                Step::Radix { r, src, dst, tw, n, ns, count, stride, dist, offset } => {
+                    let bx = n.clamp(1, 64) as u32;
+                    (
+                        func(c"agx_fft_radixr", c"agx_fft_radixr_f64")?,
+                        vec![ptr(src).byte_add(cb * offset), ptr(dst).byte_add(cb * offset), ptr(Buf::Tw(tw))],
+                        vec![n as i32, ns as i32, r as i32, count as i32, stride as i32, dist as i32, inv],
+                        [groups(n, bx), count as u32],
+                        [bx, 1],
+                    )
+                }
                 Step::Copy { src, dst, m, count, istride, idist, ostride, odist, ioffset, ooffset } => (
                     func(c"agx_fft_copy", c"agx_fft_copy_f64")?,
                     vec![ptr(src).byte_add(cb * ioffset), ptr(dst).byte_add(cb * ooffset)],
@@ -800,29 +814,6 @@ mod tests {
                         d[2 * i + 1] = v.1;
                     }
                 }
-                Step::Dft { src, dst, tw: t, n, count, stride, dist, offset } => {
-                    assert_ne!(src, dst);
-                    let mut writes = Vec::new();
-                    for c in 0..count {
-                        let base = offset + c * dist;
-                        for k in 0..n {
-                            let mut acc = (0.0, 0.0);
-                            for j in 0..n {
-                                let x = get(bufs, src, base + j * stride);
-                                let ti = (j * k) % n;
-                                let (wr, wi) = (tw[t][2 * ti], if inverse { -tw[t][2 * ti + 1] } else { tw[t][2 * ti + 1] });
-                                acc.0 += x.0 * wr - x.1 * wi;
-                                acc.1 += x.0 * wi + x.1 * wr;
-                            }
-                            writes.push((base + k * stride, acc));
-                        }
-                    }
-                    let d = bufs.get_mut(&dst).unwrap();
-                    for (i, v) in writes {
-                        d[2 * i] = v.0;
-                        d[2 * i + 1] = v.1;
-                    }
-                }
                 Step::Copy { src, dst, m, count, istride, idist, ostride, odist, ioffset, ooffset } => {
                     for c in 0..count {
                         for i in 0..m {
@@ -961,7 +952,7 @@ mod tests {
             bufs.insert(Buf::In, input.clone());
             bufs.insert(Buf::Out, input.clone());
             let st = steps(&s, true);
-            assert!(st.iter().all(|x| !matches!(x, Step::Radix { src: Buf::In, .. } | Step::Dft { src: Buf::In, .. })));
+            assert!(st.iter().all(|x| !matches!(x, Step::Radix { src: Buf::In, .. })));
             // emulate the steps
             let tw = twiddles(n);
             let mut b2 = bufs.clone();
@@ -975,30 +966,6 @@ mod tests {
                             let base = offset + c * dist;
                             let x: Vec<C> = (0..n).map(|i| (b2[&src][2 * (base + i * stride)], b2[&src][2 * (base + i * stride) + 1])).collect();
                             w.extend(stockham_pass(&x, &twd, false, r, ns).into_iter().enumerate().map(|(i, v)| (base + i * stride, v)));
-                        }
-                        let d = b2.get_mut(&dst).unwrap();
-                        for (i, v) in w {
-                            d[2 * i] = v.0;
-                            d[2 * i + 1] = v.1;
-                        }
-                    }
-                    Step::Dft { src, dst, n, count, stride, dist, offset, .. } => {
-                        assert_ne!(src, dst);
-                        let mut w = Vec::new();
-                        for c in 0..count {
-                            let base = offset + c * dist;
-                            for k in 0..n {
-                                let mut acc = (0.0, 0.0);
-                                for j in 0..n {
-                                    let i = base + j * stride;
-                                    let x = (b2[&src][2 * i], b2[&src][2 * i + 1]);
-                                    let t = (j * k) % n;
-                                    let (wr, wi) = (tw[2 * t] as f64, tw[2 * t + 1] as f64);
-                                    acc.0 += x.0 * wr - x.1 * wi;
-                                    acc.1 += x.0 * wi + x.1 * wr;
-                                }
-                                w.push((base + k * stride, acc));
-                            }
                         }
                         let d = b2.get_mut(&dst).unwrap();
                         for (i, v) in w {
@@ -1083,6 +1050,10 @@ mod tests {
         let st = steps(&Shape::contiguous(Kind::C2C, &[32], 1), false);
         let radices: Vec<usize> = st.iter().filter_map(|s| if let Step::Radix { r, .. } = s { Some(*r) } else { None }).collect();
         assert_eq!(radices, [2, 4, 4]);
+        assert_eq!(super::radices(1000), [2, 4, 5, 5, 5]);
+        assert_eq!(super::radices(1536), [2, 4, 4, 4, 4, 3]);
+        assert_eq!(super::radices(2 * 1009), [2, 1009]);
+        assert_eq!(super::radices(45), [3, 3, 5]);
         assert_eq!(Shape::contiguous(Kind::R2C, &[10], 2).odist, 6);
         assert_eq!(Shape::contiguous(Kind::C2R, &[10], 2).idist, 6);
         assert_eq!(Shape::contiguous(Kind::R2C, &[4, 6], 1).check(), Err(cufftError_t::NOT_SUPPORTED));

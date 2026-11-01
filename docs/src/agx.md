@@ -1648,8 +1648,12 @@ the rest of the matrix (the same pivots, the products summed in another order).
 A column at a time was four dependent launches per column (~12 us each): n 512
 / 1000 / 2048 / 4096 24.2 / 69.7 / 237 / 852 -> 5.2 / 12.9 / 33.3 / 116 ms
 (`tools/lubench.c`, the A x = b residual unchanged; 64-column panels: 189 ms at
-4096, a panel runs on one core). `ZLUDA_AGX_LU_PANEL=0`: a column at a time. The f32 potrf above 64 rows does the same
-by panels, the rest of the triangle updated with each panel by a syrk on the
+4096, a panel runs on one core). `ZLUDA_AGX_LU_PANEL=0`: a column at a time. The f32 potrf above 32 rows works
+by panels of 32 columns, each factored in one launch (`agx_chol_panel`, a
+workgroup of 512 threads, instead of three launches per column: n 512 / 1000 /
+2048 7.5 / 15.5 / 41 -> 3.6 / 10.4 / 39 ms, `tools/cholbench.c`, residual and
+info unchanged; at larger n the trailing syrk dominates; `ZLUDA_AGX_CHOL_PANEL=0`:
+a column at a time, panels of 64), the rest of the triangle updated with each panel by a syrk on the
 tile GEMM (the other triangle is not written); after a non-positive minor the
 later kernels do nothing, but that panel's update still reaches the trailing
 matrix. getrs and potrs above 64 rows (f32 and f64) solve on the blocked trsm (shared

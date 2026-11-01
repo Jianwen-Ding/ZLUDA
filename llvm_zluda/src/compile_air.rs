@@ -189,8 +189,13 @@ pub fn compile_air(
         _ => LIGHT_PLUS_FIRST,
     };
     unsafe { LLVMZludaSetAirPrimitives(1) };
+    // ZLUDA_AIR_DUMP_FIRST=FILE: the module before the first pipeline as bitcode (to time its passes with opt)
+    if let Some(path) = std::env::var_os("ZLUDA_AIR_DUMP_FIRST") {
+        std::fs::write(path, bitcode(&linked)).map_err(|e| e.to_string())?;
+    }
     let lowered = (|| -> Result<(), String> {
         run(&linked, first_pipeline, &air, &options)?;
+        stage("first pipeline");
         let mut err = std::ptr::null_mut();
         let clusters = unsafe { LLVMZludaAgxLowerClusters(linked.get(), &mut err) };
         if clusters < 0 {
@@ -202,6 +207,7 @@ pub fn compile_air(
                 break;
             }
             run(&linked, rerun_pipeline, &air, &options)?;
+            stage("address spaces lowered, the pipeline again");
         }
         let spilled = unsafe { LLVMZludaAgxSpillClusterShared(linked.get(), &mut err) };
         if spilled < 0 {

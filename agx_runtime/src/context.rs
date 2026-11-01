@@ -301,8 +301,10 @@ impl Context {
     /// cuMemcpyDtoD (the regions may be in the same or different allocations, and may overlap).
     pub fn memcpy_dtod(&mut self, dst: u64, src: u64, len: u64) -> io::Result<()> {
         self.stream.synchronize()?;
-        let tmp = self.bytes(src, len)?.to_vec();
-        self.bytes_mut(dst, len)?.copy_from_slice(&tmp);
+        // one memmove, overlapping or not (a temporary copy held a second buffer the size of the copy)
+        let from = self.bytes(src, len)?.as_ptr();
+        let to = self.bytes_mut(dst, len)?.as_mut_ptr();
+        unsafe { std::ptr::copy(from, to, len as usize) };
         Ok(())
     }
 

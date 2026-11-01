@@ -57,7 +57,7 @@ int main(int argc,char** argv){assert(argc==2);void* lib=dlopen(argv[1],RTLD_NOW
     object=static_cast<probe::Runtime*>(create(&logger,10701));p=object->impl;
     p->setErrorRecorder(&recorder);assert(p->getErrorRecorder()==&recorder&&recorder.references==1);
     p->setErrorRecorder(&invalid);assert(p->getErrorRecorder()==&recorder&&invalid.references==0);
-    auto logged=logger.count;assert(!p->setMaxThreads(0));assert(recorder.reports==1&&logger.count==logged);
+    auto logged=logger.count;assert(!p->setMaxThreads(0));assert(recorder.reports==1&&logger.count==logged&&recorder.getErrorCode(0)==nvinfer1::ErrorCode::kINVALID_ARGUMENT);
     recorder.fatal=true;recorder.user=p;
     recorder.callback=[](void* value){static_cast<probe::Dispatch*>(value)->setErrorRecorder(nullptr);};
     assert(!p->setMaxThreads(0));assert(!p->getErrorRecorder()&&recorder.references==0&&recorder.reports==2);

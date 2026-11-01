@@ -86,7 +86,7 @@ public:
     void setErrorRecorder(IErrorRecorder* p) noexcept override{errors.set(p,logger);}
     IErrorRecorder* getErrorRecorder() const noexcept override{return errors.get();}
     ILogger* getLogger() const noexcept override{return logger;}
-    bool setMaxThreads(int32_t n) noexcept override{if(n<=0){error(logger,"maxThreads must be positive");return false;}threads=n;return true;}
+    bool setMaxThreads(int32_t n) noexcept override{if(n<=0){errors.report(logger,"maxThreads must be positive",ErrorCode::kINVALID_ARGUMENT);return false;}threads=n;return true;}
     int32_t getMaxThreads() const noexcept override{return threads.load();}
     void setTemporaryDirectory(char const* path) noexcept override{try{std::lock_guard<std::mutex> lock(directoryMutex);directory=path?path:"";}catch(...){error(logger,"temporary directory allocation failed");}}
     char const* getTemporaryDirectory() const noexcept override{try{std::lock_guard<std::mutex> lock(directoryMutex);return directory.empty()?nullptr:directory.c_str();}catch(...){error(logger,"temporary directory lock failed");return nullptr;}}

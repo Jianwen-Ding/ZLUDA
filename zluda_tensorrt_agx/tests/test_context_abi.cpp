@@ -30,6 +30,32 @@ int main(int argc,char** argv){assert(argc==2);auto path=std::getenv("ZLUDA_AGX_
     auto engine=static_cast<probe::Engine*>(runtime->impl->deserializeCudaEngineV2(&reader));assert(engine&&reader.position==bytes);
     delete runtime; // Our engine owns its plan independently; caller bytes are no longer needed.
     std::fill(serialized.begin(),serialized.end(),0);auto object=static_cast<probe::Context*>(engine->impl->createExecutionContext(0));assert(object);auto c=object->impl;assert(recorder.references==2&&c->getErrorRecorder()==&recorder);assert(c&&c->getPImpl()==object&& &c->getEngine()==engine);
+    auto rejected=[&](auto operation,nvinfer1::ErrorCode expected){
+        auto before=recorder.reports.load();assert(!operation());assert(recorder.reports==before+1&&recorder.getErrorCode(0)==expected);
+    };
+    using Code=nvinfer1::ErrorCode;
+    rejected([&]{return c->executeV2(nullptr);},Code::kINVALID_ARGUMENT);
+    rejected([&]{return c->setTensorAddress("missing",nullptr);},Code::kINVALID_ARGUMENT);
+    rejected([&]{return c->setInputTensorAddress("output",nullptr);},Code::kINVALID_ARGUMENT);
+    rejected([&]{return c->setOutputTensorAddress("input",nullptr);},Code::kINVALID_ARGUMENT);
+    rejected([&]{return c->setOutputAllocator("input",nullptr);},Code::kINVALID_ARGUMENT);
+    rejected([&]{return c->inferShapes(-1,nullptr)>=0;},Code::kINVALID_ARGUMENT);
+    rejected([&]{return c->inferShapes(1,nullptr)>=0;},Code::kINVALID_ARGUMENT);
+    rejected([&]{return c->setOptimizationProfileAsync(99,nullptr);},Code::kINVALID_ARGUMENT);
+    rejected([&]{return c->reportToProfiler();},Code::kINVALID_STATE);
+    rejected([&]{return c->setNvtxVerbosity(99);},Code::kINVALID_ARGUMENT);
+    rejected([&]{return c->setNvtxVerbosity(0);},Code::kUNSUPPORTED_STATE);
+    rejected([&]{return c->setTensorDebugState("missing",false);},Code::kINVALID_ARGUMENT);
+    rejected([&]{return c->setAllTensorsDebugState(true);},Code::kUNSUPPORTED_STATE);
+    rejected([&]{return c->setUnfusedTensorsDebugState(true);},Code::kUNSUPPORTED_STATE);
+    rejected([&]{return c->setDebugListener(reinterpret_cast<void*>(uintptr_t(1)));},Code::kUNSUPPORTED_STATE);
+    rejected([&]{return c->setCommunicator(reinterpret_cast<void*>(uintptr_t(1)));},Code::kUNSUPPORTED_STATE);
+    rejected([&]{return c->enqueueV3(nullptr);},Code::kINVALID_CONFIG);
+    auto invalidShape=c->getTensorShape("input");invalidShape.d[0]=0;
+    rejected([&]{return c->setInputShape("input",invalidShape);},Code::kINVALID_ARGUMENT);
+    invalidShape=c->getTensorShape("input");invalidShape.d[0]=3;
+    rejected([&]{return c->setInputShape("input",invalidShape);},Code::kINVALID_CONFIG);
+    auto reports=recorder.reports.load();assert(c->getTensorShape("missing").nbDims==-1&&!c->getTensorAddress("missing"));assert(recorder.reports==reports);
     assert(c->getOptimizationProfile()==0&&c->allInputDimensionsSpecified()&&c->inferShapes(0,nullptr)==0);
     auto shape=c->getTensorShape("input");assert(shape.nbDims==2&&shape.d[0]==2&&shape.d[1]==3);assert(c->setInputShape("input",shape));shape.d[0]=3;assert(!c->setInputShape("input",shape));
     auto strides=c->getTensorStrides("input");assert(strides.nbDims==2&&strides.d[0]==3&&strides.d[1]==1);assert(c->getTensorShape("missing").nbDims==-1);

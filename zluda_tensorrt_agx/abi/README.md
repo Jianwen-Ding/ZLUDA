@@ -346,3 +346,23 @@ unknown-version rejection, logger fallback, reentrant self-unregistration, fatal
 truncation, registry registration, 4000 concurrent reports during 1000 same-recorder replacements, and engine/
 inspector lifetime cycles. Ordinary and C++ adapter/probe-ASan runs pass. This is not a ThreadSanitizer result
 or a full independently pinned reference-header ABI proof; the native backend remains uninstrumented.
+
+
+## Classified context validation failures
+
+The context adapter now records failures that previously returned false/-1 silently: null execute bindings,
+unknown binding names, wrong input/output roles, invalid inferShapes arrays, invalid shapes/ranks, unsupported
+NVTX/debug/listener/communicator settings and missing profiler state. Invalid arguments use INVALID_ARGUMENT
+(3); valid shapes incompatible with the static engine and missing I/O/workspace configuration use INVALID_CONFIG
+(4); reporting without a supported profiler uses INVALID_STATE (9); unsupported optional features use
+UNSUPPORTED_STATE (10). The runtime's nonpositive thread limit also uses INVALID_ARGUMENT.
+
+Validation still occurs before GPU execution or unsupported callback dereferences. Valid null unbinding is
+supported. Pure metadata/predicate queries keep their fallback semantics and do not create errors merely
+because a queried name is absent. Native-backend errors and some older message paths still use UNSPECIFIED_ERROR;
+full per-path classification, configuration-object routing and construction/destruction routing remain unfinished.
+
+The context ABI probe checks exactly one recorder event and its numeric classification for nineteen distinct
+validation failures, then performs normal GPU execution/graph replay. It also checks that unknown-name query
+fallbacks leave the error count unchanged. Runtime tests check the thread-limit error code. Normal and C++
+adapter/probe-ASan probes pass; this does not instrument the native Rust backend or establish full ABI coverage.

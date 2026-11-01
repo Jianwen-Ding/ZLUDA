@@ -158,6 +158,7 @@ pub fn import(data:&[u8])->Result<Graph>{
         if outputs.len()!=1 || outputs[0].is_empty() || ids.contains_key(&outputs[0]) || ints.contains_key(&outputs[0]){return Err(format!("{kind} requires one unique output"));}
         let expected = match kind.as_str() {
             "MatMul"|"Add"|"Mul"|"Sub"|"Div"|"Max"|"Min"|"Reshape" => 2..=2,
+            "ReduceSum" => 1..=2, "ReduceMean" if opset.unwrap()>=18 => 1..=2,
             "BatchNormalization" => 5..=5, "Gemm"|"Conv" => 2..=3, "Constant" => 0..=0, "Concat" => 1..=MAX_TENSORS,
             _ => 1..=1,
         };
@@ -252,6 +253,38 @@ pub fn import(data:&[u8])->Result<Graph>{
                     if d==-1{if infer.replace(i).is_some(){return Err("multiple inferred Reshape dimensions".into());}shape.push(1);}else{let v=usize::try_from(d).map_err(|_|"negative Reshape dimension")?;if v==0{return Err("empty Reshape dimensions unsupported".into());}known=known.checked_mul(v).ok_or("Reshape size overflow")?;shape.push(v);}}
                 if let Some(i)=infer{if total%known!=0{return Err("Reshape size mismatch".into());}shape[i]=total/known;}
                 g.add_node(Op::Reshape{input:x,shape})?
+            }
+            "ReduceSum"|"ReduceMean"=>{
+                let x=get(0)?;let source=g.tensors[x].shape.clone();let rank=source.len();
+                let modern=kind=="ReduceSum"||opset.unwrap()>=18;
+                let keep=take_int(&mut attrs,"keepdims",1)?;
+                let noop=if modern{take_int(&mut attrs,"noop_with_empty_axes",0)?}else{0};
+                if ![0,1].contains(&keep)||![0,1].contains(&noop){return Err("reduction flags must be zero or one".into());}
+                let axes=if modern{
+                    if let Some(name)=inputs.get(1).filter(|s|!s.is_empty()){
+                        ints.get(name).cloned().ok_or("reduction axes must be a constant i64 tensor")?
+                    }else{Vec::new()}
+                }else{take_ints(&mut attrs,"axes",&[])?};
+                let mut reduce=vec![false;rank];
+                for axis in &axes{let axis=axis_index(*axis as isize,rank)?;
+                    if reduce[axis]{return Err("duplicate reduction axis".into());}reduce[axis]=true;}
+                if axes.is_empty()&&noop==0{reduce.fill(true);}
+                if !reduce.iter().any(|&r|r){g.add_node(Op::Activation{input:x,kind:Unary::Identity})?}
+                else{
+                    let permutation:Vec<usize>=(0..rank).filter(|&i|!reduce[i]).chain((0..rank).filter(|&i|reduce[i])).collect();
+                    let mut input=x;
+                    if permutation.iter().copied().ne(0..rank){input=g.add_node(Op::Transpose{input,permutation})?;}
+                    let count:usize=source.iter().enumerate().filter(|(i,_)|reduce[*i]).map(|(_,d)|d).product();
+                    let rows=g.tensors[x].elements()?/count;
+                    // Bound temporary coefficient storage before allocation; no unbounded model-size expansion.
+                    if count>MAX_ENGINE_BYTES/4{return Err("reduction coefficients exceed engine budget".into());}
+                    let matrix=g.add_node(Op::Reshape{input,shape:vec![rows,count]})?;
+                    let value=if kind=="ReduceMean"{1./count as f32}else{1.};
+                    let weights=g.add_input(format!("__onnx_reduce_{}",g.tensors.len()),vec![count,1],Some(vec![value;count]))?;
+                    let y=g.add_node(Op::MatMul{a:matrix,b:weights,trans_a:false,trans_b:false})?;
+                    let target=source.iter().enumerate().filter_map(|(i,&d)|if reduce[i]{if keep!=0{Some(1)}else{None}}else{Some(d)}).collect();
+                    g.add_node(Op::Reshape{input:y,shape:target})?
+                }
             }
             "Transpose"=>{let x=get(0)?;let default:Vec<i64>=(0..g.tensors[x].shape.len() as i64).rev().collect();let permutation=dims(take_ints(&mut attrs,"perm",&default)?)?;g.add_node(Op::Transpose{input:x,permutation})?}
             "Concat"=>{let values=inputs.iter().map(|s|ids.get(s).copied().ok_or("unknown Concat input".into())).collect::<Result<Vec<_>>>()?;g.add_node(Op::Concat{inputs:values,axis:take_int(&mut attrs,"axis",0)? as isize})?}

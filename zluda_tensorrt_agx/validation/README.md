@@ -166,3 +166,23 @@ output. `views-before.json` and `views-after.json` record 30 samples of four enq
 were 150.8 -> 51.5 us, 164.2 -> 62.1 us and 370.7 -> 86.7 us respectively. These compare checkpoints on an
 uncontrolled-clock system, not an isolated hardware throughput result; the directly established benefits are
 eliminating the reshape copy and its allocation. No target hints or GPU math/precision changes were introduced.
+
+## Versioned sum/mean reductions
+
+ONNX ReduceSum (opsets 13–22) and ReduceMean (13–17 attribute axes, 18–22 input axes) now lower to existing
+portable transpose/reshape/GEMM operations. Axes are normalized and duplicates rejected; flags, omitted/empty
+axes and scalar inputs have explicit handling. A bounded constant coefficient vector supplies sum or mean
+weights. No proprietary code, new target hints or GPU compiler modifications are involved.
+
+44 new numerical fixtures cover both versions, both keepdims settings, multiple/negative/default axes, scalar
+inputs and no-op reductions. Additional cases reject duplicate/out-of-range axes, invalid flags and a legacy
+axes attribute used with Mean-18. All 73 ONNX cases pass with maximum absolute error 1.43051e-6. The 66 graph
+cases, lifecycle tests and 10 Rust tests also pass. The optional official ONNX checker is still unavailable.
+
+`reductions.json` adds a synthetic 64x4096 sum using the exact lowered graph pattern. It reports initial absolute
+timing and owned memory, not a speedup over a dedicated reducer. Coefficient storage is O(reduction length),
+noncontiguous axes require a transpose, and output reshapes still copy. Dedicated portable reduction kernels
+remain necessary performance work; this checkpoint does not claim optimal reduction throughput or memory use.
+
+Public semantics: https://onnx.ai/onnx/operators/onnx__ReduceMean.html and
+https://onnx.ai/onnx/operators/onnx__ReduceSum.html

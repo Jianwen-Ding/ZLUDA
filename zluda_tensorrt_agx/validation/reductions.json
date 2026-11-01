@@ -1,0 +1,85 @@
+{
+  "backend": "portable MLIR -> AIR -> AGX",
+  "samples": 30,
+  "enqueues_per_sample": 4,
+  "process_peak_rss_kib": 55312,
+  "results": [
+    {
+      "case": "softmax_64x4096",
+      "build_ms": 3.031306,
+      "prepare_ms": 0.109876,
+      "shared_prepare_ms": 0.016833,
+      "first_enqueue_ms": 2.025635,
+      "median_enqueue_sync_us": 254.3605,
+      "workspace_bytes": 0,
+      "constant_bytes": 0,
+      "fused_activations": 0
+    },
+    {
+      "case": "bias_relu_1m",
+      "build_ms": 0.052125,
+      "prepare_ms": 0.040376,
+      "shared_prepare_ms": 0.013292,
+      "first_enqueue_ms": 0.677044,
+      "median_enqueue_sync_us": 101.37537499999999,
+      "workspace_bytes": 0,
+      "constant_bytes": 4096,
+      "fused_activations": 1
+    },
+    {
+      "case": "matmul_256",
+      "build_ms": 1.889718,
+      "prepare_ms": 0.120875,
+      "shared_prepare_ms": 0.017417,
+      "first_enqueue_ms": 0.682754,
+      "median_enqueue_sync_us": 78.22425,
+      "workspace_bytes": 0,
+      "constant_bytes": 262144,
+      "fused_activations": 0
+    },
+    {
+      "case": "conv_8to16_32x32",
+      "build_ms": 0.065084,
+      "prepare_ms": 0.078334,
+      "shared_prepare_ms": 0.016708,
+      "first_enqueue_ms": 0.302252,
+      "median_enqueue_sync_us": 56.42725,
+      "workspace_bytes": 0,
+      "constant_bytes": 4672,
+      "fused_activations": 1
+    },
+    {
+      "case": "equal_shape_add_64k",
+      "build_ms": 0.01925,
+      "prepare_ms": 0.046292,
+      "shared_prepare_ms": 0.016417,
+      "first_enqueue_ms": 0.144709,
+      "median_enqueue_sync_us": 56.0105,
+      "workspace_bytes": 0,
+      "constant_bytes": 0,
+      "fused_activations": 0
+    },
+    {
+      "case": "broadcast_matmul_8x64",
+      "build_ms": 0.168168,
+      "prepare_ms": 0.051042,
+      "shared_prepare_ms": 0.016958,
+      "first_enqueue_ms": 0.438419,
+      "median_enqueue_sync_us": 50.484625,
+      "workspace_bytes": 0,
+      "constant_bytes": 16384,
+      "fused_activations": 0
+    },
+    {
+      "case": "lowered_reduce_sum_64x4096",
+      "build_ms": 0.102334,
+      "prepare_ms": 0.073167,
+      "shared_prepare_ms": 0.019917,
+      "first_enqueue_ms": 0.150001,
+      "median_enqueue_sync_us": 159.6675,
+      "workspace_bytes": 256,
+      "constant_bytes": 16384,
+      "fused_activations": 0
+    }
+  ]
+}

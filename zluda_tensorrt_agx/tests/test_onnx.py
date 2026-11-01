@@ -98,6 +98,25 @@ for sh in [(2,3),(2,3,7),(2,3,4,5),(1,3,1,2,1)]:
 for training,var_values in [(1,np.ones(3,dtype='f')),(0,-np.ones(3,dtype='f'))]:
     data=model([('x',[2,3])],[('y',[2,3])],[op('BatchNormalization',['x','s','b','m','v'],'y',training_mode=training)],[constant('s',np.ones(3)),constant('b',np.zeros(3)),constant('m',np.zeros(3)),constant('v',var_values)])
     buf=C.create_string_buffer(data);assert not build_onnx(buf,len(data),1<<30)
+# Versioned reductions: axis attributes before Mean-18, constant axis inputs thereafter.
+for kind,version in [('ReduceSum',13),('ReduceSum',18),('ReduceMean',13),('ReduceMean',18)]:
+ for axes in [[0],[1],[-1],[0,2],[]]:
+  for keep in [0,1]:
+    x=rng.normal(size=(2,3,5)).astype('f');modern=kind=='ReduceSum' or version>=18
+    nodes=[op(kind,['x','axes'] if modern else ['x'],'y',keepdims=keep,**({} if modern else {'axes':axes}))]
+    init=[constant('axes',np.asarray(axes,dtype='int64'),7)] if modern else []
+    ref=(np.sum if kind=='ReduceSum' else np.mean)(x,axis=tuple(axes) if axes else None,keepdims=bool(keep))
+    execute(model([('x',x.shape)],[('y',ref.shape)],nodes,init,opset=version),{'x':x},{'y':ref})
+for kind in ['ReduceSum','ReduceMean']:
+    x=rng.normal(size=(2,3)).astype('f')
+    execute(model([('x',x.shape)],[('y',x.shape)],[op(kind,['x'],'y',noop_with_empty_axes=1)],opset=18),{'x':x},{'y':x})
+    x=np.asarray(3.25,dtype='f');execute(model([('x',[])],[('y',[])],[op(kind,['x'],'y')],opset=18),{'x':x},{'y':x})
+# Reject duplicate/out-of-range axes, invalid flags, dynamic axes and wrong-version attributes.
+for axes,flags in [([1,1],{}),([3],{}),([1],{'keepdims':2}),([1],{'noop_with_empty_axes':2})]:
+    data=model([('x',[2,3])],[('y',[2,1])],[op('ReduceSum',['x','axes'],'y',**flags)],[constant('axes',np.asarray(axes),7)],opset=18)
+    buf=C.create_string_buffer(data);assert not build_onnx(buf,len(data),1<<30)
+data=model([('x',[2,3])],[('y',[2,1])],[op('ReduceMean',['x'],'y',axes=[1])],opset=18)
+buf=C.create_string_buffer(data);assert not build_onnx(buf,len(data),1<<30)
 # Malformed metadata and unsupported operators/attributes are explicit failures.
 for bad in [b'\0',b'\x80'*11,b'\x3a\xff\xff\xff\xff\x7f',model([('x',[2,3])],[('y',[2,3])],[op('Relu',['x'],'y',unknown=1)]),model([('x',[2,3])],[('y',[2,3])],[op('Erf',['x'],'y')]),model([('x',[2,3])],[('y',[2,3])],[op('Relu',['x'],'y')],opset=12)]:
     buf=C.create_string_buffer(bad);assert not build_onnx(buf,len(bad),1<<30),bad

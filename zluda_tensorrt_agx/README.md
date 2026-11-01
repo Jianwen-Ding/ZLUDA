@@ -34,7 +34,7 @@ waits for outstanding work before freeing owned buffers. The CUDA context must o
 
 ONNX import supports standard-domain opsets 13–22, IR versions 4–13, static f32 I/O, embedded f32 weights, and
 constant i64 reshape shapes. Supported operators: `MatMul`, `Gemm`, `Conv`, `Relu`, `Sigmoid`, `Tanh`, `Identity`,
-`BatchNormalization` (inference with constant parameters), `Add`, `Mul`, `Sub`, `Div`, binary `Max`/`Min`, `Softmax`, `MaxPool`, `AveragePool`, `GlobalAveragePool`, `Flatten`,
+`ReduceSum`, `ReduceMean`, `BatchNormalization` (inference with constant parameters), `Add`, `Mul`, `Sub`, `Div`, binary `Max`/`Min`, `Softmax`, `MaxPool`, `AveragePool`, `GlobalAveragePool`, `Flatten`,
 `Reshape`, `Transpose`, `Concat`, and tensor-valued `Constant` nodes. External weights, dynamic shapes, non-f32
 execution, custom operators/plugins, control flow, asymmetric/automatic padding, dilated/ceil pooling, and opaque
 vendor engines return explicit errors. This operator set is not the entire TensorRT API.
@@ -44,6 +44,10 @@ individual GEMMs without replicating input data. ONNX vector MatMul promotes/squ
 the caller's distinct output buffer. The native
 MatMul operation requires matrix operands. ONNX Gemm remains
 rank-2 as required by its schema.
+
+Sum/mean reductions support static axes, negative axes, multiple axes, `keepdims`, and versioned empty-axis
+semantics. They currently lower through transpose/reshape and GEMM with a bounded coefficient vector, so
+coefficient storage scales with reduction length. Specialized reduction kernels remain a performance target.
 
 Inference BatchNormalization precomputes channel scale/shift at model build time and lowers to existing portable
 MLIR multiply/add kernels. A following ReLU is fused into the add. Training mode and dynamic normalization

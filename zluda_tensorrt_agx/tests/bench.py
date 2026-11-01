@@ -13,6 +13,7 @@ g=graph();x=tensor(g,'x',[256,256]);w=tensor(g,'weights',[256,256],rng.normal(si
 g=graph();x=tensor(g,'x',[1,8,32,32]);w=tensor(g,'weights',[16,8,3,3],rng.normal(size=[16,8,3,3]));b=tensor(g,'bias',[16],rng.normal(size=[16]));y=node(g,[1,16,32,32],'conv2d',input=x,weights=w,bias=b,padding=[1,1]);y=node(g,[1,16,32,32],'activation',input=y,kind='relu');g['outputs']=[y];cases.append(('conv_8to16_32x32',g))
 g=graph();x=tensor(g,'x',[16,16,16,16]);b=tensor(g,'b',[16,16,16,16]);y=node(g,[16,16,16,16],'element_wise',a=x,b=b,kind='add');g['outputs']=[y];cases.append(('equal_shape_add_64k',g))
 g=graph();x=tensor(g,'x',[8,64,64]);w=tensor(g,'weights',[64,64],rng.normal(size=[64,64]));y=node(g,[8,64,64],'mat_mul',a=x,b=w);g['outputs']=[y];cases.append(('broadcast_matmul_8x64',g))
+g=graph();x=tensor(g,'x',[64,4096]);w=tensor(g,'coefficients',[4096,1],np.ones((4096,1),dtype='f'));y=node(g,[64,1],'mat_mul',a=x,b=w);y=node(g,[64],'reshape',input=y,shape=[64]);g['outputs']=[y];cases.append(('lowered_reduce_sum_64x4096',g))
 results=[]
 for name,g in cases:
     data=json.dumps(g,separators=(',',':')).encode();source=C.create_string_buffer(data);start=time.perf_counter_ns();e=ck(build(source,len(data),1<<30));build_ms=(time.perf_counter_ns()-start)/1e6

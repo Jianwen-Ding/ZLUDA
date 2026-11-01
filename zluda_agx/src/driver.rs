@@ -55,7 +55,7 @@ pub(crate) struct Driver {
     batching: bool,
     batch: Option<Batch>,
     /// The copy kernels of `copy_in_batch` once loaded (None inside: they failed to)
-    copy_kernels: Option<Option<[usize; 3]>>,
+    copy_kernels: Option<Option<[usize; 7]>>,
     events: HashMap<usize, Event>,
     /// cuCtxSetLimit values of this context.
     limits: HashMap<u32, usize>,
@@ -959,6 +959,54 @@ impl Driver {
         self.copy_kernel(dst, src, n, sh)
     }
 
+    /// An asynchronous memset (`pattern` 1, 2 or 4 bytes, `count` of them) as a fill kernel on stream `sh` while
+    /// the stream is busy, as `copy_async`; false when not done this way.
+    fn memset_async(&mut self, dst: u64, pattern: &[u8], count: u64, sh: usize) -> Result<bool, CUerror> {
+        let n = count * pattern.len() as u64;
+        if !gpu_async_copies() || n == 0 || self.ctx.address_range(dst).is_none() || self.module_global(dst, n).is_some() {
+            return Ok(false);
+        }
+        let busy = {
+            let (q, waits) = self.queue(sh)?;
+            !waits.is_empty() || !q.is_done(q.last()).unwrap_or(true)
+        };
+        if !busy && self.batch.as_ref().is_none_or(|b| b.stream != sh) {
+            return Ok(false);
+        }
+        if self.copy_kernels.is_none() {
+            self.copy_kernels = Some(unsafe { load_copy_kernels(self) }.ok());
+        }
+        let Some(Some(kernels)) = self.copy_kernels else { return Ok(false) };
+        // the pattern repeated in a 32-bit word, filled in the widest unit the address and the size allow
+        let word = match *pattern {
+            [b] => u32::from_le_bytes([b; 4]),
+            [a, b] => u32::from_le_bytes([a, b, a, b]),
+            [a, b, c, e] => u32::from_le_bytes([a, b, c, e]),
+            _ => return Ok(false),
+        };
+        let all = dst | n;
+        let (f, unit) = if all % 16 == 0 {
+            (kernels[3], 16)
+        } else if all % 4 == 0 {
+            (kernels[4], 4)
+        } else if all % 2 == 0 && pattern.len() <= 2 {
+            (kernels[5], 2)
+        } else if pattern.len() == 1 {
+            (kernels[6], 1)
+        } else {
+            return Ok(false);
+        };
+        let units = n / unit;
+        let grid = units.div_ceil(256);
+        if grid > u32::MAX as u64 {
+            return Ok(false);
+        }
+        let args = [dst.to_le_bytes().to_vec(), word.to_le_bytes().to_vec(), units.to_le_bytes().to_vec()];
+        let args: Vec<&[u8]> = args.iter().map(|a| &a[..]).collect();
+        self.launch(f, [grid as u32, 1, 1], [256, 1, 1], 0, sh, &args)?;
+        Ok(true)
+    }
+
     /// The copy as a launch of the copy kernels on stream `sh`; false for module globals (which the CPU writes) or
     /// when the copy kernels do not load.
     fn copy_kernel(&mut self, dst: u64, src: u64, n: u64, sh: usize) -> Result<bool, CUerror> {
@@ -1084,15 +1132,92 @@ DONE:
 DONE:
     ret;
 }
+.visible .entry __zluda_agx_fill16(.param .u64 dst, .param .u32 word, .param .u64 count)
+{
+    .reg .u64 %d, %n, %i, %o;
+    .reg .u32 %t, %b, %c, %w;
+    .reg .u16 %h;
+    .reg .pred %p;
+    ld.param.u64 %d, [dst]; ld.param.u32 %w, [word]; ld.param.u64 %n, [count];
+    cvt.u16.u32 %h, %w;
+    mov.u32 %t, %tid.x; mov.u32 %b, %ctaid.x; mov.u32 %c, %ntid.x;
+    mul.wide.u32 %i, %b, %c; cvt.u64.u32 %o, %t; add.u64 %i, %i, %o;
+    setp.ge.u64 %p, %i, %n;
+    @%p bra DONE;
+    shl.b64 %o, %i, 4;
+    add.u64 %d, %d, %o;
+    st.global.v4.u32 [%d], {%w, %w, %w, %w};
+DONE:
+    ret;
+}
+.visible .entry __zluda_agx_fill4(.param .u64 dst, .param .u32 word, .param .u64 count)
+{
+    .reg .u64 %d, %n, %i, %o;
+    .reg .u32 %t, %b, %c, %w;
+    .reg .u16 %h;
+    .reg .pred %p;
+    ld.param.u64 %d, [dst]; ld.param.u32 %w, [word]; ld.param.u64 %n, [count];
+    cvt.u16.u32 %h, %w;
+    mov.u32 %t, %tid.x; mov.u32 %b, %ctaid.x; mov.u32 %c, %ntid.x;
+    mul.wide.u32 %i, %b, %c; cvt.u64.u32 %o, %t; add.u64 %i, %i, %o;
+    setp.ge.u64 %p, %i, %n;
+    @%p bra DONE;
+    shl.b64 %o, %i, 2;
+    add.u64 %d, %d, %o;
+    st.global.u32 [%d], %w;
+DONE:
+    ret;
+}
+.visible .entry __zluda_agx_fill2(.param .u64 dst, .param .u32 word, .param .u64 count)
+{
+    .reg .u64 %d, %n, %i, %o;
+    .reg .u32 %t, %b, %c, %w;
+    .reg .u16 %h;
+    .reg .pred %p;
+    ld.param.u64 %d, [dst]; ld.param.u32 %w, [word]; ld.param.u64 %n, [count];
+    cvt.u16.u32 %h, %w;
+    mov.u32 %t, %tid.x; mov.u32 %b, %ctaid.x; mov.u32 %c, %ntid.x;
+    mul.wide.u32 %i, %b, %c; cvt.u64.u32 %o, %t; add.u64 %i, %i, %o;
+    setp.ge.u64 %p, %i, %n;
+    @%p bra DONE;
+    shl.b64 %o, %i, 1;
+    add.u64 %d, %d, %o;
+    st.global.u16 [%d], %h;
+DONE:
+    ret;
+}
+.visible .entry __zluda_agx_fill1(.param .u64 dst, .param .u32 word, .param .u64 count)
+{
+    .reg .u64 %d, %n, %i, %o;
+    .reg .u32 %t, %b, %c, %w;
+    .reg .u16 %h;
+    .reg .pred %p;
+    ld.param.u64 %d, [dst]; ld.param.u32 %w, [word]; ld.param.u64 %n, [count];
+    cvt.u16.u32 %h, %w;
+    mov.u32 %t, %tid.x; mov.u32 %b, %ctaid.x; mov.u32 %c, %ntid.x;
+    mul.wide.u32 %i, %b, %c; cvt.u64.u32 %o, %t; add.u64 %i, %i, %o;
+    setp.ge.u64 %p, %i, %n;
+    @%p bra DONE;
+    mov.u64 %o, %i;
+    add.u64 %d, %d, %o;
+    st.global.u8 [%d], %h;
+DONE:
+    ret;
+}
 \0";
 
-/// The handles of the copy kernels (16, 4 and 1 byte units).
-unsafe fn load_copy_kernels(d: &mut Driver) -> Result<[usize; 3], CUerror> {
+/// The handles of the copy kernels (16, 4 and 1 byte units), then the fill kernels (a 32-bit word in 16-, 4-, 2- and
+/// 1-byte units).
+unsafe fn load_copy_kernels(d: &mut Driver) -> Result<[usize; 7], CUerror> {
     let m = load_module_data(d, COPY_PTX.as_ptr())?;
     Ok([
         module_function(d, m, "__zluda_agx_copy16")?,
         module_function(d, m, "__zluda_agx_copy4")?,
         module_function(d, m, "__zluda_agx_copy1")?,
+        module_function(d, m, "__zluda_agx_fill16")?,
+        module_function(d, m, "__zluda_agx_fill4")?,
+        module_function(d, m, "__zluda_agx_fill2")?,
+        module_function(d, m, "__zluda_agx_fill1")?,
     ])
 }
 
@@ -3182,6 +3307,9 @@ pub(crate) unsafe fn cuMemsetD8Async(dst: CUdeviceptr, uc: u8, n: usize, s: CUst
     if with(|d| Ok(d.captured(s, || Op::Memset { dst: dst.0 as u64, pattern: vec![uc], count: n as u64 })))? {
         return Ok(());
     }
+    if with(|d| d.memset_async(dst.0 as u64, &[uc], n as u64, s.0 as usize))? {
+        return Ok(());
+    }
     cuMemsetD8_v2(dst, uc, n)
 }
 
@@ -3196,11 +3324,17 @@ pub(crate) unsafe fn cuMemsetD16Async(dst: CUdeviceptr, us: u16, n: usize, s: CU
     if with(|d| Ok(d.captured(s, || Op::Memset { dst: dst.0 as u64, pattern: us.to_le_bytes().to_vec(), count: n as u64 })))? {
         return Ok(());
     }
+    if with(|d| d.memset_async(dst.0 as u64, &us.to_le_bytes(), n as u64, s.0 as usize))? {
+        return Ok(());
+    }
     cuMemsetD16_v2(dst, us, n)
 }
 
 pub(crate) unsafe fn cuMemsetD32Async(dst: CUdeviceptr, ui: c_uint, n: usize, s: CUstream) -> CUresult {
     if with(|d| Ok(d.captured(s, || Op::Memset { dst: dst.0 as u64, pattern: ui.to_le_bytes().to_vec(), count: n as u64 })))? {
+        return Ok(());
+    }
+    if with(|d| d.memset_async(dst.0 as u64, &ui.to_le_bytes(), n as u64, s.0 as usize))? {
         return Ok(());
     }
     cuMemsetD32_v2(dst, ui, n)

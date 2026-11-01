@@ -300,7 +300,13 @@ fn ensure_flusher() {
     }
     std::thread::spawn(|| loop {
         std::thread::sleep(std::time::Duration::from_micros(30));
-        let mut g = DRIVER.lock().unwrap_or_else(|p| p.into_inner());
+        // (a busy lock is an API call in progress: it submits the batch itself, or is a launch joining it; waiting for
+        // the lock would only delay the program's launches, by ~5 us each in Geekbench)
+        let mut g = match DRIVER.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => continue,
+        };
         let mut pending = false;
         if let Some(contexts) = g.as_mut() {
             for d in contexts.states_mut() {

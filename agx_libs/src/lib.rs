@@ -142,6 +142,18 @@ fn generic(ta: bool, tb: bool, m: u64, n: u64, k: u64, lda: u64, ldb: u64, ldc: 
 pub fn plan(ta: bool, tb: bool, m: u64, n: u64, k: u64, lda: u64, ldb: u64, ldc: u64, tile: bool, aligned: bool) -> Vec<Part> {
     let part = |plan, offsets, accumulate| Part { plan, offsets, accumulate };
     let (m64, n64, k8) = (m / 64 * 64, n / 64 * 64, k / 8 * 8);
+    // 9 to 63 columns with op(A) contiguous along K: the row kernel on each 8 of them (the generic kernel read op(A)
+    // along K one thread per element of C: 896 x 16 x 896 167 us)
+    if n64 == 0 && n > DOT_ROWS_SIDE && ta && k >= 32 && dot_rows_enabled() {
+        let col_b = |j: u64| if tb { j } else { j * ldb };
+        return (0..n)
+            .step_by(DOT_ROWS_SIDE as usize)
+            .map(|j0| {
+                let cols = (n - j0).min(DOT_ROWS_SIDE);
+                part(generic(ta, tb, m, cols, k, lda, ldb, ldc), [0, col_b(j0), j0 * ldc], false)
+            })
+            .collect();
+    }
     if m64 == 0 || n64 == 0 || k8 == 0 || !tile {
         return vec![part(generic(ta, tb, m, n, k, lda, ldb, ldc), [0; 3], false)];
     }

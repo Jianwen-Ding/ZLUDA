@@ -1196,6 +1196,17 @@ ZLUDA_AGX_ZOC=target/debug/zoc target/debug/agx_cuda_smoke
   (`cuMemAllocAsync`, which allocates at once, and `cuMemFreeAsync`, which
   waits for all work) are supported. `cuMemHostRegister` is not: Asahi cannot
   map existing user memory into the GPU.
+* Allocation cache: `cuMemFree` waits for the context's work, so a freed
+  `cuMemAlloc` object is idle; it is kept for reuse (by an allocation of 1 to
+  1.25 times its size, the smallest that fits) instead of being destroyed.
+  Creating, binding and mapping an object and destroying it cost 17 us at
+  4 KiB, 134 us at 1 MiB and 6.6 ms at 64 MiB; reused, 0.3 us
+  (`zluda_agx/tools/rtbench.c`, which also times copies, synchronizations and
+  events). At most 512 MiB stays cached (`ZLUDA_AGX_ALLOC_CACHE`, in MiB; 0 turns
+  it off), objects up to half that; the oldest go first, the cache empties when
+  an allocation fails, and `cuMemGetInfo` counts it as free. A reused object
+  keeps its old contents, as CUDA's allocations may (`AGX_ZERO_ALLOC=1` zeroes
+  it).
 * Scratch: kernels that spill or use `.local` memory get per-thread stack
   memory as Mesa sets it up (AGX Performance Simulator
   `tasks/ptx-re-blockers.md`, B1, measured on the M2 Max): each command that

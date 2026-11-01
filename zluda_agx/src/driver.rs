@@ -2186,7 +2186,8 @@ pub(crate) unsafe fn cuCtxSynchronize() -> CUresult {
 }
 
 pub(crate) unsafe fn cuMemAlloc_v2(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult {
-    let va = with(|d| d.ctx.mem_alloc(bytesize as u64).map_err(from_io))?;
+    // through the reuse cache of freed allocations (agx_runtime Context::mem_alloc_cached)
+    let va = with(|d| d.ctx.mem_alloc_cached(bytesize as u64).map_err(from_io))?;
     out(dptr, CUdeviceptr_v2(va as *mut c_void))
 }
 

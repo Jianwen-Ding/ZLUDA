@@ -2178,7 +2178,7 @@ impl LoadedModule {
 }
 
 /// AGX_ZERO_ALLOC=1: fill new objects with zeros on the CPU, as before the kernel's zeroed pages were relied on.
-fn zero_alloc() -> bool {
+pub(crate) fn zero_alloc() -> bool {
     static ZERO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ZERO.get_or_init(|| std::env::var("AGX_ZERO_ALLOC").is_ok_and(|v| v == "1"))
 }

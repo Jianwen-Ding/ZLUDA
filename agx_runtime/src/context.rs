@@ -119,10 +119,22 @@ impl Memory {
     }
 }
 
+/// The reuse cache's limit in bytes: ZLUDA_AGX_ALLOC_CACHE (MiB; 0 turns it off), 512 MiB by default.
+fn cache_limit() -> u64 {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| std::env::var("ZLUDA_AGX_ALLOC_CACHE").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(512) << 20)
+}
+
 /// Fields drop in declaration order: the allocations and the queue are unbound before the VM is destroyed (a VM
 /// destroyed with objects still bound strands their memory in the kernel, also past process exit; B42).
 pub struct Context {
     allocs: BTreeMap<u64, (Memory, u64)>,
+    /// Freed allocations kept for reuse by `mem_alloc_cached` (oldest first): creating, binding and mapping an object
+    /// cost 17 us at 4 KiB, 160 us at 1 MiB and 6.6 ms at 64 MiB (allocation and free). At most `cache_limit()`
+    /// bytes; emptied when an allocation fails; counted as free by `mem_info`.
+    free_cache: Vec<Bo>,
+    /// The addresses of live allocations from `mem_alloc_cached`, which return to the cache when freed.
+    cacheable: std::collections::HashSet<u64>,
     pub stream: Queue,
     pub vm: Vm,
     pub props: DeviceProps,
@@ -139,7 +151,7 @@ impl Context {
         let props = DeviceProps::from_params(&device.params, system_memory());
         let mut vm = Vm::new(&device)?;
         let stream = Queue::new(&mut vm)?;
-        Ok(Context { device, props, vm, stream, allocs: BTreeMap::new() })
+        Ok(Context { device, props, vm, stream, allocs: BTreeMap::new(), free_cache: Vec::new(), cacheable: Default::default() })
     }
 
     /// cuMemAlloc: `size` bytes, zeroed, 16 KiB aligned.
@@ -216,14 +228,57 @@ impl Context {
         }
     }
 
-    /// cuMemFree: waits for the default stream first, as CUDA does.
+    /// cuMemFree: waits for the default stream first, as CUDA does. A data object that `mem_alloc_cached` made goes
+    /// to the reuse cache (idle: nothing queued uses it after the wait).
     pub fn mem_free(&mut self, va: u64) -> io::Result<()> {
         if !self.allocs.get(&va).is_some_and(|a| matches!(a.0, Memory::Bo(_))) {
             return Err(invalid(format!("{va:#x} is not an allocation")));
         }
         self.stream.synchronize()?;
-        self.allocs.remove(&va);
+        if let Some((Memory::Bo(bo), _)) = self.allocs.remove(&va) {
+            let limit = cache_limit();
+            if self.cacheable.remove(&va) && bo.size <= limit / 2 {
+                self.free_cache.push(bo);
+                // the oldest go first
+                while self.free_cache.iter().map(|b| b.size).sum::<u64>() > limit {
+                    self.free_cache.remove(0);
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// cuMemAlloc through the reuse cache: a freed data object of between `size` and 1.25 `size` bytes (the
+    /// smallest), else a new one (after emptying the cache if the first attempt fails). A reused object keeps its old
+    /// contents, as CUDA's allocations may (AGX_ZERO_ALLOC=1 zeroes it). ZLUDA_AGX_ALLOC_CACHE=0: no cache.
+    pub fn mem_alloc_cached(&mut self, size: u64) -> io::Result<u64> {
+        let need = size.max(1).div_ceil(PAGE) * PAGE;
+        let best = (0..self.free_cache.len())
+            .filter(|&i| (need..=need + need / 4).contains(&self.free_cache[i].size))
+            .min_by_key(|&i| self.free_cache[i].size);
+        if let Some(i) = best {
+            let mut bo = self.free_cache.remove(i);
+            if crate::zero_alloc() {
+                bo.as_mut_slice().fill(0);
+            }
+            let va = bo.va;
+            self.allocs.insert(va, (Memory::Bo(bo), size.max(1)));
+            self.cacheable.insert(va);
+            return Ok(va);
+        }
+        let bo = match self.vm.alloc_data(size) {
+            Err(_) if !self.free_cache.is_empty() => {
+                self.free_cache.clear();
+                self.vm.alloc_data(size)?
+            }
+            r => r?,
+        };
+        let va = bo.va;
+        self.allocs.insert(va, (Memory::Bo(bo), size.max(1)));
+        if cache_limit() > 0 {
+            self.cacheable.insert(va);
+        }
+        Ok(va)
     }
 
     /// cuMemAllocManaged: an allocation whose GPU address is also its CPU address. Fails if that CPU range is taken.
@@ -328,6 +383,7 @@ impl Context {
     /// (ptx-re-blockers B39): free is the system's available memory (MemAvailable, which counts reclaimable
     /// caches), both within the process's cgroup limit if it has one.
     pub fn mem_info(&self) -> (u64, u64) {
+        let cached: u64 = self.free_cache.iter().map(|b| b.size).sum();
         let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
         let field = |name: &str| {
             meminfo
@@ -345,7 +401,8 @@ impl Context {
             total = total.min(limit);
             free = free.min(limit.saturating_sub(used));
         }
-        (free, total)
+        // the reuse cache's objects are free to the application
+        ((free + cached).min(total), total)
     }
 }
 

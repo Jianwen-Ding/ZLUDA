@@ -695,10 +695,10 @@ mod imp {
                     (
                         func(c"agx_fft_radixr", c"agx_fft_radixr_f64")?,
                         vec![ptr(src).byte_add(cb * offset), ptr(dst).byte_add(cb * offset), ptr(Buf::Tw(tw))],
-                        vec![n as i32, ns as i32, r as i32, count as i32, stride as i32, dist as i32, inv],
+                        vec![n as i32, ns as i32, r as i32, (n / r) as i32, (n / (r * ns)) as i32, count as i32, stride as i32, dist as i32, inv],
                         [groups(n, bx), count as u32],
                         [bx, 1],
-                        Some((3, cb * dist, cb * dist)),
+                        Some((5, cb * dist, cb * dist)),
                     )
                 }
                 Step::Copy { src, dst, m, count, istride, idist, ostride, odist, ioffset, ooffset } => (

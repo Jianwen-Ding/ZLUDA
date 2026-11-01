@@ -638,12 +638,14 @@ gpu.module @agx_fft {
   // ns, writes dst[(j / ns) r ns + q + m ns] = sum over k < r of
   // src[j + k n / r] tw[(k (q n / (r ns) + m n / r)) mod n] (conjugated when
   // inverse): the twiddle of the pass times that of the r-point transform. With
-  // r = n and ns = 1 it is the direct transform. Launch an n x batch grid; src
-  // and dst must not overlap.
+  // r = n and ns = 1 it is the direct transform. nr = n / r and step =
+  // n / (r ns) are arguments so that every division is by an argument (a
+  // multiply and shifts at launch, not a software divide). Launch an n x batch
+  // grid; src and dst must not overlap.
   gpu.func @agx_fft_radixr(%src0: memref<1xf32, 1>, %dst0: memref<1xf32, 1>,
                            %tw0: memref<1xf32, 1>, %n_: i32, %ns_: i32, %r_: i32,
-                           %batch_: i32, %stride_: i32, %dist_: i32,
-                           %inverse_: i32) kernel {
+                           %nr_: i32, %step_: i32, %batch_: i32, %stride_: i32,
+                           %dist_: i32, %inverse_: i32) kernel {
     %i0 = arith.constant 0 : index
     %i1 = arith.constant 1 : index
     %i2 = arith.constant 2 : index
@@ -670,12 +672,12 @@ gpu.module @agx_fft {
     scf.if %live {
       %base = arith.muli %b, %dist : index
       %is_inv = arith.cmpi ne, %inverse, %i0 : index
-      %nr = arith.divui %n, %r : index
+      %nr = arith.index_cast %nr_ : i32 to index
+      %step = arith.index_cast %step_ : i32 to index
       %m = arith.divui %g, %nr : index
       %j = arith.remui %g, %nr : index
       %q = arith.remui %j, %ns : index
       %rns = arith.muli %r, %ns : index
-      %step = arith.divui %n, %rns : index
       %qs = arith.muli %q, %step : index
       %mn = arith.muli %m, %nr : index
       // below n: q step < n / r and m n / r <= n - n / r

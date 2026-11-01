@@ -605,7 +605,8 @@ def case_fft(a, obj, tmp, n, batch, stride, dist, inverse, radix2, rnd, t="f"):
                               ("i32", dist), ("i32", inverse)], (n // r, batch), (min(n // r, 64), 1), tmp)
             else:
                 (buf,) = run(a, obj, "agx_fft_radixr" + sfx,
-                             [("buf", buf), out, ("buf", tw), ("i32", n), ("i32", ns), ("i32", r), ("i32", batch),
+                             [("buf", buf), out, ("buf", tw), ("i32", n), ("i32", ns), ("i32", r), ("i32", n // r),
+                              ("i32", n // (r * ns)), ("i32", batch),
                               ("i32", stride), ("i32", dist), ("i32", inverse)],
                              (-(-n // 64) * 64, batch), (64, 1), tmp)
             ns *= r

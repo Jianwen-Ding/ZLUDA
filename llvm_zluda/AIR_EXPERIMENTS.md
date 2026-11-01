@@ -70,6 +70,14 @@ wall time, peak RSS, object md5).
   llama.cpp's 10 MB module +0.9 s (26.5 -> 27.4 s, the stage runs in parallel), same peak memory; llama.cpp
   tg64 133.1 -> 134.5 t/s (two runs each, run-to-run spread +-1.3), pp128 equal. Within noise: left off (Cycles' compile
   paid 31 -> 44 s for it before).
+- **A module of independent kernels compiled in parts** (zoc, `parts`): llama.cpp's 10 MB module has 317 kernels and
+  no other function, so its PTX splits into 12 parts (every part with the module's variables, the kernels balanced by
+  size), each compiled on its own thread with its own context, the objects merged (the parts' global data are equal;
+  the merger checks it, and any failure compiles the module whole). 22.1 -> 6.1 s, peak 2.4 -> 1.2 GB; the 7 MB one
+  6.3 -> 1.4 s; the corpus 40.6 -> 19.3 s. A part takes the module's light+ / per-kernel O3 decision (by its own
+  ratio, few kernels next to the linked helpers, it would have taken O3: the Q5_K kernel back at 122 us); with it the
+  Q5_K kernel 116.7-117.2 us, the Q5_1 one 25.9-26.3 us (controlled replays), completions 4/4 exact. Cycles (383
+  .func) and the other 28 modules are byte-identical. ZLUDA_AGX_PARTS=0 / N.
 - **Light cleanup in AIR's address spaces, O3 per kernel** (`ZLUDA_AIR_AS_PIPELINE=light+` with
   `ZLUDA_AIR_AGX_PIPELINE=o3`, experiment): llama.cpp's modules 44.1 -> 36.7 s (the 10 MB one 26.5 -> 22.1 s; peak
   2.08 -> 2.44 GB, every compiling thread running O3), completions 4/4 exact; but GPU time not shown to be equal

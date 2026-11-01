@@ -357,6 +357,56 @@ fn compile_air(
     object_only: bool,
     agx_only: bool,
 ) -> Result<(), CompilerError> {
+    // A large module of independent kernels (only entries, no other functions) that the driver compiles a kernel at a
+    // time: compiled in parts, each on a thread of its own, from the PTX on (see parts::split)
+    let arch_agx = arch.as_deref().is_some_and(|a| a.starts_with("agx"));
+    if agx_only && object_only && arch_agx && texts.len() == 1 && !parts::in_part()
+        && std::env::var("ZLUDA_AGX_PER_KERNEL").is_ok_and(|v| v == "1")
+        && std::env::var("ZLUDA_AGX_PARTS").map_or(true, |v| v != "0")
+    {
+        if let Some(split) = parts::split(&texts[0], parts::count()) {
+            let compile_part = |part: &String| -> Result<Vec<u8>, String> {
+                let object = std::cell::RefCell::new(None);
+                let part_sink = |bytes: &Vec<u8>, extension: String| {
+                    if extension == "o" {
+                        *object.borrow_mut() = Some(bytes.clone());
+                    }
+                };
+                parts::enter();
+                llvm_zluda::compile_air::set_thread_jobs(Some(1));
+                // (the module's kernels are independent: it has no other functions)
+                llvm_zluda::compile_air::set_thread_independent(Some(true));
+                let r = compile_air(&[part.clone()], &part_sink, arch.clone(), ignore_errors, strict_fp, f32_textures, stack_size, true, true);
+                r.map_err(|e| e.to_string())?;
+                let object = object.into_inner().ok_or("a part made no object")?;
+                Ok(object)
+            };
+            let started = Instant::now();
+            let results: Vec<Result<Vec<u8>, String>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = split.iter().map(|part| scope.spawn(|| compile_part(part))).collect();
+                handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("a part's compilation panicked".into()))).collect()
+            });
+            let merged = results
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .and_then(|objects| llvm_zluda::compile_air::merge_objects(&objects));
+            match merged {
+                Ok(object) => {
+                    if std::env::var_os("ZLUDA_AIR_TIMINGS").is_some() {
+                        eprintln!("[zluda air] {} parts on threads of their own: {:.3} s", split.len(), started.elapsed().as_secs_f64());
+                    }
+                    sink(&object, "o".to_string());
+                    return Ok(());
+                }
+                // (any failure: the module compiled whole, as before)
+                Err(e) => {
+                    if std::env::var_os("ZLUDA_AIR_TIMINGS").is_some() {
+                        eprintln!("[zluda air] compiling in parts failed, compiling the module whole: {e}");
+                    }
+                }
+            }
+        }
+    }
     let options =
         ptx::Options { target: ptx::Target::Air, strict_fp, f32_textures, stack_size, ..ptx::Options::default() };
     let llvm = ptx_to_llvm(ignore_errors, !object_only, &texts[0], options)?;
@@ -925,4 +975,121 @@ mod hip {
     }
     #[allow(non_camel_case_types)]
     pub type hipUUID = hipUUID_t;
+}
+
+/// A large PTX module of independent kernels in parts (`--target air --agx-only`, a kernel at a time): each part has
+/// the module's directives and module-scope variables and some of its kernels, compiles on its own thread with its
+/// own LLVM context, and the parts' objects merge into the module's (the variables are kept in every part, so the
+/// parts lay out the global data alike; the merger checks it). Only modules without functions other than kernels
+/// (`.func` definitions), so that no code is compiled twice: llama.cpp's 10 MB module of 317 kernels. ZLUDA_AGX_PARTS=0:
+/// off; ZLUDA_AGX_PARTS=N: N parts.
+#[cfg(feature = "agx")]
+mod parts {
+    thread_local! {
+        static IN_PART: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Whether this thread compiles a part (which is not split again).
+    pub fn in_part() -> bool {
+        IN_PART.with(|p| p.get())
+    }
+
+    pub fn enter() {
+        IN_PART.with(|p| p.set(true));
+    }
+
+    /// The parts: the cores, at most one per 1.5 GB of available memory (as the per-kernel AGX code's threads).
+    pub fn count() -> usize {
+        if let Some(n) = std::env::var("ZLUDA_AGX_PARTS").ok().and_then(|v| v.parse::<usize>().ok()) {
+            return n.max(1);
+        }
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let available_kb = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| {
+            m.lines().find_map(|l| l.strip_prefix("MemAvailable:")?.trim().strip_suffix("kB")?.trim().parse::<u64>().ok())
+        });
+        match available_kb {
+            Some(kb) => cores.min((kb * 1024 / (3 << 29)) as usize).max(1),
+            None => cores.min(4),
+        }
+    }
+
+    /// `src` in up to `n` parts of about the same size (whole kernels, in source order within each), or None: fewer
+    /// than 64 kernels, a function other than a kernel, or a structure this split does not follow.
+    pub fn split(src: &str, n: usize) -> Option<Vec<String>> {
+        // the kernels' spans, from the start of the line of their `.entry` to the end of their body
+        let mut spans = Vec::new();
+        let mut depth = 0i32;
+        let mut line_start = 0;
+        let mut i = 0;
+        let bytes = src.as_bytes();
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                b'\n' => line_start = i + 1,
+                b'.' if depth == 0 => {
+                    let rest = &src[i..];
+                    let word = |w: &str| rest.starts_with(w) && rest[w.len()..].starts_with(|c: char| c.is_whitespace());
+                    if word(".func") {
+                        // a function declared .extern has no body: only definitions count
+                        if !src[line_start..i].contains(".extern") {
+                            return None;
+                        }
+                    } else if word(".entry") {
+                        let open = i + rest.find('{')?;
+                        // the body's matching brace
+                        let mut d = 0i32;
+                        let mut end = None;
+                        for (k, c) in src[open..].char_indices() {
+                            match c {
+                                '{' => d += 1,
+                                '}' => {
+                                    d -= 1;
+                                    if d == 0 {
+                                        end = Some(open + k + 1);
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        let end = end?;
+                        spans.push((line_start, end));
+                        i = end;
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        if depth != 0 || spans.len() < 64 || n < 2 {
+            return None;
+        }
+        let n = n.min(spans.len() / 16).max(2);
+        // the largest kernels first, each to the smallest part so far
+        let mut order: Vec<usize> = (0..spans.len()).collect();
+        order.sort_by_key(|&k| std::cmp::Reverse(spans[k].1 - spans[k].0));
+        let mut size = vec![0usize; n];
+        let mut part_of = vec![0usize; spans.len()];
+        for k in order {
+            let p = (0..n).min_by_key(|&p| size[p]).unwrap();
+            part_of[k] = p;
+            size[p] += spans[k].1 - spans[k].0;
+        }
+        let mut parts = vec![String::with_capacity(src.len() / n + 4096); n];
+        let mut at = 0;
+        for (k, &(start, end)) in spans.iter().enumerate() {
+            // what is between kernels (directives, variables) goes in every part
+            for part in parts.iter_mut() {
+                part.push_str(&src[at..start]);
+            }
+            parts[part_of[k]].push_str(&src[start..end]);
+            at = end;
+        }
+        for part in parts.iter_mut() {
+            part.push_str(&src[at..]);
+        }
+        Some(parts)
+    }
 }

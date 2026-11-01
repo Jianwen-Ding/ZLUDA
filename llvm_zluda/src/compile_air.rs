@@ -291,7 +291,9 @@ pub fn compile_air(
         && match std::env::var("ZLUDA_AIR_AS_PIPELINE").as_deref() {
             Ok("light+") => true,
             Ok("o3") => false,
-            _ => std::env::var("ZLUDA_AGX_PER_KERNEL").is_ok_and(|v| v == "1") && independent_kernels(&linked),
+            _ => THREAD_INDEPENDENT.with(|i| i.get()).unwrap_or_else(|| {
+                std::env::var("ZLUDA_AGX_PER_KERNEL").is_ok_and(|v| v == "1") && independent_kernels(&linked)
+            }),
         };
     // O3 again in AIR's address spaces: a lighter cleanup (inlining, SROA, EarlyCSE, InstCombine, SimplifyCFG,
     // GVN) gives the tensor-core PTX tests 18-23% more AGX code (their loops are unrolled differently)
@@ -375,9 +377,9 @@ pub fn compile_air(
                 // and target machine; the objects in the kernels' order.
                 drop(linked);
                 drop(agx);
-                let jobs = std::env::var("ZLUDA_AGX_JOBS")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
+                let jobs = THREAD_JOBS
+                    .with(|j| j.get())
+                    .or_else(|| std::env::var("ZLUDA_AGX_JOBS").ok().and_then(|v| v.parse::<usize>().ok()))
                     .unwrap_or_else(default_jobs)
                     .clamp(1, kernels.len());
                 // ZLUDA_AGX_INLINE_KERNELS (comma separated, or "all"): these kernels' functions inlined, no real
@@ -575,6 +577,32 @@ fn metal_air(
         }
     }
     Ok((metal_air, metal_globals))
+}
+
+thread_local! {
+    /// The threads of the per-kernel AGX code of compilations on this thread (`set_thread_jobs`).
+    static THREAD_JOBS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Whether the kernels of compilations on this thread share few functions (`set_thread_independent`).
+    static THREAD_INDEPENDENT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the kernels of compilations on this thread are independent (light+ in AIR's address spaces, O3 a kernel
+/// at a time), in place of `independent_kernels` on the module: a part of a module of independent kernels holds few
+/// kernels next to the helper functions the module links, which the ratio would count against it.
+pub fn set_thread_independent(independent: Option<bool>) {
+    THREAD_INDEPENDENT.with(|i| i.set(independent));
+}
+
+/// The threads compile_air's per-kernel AGX code takes on the calling thread, in place of ZLUDA_AGX_JOBS and the
+/// default (a module compiled in parts on threads of their own: 1 each).
+pub fn set_thread_jobs(jobs: Option<usize>) {
+    THREAD_JOBS.with(|j| j.set(jobs));
+}
+
+/// The object of a module from the objects of its parts (each compiled with every global variable, as the parts of a
+/// kernel-at-a-time compilation): see agx_merge. An error when they cannot be merged (e.g. their global data differ).
+pub fn merge_objects(objects: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+    crate::agx_merge::merge(objects)
 }
 
 /// Marks every function of `module` that is not a kernel always-inline (and not no-inline), so that the AGX backend

@@ -1695,6 +1695,14 @@ cache hits also occur in successful container runs, so cache use alone does not 
 Module-parser failures now include their reason, and failures through the existing runtime module-registration
 interface are logged as well. Cache-hit messages include the entry key, identifying its `.o` and `.s` files.
 
+The host cache-bypass run still failed all three engines after successful compiler responses for both AI modules,
+so bypassing the disk cache does not resolve the failure. It uploaded a score of 3,183 despite those failures.
+The container trace loads the two modules with 4 and 30 kernels, then allocates and copies model data.
+For comparing initialization, `ZLUDA_AGX_API_TRACE=N` logs at most N exported API calls and runtime module-loading
+calls, including return codes and exported implemented functions' arguments. Pointer arguments are logged as
+addresses, without reading their contents. Tracing is disabled by default; it is for diagnosis, not performance
+measurement. `ZLUDA_AGX_LOG=1` also reports successfully loaded modules' kernel counts and global-data sizes.
+
 For a comparison run, use the same Geekbench build, the matching ZLUDA driver and `zoc`, and absolute paths:
 
 ```bash

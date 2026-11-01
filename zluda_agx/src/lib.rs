@@ -23,16 +23,37 @@ fn log_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("ZLUDA_AGX_LOG").is_some())
 }
 
+/// Log at most N API calls when ZLUDA_AGX_API_TRACE=N. Pointer arguments are addresses only.
+fn trace_api() -> bool {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static LEFT: OnceLock<AtomicUsize> = OnceLock::new();
+    let left = LEFT.get_or_init(|| {
+        AtomicUsize::new(std::env::var("ZLUDA_AGX_API_TRACE").ok().and_then(|s| s.parse().ok()).unwrap_or(0))
+    });
+    let mut n = left.load(Ordering::Relaxed);
+    while n != 0 {
+        match left.compare_exchange_weak(n, n - 1, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(actual) => n = actual,
+        }
+    }
+    false
+}
+
 macro_rules! unimplemented {
     ($($abi:literal fn $fn_name:ident( $($arg_id:ident : $arg_type:ty),* ) -> $ret_type:ty;)*) => {
         $(
             #[cfg_attr(not(test), no_mangle)]
             #[allow(improper_ctypes, improper_ctypes_definitions, unused_variables, non_snake_case)]
             pub unsafe extern $abi fn $fn_name ( $( $arg_id : $arg_type),* ) -> $ret_type {
+                let r: $ret_type = Err(CUerror::NOT_SUPPORTED);
+                if trace_api() {
+                    eprintln!("[zluda_agx] API {} (unimplemented) => {:?}", stringify!($fn_name), r);
+                }
                 if log_enabled() {
                     eprintln!("[zluda_agx] {} is not implemented", stringify!($fn_name));
                 }
-                Err(CUerror::NOT_SUPPORTED)
+                r
             }
         )*
     };
@@ -93,8 +114,12 @@ macro_rules! implemented {
             #[cfg_attr(not(test), no_mangle)]
             #[allow(improper_ctypes, improper_ctypes_definitions, non_snake_case)]
             pub unsafe extern $abi fn $fn_name ( $( $arg_id : $arg_type),* ) -> $ret_type {
+                let trace = trace_api();
                 let start = api_stats::enabled().then(std::time::Instant::now);
                 let r = driver::$fn_name($($arg_id),*);
+                if trace {
+                    eprintln!(concat!("[zluda_agx] API ", stringify!($fn_name), "(", $(stringify!($arg_id), "={:?}, ",)* ") => {:?}"), $($arg_id,)* r);
+                }
                 if let Some(start) = start {
                     api_stats::record(stringify!($fn_name), start);
                 }

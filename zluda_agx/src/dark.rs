@@ -29,7 +29,12 @@ extern "C" {
 struct DarkApi {}
 
 unsafe fn load_runtime_module(api: &str, result: *mut CUmodule, image: *const c_void) -> CUresult {
-    driver::cuModuleLoadData(result, image).inspect_err(|e| {
+    let trace = crate::trace_api();
+    let r = driver::cuModuleLoadData(result, image);
+    if trace {
+        eprintln!("[zluda_agx] API runtime {api}(image={image:p}) => {r:?}");
+    }
+    r.inspect_err(|e| {
         if crate::log_enabled() {
             eprintln!("[zluda_agx] {api}: runtime module registration failed with CUDA error {}", e.0);
         }

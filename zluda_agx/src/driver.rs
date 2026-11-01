@@ -2131,6 +2131,9 @@ unsafe fn load_module_data(d: &mut Driver, bytes: *const u8) -> Result<usize, CU
             loaded.uses_timer()
         );
     }
+    if crate::log_enabled() {
+        eprintln!("[zluda_agx] loaded module={h:#x}, kernels={}, globals={} bytes", loaded.module.kernels.len(), loaded.module.globals.len());
+    }
     d.modules.insert(h, loaded);
     if let Some((ptx, names)) = lazy {
         let workers = std::env::var("ZLUDA_AGX_PARALLEL_KERNELS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(16);

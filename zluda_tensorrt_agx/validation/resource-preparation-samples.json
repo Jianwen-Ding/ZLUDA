@@ -1,0 +1,157 @@
+{
+  "baseline_commit": "ba6204d",
+  "candidate_commit": "81a8b04",
+  "repetitions_per_mode": 5,
+  "samples": {
+    "baseline": {
+      "generated_weights_mib": 32,
+      "results": [
+        {
+          "mode": "buffer",
+          "seconds": 0.024273085000459105,
+          "peak_rss_kib": 114816,
+          "first_context_seconds": 0.008943004999309778,
+          "cached_context_seconds": 2.0292005501687527e-05
+        },
+        {
+          "mode": "reader",
+          "seconds": 0.025795677007408813,
+          "peak_rss_kib": 81552,
+          "first_context_seconds": 0.00907921401085332,
+          "cached_context_seconds": 1.87920086318627e-05
+        },
+        {
+          "mode": "buffer",
+          "seconds": 0.02453879499807954,
+          "peak_rss_kib": 114848,
+          "first_context_seconds": 0.00832196100964211,
+          "cached_context_seconds": 1.912500010803342e-05
+        },
+        {
+          "mode": "reader",
+          "seconds": 0.022471825999673456,
+          "peak_rss_kib": 81552,
+          "first_context_seconds": 0.009175131999654695,
+          "cached_context_seconds": 2.21250083995983e-05
+        },
+        {
+          "mode": "buffer",
+          "seconds": 0.02343183099583257,
+          "peak_rss_kib": 114816,
+          "first_context_seconds": 0.008159709002939053,
+          "cached_context_seconds": 1.85410026460886e-05
+        },
+        {
+          "mode": "reader",
+          "seconds": 0.019986687999335118,
+          "peak_rss_kib": 82064,
+          "first_context_seconds": 0.008286085008876398,
+          "cached_context_seconds": 1.999999221879989e-05
+        },
+        {
+          "mode": "buffer",
+          "seconds": 0.022850162000395358,
+          "peak_rss_kib": 114816,
+          "first_context_seconds": 0.008008584001800045,
+          "cached_context_seconds": 1.824999344535172e-05
+        },
+        {
+          "mode": "reader",
+          "seconds": 0.022109823999926448,
+          "peak_rss_kib": 82112,
+          "first_context_seconds": 0.00871821200416889,
+          "cached_context_seconds": 1.7874990589916706e-05
+        },
+        {
+          "mode": "buffer",
+          "seconds": 0.023714583003311418,
+          "peak_rss_kib": 113776,
+          "first_context_seconds": 0.007914333007647656,
+          "cached_context_seconds": 1.8709004507400095e-05
+        },
+        {
+          "mode": "reader",
+          "seconds": 0.022948662008275278,
+          "peak_rss_kib": 81616,
+          "first_context_seconds": 0.008950505012762733,
+          "cached_context_seconds": 2.1957996068522334e-05
+        }
+      ]
+    },
+    "candidate": {
+      "generated_weights_mib": 32,
+      "results": [
+        {
+          "mode": "buffer",
+          "seconds": 0.02325778799422551,
+          "peak_rss_kib": 82080,
+          "first_context_seconds": 0.0054526540043298155,
+          "cached_context_seconds": 1.8708000425249338e-05
+        },
+        {
+          "mode": "reader",
+          "seconds": 0.021553405007580295,
+          "peak_rss_kib": 48336,
+          "first_context_seconds": 0.005483820990775712,
+          "cached_context_seconds": 1.937500201165676e-05
+        },
+        {
+          "mode": "buffer",
+          "seconds": 0.02667872300662566,
+          "peak_rss_kib": 81104,
+          "first_context_seconds": 0.005502070009242743,
+          "cached_context_seconds": 2.370899892412126e-05
+        },
+        {
+          "mode": "reader",
+          "seconds": 0.019009307987289503,
+          "peak_rss_kib": 48400,
+          "first_context_seconds": 0.005085609998786822,
+          "cached_context_seconds": 2.2042004275135696e-05
+        },
+        {
+          "mode": "buffer",
+          "seconds": 0.024000625999178737,
+          "peak_rss_kib": 82080,
+          "first_context_seconds": 0.00498977598908823,
+          "cached_context_seconds": 2.3041997337713838e-05
+        },
+        {
+          "mode": "reader",
+          "seconds": 0.019387100997846574,
+          "peak_rss_kib": 49280,
+          "first_context_seconds": 0.005479237006511539,
+          "cached_context_seconds": 2.412599860690534e-05
+        },
+        {
+          "mode": "buffer",
+          "seconds": 0.023537581990240142,
+          "peak_rss_kib": 82080,
+          "first_context_seconds": 0.0052226100087864324,
+          "cached_context_seconds": 2.12500017369166e-05
+        },
+        {
+          "mode": "reader",
+          "seconds": 0.022483367996755987,
+          "peak_rss_kib": 48848,
+          "first_context_seconds": 0.005702071997802705,
+          "cached_context_seconds": 2.216699067503214e-05
+        },
+        {
+          "mode": "buffer",
+          "seconds": 0.023203246004413813,
+          "peak_rss_kib": 82032,
+          "first_context_seconds": 0.0055367790046148,
+          "cached_context_seconds": 1.937500201165676e-05
+        },
+        {
+          "mode": "reader",
+          "seconds": 0.018910641010734253,
+          "peak_rss_kib": 49296,
+          "first_context_seconds": 0.005051193002145737,
+          "cached_context_seconds": 2.1208004909567535e-05
+        }
+      ]
+    }
+  }
+}

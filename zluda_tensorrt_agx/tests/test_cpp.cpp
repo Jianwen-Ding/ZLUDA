@@ -35,6 +35,14 @@ int main(int argc,char** argv){
     char bad[]="not an independently generated engine";assert(!std::unique_ptr<ICudaEngine>(runtime->deserializeCudaEngine(bad,sizeof(bad))));
     std::unique_ptr<INetworkDefinition> other(builder->createNetworkV2(0));
     std::unique_ptr<nvonnxparser::IParser> parser(nvonnxparser::createParser(*other,logger));assert(!parser->parse(bad,sizeof(bad)));assert(parser->getNbErrors()==1&&parser->getError(0));
+    std::unique_ptr<INetworkDefinition> reduced(builder->createNetworkV2(0));
+    auto rx=reduced->addInput("reduction_input",DataType::kFLOAT,Dims3(2,3,4));assert(rx);
+    auto sum=reduced->addReduce(*rx,ReduceOperation::kSUM,5,false);assert(sum);
+    auto rd=sum->getOutput(0)->getDimensions();assert(rd.nbDims==1&&rd.d[0]==3);
+    auto avg=reduced->addReduce(*rx,ReduceOperation::kAVG,2,true);assert(avg);
+    rd=avg->getOutput(0)->getDimensions();assert(rd.nbDims==3&&rd.d[1]==1);
+    assert(!reduced->addReduce(*rx,ReduceOperation::kSUM,8,false));
+    assert(!reduced->addReduce(*rx,ReduceOperation::kPROD,1,false));
     if(argc>1){
         std::ifstream file(argv[1],std::ios::binary);assert(file);
         std::vector<char> model((std::istreambuf_iterator<char>(file)),std::istreambuf_iterator<char>());

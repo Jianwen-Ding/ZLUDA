@@ -271,19 +271,12 @@ pub fn import(data:&[u8])->Result<Graph>{
                 if axes.is_empty()&&noop==0{reduce.fill(true);}
                 if !reduce.iter().any(|&r|r){g.add_node(Op::Activation{input:x,kind:Unary::Identity})?}
                 else{
-                    let permutation:Vec<usize>=(0..rank).filter(|&i|!reduce[i]).chain((0..rank).filter(|&i|reduce[i])).collect();
-                    let mut input=x;
-                    if permutation.iter().copied().ne(0..rank){input=g.add_node(Op::Transpose{input,permutation})?;}
-                    let count:usize=source.iter().enumerate().filter(|(i,_)|reduce[*i]).map(|(_,d)|d).product();
-                    let rows=g.tensors[x].elements()?/count;
-                    // Bound temporary coefficient storage before allocation; no unbounded model-size expansion.
-                    if count>MAX_ENGINE_BYTES/4{return Err("reduction coefficients exceed engine budget".into());}
-                    let matrix=g.add_node(Op::Reshape{input,shape:vec![rows,count]})?;
-                    let value=if kind=="ReduceMean"{1./count as f32}else{1.};
-                    let weights=g.add_input(format!("__onnx_reduce_{}",g.tensors.len()),vec![count,1],Some(vec![value;count]))?;
-                    let y=g.add_node(Op::MatMul{a:matrix,b:weights,trans_a:false,trans_b:false})?;
-                    let target=source.iter().enumerate().filter_map(|(i,&d)|if reduce[i]{if keep!=0{Some(1)}else{None}}else{Some(d)}).collect();
-                    g.add_node(Op::Reshape{input:y,shape:target})?
+                    let mut y=x;
+                    // Descending axes preserve remaining axis numbers when dimensions are removed.
+                    for axis in (0..rank).rev().filter(|&i|reduce[i]) {
+                        y=g.add_node(Op::Reduce{input:y,axis:axis as isize,mean:kind=="ReduceMean",keepdims:keep!=0})?;
+                    }
+                    y
                 }
             }
             "Transpose"=>{let x=get(0)?;let default:Vec<i64>=(0..g.tensors[x].shape.len() as i64).rev().collect();let permutation=dims(take_ints(&mut attrs,"perm",&default)?)?;g.add_node(Op::Transpose{input:x,permutation})?}

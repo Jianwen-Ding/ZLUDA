@@ -186,3 +186,24 @@ remain necessary performance work; this checkpoint does not claim optimal reduct
 
 Public semantics: https://onnx.ai/onnx/operators/onnx__ReduceMean.html and
 https://onnx.ai/onnx/operators/onnx__ReduceSum.html
+
+## Dedicated portable reductions
+
+The importer now emits native Reduce nodes instead of coefficient-vector GEMM graphs. Two original standard
+MLIR kernels handle short axes with a per-row loop and long axes with gpu.subgroup_reduce. Arbitrary inner
+strides are read directly; no transpose, coefficient weights or final reshape copy is required. Multiple axes
+use successive reductions, with intermediate results covered by normal liveness planning. C and C++ builders
+expose sum/average reductions with axis masks; unsupported product/min/max builder requests fail explicitly.
+
+All 76 GPU graph cases pass, including serial/subgroup paths, 37-element tails, 4096-element rows, strided axes,
+sum/mean and native serialization roundtrips (maximum absolute error 1.52588e-5). All 73 ONNX cases pass (maximum
+absolute error 9.53674e-7), as do 10 Rust tests, lifecycle and C++ builder tests. All ten inference primitives,
+including both new reduction kernels, replay successfully on AGX Performance Simulator against NumPy references.
+The same source emitted upstream AIR bitcode/text and AGX fat objects. No target hints or relaxed math added.
+
+`native-reductions.json` measures both implementations in one benchmark process. For 64x4096 sum, the earlier
+lowering measured 146.42 us versus 71.23 us for the native kernel, with constant bytes 16,384 -> 0 and activation
+workspace 256 -> 0. These are initial uncontrolled-clock measurements, not a general reduction speedup guarantee.
+
+The repeated PTX smoke check (`native-reductions-ptx.json`) has five passes and the same known cvt-0 failure:
+O22[15] expected 0xffff, got 0x0. This checkpoint changes no PTX compiler code and makes no full-compliance claim.

@@ -1,0 +1,26 @@
+{
+ "addr32.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "barrier.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "cvt-0.ptx": {
+  "status": "FAIL",
+  "detail": "O22[15] expected 0xffff, got 0x0"
+ },
+ "launch-ok.ptx": {
+  "status": "PASS",
+  "detail": "2 launch(es), 2 check(s)"
+ },
+ "fma.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ },
+ "mov.ptx": {
+  "status": "PASS",
+  "detail": "1 launch(es), 1 check(s)"
+ }
+}

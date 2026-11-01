@@ -101,6 +101,10 @@ impl Resources {
                 }
                 Op::Activation { .. } => { get(agx_libs::INFERENCE, c"agx_infer_unary")?; None }
                 Op::Pool2d { .. } => { get(agx_libs::INFERENCE, c"agx_infer_pool")?; None }
+                Op::Reduce { input, axis, .. } => {
+                    let shape=&plan.graph.tensors[*input].shape;let axis=axis_index(*axis,shape.len())?;
+                    get(agx_libs::INFERENCE,if shape[axis]>=32 {c"agx_infer_reduce_simd"}else{c"agx_infer_reduce"})?;None
+                }
                 Op::Softmax { axis, .. } => {
                     let axis = axis_index(*axis, out.len())?;
                     let inner: usize = out[axis+1..].iter().product();
@@ -248,6 +252,14 @@ impl Context {
                     let mut params = vec![arg(&mut xp), arg(&mut wp), arg(&mut bp), arg(&mut yp)];
                     params.extend(args.iter_mut().map(arg));
                     self.launch(c"agx_infer_conv2d", n, &mut params, stream)?;
+                }
+                Op::Reduce { input, axis, mean, .. } => {
+                    let shape=&g.tensors[*input].shape;let axis=axis_index(*axis,shape.len())?;
+                    let mut rows=n as i32;let mut channels=shape[axis] as i32;
+                    let mut inner=shape[axis+1..].iter().product::<usize>() as i32;let mut average=i32::from(*mean);
+                    let mut x=self.pointers[*input];let mut y=self.pointers[yid];
+                    let simd=channels>=32;let name=if simd{c"agx_infer_reduce_simd"}else{c"agx_infer_reduce"};
+                    self.launch(name,n*if simd{32}else{1},&mut[arg(&mut x),arg(&mut y),arg(&mut rows),arg(&mut channels),arg(&mut inner),arg(&mut average)],stream)?;
                 }
                 Op::Softmax { input, axis } => {
                     let axis = axis_index(*axis, yshape.len())?;

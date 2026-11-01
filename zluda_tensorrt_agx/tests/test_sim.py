@@ -43,6 +43,10 @@ for folder in sorted(a.captures.iterdir()):
         else:x,y,rows,channels,inner=args
         n=rows*channels;v=view(x,n).reshape(rows//inner,channels,inner)
         e=np.exp(v-v.max(axis=1,keepdims=True));reference=(e/e.sum(axis=1,keepdims=True)).reshape(-1)
+    elif name in ['agx_infer_reduce','agx_infer_reduce_simd']:
+        x,y,rows,channels,inner,mean=args;n=rows
+        value=view(x,rows*channels).reshape(rows//inner,channels,inner)
+        reference=(value.mean(axis=1) if mean else value.sum(axis=1)).reshape(-1)
     elif name=='agx_infer_transpose':
         x,y,meta,n,rank=args;desc=view(meta,rank*2,np.int32);shape=tuple(desc[:rank]);coords=np.indices(shape).reshape(rank,-1) if rank else np.zeros((0,1),dtype=np.int32)
         indices=np.sum(coords*desc[rank:,None],axis=0,dtype=np.int64);reference=view(x,int(np.max(indices))+1)[indices]
@@ -77,5 +81,5 @@ for folder in sorted(a.captures.iterdir()):
     else:raise AssertionError(name)
     np.testing.assert_allclose(view(y,n,after=True),reference,rtol=5e-4,atol=3e-5,equal_nan=True,err_msg=name)
     passed.append(name);print('PASS',name)
-assert len(set(passed))==8,passed
-print('PASS: eight portable inference kernels on the simulator')
+assert len(set(passed))==10,passed
+print('PASS: ten portable inference kernels on the simulator')

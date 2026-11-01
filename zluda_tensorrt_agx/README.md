@@ -46,8 +46,10 @@ MatMul operation requires matrix operands. ONNX Gemm remains
 rank-2 as required by its schema.
 
 Sum/mean reductions support static axes, negative axes, multiple axes, `keepdims`, and versioned empty-axis
-semantics. They currently lower through transpose/reshape and GEMM with a bounded coefficient vector, so
-coefficient storage scales with reduction length. Specialized reduction kernels remain a performance target.
+semantics. Dedicated portable MLIR kernels read strided input directly, with standard subgroup reduction for
+long axes. They need no coefficient vectors or transpose operations. Multiple axes use successive reductions;
+intermediate outputs use the normal liveness-managed workspace. The C API exposes `ztrtBuilderAddReduce`, and
+the source-level C++ subset exposes `addReduce` with `kSUM` and `kAVG`.
 
 Inference BatchNormalization precomputes channel scale/shift at model build time and lowers to existing portable
 MLIR multiply/add kernels. A following ReLU is fused into the add. Training mode and dynamic normalization
@@ -133,7 +135,7 @@ the AGX Performance Simulator:
 
 ```sh
 ZLUDA_AGX_CAPTURE=/tmp/inference-captures \
-ZLUDA_AGX_CAPTURE_KERNELS=agx_infer_conv2d,agx_infer_binary,agx_infer_unary,agx_infer_softmax,agx_infer_softmax_simd,agx_infer_pool,agx_infer_transpose,agx_infer_concat \
+ZLUDA_AGX_CAPTURE_KERNELS=agx_infer_reduce,agx_infer_reduce_simd,agx_infer_conv2d,agx_infer_binary,agx_infer_unary,agx_infer_softmax,agx_infer_softmax_simd,agx_infer_pool,agx_infer_transpose,agx_infer_concat \
 ZLUDA_AGX_CAPTURE_MAX=1 python3 zluda_tensorrt_agx/tests/test_gpu.py
 python3 zluda_tensorrt_agx/tests/test_sim.py /tmp/inference-captures --agx-run /path/to/agx_run
 ```

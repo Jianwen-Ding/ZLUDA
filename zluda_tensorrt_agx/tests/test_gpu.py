@@ -45,6 +45,14 @@ for ap,bp in [([3],[3]),([3],[]),([],[3]),([2,1],[1,3]),([1,3],[2,1]),([2,1,1,1,
     g=graph();a=tensor(g,'a',ash);b=tensor(g,'b',bsh);y=node(g,ref.shape,'mat_mul',a=a,b=b,trans_a=ta,trans_b=tb);g['outputs']=[y]
     run(g,{'a':av,'b':bv},{f't{y}':ref},roundtrip=True)
 
+# Dedicated reductions cover serial and subgroup paths, tails and strided axes.
+for shape,axis in [([3,7],1),([3,37],1),([3,4096],1),([2,37,5],1),([2,3,5],0)]:
+ for mean in [False,True]:
+    g=graph();x=tensor(g,'x',shape);value=rng.normal(size=shape).astype('f')
+    ref=(np.mean if mean else np.sum)(value,axis=axis)
+    y=node(g,ref.shape,'reduce',input=x,axis=axis,mean=mean,keepdims=False);g['outputs']=[y]
+    info=run(g,{'x':value},{f't{y}':ref},roundtrip=True,atol=2e-4,rtol=5e-4);assert info['workspace']==0
+
 def conv_ref(x,w,b,stride,pad,dil,groups):
     N,C,H,W=x.shape; K,_,R,S_=w.shape
     P_=(H+2*pad[0]-dil[0]*(R-1)-1)//stride[0]+1

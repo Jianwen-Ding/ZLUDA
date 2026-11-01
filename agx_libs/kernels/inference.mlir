@@ -455,4 +455,92 @@ gpu.module @inference {
     }
     gpu.return
   }
+
+  // Standard MLIR reduction. Inner-strided rows avoid transpose and coefficient buffers.
+  gpu.func @agx_infer_reduce(%x0: memref<1xf32, 1>, %y0: memref<1xf32, 1>, %rows_: i32, %channels_: i32, %inner_: i32, %mean_: i32) kernel {
+    %big = arith.constant 2147483647 : index
+    %x = memref.reinterpret_cast %x0 to offset: [0], sizes: [%big], strides: [1] : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %y = memref.reinterpret_cast %y0 to offset: [0], sizes: [%big], strides: [1] : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %zero = arith.constant 0 : index
+    %fzero = arith.constant 0.0 : f32
+    %izero = arith.constant 0 : i32
+    %id = gpu.global_id x
+    %width = arith.constant 1 : index
+    %lane = arith.constant 0 : index
+    %row = arith.addi %id, %zero : index
+    %rows = arith.index_cast %rows_ : i32 to index
+    %channels = arith.index_cast %channels_ : i32 to index
+    %inner = arith.index_cast %inner_ : i32 to index
+    %live = arith.cmpi ult, %row, %rows : index
+    scf.if %live {
+      %outer = arith.divui %row, %inner : index
+      %tail = arith.remui %row, %inner : index
+      %span = arith.muli %channels, %inner : index
+      %head = arith.muli %outer, %span : index
+      %base = arith.addi %head, %tail : index
+      %local = scf.for %c = %lane to %channels step %width iter_args(%acc = %fzero) -> f32 {
+        %offset = arith.muli %c, %inner : index
+        %at = arith.addi %base, %offset : index
+        %value = memref.load %x[%at] : memref<?xf32, strided<[1]>, 1>
+        %next = arith.addf %acc, %value : f32
+        scf.yield %next : f32
+      }
+      %sum = arith.addf %local, %fzero : f32
+      %first = arith.cmpi eq, %lane, %zero : index
+      scf.if %first {
+        %average = arith.cmpi ne, %mean_, %izero : i32
+        %result = scf.if %average -> f32 {
+          %count = arith.sitofp %channels_ : i32 to f32
+          %mean = arith.divf %sum, %count : f32
+          scf.yield %mean : f32
+        } else { scf.yield %sum : f32 }
+        memref.store %result, %y[%row] : memref<?xf32, strided<[1]>, 1>
+      }
+    }
+    gpu.return
+  }
+
+  // Standard MLIR reduction. Inner-strided rows avoid transpose and coefficient buffers.
+  gpu.func @agx_infer_reduce_simd(%x0: memref<1xf32, 1>, %y0: memref<1xf32, 1>, %rows_: i32, %channels_: i32, %inner_: i32, %mean_: i32) kernel {
+    %big = arith.constant 2147483647 : index
+    %x = memref.reinterpret_cast %x0 to offset: [0], sizes: [%big], strides: [1] : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %y = memref.reinterpret_cast %y0 to offset: [0], sizes: [%big], strides: [1] : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %zero = arith.constant 0 : index
+    %fzero = arith.constant 0.0 : f32
+    %izero = arith.constant 0 : i32
+    %id = gpu.global_id x
+    %width = gpu.subgroup_size : index
+    %lane = gpu.lane_id
+    %row = arith.divui %id, %width : index
+    %rows = arith.index_cast %rows_ : i32 to index
+    %channels = arith.index_cast %channels_ : i32 to index
+    %inner = arith.index_cast %inner_ : i32 to index
+    %live = arith.cmpi ult, %row, %rows : index
+    scf.if %live {
+      %outer = arith.divui %row, %inner : index
+      %tail = arith.remui %row, %inner : index
+      %span = arith.muli %channels, %inner : index
+      %head = arith.muli %outer, %span : index
+      %base = arith.addi %head, %tail : index
+      %local = scf.for %c = %lane to %channels step %width iter_args(%acc = %fzero) -> f32 {
+        %offset = arith.muli %c, %inner : index
+        %at = arith.addi %base, %offset : index
+        %value = memref.load %x[%at] : memref<?xf32, strided<[1]>, 1>
+        %next = arith.addf %acc, %value : f32
+        scf.yield %next : f32
+      }
+      %sum = gpu.subgroup_reduce add %local : (f32) -> f32
+      %first = arith.cmpi eq, %lane, %zero : index
+      scf.if %first {
+        %average = arith.cmpi ne, %mean_, %izero : i32
+        %result = scf.if %average -> f32 {
+          %count = arith.sitofp %channels_ : i32 to f32
+          %mean = arith.divf %sum, %count : f32
+          scf.yield %mean : f32
+        } else { scf.yield %sum : f32 }
+        memref.store %result, %y[%row] : memref<?xf32, strided<[1]>, 1>
+      }
+    }
+    gpu.return
+  }
 }

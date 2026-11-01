@@ -110,6 +110,20 @@ unsafe fn copy_shape(s: &[usize], p: *mut i64, capacity: usize) -> Result<i32> {
 #[no_mangle] pub unsafe extern "C" fn ztrtBuilderAddActivation(p: *mut Builder, input: i32, kind: i32) -> i32 {
     boundary(-1, || Ok(object_mut(p)?.graph.add_node(Op::Activation { input: id(input)?, kind: unary(kind)? })? as i32))
 }
+/// Independent reduction API: kind 0 = sum, kind 1 = mean; axes are a rank-relative bitmask.
+#[no_mangle] pub unsafe extern "C" fn ztrtBuilderAddReduce(p:*mut Builder,input:i32,axes:u32,kind:i32,keepdims:i32)->i32 {
+    boundary(-1,||{
+        if ![0,1].contains(&kind)||![0,1].contains(&keepdims){return Err("unsupported reduction kind or keepdims flag".into());}
+        let g=&mut object_mut(p)?.graph;let mut y=id(input)?;
+        let rank=g.tensors.get(y).ok_or("unknown reduction input")?.shape.len();
+        if axes>>rank!=0{return Err("reduction axis mask exceeds input rank".into());}
+        if axes==0{return Ok(g.add_node(Op::Activation{input:y,kind:Unary::Identity})? as i32);}
+        for axis in (0..rank).rev().filter(|&i|axes&(1u32<<i)!=0){
+            y=g.add_node(Op::Reduce{input:y,axis:axis as isize,mean:kind==1,keepdims:keepdims!=0})?;
+        }
+        Ok(y as i32)
+    })
+}
 #[no_mangle] pub unsafe extern "C" fn ztrtBuilderAddSoftmax(p: *mut Builder, input: i32, axis: i32) -> i32 {
     boundary(-1, || Ok(object_mut(p)?.graph.add_node(Op::Softmax { input: id(input)?, axis: axis as isize })? as i32))
 }

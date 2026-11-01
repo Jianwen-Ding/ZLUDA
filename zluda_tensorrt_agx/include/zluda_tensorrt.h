@@ -29,6 +29,8 @@ int32_t ztrtBuilderMarkOutput(ZtrtBuilder*, int32_t);
 int32_t ztrtBuilderAddMatMul(ZtrtBuilder*, int32_t, int32_t, int32_t, int32_t);
 int32_t ztrtBuilderAddElementWise(ZtrtBuilder*, int32_t, int32_t, int32_t);
 int32_t ztrtBuilderAddActivation(ZtrtBuilder*, int32_t, int32_t);
+/* axes bitmask, kind 0=sum or 1=mean, keepdims 0/1. */
+int32_t ztrtBuilderAddReduce(ZtrtBuilder*, int32_t, uint32_t, int32_t, int32_t);
 int32_t ztrtBuilderAddSoftmax(ZtrtBuilder*, int32_t, int32_t);
 int32_t ztrtBuilderAddReshape(ZtrtBuilder*, int32_t, const int64_t*, size_t);
 int32_t ztrtBuilderAddTranspose(ZtrtBuilder*, int32_t, const int32_t*, size_t);

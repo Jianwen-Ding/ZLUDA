@@ -52,6 +52,16 @@ instructions over the PTX-formalization tests), which is kept only while
 `zluda_agx` still compiles with it. **`--target agx` is superseded**: new work
 goes to `--target air`.
 
+`--agx-only` (what `zluda_agx` passes, and what every `zoc --serve` request implies) makes the AGX object alone: no
+AIR for Metal and no portable AIR output, whose copy of the module and passes cost time and memory for nothing on
+Asahi. A large module that the driver compiles a kernel at a time (`ZLUDA_AGX_PER_KERNEL=1`) is compiled in parts when
+it has only kernels (no `.func` definitions, at least 64 entries: llama.cpp's 10 MB module of 317 kernels): its PTX is
+split by kernels, each part keeping the module's variables, the parts compile on threads of their own and their
+objects merge (22 s and 2.4 GB -> 6 s and 1.2 GB; `ZLUDA_AGX_PARTS=0` / `N`). Modules of such independent kernels
+also get a light cleanup in AIR's address spaces and O3 a kernel at a time instead of the whole module's O3
+(`ZLUDA_AIR_AS_PIPELINE=o3` / `light+` to choose); modules whose kernels share functions (Blender Cycles) keep the
+whole-module O3.
+
 The older route, from PTX to the AGX backend without AIR:
 
 ```

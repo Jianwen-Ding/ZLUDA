@@ -66,6 +66,17 @@ wall time, peak RSS, object md5).
   0.45 GB/s (a pattern copy per element, length known at run time; a micro-benchmark with a constant pattern length
   had looked fast: measure the real call). Fill as typed slices: 866 -> 8 ms, start-up 0.72 s. Generation: per token
   ~4.7 ms waiting for the logits (GPU time) and ~3 ms in cuGraphLaunch overlapping it; GPU-bound.
+- **AGX O3 per kernel for large modules** (`ZLUDA_AIR_AGX_PIPELINE=o3`, possible once the stack fix above was in):
+  llama.cpp's 10 MB module +0.9 s (26.5 -> 27.4 s, the stage runs in parallel), same peak memory; llama.cpp
+  tg64 133.1 -> 134.5 t/s (two runs each, run-to-run spread +-1.3), pp128 equal. Within noise: left off (Cycles' compile
+  paid 31 -> 44 s for it before).
+- Dead end: reading each kernel's module lazily from the portable AIR (getLazyBitcodeModule, materializing only the
+  functions the kernel reaches, instead of parsing all 13 MB of Cycles per kernel): the same object, peak 6.1-6.3 GB
+  against 6.3-6.7, the AGX stage 30.6-32.6 s against 26.6-32.1 (two runs each): within noise. Cycles' peak is the
+  12 kernels being compiled at once (the largest ~1-2 GB each), not the parses. Reverted.
+- cuDNN (agx): temporaries from a per-handle pool instead of an allocation, a synchronization and a free per call:
+  3x3 convolutions 1.4-4x faster (8x64x56x56 4.52 -> 1.11 ms), the CPU no longer blocked on each call
+  (`zluda_dnn_agx/tools/convbench.c`, checked against a CPU convolution).
 - cuBLAS (agx) split K now also for f16 A/B with f32 C from K = 512: 896 x 64 x 896 98 -> 86 us, 128 x 512 x 896
   99 -> 82 us (`zluda_blas_agx/tools/gemmbench.c`). Skinny n <= 8 products stay slow (0.2-0.3 TFLOPS: the dot kernel
   reads A once per column), but ggml uses its own kernels there.

@@ -973,7 +973,14 @@ mod imp {
                         [64, 1],
                     )?
                 }
-                Launch::CsrSpmm { mut n, mut brs, mut bcs, mut crs, mut ccs } => run(
+                Launch::CsrSpmm { mut n, mut brs, mut bcs, mut crs, mut ccs } => {
+                    // row-major B: C's columns along x, so a SIMD-group reads one row of A (broadcast) and neighbouring
+                    // elements of B (262144 x 16 entries, 64 columns: 10.9 ms with rows along x)
+                    let on = bcs == 1 && std::env::var("ZLUDA_AGX_SPMM_JFAST").map_or(true, |v| v != "0");
+                    // n (0: off): a 1-D grid of rows x n, the rows' columns back to back
+                    let mut jfast = if on { n } else { 0 };
+                    let (grid, block) = if on { ([rows * jfast, 1], [128, 1]) } else { ([rows, n], [16, 4]) };
+                    run(
                     h,
                     pick(c"agx_csr_spmm_i32", c"agx_csr_spmm_i64", c"agx_csr_spmm_i32_f64", c"agx_csr_spmm_i64_f64"),
                     &mut [
@@ -989,12 +996,14 @@ mod imp {
                         arg(&mut bcs),
                         arg(&mut crs),
                         arg(&mut ccs),
+                        arg(&mut jfast),
                         alpha,
                         beta,
                     ],
-                    [rows, n],
-                    [16, 4],
-                )?,
+                    grid,
+                    block,
+                )?
+                }
             }
         }
         Ok(())

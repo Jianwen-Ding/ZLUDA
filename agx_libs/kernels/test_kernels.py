@@ -740,10 +740,13 @@ def case_sparse(a, obj, tmp, what, I, base, rnd):
     cs = (1, ldc) if col_major else (ldc, 1)
     B = rounded([rnd.uniform(-1, 1) for _ in range(ldb * (n if col_major else cols))], BT)
     C = rounded([rnd.uniform(-1, 1) for _ in range(ldc * (n if col_major else rows))], BT)
+    # row-major B: C's columns along x (jfast), as zluda_sparse_agx launches it
+    jfast = 0 if col_major else n
+    grid, block = ((-(-rows * jfast // 128) * 128, 1), (128, 1)) if jfast else ((-(-rows // 16) * 16, -(-n // 4) * 4), (16, 4))
     (got,) = run(a, obj, K("agx_csr_spmm_" + I),
                  [("buf", rp), ("buf", ci), ("buf", pack(val, BT)), ("buf", pack(B, BT)), ("buf", pack(C, BT), True),
                   ("i64", rows), ("i64", n), ("i64", base), ("i64", bs[0]), ("i64", bs[1]), ("i64", cs[0]), ("i64", cs[1]),
-                  (S(), alpha), (S(), beta)], (-(-rows // 16) * 16, -(-n // 4) * 4), (16, 4), tmp)
+                  ("i64", jfast), (S(), alpha), (S(), beta)], grid, block, tmp)
     want = list(C)
     idx = []
     for i in range(rows):

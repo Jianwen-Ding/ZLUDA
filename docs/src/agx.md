@@ -1572,7 +1572,12 @@ of their transpose:
   neighbouring lanes read neighbouring entries: warm, `tools/spmvbench.c`
   (exact against the CPU), 1M rows x 16 entries 1082 -> 453 us, 256K x 64
   1152 -> 384, 64K x 256 1170 -> 380, 4K x 2048 836 -> 217 us, 300-360 GB/s
-  (`ZLUDA_AGX_SPMV_VEC=0`: a thread per row).
+  (`ZLUDA_AGX_SPMV_VEC=0`: a thread per row). SpMM with a row-major B runs C's columns along the
+  SIMD-group's lanes (a 1-D grid of rows x n threads), so a group reads one
+  row of A once and neighbouring elements of B and C: `tools/spmmbench.c`
+  (exact against the CPU), 262144 rows x 16 entries and 8 / 16 / 64 columns
+  1069 / 2747 / 10860 -> 457 / 880 / 3448 us, 65536 x 64 x 32 5270 -> 1470 us
+  (`ZLUDA_AGX_SPMM_JFAST=0`: rows along the lanes, as column-major B keeps).
 - Sparse vectors (`cusparseCreateSpVec`): `cusparseSpVV` (256 partial sums in
   its workspace, added in order, so the result is deterministic),
   `cusparseAxpby`, `cusparseGather`, `cusparseScatter` and `cusparseRot`.

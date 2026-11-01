@@ -353,14 +353,16 @@ gpu.module @agx_sparse {
   // C[i, j] = alpha * sum over k in row i of val[k] B[col[k] - base, j]
   // + beta * C[i, j] for a CSR matrix (i32 indices) and dense B (K x n) and C
   // (rows x n) with element strides (row, column) each. C is not read when
-  // beta is 0. One thread per element of C: launch a rows x n grid.
+  // beta is 0. One thread per element of C: launch a rows x n grid, or with
+  // jfast = n a 1-D grid of rows x n threads (C's columns along x).
   gpu.func @agx_csr_spmm_i32(%rowptr0: memref<1xi32, 1>, %col0: memref<1xi32, 1>,
                              %val0: memref<1xf32, 1>, %b0: memref<1xf32, 1>,
                              %c0: memref<1xf32, 1>, %rows_: i64, %n_: i64,
                              %base_: i64, %brs_: i64, %bcs_: i64,
-                             %crs_: i64, %ccs_: i64, %alpha: f32,
+                             %crs_: i64, %ccs_: i64, %jfast_: i64, %alpha: f32,
                              %beta: f32) kernel {
     %i0 = arith.constant 0 : index
+    %c0_i64 = arith.constant 0 : i64
     %i1 = arith.constant 1 : index
     %f0 = arith.constant 0.0 : f32
     %big = arith.constant 4611686018427387904 : index
@@ -381,8 +383,17 @@ gpu.module @agx_sparse {
         : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
     %c = memref.reinterpret_cast %c0 to offset: [0], sizes: [%big], strides: [1]
         : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
-    %i = gpu.global_id x
-    %j = gpu.global_id y
+    // jfast (= n, > 0): a 1-D grid of rows x n threads, C's columns along x (row-major B: neighbouring lanes read one
+    // row of A and neighbouring elements of B)
+    %gx = gpu.global_id x
+    %gy = gpu.global_id y
+    %jf = arith.cmpi ne, %jfast_, %c0_i64 : i64
+    %jfi = arith.index_cast %jfast_ : i64 to index
+    %jd = arith.maxui %jfi, %i1 : index
+    %fi = arith.divui %gx, %jd : index
+    %fj = arith.remui %gx, %jd : index
+    %i = arith.select %jf, %fi, %gx : index
+    %j = arith.select %jf, %fj, %gy : index
     %in_i = arith.cmpi ult, %i, %rows : index
     %in_j = arith.cmpi ult, %j, %n : index
     %live = arith.andi %in_i, %in_j : i1
@@ -572,14 +583,16 @@ gpu.module @agx_sparse {
   // C[i, j] = alpha * sum over k in row i of val[k] B[col[k] - base, j]
   // + beta * C[i, j] for a CSR matrix (i64 indices) and dense B (K x n) and C
   // (rows x n) with element strides (row, column) each. C is not read when
-  // beta is 0. One thread per element of C: launch a rows x n grid.
+  // beta is 0. One thread per element of C: launch a rows x n grid, or with
+  // jfast = n a 1-D grid of rows x n threads (C's columns along x).
   gpu.func @agx_csr_spmm_i64(%rowptr0: memref<1xi64, 1>, %col0: memref<1xi64, 1>,
                              %val0: memref<1xf32, 1>, %b0: memref<1xf32, 1>,
                              %c0: memref<1xf32, 1>, %rows_: i64, %n_: i64,
                              %base_: i64, %brs_: i64, %bcs_: i64,
-                             %crs_: i64, %ccs_: i64, %alpha: f32,
+                             %crs_: i64, %ccs_: i64, %jfast_: i64, %alpha: f32,
                              %beta: f32) kernel {
     %i0 = arith.constant 0 : index
+    %c0_i64 = arith.constant 0 : i64
     %i1 = arith.constant 1 : index
     %f0 = arith.constant 0.0 : f32
     %big = arith.constant 4611686018427387904 : index
@@ -600,8 +613,17 @@ gpu.module @agx_sparse {
         : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
     %c = memref.reinterpret_cast %c0 to offset: [0], sizes: [%big], strides: [1]
         : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
-    %i = gpu.global_id x
-    %j = gpu.global_id y
+    // jfast (= n, > 0): a 1-D grid of rows x n threads, C's columns along x (row-major B: neighbouring lanes read one
+    // row of A and neighbouring elements of B)
+    %gx = gpu.global_id x
+    %gy = gpu.global_id y
+    %jf = arith.cmpi ne, %jfast_, %c0_i64 : i64
+    %jfi = arith.index_cast %jfast_ : i64 to index
+    %jd = arith.maxui %jfi, %i1 : index
+    %fi = arith.divui %gx, %jd : index
+    %fj = arith.remui %gx, %jd : index
+    %i = arith.select %jf, %fi, %gx : index
+    %j = arith.select %jf, %fj, %gy : index
     %in_i = arith.cmpi ult, %i, %rows : index
     %in_j = arith.cmpi ult, %j, %n : index
     %live = arith.andi %in_i, %in_j : i1

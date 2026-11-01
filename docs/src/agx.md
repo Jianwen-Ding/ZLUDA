@@ -1417,8 +1417,16 @@ convolutions with one group and dense output planes, with K, C R S and
 P Q at least 16, write each image's im2col matrix (C R S x P Q,
 `agx_conv2d_im2col_*`) to a temporary buffer and run y[n] = w col on the GEMM
 path (in the cost model about 11 times cheaper per output than the direct
-kernel for a 3x3, 64-channel layer); the call then waits for its stream
-before it frees the buffer. `cudnnConvolutionBackwardFilter` does the same
+kernel for a 3x3, 64-channel layer). The images go in chunks of up to 64 MiB
+of columns: one im2col launch per chunk (image = first + grid y) and one
+strided batched GEMM; temporaries come from a per-handle pool, reused in
+stream order without waiting. Warm, fp32 3x3, every result bit-identical
+(`tools/convbench.c`): 8 x 64 x 56 x 56 -> 64 6.05 -> 0.66 ms, 1 x 64 x 56 x 56
+2.14 -> 0.13 ms, 4 x 32 x 112 x 112 6.92 -> 0.67 ms, 16 x 128 x 28 x 28 -> 128
+6.18 -> 1.17 ms, 32 x 64 x 14 x 14 -> 128 3.36 -> 0.50 ms, 64 x 32 x 8 x 8 -> 64
+0.38 -> 0.09 ms (against the build before the pool; the last step, one im2col
+launch per chunk instead of per image, took the host's time per call from
+0.6-0.8 ms to ~0.02 ms on the many-image shapes). `cudnnConvolutionBackwardFilter` does the same
 for one group and dense dy planes: dw = sum over n of dy[n] col^T, the
 images after the first added with beta 1. `cudnnConvolutionBackwardData`
 (one group, dense dy planes) forms col = w^T dy[n] in f32 on the GEMM path

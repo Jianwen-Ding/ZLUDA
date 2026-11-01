@@ -856,6 +856,14 @@ gpu.module @agx_dnn_conv {
     %Cm = memref.reinterpret_cast %col0 to offset: [0], sizes: [%big], strides: [1]
         : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
     %id = gpu.global_id x
+    // image n + (global y): one launch for a chunk of images, each one C R S P Q block of col further
+    %img = gpu.global_id y
+    %n_img = arith.addi %n, %img : index
+    %rs = arith.muli %R, %S : index
+    %crs = arith.muli %C, %rs : index
+    %pq = arith.muli %P, %Q : index
+    %elems = arith.muli %crs, %pq : index
+    %col_off = arith.muli %img, %elems : index
     %q = arith.remui %id, %Q : index
     %t1 = arith.divui %id, %Q : index
     %p = arith.remui %t1, %P : index
@@ -889,7 +897,7 @@ gpu.module @agx_dnn_conv {
       %ok1 = arith.andi %w_ok0, %w_ok1 : i1
       %ok = arith.andi %ok0, %ok1 : i1
       %v = scf.if %ok -> f32 {
-        %xn = arith.muli %n, %xsn : index
+        %xn = arith.muli %n_img, %xsn : index
         %xc = arith.muli %c, %xsc : index
         %xh = arith.muli %h, %xsh : index
         %xw = arith.muli %w, %xsw : index
@@ -901,7 +909,8 @@ gpu.module @agx_dnn_conv {
       } else {
         scf.yield %z : f32
       }
-      memref.store %v, %Cm[%id] : memref<?xf32, strided<[1]>, 1>
+      %ci = arith.addi %id, %col_off : index
+      memref.store %v, %Cm[%ci] : memref<?xf32, strided<[1]>, 1>
     }
     gpu.return
   }
@@ -942,6 +951,14 @@ gpu.module @agx_dnn_conv {
     %Cm = memref.reinterpret_cast %col0 to offset: [0], sizes: [%big], strides: [1]
         : memref<1xf16, 1> to memref<?xf16, strided<[1]>, 1>
     %id = gpu.global_id x
+    // image n + (global y): one launch for a chunk of images, each one C R S P Q block of col further
+    %img = gpu.global_id y
+    %n_img = arith.addi %n, %img : index
+    %rs = arith.muli %R, %S : index
+    %crs = arith.muli %C, %rs : index
+    %pq = arith.muli %P, %Q : index
+    %elems = arith.muli %crs, %pq : index
+    %col_off = arith.muli %img, %elems : index
     %q = arith.remui %id, %Q : index
     %t1 = arith.divui %id, %Q : index
     %p = arith.remui %t1, %P : index
@@ -975,7 +992,7 @@ gpu.module @agx_dnn_conv {
       %ok1 = arith.andi %w_ok0, %w_ok1 : i1
       %ok = arith.andi %ok0, %ok1 : i1
       %v = scf.if %ok -> f16 {
-        %xn = arith.muli %n, %xsn : index
+        %xn = arith.muli %n_img, %xsn : index
         %xc = arith.muli %c, %xsc : index
         %xh = arith.muli %h, %xsh : index
         %xw = arith.muli %w, %xsw : index
@@ -987,7 +1004,8 @@ gpu.module @agx_dnn_conv {
       } else {
         scf.yield %z : f16
       }
-      memref.store %v, %Cm[%id] : memref<?xf16, strided<[1]>, 1>
+      %ci = arith.addi %id, %col_off : index
+      memref.store %v, %Cm[%ci] : memref<?xf16, strided<[1]>, 1>
     }
     gpu.return
   }

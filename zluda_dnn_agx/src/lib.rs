@@ -1129,18 +1129,17 @@ mod imp {
         Some((|| {
             let col = temp(h, elements * size * chunk as i64)?;
             let name = if half { c"agx_conv2d_im2col_f16" } else { c"agx_conv2d_im2col_f32" };
-            let f = conv_function(name, index32(s, elements))?;
+            let f = conv_function(name, index32(s, elements * chunk as i64))?;
             let (alpha, beta) = (*(alpha as *const f32) as f64, *(beta as *const f32) as f64);
             let types = if half { agx_libs::Types::H } else { agx_libs::Types::S };
             for first in (0..n).step_by(chunk as usize) {
                 let count = chunk.min(n - first);
-                for image in first..first + count {
-                    let mut colp = col.0.byte_offset(((image - first) as i64 * elements * size) as isize);
-                    let mut shape: [i32; 22] = std::array::from_fn(|i| if i < 21 { s[i] } else { image });
-                    let mut params: Vec<*mut c_void> = vec![&mut x as *mut _ as *mut c_void, &mut colp as *mut _ as *mut c_void];
-                    params.extend(shape.iter_mut().map(|v| v as *mut i32 as *mut c_void));
-                    engine::launch_kernel(f, [groups, 1], [256, 1], &mut params, h.stream).map_err(status)?;
-                }
+                // the chunk's images in one launch: image first + (grid y), its columns one image's size further
+                let mut colp = col.0;
+                let mut shape: [i32; 22] = std::array::from_fn(|i| if i < 21 { s[i] } else { first });
+                let mut params: Vec<*mut c_void> = vec![&mut x as *mut _ as *mut c_void, &mut colp as *mut _ as *mut c_void];
+                params.extend(shape.iter_mut().map(|v| v as *mut i32 as *mut c_void));
+                engine::launch_kernel(f, [groups, count as u32], [256, 1], &mut params, h.stream).map_err(status)?;
                 let y_n = y.byte_offset(first as isize * s[21] as isize * size as isize);
                 let g = if filter {
                     engine::Gemm {

@@ -1207,6 +1207,10 @@ ZLUDA_AGX_ZOC=target/debug/zoc target/debug/agx_cuda_smoke
   an allocation fails, and `cuMemGetInfo` counts it as free. A reused object
   keeps its old contents, as CUDA's allocations may (`AGX_ZERO_ALLOC=1` zeroes
   it).
+* Host copies (`cuMemcpyHtoD` / `DtoH` / non-overlapping `DtoD` on the CPU
+  mapping) of 4 MiB and more run on up to 4 threads (`ZLUDA_AGX_COPY_THREADS`):
+  one thread moves 16 MiB in ~450-560 us (30-35 GB/s), four in ~260-500 us
+  (runs vary).
 * Scratch: kernels that spill or use `.local` memory get per-thread stack
   memory as Mesa sets it up (AGX Performance Simulator
   `tasks/ptx-re-blockers.md`, B1, measured on the M2 Max): each command that

@@ -119,6 +119,37 @@ impl Memory {
     }
 }
 
+/// A copy between CPU-mapped memory and host memory (non-overlapping), on several threads from 4 MiB: one thread
+/// moves ~30-35 GB/s, under the memory system's rate. ZLUDA_AGX_COPY_THREADS sets the most threads (1: one).
+fn par_copy(dst: &mut [u8], src: &[u8]) {
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let most = *THREADS.get_or_init(|| {
+        std::env::var("ZLUDA_AGX_COPY_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4).max(1)
+    });
+    let n = dst.len().min(src.len());
+    let threads = most.min(n >> 22).max(1);
+    if threads == 1 {
+        dst[..n].copy_from_slice(&src[..n]);
+        return;
+    }
+    // chunks on 64-byte boundaries
+    let part = (n / threads).div_ceil(64) * 64;
+    std::thread::scope(|sc| {
+        let mut rest = (&mut dst[..n], &src[..n]);
+        while !rest.0.is_empty() {
+            let take = part.min(rest.0.len());
+            let (d, dr) = std::mem::take(&mut rest.0).split_at_mut(take);
+            let (s, sr) = rest.1.split_at(take);
+            rest = (dr, sr);
+            if rest.0.is_empty() {
+                d.copy_from_slice(s);
+            } else {
+                sc.spawn(move || d.copy_from_slice(s));
+            }
+        }
+    });
+}
+
 /// The reuse cache's limit in bytes: ZLUDA_AGX_ALLOC_CACHE (MiB; 0 turns it off), 512 MiB by default.
 fn cache_limit() -> u64 {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -342,14 +373,14 @@ impl Context {
     /// cuMemcpyHtoD (synchronous with respect to the default stream).
     pub fn memcpy_htod(&mut self, dst: u64, src: &[u8]) -> io::Result<()> {
         self.stream.synchronize()?;
-        self.bytes_mut(dst, src.len() as u64)?.copy_from_slice(src);
+        par_copy(self.bytes_mut(dst, src.len() as u64)?, src);
         Ok(())
     }
 
     /// cuMemcpyDtoH.
     pub fn memcpy_dtoh(&mut self, dst: &mut [u8], src: u64) -> io::Result<()> {
         self.stream.synchronize()?;
-        dst.copy_from_slice(self.bytes(src, dst.len() as u64)?);
+        par_copy(dst, self.bytes(src, dst.len() as u64)?);
         Ok(())
     }
 
@@ -359,7 +390,11 @@ impl Context {
         // one memmove, overlapping or not (a temporary copy held a second buffer the size of the copy)
         let from = self.bytes(src, len)?.as_ptr();
         let to = self.bytes_mut(dst, len)?.as_mut_ptr();
-        unsafe { std::ptr::copy(from, to, len as usize) };
+        if from as usize + len as usize <= to as usize || to as usize + len as usize <= from as usize {
+            par_copy(unsafe { std::slice::from_raw_parts_mut(to, len as usize) }, unsafe { std::slice::from_raw_parts(from, len as usize) });
+        } else {
+            unsafe { std::ptr::copy(from, to, len as usize) };
+        }
         Ok(())
     }
 

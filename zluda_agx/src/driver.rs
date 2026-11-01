@@ -1480,6 +1480,8 @@ fn compile_or_cached(sources: &[&[u8]], cpu: &str, cached_only: bool) -> Result<
         }
         let target = if direct { "agx" } else { "air" };
         let mut args: Vec<String> = ["--target", target, "--arch", cpu, "--object-only"].iter().map(|a| a.to_string()).collect();
+        // (the AGX object alone: no AIR for Metal, which nothing on Asahi reads)
+        args.extend((!direct).then(|| "--agx-only".to_string()));
         args.extend(mesa.then(|| "--agx-strict".to_string()));
         args.extend(checked.then(|| "--agx-checked".to_string()));
         args.extend(strict_fp.then(|| "--strict-fp".to_string()));

@@ -76,6 +76,12 @@ pub struct Options {
     /// compilation the runtime uses
     object_only: bool,
 
+    #[bpaf(long("agx-only"))]
+    /// --target air with an AGX --arch: the AGX object alone, without the AIR
+    /// for Metal (NAME.air, NAME.air.globals) or the portable AIR, which only
+    /// Metal and other AIR consumers read (what zluda_agx compiles on Asahi)
+    agx_only: bool,
+
     #[bpaf(long("stack-size"), argument("BYTES"), fallback(0))]
     /// AGX: stack per thread for alloca of a dynamic size (CUDA's
     /// CU_LIMIT_STACK_SIZE, 1024 by default); recursive functions get four
@@ -160,6 +166,7 @@ fn main_core() -> Result<(), CompilerError> {
             opts.strict_fp_f32_textures,
             opts.stack_size,
             opts.object_only,
+            opts.agx_only,
         );
     }
     if target == ptx::Target::Agx {
@@ -348,6 +355,7 @@ fn compile_air(
     f32_textures: bool,
     stack_size: u32,
     object_only: bool,
+    agx_only: bool,
 ) -> Result<(), CompilerError> {
     let options =
         ptx::Options { target: ptx::Target::Air, strict_fp, f32_textures, stack_size, ..ptx::Options::default() };
@@ -370,6 +378,7 @@ fn compile_air(
         arch.as_deref().filter(|a| a.starts_with("agx")),
         Some(&compiler_hook),
         object_only,
+        agx_only,
         strict_fp,
     )
     .map_err(|message| CompilerError::GenericError { cause: None, message })?;
@@ -384,8 +393,10 @@ fn compile_air(
     _arch: Option<String>,
     _ignore_errors: bool,
     _strict_fp: bool,
+    _f32_textures: bool,
     _stack_size: u32,
     _object_only: bool,
+    _agx_only: bool,
 ) -> Result<(), CompilerError> {
     Err(CompilerError::GenericError { cause: None, message: "zoc was built without the agx feature".to_string() })
 }
@@ -477,7 +488,9 @@ fn serve_one(args: &[String], texts: &[String]) -> Result<(Vec<u8>, Vec<u8>), St
     let opts = options().run_inner(&argv[..]).map_err(|e| format!("{e:?}"))?;
     let outputs = std::cell::RefCell::new(std::collections::HashMap::<String, Vec<u8>>::new());
     let sink = |bytes: &Vec<u8>, extension: String| {
-        outputs.borrow_mut().insert(extension, bytes.clone());
+        if extension == "o" || extension == "asm" {
+            outputs.borrow_mut().insert(extension, bytes.clone());
+        }
     };
     // the target as zoc's command line takes it (--target air: PTX through AIR; it compiled every served request
     // with the direct route before)
@@ -491,6 +504,8 @@ fn serve_one(args: &[String], texts: &[String]) -> Result<(Vec<u8>, Vec<u8>), St
             opts.strict_fp_f32_textures,
             opts.stack_size,
             opts.object_only,
+            // (a served request returns only the object and the assembly)
+            true,
         ),
         Some("agx") | None => compile_agx(
             texts,

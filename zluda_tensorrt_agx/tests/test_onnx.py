@@ -49,6 +49,10 @@ execute(data,{'x':x},{'y':np.maximum(x@w+b,0)})
 if os.environ.get('ZTRT_ONNX_FIXTURE'):
     from pathlib import Path
     Path(os.environ['ZTRT_ONNX_FIXTURE']).write_bytes(data)
+# ONNX MatMul batch broadcasting preserves leading batch dimensions.
+for ash,bsh in [((3,4,5),(3,5,7)),((2,1,4,5),(1,3,5,7)),((2,3,4,5),(5,7)),((5,),(5,)),((5,),(5,7)),((3,5),(5,)),((5,),(2,3,5,7)),((2,3,4,5),(5,))]:
+    a=rng.normal(size=ash).astype('f');b=rng.normal(size=bsh).astype('f');ref=a@b
+    execute(model([('a',ash),('b',bsh)],[('y',ref.shape)],[op('MatMul',['a','b'],'y')]),{'a':a,'b':b},{'y':ref})
 # Gemm transposition, scaling, broadcast bias.
 x=rng.normal(size=(3,2)).astype('f');w=rng.normal(size=(4,3)).astype('f');b=rng.normal(size=(4,)).astype('f')
 data=model([('x',[3,2])],[('y',[2,4])],[op('Gemm',['x','w','b'],'y',transA=1,transB=1,alpha=0.5,beta=0.25)],[constant('w',w),constant('b',b)])

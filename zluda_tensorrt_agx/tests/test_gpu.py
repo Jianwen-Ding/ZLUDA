@@ -36,6 +36,15 @@ for m,n,k in [(3,4,5),(65,70,17),(128,128,64)]:
         av=rng.normal(size=ash).astype('f'); bv=rng.normal(size=bsh).astype('f')
         run(g,{'a':av,'b':bv},{f't{y}':(av.T if ta else av)@(bv.T if tb else bv)},atol=2e-4)
 
+# Broadcast batches use strided GEMM when possible and distinct offsets for mixed axes.
+for ap,bp in [([3],[3]),([3],[]),([],[3]),([2,1],[1,3]),([1,3],[2,1]),([2,1,1,1,1,1],[1,1,1,1,1,3])]:
+ for ta,tb in [(False,False),(True,False),(False,True),(True,True)]:
+    ash=ap+([5,3] if ta else [3,5]);bsh=bp+([4,5] if tb else [5,4])
+    av=rng.normal(size=ash).astype('f');bv=rng.normal(size=bsh).astype('f')
+    ref=np.matmul(av.swapaxes(-1,-2) if ta else av,bv.swapaxes(-1,-2) if tb else bv)
+    g=graph();a=tensor(g,'a',ash);b=tensor(g,'b',bsh);y=node(g,ref.shape,'mat_mul',a=a,b=b,trans_a=ta,trans_b=tb);g['outputs']=[y]
+    run(g,{'a':av,'b':bv},{f't{y}':ref},roundtrip=True)
+
 def conv_ref(x,w,b,stride,pad,dil,groups):
     N,C,H,W=x.shape; K,_,R,S_=w.shape
     P_=(H+2*pad[0]-dil[0]*(R-1)-1)//stride[0]+1

@@ -1,0 +1,74 @@
+{
+  "backend": "portable MLIR -> AIR -> AGX",
+  "samples": 30,
+  "enqueues_per_sample": 4,
+  "process_peak_rss_kib": 55152,
+  "results": [
+    {
+      "case": "softmax_64x4096",
+      "build_ms": 0.035084,
+      "prepare_ms": 0.113168,
+      "shared_prepare_ms": 0.016875,
+      "first_enqueue_ms": 0.804754,
+      "median_enqueue_sync_us": 180.97475,
+      "workspace_bytes": 0,
+      "constant_bytes": 0,
+      "fused_activations": 0
+    },
+    {
+      "case": "bias_relu_1m",
+      "build_ms": 0.052125,
+      "prepare_ms": 0.040375,
+      "shared_prepare_ms": 0.014709,
+      "first_enqueue_ms": 2.11926,
+      "median_enqueue_sync_us": 106.28175,
+      "workspace_bytes": 0,
+      "constant_bytes": 4096,
+      "fused_activations": 1
+    },
+    {
+      "case": "matmul_256",
+      "build_ms": 1.894634,
+      "prepare_ms": 0.105208,
+      "shared_prepare_ms": 0.014084,
+      "first_enqueue_ms": 0.326835,
+      "median_enqueue_sync_us": 86.724375,
+      "workspace_bytes": 0,
+      "constant_bytes": 262144,
+      "fused_activations": 0
+    },
+    {
+      "case": "conv_8to16_32x32",
+      "build_ms": 0.055459,
+      "prepare_ms": 0.032125,
+      "shared_prepare_ms": 0.014125,
+      "first_enqueue_ms": 0.107042,
+      "median_enqueue_sync_us": 55.557500000000005,
+      "workspace_bytes": 0,
+      "constant_bytes": 4672,
+      "fused_activations": 1
+    },
+    {
+      "case": "equal_shape_add_64k",
+      "build_ms": 0.010042,
+      "prepare_ms": 0.02675,
+      "shared_prepare_ms": 0.010625,
+      "first_enqueue_ms": 0.628252,
+      "median_enqueue_sync_us": 46.3855,
+      "workspace_bytes": 0,
+      "constant_bytes": 0,
+      "fused_activations": 0
+    },
+    {
+      "case": "broadcast_matmul_8x64",
+      "build_ms": 0.145417,
+      "prepare_ms": 0.029583,
+      "shared_prepare_ms": 0.0125,
+      "first_enqueue_ms": 0.263668,
+      "median_enqueue_sync_us": 55.234625,
+      "workspace_bytes": 0,
+      "constant_bytes": 16384,
+      "fused_activations": 0
+    }
+  ]
+}

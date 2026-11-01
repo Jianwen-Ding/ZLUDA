@@ -198,13 +198,39 @@ impl Context {
                 Op::ElementWise { a, b, kind } => self.binary(at, *a, *b, yid, *kind, step.relu, stream)?,
                 Op::Reshape { input, .. } => gpu(engine::copy(self.pointers[yid] as *mut _, self.pointers[*input] as *const _, n * 4, stream))?,
                 Op::MatMul { a, b, trans_a, trans_b } => {
-                    let ashape = &g.tensors[*a].shape; let bshape = &g.tensors[*b].shape;
-                    let k = if *trans_a { ashape[0] } else { ashape[1] };
-                    gpu(engine::gemm(&engine::Gemm { types: agx_libs::Types::S, ta: *trans_b, tb: *trans_a,
-                        m: yshape[1] as u64, n: yshape[0] as u64, k: k as u64, alpha: 1., beta: 0.,
-                        a: self.pointers[*b] as *const _, b: self.pointers[*a] as *const _, c: self.pointers[yid] as *mut _,
-                        lda: bshape[1] as u64, ldb: ashape[1] as u64, ldc: yshape[1] as u64,
-                        stride_a: 0, stride_b: 0, stride_c: 0, batch: 1 }, stream))?;
+                    let ashape=&g.tensors[*a].shape;let bshape=&g.tensors[*b].shape;
+                    let (ar,ac)=(ashape[ashape.len()-2],ashape[ashape.len()-1]);
+                    let (br,bc)=(bshape[bshape.len()-2],bshape[bshape.len()-1]);
+                    let k=if *trans_a {ar}else{ac};let m=yshape[yshape.len()-2];let cols=yshape[yshape.len()-1];
+                    let batches=&yshape[..yshape.len()-2];let count:usize=batches.iter().product();
+                    let ap=&ashape[..ashape.len()-2];let bp=&bshape[..bshape.len()-2];
+                    let linear=|shape:&[usize]|shape.iter().product::<usize>()==1 || shape==batches;
+                    let mut gemm=engine::Gemm { types:agx_libs::Types::S,ta:*trans_b,tb:*trans_a,
+                        m:cols as u64,n:m as u64,k:k as u64,alpha:1.,beta:0.,
+                        a:self.pointers[*b] as *const _,b:self.pointers[*a] as *const _,c:self.pointers[yid] as *mut _,
+                        lda:bc as u64,ldb:ac as u64,ldc:cols as u64,
+                        stride_a:if bp.iter().product::<usize>()==1 {0}else{(br*bc) as i64},
+                        stride_b:if ap.iter().product::<usize>()==1 {0}else{(ar*ac) as i64},
+                        stride_c:(m*cols) as i64,batch:count as u64 };
+                    if linear(ap)&&linear(bp){gpu(engine::gemm(&gemm,stream))?;}
+                    else {
+                        // Mixed broadcast dimensions require different offsets, never replicated input buffers.
+                        let offset=|shape:&[usize],mut index:usize|{
+                            let mut result=0;let mut stride=1;
+                            for axis in (0..batches.len()).rev(){
+                                let coordinate=index%batches[axis];index/=batches[axis];
+                                if axis+shape.len()>=batches.len(){let d=shape[axis+shape.len()-batches.len()];
+                                    if d!=1{result+=coordinate*stride;}stride*=d;}
+                            }result
+                        };
+                        gemm.batch=1;
+                        for batch in 0..count{
+                            gemm.a=(self.pointers[*b]+offset(bp,batch)*br*bc*4) as *const _;
+                            gemm.b=(self.pointers[*a]+offset(ap,batch)*ar*ac*4) as *const _;
+                            gemm.c=(self.pointers[yid]+batch*m*cols*4) as *mut _;
+                            gpu(engine::gemm(&gemm,stream))?;
+                        }
+                    }
                 }
                 Op::Conv2d { input, weights, bias, stride, padding, dilation, groups } => {
                     let x = &g.tensors[*input].shape; let w = &g.tensors[*weights].shape;

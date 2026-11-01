@@ -127,3 +127,23 @@ Training mode and negative variance rejection are checked. All 21 ONNX models pa
 4.76837e-7); all 9 Rust tests, 42 graph tests and lifecycle tests also pass. Official ONNX checker remains unavailable.
 No PTX compiler or MLIR kernel changes were made in this checkpoint.
 Public semantics: https://onnx.ai/onnx/operators/onnx__BatchNormalization.html
+
+## Broadcast-batched and vector MatMul
+
+Native MatMul now accepts rank-2 through rank-8 matrices, broadcasting leading batch axes and applying transpose
+only to the final two dimensions. Matching batches and shared-matrix cases use one existing strided-batched
+MLIR/AIR GEMM dispatch. Mixed broadcast axes use per-matrix offsets without replicating inputs. This fallback
+currently performs one GEMM call per matrix, so mixed-broadcast launch overhead remains an optimization target.
+ONNX vector operands are promoted to matrices and the result squeezed with reshape operations, including scalar
+dot products. Those reshape operations currently perform device copies; no zero-copy view claim is made.
+ONNX Gemm explicitly remains rank-2.
+
+24 new graph tests cover all transpose combinations, shared operands, mixed broadcast axes and rank-8 operands.
+Eight new ONNX cases cover batch broadcasting and vector combinations. All 66 GPU graphs and 29 ONNX models
+pass; maximum errors are 1.90735e-6 and 9.53674e-7 respectively. Existing lifecycle checks and 9 Rust tests pass.
+`batched-matmul.json` records a new eight-batch 64x64 shared-weight microbenchmark: 55.23 us median enqueue/sync,
+zero activation workspace, 16,384 constant bytes. This is an initial absolute measurement, not a speedup claim.
+No PTX compiler changes, target hints or new MLIR kernels were introduced.
+
+Public semantics: https://onnx.ai/onnx/operators/onnx__MatMul.html and
+https://onnx.ai/onnx/operators/onnx__Gemm.html

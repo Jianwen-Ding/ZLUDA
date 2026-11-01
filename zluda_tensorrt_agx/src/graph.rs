@@ -77,11 +77,12 @@ impl Op {
         let result = match self {
             Self::MatMul { a, b, trans_a, trans_b } => {
                 let (a, b) = (get(*a)?, get(*b)?);
-                if a.len() != 2 || b.len() != 2 { return Err("matmul currently requires rank-2 tensors".into()); }
-                let (m, k) = if *trans_a { (a[1], a[0]) } else { (a[0], a[1]) };
-                let (kb, n) = if *trans_b { (b[1], b[0]) } else { (b[0], b[1]) };
-                if k != kb { return Err("matmul contraction dimensions differ".into()); }
-                vec![m, n]
+                if a.len()<2 || b.len()<2 { return Err("matmul requires matrix operands of rank >= 2".into()); }
+                let (ar,ac)=(a[a.len()-2],a[a.len()-1]);let (br,bc)=(b[b.len()-2],b[b.len()-1]);
+                let (m,k)=if *trans_a {(ac,ar)}else{(ar,ac)};
+                let (kb,n)=if *trans_b {(bc,br)}else{(br,bc)};
+                if k!=kb{return Err("matmul contraction dimensions differ".into());}
+                let mut out=broadcast(&a[..a.len()-2],&b[..b.len()-2])?;out.extend([m,n]);out
             }
             Self::ElementWise { a, b, .. } => broadcast(get(*a)?, get(*b)?)?,
             Self::Activation { input, .. } => get(*input)?.to_vec(),

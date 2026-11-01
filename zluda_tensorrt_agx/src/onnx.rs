@@ -174,8 +174,18 @@ pub fn import(data:&[u8])->Result<Graph>{
             }continue;
         }
         let output=match kind.as_str(){
-            "MatMul"=>g.add_node(Op::MatMul{a:get(0)?,b:get(1)?,trans_a:false,trans_b:false})?,
+            "MatMul"=>{
+                let mut a=get(0)?;let mut b=get(1)?;
+                let av=g.tensors[a].shape.len()==1;let bv=g.tensors[b].shape.len()==1;
+                if av {let k=g.tensors[a].shape[0];a=g.add_node(Op::Reshape{input:a,shape:vec![1,k]})?;}
+                if bv {let k=g.tensors[b].shape[0];b=g.add_node(Op::Reshape{input:b,shape:vec![k,1]})?;}
+                let y=g.add_node(Op::MatMul{a,b,trans_a:false,trans_b:false})?;
+                if av||bv {let mut shape=g.tensors[y].shape.clone();if av{shape.remove(shape.len()-2);}if bv{shape.pop();}
+                    g.add_node(Op::Reshape{input:y,shape})?
+                }else{y}
+            },
             "Gemm"=>{
+                if g.tensors[get(0)?].shape.len()!=2 || g.tensors[get(1)?].shape.len()!=2{return Err("ONNX Gemm requires rank-2 operands".into());}
                 let ta=take_int(&mut attrs,"transA",0)?;let tb=take_int(&mut attrs,"transB",0)?;
                 if ![0,1].contains(&ta)||![0,1].contains(&tb){return Err("invalid Gemm transpose flag".into());}
                 let alpha=take_float(&mut attrs,"alpha",1.)?;let beta=take_float(&mut attrs,"beta",1.)?;

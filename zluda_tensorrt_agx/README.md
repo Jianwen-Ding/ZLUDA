@@ -18,7 +18,7 @@ In particular, do not install `libcudart.so` for this implementation. CUDA Drive
 ## Supported execution
 
 * Contiguous **f32**, static positive dimensions, rank 0 through 8, with at most `INT32_MAX` elements per tensor.
-* Rank-2 matrix multiplication with either operand transposed, using the tiled MLIR/AIR GEMM engine.
+* Matrix multiplication of rank-2 through rank-8 operands, with batch broadcasting and either matrix operand transposed, using the tiled MLIR/AIR GEMM engine.
 * NCHW 2-D convolution, including grouped/depthwise convolution, symmetric padding, strides, dilation, and bias.
 * ReLU, sigmoid, tanh, identity; add/multiply/subtract/divide/min/max with multidimensional broadcasting.
 * Stable softmax along one axis; long contiguous rows use portable `gpu.subgroup_reduce` operations.
@@ -38,6 +38,11 @@ constant i64 reshape shapes. Supported operators: `MatMul`, `Gemm`, `Conv`, `Rel
 `Reshape`, `Transpose`, `Concat`, and tensor-valued `Constant` nodes. External weights, dynamic shapes, non-f32
 execution, custom operators/plugins, control flow, asymmetric/automatic padding, dilated/ceil pooling, and opaque
 vendor engines return explicit errors. This operator set is not the entire TensorRT API.
+
+MatMul uses one strided-batched GEMM for matching batches or a shared matrix. Mixed broadcast axes dispatch
+individual GEMMs without replicating input data. ONNX vector MatMul promotes/squeezes dimensions through reshape operations (currently device copies). The native
+MatMul operation requires matrix operands. ONNX Gemm remains
+rank-2 as required by its schema.
 
 Inference BatchNormalization precomputes channel scale/shift at model build time and lowers to existing portable
 MLIR multiply/add kernels. A following ReLU is fused into the add. Training mode and dynamic normalization

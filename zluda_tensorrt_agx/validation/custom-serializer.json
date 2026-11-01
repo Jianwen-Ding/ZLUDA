@@ -1,0 +1,63 @@
+{
+  "backend": "portable MLIR -> AIR -> AGX",
+  "samples": 30,
+  "enqueues_per_sample": 4,
+  "process_peak_rss_kib": 54928,
+  "results": [
+    {
+      "case": "softmax_64x4096",
+      "build_ms": 0.026542,
+      "prepare_ms": 0.095334,
+      "shared_prepare_ms": 0.015042,
+      "first_enqueue_ms": 0.779753,
+      "median_enqueue_sync_us": 156.97449999999998,
+      "workspace_bytes": 0,
+      "constant_bytes": 0,
+      "fused_activations": 0
+    },
+    {
+      "case": "bias_relu_1m",
+      "build_ms": 0.0475,
+      "prepare_ms": 0.028708,
+      "shared_prepare_ms": 0.011375,
+      "first_enqueue_ms": 0.679878,
+      "median_enqueue_sync_us": 117.714,
+      "workspace_bytes": 0,
+      "constant_bytes": 4096,
+      "fused_activations": 1
+    },
+    {
+      "case": "matmul_256",
+      "build_ms": 1.871507,
+      "prepare_ms": 0.096333,
+      "shared_prepare_ms": 0.014833,
+      "first_enqueue_ms": 0.583544,
+      "median_enqueue_sync_us": 71.01075,
+      "workspace_bytes": 0,
+      "constant_bytes": 262144,
+      "fused_activations": 0
+    },
+    {
+      "case": "conv_8to16_32x32",
+      "build_ms": 0.051542,
+      "prepare_ms": 0.027417,
+      "shared_prepare_ms": 0.013333,
+      "first_enqueue_ms": 0.549961,
+      "median_enqueue_sync_us": 64.453375,
+      "workspace_bytes": 0,
+      "constant_bytes": 4672,
+      "fused_activations": 1
+    },
+    {
+      "case": "equal_shape_add_64k",
+      "build_ms": 0.00775,
+      "prepare_ms": 0.025084,
+      "shared_prepare_ms": 0.011125,
+      "first_enqueue_ms": 0.53896,
+      "median_enqueue_sync_us": 61.401250000000005,
+      "workspace_bytes": 0,
+      "constant_bytes": 0,
+      "fused_activations": 0
+    }
+  ]
+}

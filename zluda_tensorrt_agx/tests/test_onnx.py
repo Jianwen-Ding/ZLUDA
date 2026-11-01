@@ -39,7 +39,7 @@ def execute(data,values,expected):
     if onnx is not None:onnx.checker.check_model(onnx.load_model_from_string(data))
     source=C.create_string_buffer(data);e=ck(build_onnx(source,len(data),1<<30))
     size=serialize(e,None,0);native=(C.c_ubyte*size)();assert serialize(e,native,size)==size
-    g=json.loads(bytes(native)[16:])
+    g=decode_engine(bytes(native))
     run(g,values,expected,engine_override=e)
 
 rng=np.random.default_rng(4321)

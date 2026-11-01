@@ -100,3 +100,16 @@ optimization, so the new host-generated indexing is validated by the exhaustive 
 values (shape 16x16x16x16) measured 52.26 us before and 44.02 us after. The four-axis address loop becomes one axis.
 Other workloads varied substantially (including unchanged softmax); these are preliminary uncontrolled-clock
 measurements, not a general speedup claim. The new benchmark remains available for repeat measurements.
+
+## Custom serializer, version 2
+
+New engines use our ZTRTAGX2 framing with JSON graph metadata and raw little-endian f32 weight records.
+The serializer borrows graph weights and converts them through a fixed 4 KiB stack buffer; it does not clone
+weights or encode them as decimal JSON. The reader retains support for our legacy ZTRTAGX1 JSON engines.
+All 9 Rust tests pass, including exact float-bit preservation (negative zero and subnormals), duplicate weight
+record/invalid tensor rejection, and legacy loading. The 42 GPU graphs, 17 ONNX models, lifecycle tests and C++
+source-interface tests pass with the new format. This does not add NVIDIA engine-format compatibility.
+
+`custom-serializer.json` records the same small benchmark: MatMul model build measured 1.87 ms versus 3.74 ms
+in `broadcast-after.json`; convolution model build measured 0.052 ms versus 0.098 ms. Build includes JSON input
+parsing and validation as well as serialization, so these are not isolated serializer throughput measurements.

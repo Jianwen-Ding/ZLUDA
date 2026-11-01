@@ -12,7 +12,7 @@ be compiled against these headers and `-ltensorrt_agx`. This is **not binary ABI
 to impersonate those libraries or claim it loads Geekbench's opaque TensorRT engines.
 
 The supported input formats are public ONNX and our documented JSON graph; the runtime generates and reads its
-own `ZTRTAGX1` engines. No NVIDIA runtime, SDK, compiler, library binary, or vendor-generated engine is required.
+own `ZTRTAGX2` engines. No NVIDIA runtime, SDK, compiler, library binary, or vendor-generated engine is required.
 In particular, do not install `libcudart.so` for this implementation. CUDA Driver API calls go to our ZLUDA AGX driver.
 
 ## Supported execution
@@ -71,10 +71,13 @@ target/release/ztrt-compile --format onnx --workspace 1073741824 model.onnx mode
 ```
 
 `--format json` accepts the independent JSON graph (see the generated test models in `tests/test_gpu.py`). A native
-engine contains `ZTRTAGX1`, a little-endian u64 JSON payload length, then the graph/weights JSON. Unknown fields,
-invalid shapes, unsupported formats, duplicate producers, cycles, invalid tensor sizes and truncated payloads are
-rejected. The payload is bounded to 256 MiB. The serialized workspace ceiling is preserved and can be tightened
-at load time. It contains a portable graph and weights, rather than NVIDIA code or a hardware-specific engine.
+engine contains `ZTRTAGX2`, a little-endian u64 payload length, a u64 JSON metadata length,
+then metadata without weights. Remaining records contain a u32 tensor ID, u64 element count and little-endian
+IEEE f32 weight bytes. Duplicate records, invalid IDs/counts, nonfinite weights and truncated payloads are rejected.
+The payload is bounded to 256 MiB. The serialized workspace ceiling is preserved and can be tightened at load time.
+Legacy independently generated `ZTRTAGX1` JSON engines remain readable. This format contains our graph and
+weights, not NVIDIA code. Serialization borrows weights and uses a fixed-size conversion buffer rather than
+cloning a model or converting weights to decimal strings.
 
 To emit the math kernels separately as portable AIR bitcode/text and an AGX fat object:
 

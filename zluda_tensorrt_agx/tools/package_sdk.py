@@ -44,7 +44,7 @@ subprocess.run([args.cxx, '-std=c++17', '-Wall', '-Wextra', '-Werror',
 (out / 'README.md').write_text('''# Independent MLIR/AIR inference SDK
 
 This package contains our original library and its source-level TensorRT API subset.
-It uses its own ZTRTAGX1 engines. It does not load opaque NVIDIA engines and is not
+It uses its own ZTRTAGX2 engines. It does not load opaque NVIDIA engines and is not
 binary-compatible with libtensorrt_rtx.so or libnvinfer.so. See REFERENCE.md for scope.
 
 Run the included independently built MLP:

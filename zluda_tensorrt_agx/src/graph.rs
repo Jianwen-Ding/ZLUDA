@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 pub type Result<T> = std::result::Result<T, String>;
 pub const MAX_RANK: usize = 8;
 pub const MAX_TENSORS: usize = 65536;
-pub const MAGIC: &[u8; 8] = b"ZTRTAGX1";
+pub const MAGIC: &[u8; 8] = b"ZTRTAGX2";
 pub const MAX_ENGINE_BYTES: usize = 256 << 20;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -292,17 +292,62 @@ impl Graph {
             }
             fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
         }
+        use std::io::Write;
+        #[derive(Serialize)]
+        struct TensorView<'a> { name: &'a str, shape: &'a [usize] }
+        #[derive(Serialize)]
+        struct GraphView<'a> {
+            tensors: Vec<TensorView<'a>>, inputs: &'a [usize], outputs: &'a [usize],
+            nodes: &'a [Node], workspace_limit: Option<usize>,
+        }
+        let view = GraphView { tensors: self.tensors.iter().map(|t| TensorView { name: &t.name, shape: &t.shape }).collect(),
+            inputs: &self.inputs, outputs: &self.outputs, nodes: &self.nodes, workspace_limit: self.workspace_limit };
         let mut writer = Writer(Vec::with_capacity(4096));
-        writer.0.extend(MAGIC); writer.0.extend(0u64.to_le_bytes());
-        serde_json::to_writer(&mut writer, self).map_err(|e| e.to_string())?;
+        writer.0.extend(MAGIC); writer.0.extend([0u8; 16]);
+        serde_json::to_writer(&mut writer, &view).map_err(|e| e.to_string())?;
+        let metadata_size = writer.0.len() - 24;
+        // Weight data is borrowed, never cloned into an intermediate graph or JSON array.
+        for (id, tensor) in self.tensors.iter().enumerate() {
+            if let Some(values) = &tensor.data {
+                writer.write_all(&(id as u32).to_le_bytes()).map_err(|e| e.to_string())?;
+                writer.write_all(&(values.len() as u64).to_le_bytes()).map_err(|e| e.to_string())?;
+                for chunk in values.chunks(1024) {
+                    let mut bytes = [0u8; 4096];
+                    for (i, value) in chunk.iter().enumerate() { bytes[i*4..i*4+4].copy_from_slice(&value.to_le_bytes()); }
+                    writer.write_all(&bytes[..chunk.len()*4]).map_err(|e| e.to_string())?;
+                }
+            }
+        }
         let size = (writer.0.len() - 16) as u64;
-        writer.0[8..16].copy_from_slice(&size.to_le_bytes()); Ok(writer.0)
+        writer.0[8..16].copy_from_slice(&size.to_le_bytes());
+        writer.0[16..24].copy_from_slice(&(metadata_size as u64).to_le_bytes()); Ok(writer.0)
     }
     pub fn deserialize(data: &[u8]) -> Result<Self> {
-        if data.len() < 16 || data.get(..8) != Some(MAGIC) { return Err("unsupported engine format: expected independently generated ZTRTAGX1 engine; NVIDIA engines are not supported".into()); }
+        if data.len() < 16 || ![MAGIC.as_slice(), b"ZTRTAGX1"].contains(&&data[..8]) {
+            return Err("unsupported independently serialized engine; NVIDIA engines are not supported".into());
+        }
         let size = u64::from_le_bytes(data[8..16].try_into().unwrap());
         if size > MAX_ENGINE_BYTES as u64 || size as usize != data.len() - 16 { return Err("invalid engine payload size".into()); }
-        let graph: Self = serde_json::from_slice(&data[16..]).map_err(|e| e.to_string())?;
+        if &data[..8] == b"ZTRTAGX1" {
+            let graph: Self = serde_json::from_slice(&data[16..]).map_err(|e| e.to_string())?;
+            graph.validate()?; return Ok(graph);
+        }
+        let length = data.get(16..24).ok_or("truncated metadata header")?;
+        let length = usize::try_from(u64::from_le_bytes(length.try_into().unwrap())).map_err(|_| "metadata length overflow")?;
+        let end = 24usize.checked_add(length).filter(|&n| n <= data.len()).ok_or("invalid metadata length")?;
+        let mut graph: Self = serde_json::from_slice(&data[24..end]).map_err(|e| e.to_string())?;
+        if graph.tensors.len() > MAX_TENSORS || graph.tensors.iter().any(|t| t.data.is_some()) { return Err("invalid binary engine metadata".into()); }
+        let mut at = end;
+        while at < data.len() {
+            let header = data.get(at..at+12).ok_or("truncated weight record")?; at += 12;
+            let id = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
+            let count = u64::from_le_bytes(header[4..].try_into().unwrap());
+            let tensor = graph.tensors.get_mut(id).ok_or("invalid weight tensor ID")?;
+            if tensor.data.is_some() || count != tensor.elements()? as u64 { return Err("duplicate or invalid weight record".into()); }
+            let bytes = (count as usize).checked_mul(4).and_then(|n| at.checked_add(n)).filter(|&n| n <= data.len()).ok_or("truncated weight data")?;
+            tensor.data = Some(data[at..bytes].chunks_exact(4).map(|v| f32::from_le_bytes(v.try_into().unwrap())).collect());
+            at = bytes;
+        }
         graph.validate()?; Ok(graph)
     }
 }
@@ -383,6 +428,21 @@ mod tests {
         assert!(broadcast(&[2, 3], &[2]).is_err());
         assert_eq!(broadcast(&[2, 3], &[3]).unwrap(), vec![2, 3]);
         assert_eq!(spatial(5, 3, 1, 2, 1).unwrap(), 3);
+    }
+    #[test] fn binary_weights_are_exact_and_malformed_records_fail() {
+        let mut g = graph(); g.tensors[1].data = Some(vec![-0.0, f32::MIN_POSITIVE, f32::from_bits(1), -2.5, 3.25, 6.]);
+        let bytes = g.serialize().unwrap(); let restored = Graph::deserialize(&bytes).unwrap();
+        let bits = |g: &Graph| g.tensors[1].data.as_ref().unwrap().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&g), bits(&restored));
+        let start = 24 + u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
+        let mut bad = bytes.clone(); bad[start..start+4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(Graph::deserialize(&bad).is_err());
+        let mut bad = bytes.clone(); bad.extend_from_slice(&bytes[start..]);
+        let size = (bad.len()-16) as u64; bad[8..16].copy_from_slice(&size.to_le_bytes());
+        assert!(Graph::deserialize(&bad).is_err());
+        let json = serde_json::to_vec(&g).unwrap(); let mut legacy = b"ZTRTAGX1".to_vec();
+        legacy.extend((json.len() as u64).to_le_bytes()); legacy.extend(json);
+        assert_eq!(bits(&g), bits(&Graph::deserialize(&legacy).unwrap()));
     }
     #[test] fn collapsed_broadcast_preserves_every_address() {
         let shapes: Vec<Vec<usize>> = (0..81usize).map(|mut n| {

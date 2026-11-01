@@ -22,7 +22,7 @@ int main(int argc,char** argv){
     pool->setStrideNd(Dims2(2,2));pool->getOutput(0)->setName("result");network->markOutput(*pool->getOutput(0));
     std::unique_ptr<IBuilderConfig> config(builder->createBuilderConfig());config->setMemoryPoolLimit(MemoryPoolType::kWORKSPACE,4096);
     std::unique_ptr<IHostMemory> blob(builder->buildSerializedNetwork(*network,*config));assert(blob&&blob->size()>16);
-    assert(std::memcmp(blob->data(),"ZTRTAGX1",8)==0);
+    assert(std::memcmp(blob->data(),"ZTRTAGX2",8)==0);
     std::unique_ptr<IRuntime> runtime(createInferRuntime(logger));
     std::unique_ptr<ICudaEngine> engine(runtime->deserializeCudaEngine(blob->data(),blob->size()));assert(engine);
     assert(engine->getNbIOTensors()==2&&engine->getTensorIOMode("image")==TensorIOMode::kINPUT&&engine->getTensorIOMode("result")==TensorIOMode::kOUTPUT);

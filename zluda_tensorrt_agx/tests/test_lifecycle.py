@@ -8,7 +8,7 @@ data=json.dumps(g).encode();source=C.create_string_buffer(data)
 assert not build(source,len(data),0)
 e=ck(build(source,len(data),256));assert workspace(e)==256
 size=serialize(e,None,0);payload=(C.c_ubyte*size)();assert serialize(e,payload,size)==size
-assert json.loads(bytes(payload)[16:])['workspace_limit']==256
+assert decode_engine(bytes(payload))['workspace_limit']==256
 r=ck(runtime())
 assert not restore(r,payload,size,128)
 restored=ck(restore(r,payload,size,512));destroy(restored);free_runtime(r)

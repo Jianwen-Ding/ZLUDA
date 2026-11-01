@@ -101,3 +101,14 @@ def run(g,values,expected,rtol=3e-4,atol=3e-5,roundtrip=False,repeats=2,engine_o
         if e: destroy(e)
         while len(allocations)>count: dc('cuMemFree_v2',allocations.pop())
 
+
+def decode_engine(data):
+    import struct
+    if data[:8] == b'ZTRTAGX1': return json.loads(data[16:])
+    assert data[:8] == b'ZTRTAGX2'
+    size=struct.unpack_from('<Q',data,16)[0];g=json.loads(data[24:24+size]);at=24+size
+    while at<len(data):
+        i,n=struct.unpack_from('<IQ',data,at);at+=12
+        g['tensors'][i]['data']=list(struct.unpack_from('<'+'f'*n,data,at));at+=n*4
+    assert at==len(data)
+    return g

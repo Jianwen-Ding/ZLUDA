@@ -8,6 +8,11 @@
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
+static float h2f(uint16_t h) {  // IEEE binary16 to float (normal numbers and zero: the benchmark's inputs)
+    uint32_t e = (h >> 10) & 31, f = h & 1023, s = (uint32_t)(h >> 15) << 31, u = e ? s | (e + 112) << 23 | f << 13 : s;
+    float x; memcpy(&x, &u, 4); return x;
+}
 typedef int CUresult; typedef void *CUcontext; typedef uint64_t CUdeviceptr; typedef void *cublasHandle_t; typedef void *CUevent;
 CUresult cuInit(unsigned); CUresult cuDevicePrimaryCtxRetain(CUcontext *, int); CUresult cuCtxSetCurrent(CUcontext);
 CUresult cuMemAlloc_v2(CUdeviceptr *, size_t); CUresult cuMemcpyHtoD_v2(CUdeviceptr, const void *, size_t);
@@ -43,7 +48,21 @@ int main(int argc, char **argv) {
     // a checksum of C (to compare plans): the sum of the f32 values in double, and of their bits
     size_t cn = (size_t)m * n; float *hc = malloc(cn * 4); double sum = 0; uint64_t bits = 0;
     if (!c16) { CK(cuMemcpyDtoH_v2(hc, c, cn * 4)); for (size_t i = 0; i < cn; i++) { sum += hc[i]; uint32_t u; memcpy(&u, &hc[i], 4); bits = bits * 31 + u; } }
-    printf("{\"m\":%d,\"n\":%d,\"k\":%d,\"c\":\"%s\",\"us_per_gemm\":%.1f,\"host_us_per_call\":%.1f,\"tflops\":%.3f,\"sum\":%.6e,\"bits\":\"%016llx\"}\n", m, n, k,
+    // CPU reference for products up to 4e9 multiply-adds (f32 C only): the largest relative error
+    double maxrel = -1;
+    if (!c16 && (double)m * n * k <= 4e9) {
+        uint16_t *ha = malloc((size_t)m * k * 2), *hb = malloc((size_t)k * n * 2);
+        CK(cuMemcpyDtoH_v2(ha, a, (size_t)m * k * 2)); CK(cuMemcpyDtoH_v2(hb, b, (size_t)k * n * 2));
+        maxrel = 0;
+        for (int j = 0; j < n; j++) for (int i = 0; i < m; i++) {
+            double r = 0;
+            for (int l = 0; l < k; l++) r += (double)h2f(ha[(size_t)i * k + l]) * h2f(hb[(size_t)j * k + l]);
+            double e = fabs(hc[(size_t)j * m + i] - r) / (fabs(r) + 1e-30);
+            if (e > maxrel) maxrel = e;
+        }
+    }
+    printf("{\"maxrel\":%.2e,", maxrel);
+    printf("\"m\":%d,\"n\":%d,\"k\":%d,\"c\":\"%s\",\"us_per_gemm\":%.1f,\"host_us_per_call\":%.1f,\"tflops\":%.3f,\"sum\":%.6e,\"bits\":\"%016llx\"}\n", m, n, k,
            c16 ? "f16" : "f32", ms * 1e3 / iters, host * 1e6 / iters, flops / (ms * 1e-3 / iters) / 1e12, sum, (unsigned long long)bits);
     return 0;
 }

@@ -4191,4 +4191,476 @@ gpu.module @agx_blas_f16 {
     }
     gpu.return
   }
+
+  // A SIMD-group per row of C computing its (at most 8) columns, A read once (gen_small_gemm.py):
+  // for C with at most 8 columns and op(A) contiguous along K.
+  gpu.func @agx_hgemm_dotrows_cf16(%a0: memref<1xf16, 1>, %b0: memref<1xf16, 1>,
+      %c0: memref<1xf16, 1>, %M: index, %N: index, %K: index, %sar: index, %sac: index,
+      %sbr: index, %sbc: index, %scr: index, %scc: index, %sa: index, %sb: index, %sc: index,
+      %alpha: f32, %beta: f32) kernel {
+    %i0 = arith.constant 0 : index
+    %i1 = arith.constant 1 : index
+    %i32 = arith.constant 32 : index
+    %big = arith.constant 4611686018427387904 : index
+    %z = gpu.block_id y
+    %oa = arith.muli %z, %sa : index
+    %ob = arith.muli %z, %sb : index
+    %oc = arith.muli %z, %sc : index
+    %A = memref.reinterpret_cast %a0 to offset: [%oa], sizes: [%big], strides: [1]
+        : memref<1xf16, 1> to memref<?xf16, strided<[1], offset: ?>, 1>
+    %B = memref.reinterpret_cast %b0 to offset: [%ob], sizes: [%big], strides: [1]
+        : memref<1xf16, 1> to memref<?xf16, strided<[1], offset: ?>, 1>
+    %C = memref.reinterpret_cast %c0 to offset: [%oc], sizes: [%big], strides: [1]
+        : memref<1xf16, 1> to memref<?xf16, strided<[1], offset: ?>, 1>
+    %f0 = arith.constant 0.0 : f32
+    %g = gpu.global_id x
+    %i = arith.divui %g, %i32 : index
+    %lane = gpu.lane_id
+    // the same for the whole SIMD-group, which reduces together
+    %live = arith.cmpi ult, %i, %M : index
+    scf.if %live {
+      %ia = arith.muli %i, %sar : index
+      %nl = arith.subi %N, %i1 : index
+      %j0c = arith.constant 0 : index
+      %j0 = arith.minui %j0c, %nl : index
+      %jb0 = arith.muli %j0, %sbc : index
+      %j1c = arith.constant 1 : index
+      %j1 = arith.minui %j1c, %nl : index
+      %jb1 = arith.muli %j1, %sbc : index
+      %j2c = arith.constant 2 : index
+      %j2 = arith.minui %j2c, %nl : index
+      %jb2 = arith.muli %j2, %sbc : index
+      %j3c = arith.constant 3 : index
+      %j3 = arith.minui %j3c, %nl : index
+      %jb3 = arith.muli %j3, %sbc : index
+      %j4c = arith.constant 4 : index
+      %j4 = arith.minui %j4c, %nl : index
+      %jb4 = arith.muli %j4, %sbc : index
+      %j5c = arith.constant 5 : index
+      %j5 = arith.minui %j5c, %nl : index
+      %jb5 = arith.muli %j5, %sbc : index
+      %j6c = arith.constant 6 : index
+      %j6 = arith.minui %j6c, %nl : index
+      %jb6 = arith.muli %j6, %sbc : index
+      %j7c = arith.constant 7 : index
+      %j7 = arith.minui %j7c, %nl : index
+      %jb7 = arith.muli %j7, %sbc : index
+      %s:8 = scf.for %k = %lane to %K step %i32 iter_args(%r0_ = %f0, %r1_ = %f0, %r2_ = %f0, %r3_ = %f0, %r4_ = %f0, %r5_ = %f0, %r6_ = %f0, %r7_ = %f0) -> (f32, f32, f32, f32, f32, f32, f32, f32) {
+        %ka = arith.muli %k, %sac : index
+        %pa = arith.addi %ia, %ka : index
+        %kb = arith.muli %k, %sbr : index
+        %xn = memref.load %A[%pa] : memref<?xf16, strided<[1], offset: ?>, 1>
+        %x = arith.extf %xn : f16 to f32
+        %pb0 = arith.addi %kb, %jb0 : index
+        %yn0 = memref.load %B[%pb0] : memref<?xf16, strided<[1], offset: ?>, 1>
+        %y0 = arith.extf %yn0 : f16 to f32
+        %d0 = math.fma %x, %y0, %r0_ : f32
+        %pb1 = arith.addi %kb, %jb1 : index
+        %yn1 = memref.load %B[%pb1] : memref<?xf16, strided<[1], offset: ?>, 1>
+        %y1 = arith.extf %yn1 : f16 to f32
+        %d1 = math.fma %x, %y1, %r1_ : f32
+        %pb2 = arith.addi %kb, %jb2 : index
+        %yn2 = memref.load %B[%pb2] : memref<?xf16, strided<[1], offset: ?>, 1>
+        %y2 = arith.extf %yn2 : f16 to f32
+        %d2 = math.fma %x, %y2, %r2_ : f32
+        %pb3 = arith.addi %kb, %jb3 : index
+        %yn3 = memref.load %B[%pb3] : memref<?xf16, strided<[1], offset: ?>, 1>
+        %y3 = arith.extf %yn3 : f16 to f32
+        %d3 = math.fma %x, %y3, %r3_ : f32
+        %pb4 = arith.addi %kb, %jb4 : index
+        %yn4 = memref.load %B[%pb4] : memref<?xf16, strided<[1], offset: ?>, 1>
+        %y4 = arith.extf %yn4 : f16 to f32
+        %d4 = math.fma %x, %y4, %r4_ : f32
+        %pb5 = arith.addi %kb, %jb5 : index
+        %yn5 = memref.load %B[%pb5] : memref<?xf16, strided<[1], offset: ?>, 1>
+        %y5 = arith.extf %yn5 : f16 to f32
+        %d5 = math.fma %x, %y5, %r5_ : f32
+        %pb6 = arith.addi %kb, %jb6 : index
+        %yn6 = memref.load %B[%pb6] : memref<?xf16, strided<[1], offset: ?>, 1>
+        %y6 = arith.extf %yn6 : f16 to f32
+        %d6 = math.fma %x, %y6, %r6_ : f32
+        %pb7 = arith.addi %kb, %jb7 : index
+        %yn7 = memref.load %B[%pb7] : memref<?xf16, strided<[1], offset: ?>, 1>
+        %y7 = arith.extf %yn7 : f16 to f32
+        %d7 = math.fma %x, %y7, %r7_ : f32
+        scf.yield %d0, %d1, %d2, %d3, %d4, %d5, %d6, %d7 : f32, f32, f32, f32, f32, f32, f32, f32
+      }
+      %first = arith.cmpi eq, %lane, %i0 : index
+      %ic = arith.muli %i, %scr : index
+      %no_c = arith.cmpf oeq, %beta, %f0 : f32
+      %sum0 = gpu.subgroup_reduce add %s#0 : (f32) -> f32
+      %in0 = arith.cmpi ult, %j0c, %N : index
+      %w0 = arith.andi %first, %in0 : i1
+      scf.if %w0 {
+        %jc0 = arith.muli %j0c, %scc : index
+        %pc0 = arith.addi %ic, %jc0 : index
+        %scaled0 = arith.mulf %sum0, %alpha : f32
+        %out0 = scf.if %no_c -> f32 {
+          scf.yield %scaled0 : f32
+        } else {
+          %oldn0 = memref.load %C[%pc0] : memref<?xf16, strided<[1], offset: ?>, 1>
+          %old0 = arith.extf %oldn0 : f16 to f32
+          %r0 = math.fma %old0, %beta, %scaled0 : f32
+          scf.yield %r0 : f32
+        }
+        %outn0 = arith.truncf %out0 : f32 to f16
+        memref.store %outn0, %C[%pc0] : memref<?xf16, strided<[1], offset: ?>, 1>
+      }
+      %sum1 = gpu.subgroup_reduce add %s#1 : (f32) -> f32
+      %in1 = arith.cmpi ult, %j1c, %N : index
+      %w1 = arith.andi %first, %in1 : i1
+      scf.if %w1 {
+        %jc1 = arith.muli %j1c, %scc : index
+        %pc1 = arith.addi %ic, %jc1 : index
+        %scaled1 = arith.mulf %sum1, %alpha : f32
+        %out1 = scf.if %no_c -> f32 {
+          scf.yield %scaled1 : f32
+        } else {
+          %oldn1 = memref.load %C[%pc1] : memref<?xf16, strided<[1], offset: ?>, 1>
+          %old1 = arith.extf %oldn1 : f16 to f32
+          %r1 = math.fma %old1, %beta, %scaled1 : f32
+          scf.yield %r1 : f32
+        }
+        %outn1 = arith.truncf %out1 : f32 to f16
+        memref.store %outn1, %C[%pc1] : memref<?xf16, strided<[1], offset: ?>, 1>
+      }
+      %sum2 = gpu.subgroup_reduce add %s#2 : (f32) -> f32
+      %in2 = arith.cmpi ult, %j2c, %N : index
+      %w2 = arith.andi %first, %in2 : i1
+      scf.if %w2 {
+        %jc2 = arith.muli %j2c, %scc : index
+        %pc2 = arith.addi %ic, %jc2 : index
+        %scaled2 = arith.mulf %sum2, %alpha : f32
+        %out2 = scf.if %no_c -> f32 {
+          scf.yield %scaled2 : f32
+        } else {
+          %oldn2 = memref.load %C[%pc2] : memref<?xf16, strided<[1], offset: ?>, 1>
+          %old2 = arith.extf %oldn2 : f16 to f32
+          %r2 = math.fma %old2, %beta, %scaled2 : f32
+          scf.yield %r2 : f32
+        }
+        %outn2 = arith.truncf %out2 : f32 to f16
+        memref.store %outn2, %C[%pc2] : memref<?xf16, strided<[1], offset: ?>, 1>
+      }
+      %sum3 = gpu.subgroup_reduce add %s#3 : (f32) -> f32
+      %in3 = arith.cmpi ult, %j3c, %N : index
+      %w3 = arith.andi %first, %in3 : i1
+      scf.if %w3 {
+        %jc3 = arith.muli %j3c, %scc : index
+        %pc3 = arith.addi %ic, %jc3 : index
+        %scaled3 = arith.mulf %sum3, %alpha : f32
+        %out3 = scf.if %no_c -> f32 {
+          scf.yield %scaled3 : f32
+        } else {
+          %oldn3 = memref.load %C[%pc3] : memref<?xf16, strided<[1], offset: ?>, 1>
+          %old3 = arith.extf %oldn3 : f16 to f32
+          %r3 = math.fma %old3, %beta, %scaled3 : f32
+          scf.yield %r3 : f32
+        }
+        %outn3 = arith.truncf %out3 : f32 to f16
+        memref.store %outn3, %C[%pc3] : memref<?xf16, strided<[1], offset: ?>, 1>
+      }
+      %sum4 = gpu.subgroup_reduce add %s#4 : (f32) -> f32
+      %in4 = arith.cmpi ult, %j4c, %N : index
+      %w4 = arith.andi %first, %in4 : i1
+      scf.if %w4 {
+        %jc4 = arith.muli %j4c, %scc : index
+        %pc4 = arith.addi %ic, %jc4 : index
+        %scaled4 = arith.mulf %sum4, %alpha : f32
+        %out4 = scf.if %no_c -> f32 {
+          scf.yield %scaled4 : f32
+        } else {
+          %oldn4 = memref.load %C[%pc4] : memref<?xf16, strided<[1], offset: ?>, 1>
+          %old4 = arith.extf %oldn4 : f16 to f32
+          %r4 = math.fma %old4, %beta, %scaled4 : f32
+          scf.yield %r4 : f32
+        }
+        %outn4 = arith.truncf %out4 : f32 to f16
+        memref.store %outn4, %C[%pc4] : memref<?xf16, strided<[1], offset: ?>, 1>
+      }
+      %sum5 = gpu.subgroup_reduce add %s#5 : (f32) -> f32
+      %in5 = arith.cmpi ult, %j5c, %N : index
+      %w5 = arith.andi %first, %in5 : i1
+      scf.if %w5 {
+        %jc5 = arith.muli %j5c, %scc : index
+        %pc5 = arith.addi %ic, %jc5 : index
+        %scaled5 = arith.mulf %sum5, %alpha : f32
+        %out5 = scf.if %no_c -> f32 {
+          scf.yield %scaled5 : f32
+        } else {
+          %oldn5 = memref.load %C[%pc5] : memref<?xf16, strided<[1], offset: ?>, 1>
+          %old5 = arith.extf %oldn5 : f16 to f32
+          %r5 = math.fma %old5, %beta, %scaled5 : f32
+          scf.yield %r5 : f32
+        }
+        %outn5 = arith.truncf %out5 : f32 to f16
+        memref.store %outn5, %C[%pc5] : memref<?xf16, strided<[1], offset: ?>, 1>
+      }
+      %sum6 = gpu.subgroup_reduce add %s#6 : (f32) -> f32
+      %in6 = arith.cmpi ult, %j6c, %N : index
+      %w6 = arith.andi %first, %in6 : i1
+      scf.if %w6 {
+        %jc6 = arith.muli %j6c, %scc : index
+        %pc6 = arith.addi %ic, %jc6 : index
+        %scaled6 = arith.mulf %sum6, %alpha : f32
+        %out6 = scf.if %no_c -> f32 {
+          scf.yield %scaled6 : f32
+        } else {
+          %oldn6 = memref.load %C[%pc6] : memref<?xf16, strided<[1], offset: ?>, 1>
+          %old6 = arith.extf %oldn6 : f16 to f32
+          %r6 = math.fma %old6, %beta, %scaled6 : f32
+          scf.yield %r6 : f32
+        }
+        %outn6 = arith.truncf %out6 : f32 to f16
+        memref.store %outn6, %C[%pc6] : memref<?xf16, strided<[1], offset: ?>, 1>
+      }
+      %sum7 = gpu.subgroup_reduce add %s#7 : (f32) -> f32
+      %in7 = arith.cmpi ult, %j7c, %N : index
+      %w7 = arith.andi %first, %in7 : i1
+      scf.if %w7 {
+        %jc7 = arith.muli %j7c, %scc : index
+        %pc7 = arith.addi %ic, %jc7 : index
+        %scaled7 = arith.mulf %sum7, %alpha : f32
+        %out7 = scf.if %no_c -> f32 {
+          scf.yield %scaled7 : f32
+        } else {
+          %oldn7 = memref.load %C[%pc7] : memref<?xf16, strided<[1], offset: ?>, 1>
+          %old7 = arith.extf %oldn7 : f16 to f32
+          %r7 = math.fma %old7, %beta, %scaled7 : f32
+          scf.yield %r7 : f32
+        }
+        %outn7 = arith.truncf %out7 : f32 to f16
+        memref.store %outn7, %C[%pc7] : memref<?xf16, strided<[1], offset: ?>, 1>
+      }
+    }
+    gpu.return
+  }
+
+  // A SIMD-group per row of C computing its (at most 8) columns, A read once (gen_small_gemm.py):
+  // for C with at most 8 columns and op(A) contiguous along K.
+  gpu.func @agx_hgemm_dotrows_cf32(%a0: memref<1xf16, 1>, %b0: memref<1xf16, 1>,
+      %c0: memref<1xf32, 1>, %M: index, %N: index, %K: index, %sar: index, %sac: index,
+      %sbr: index, %sbc: index, %scr: index, %scc: index, %sa: index, %sb: index, %sc: index,
+      %alpha: f32, %beta: f32) kernel {
+    %i0 = arith.constant 0 : index
+    %i1 = arith.constant 1 : index
+    %i32 = arith.constant 32 : index
+    %big = arith.constant 4611686018427387904 : index
+    %z = gpu.block_id y
+    %oa = arith.muli %z, %sa : index
+    %ob = arith.muli %z, %sb : index
+    %oc = arith.muli %z, %sc : index
+    %A = memref.reinterpret_cast %a0 to offset: [%oa], sizes: [%big], strides: [1]
+        : memref<1xf16, 1> to memref<?xf16, strided<[1], offset: ?>, 1>
+    %B = memref.reinterpret_cast %b0 to offset: [%ob], sizes: [%big], strides: [1]
+        : memref<1xf16, 1> to memref<?xf16, strided<[1], offset: ?>, 1>
+    %C = memref.reinterpret_cast %c0 to offset: [%oc], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1], offset: ?>, 1>
+    %f0 = arith.constant 0.0 : f32
+    %g = gpu.global_id x
+    %i = arith.divui %g, %i32 : index
+    %lane = gpu.lane_id
+    // the same for the whole SIMD-group, which reduces together
+    %live = arith.cmpi ult, %i, %M : index
+    scf.if %live {
+      %ia = arith.muli %i, %sar : index
+      %nl = arith.subi %N, %i1 : index
+      %j0c = arith.constant 0 : index
+      %j0 = arith.minui %j0c, %nl : index
+      %jb0 = arith.muli %j0, %sbc : index
+      %j1c = arith.constant 1 : index
+      %j1 = arith.minui %j1c, %nl : index
+      %jb1 = arith.muli %j1, %sbc : index
+      %j2c = arith.constant 2 : index
+      %j2 = arith.minui %j2c, %nl : index
+      %jb2 = arith.muli %j2, %sbc : index
+      %j3c = arith.constant 3 : index
+      %j3 = arith.minui %j3c, %nl : index
+      %jb3 = arith.muli %j3, %sbc : index
+      %j4c = arith.constant 4 : index
+      %j4 = arith.minui %j4c, %nl : index
+      %jb4 = arith.muli %j4, %sbc : index
+      %j5c = arith.constant 5 : index
+      %j5 = arith.minui %j5c, %nl : index
+      %jb5 = arith.muli %j5, %sbc : index
+      %j6c = arith.constant 6 : index
+      %j6 = arith.minui %j6c, %nl : index
+      %jb6 = arith.muli %j6, %sbc : index
+      %j7c = arith.constant 7 : index
+      %j7 = arith.minui %j7c, %nl : index
+      %jb7 = arith.muli %j7, %sbc : index
+      %s:8 = scf.for %k = %lane to %K step %i32 iter_args(%r0_ = %f0, %r1_ = %f0, %r2_ = %f0, %r3_ = %f0, %r4_ = %f0, %r5_ = %f0, %r6_ = %f0, %r7_ = %f0) -> (f32, f32, f32, f32, f32, f32, f32, f32) {
+        %ka = arith.muli %k, %sac : index
+        %pa = arith.addi %ia, %ka : index
+        %kb = arith.muli %k, %sbr : index
+        %xn = memref.load %A[%pa] : memref<?xf16, strided<[1], offset: ?>, 1>
+        %x = arith.extf %xn : f16 to f32
+        %pb0 = arith.addi %kb, %jb0 : index
+        %yn0 = memref.load %B[%pb0] : memref<?xf16, strided<[1], offset: ?>, 1>
+        %y0 = arith.extf %yn0 : f16 to f32
+        %d0 = math.fma %x, %y0, %r0_ : f32
+        %pb1 = arith.addi %kb, %jb1 : index
+        %yn1 = memref.load %B[%pb1] : memref<?xf16, strided<[1], offset: ?>, 1>
+        %y1 = arith.extf %yn1 : f16 to f32
+        %d1 = math.fma %x, %y1, %r1_ : f32
+        %pb2 = arith.addi %kb, %jb2 : index
+        %yn2 = memref.load %B[%pb2] : memref<?xf16, strided<[1], offset: ?>, 1>
+        %y2 = arith.extf %yn2 : f16 to f32
+        %d2 = math.fma %x, %y2, %r2_ : f32
+        %pb3 = arith.addi %kb, %jb3 : index
+        %yn3 = memref.load %B[%pb3] : memref<?xf16, strided<[1], offset: ?>, 1>
+        %y3 = arith.extf %yn3 : f16 to f32
+        %d3 = math.fma %x, %y3, %r3_ : f32
+        %pb4 = arith.addi %kb, %jb4 : index
+        %yn4 = memref.load %B[%pb4] : memref<?xf16, strided<[1], offset: ?>, 1>
+        %y4 = arith.extf %yn4 : f16 to f32
+        %d4 = math.fma %x, %y4, %r4_ : f32
+        %pb5 = arith.addi %kb, %jb5 : index
+        %yn5 = memref.load %B[%pb5] : memref<?xf16, strided<[1], offset: ?>, 1>
+        %y5 = arith.extf %yn5 : f16 to f32
+        %d5 = math.fma %x, %y5, %r5_ : f32
+        %pb6 = arith.addi %kb, %jb6 : index
+        %yn6 = memref.load %B[%pb6] : memref<?xf16, strided<[1], offset: ?>, 1>
+        %y6 = arith.extf %yn6 : f16 to f32
+        %d6 = math.fma %x, %y6, %r6_ : f32
+        %pb7 = arith.addi %kb, %jb7 : index
+        %yn7 = memref.load %B[%pb7] : memref<?xf16, strided<[1], offset: ?>, 1>
+        %y7 = arith.extf %yn7 : f16 to f32
+        %d7 = math.fma %x, %y7, %r7_ : f32
+        scf.yield %d0, %d1, %d2, %d3, %d4, %d5, %d6, %d7 : f32, f32, f32, f32, f32, f32, f32, f32
+      }
+      %first = arith.cmpi eq, %lane, %i0 : index
+      %ic = arith.muli %i, %scr : index
+      %no_c = arith.cmpf oeq, %beta, %f0 : f32
+      %sum0 = gpu.subgroup_reduce add %s#0 : (f32) -> f32
+      %in0 = arith.cmpi ult, %j0c, %N : index
+      %w0 = arith.andi %first, %in0 : i1
+      scf.if %w0 {
+        %jc0 = arith.muli %j0c, %scc : index
+        %pc0 = arith.addi %ic, %jc0 : index
+        %scaled0 = arith.mulf %sum0, %alpha : f32
+        %out0 = scf.if %no_c -> f32 {
+          scf.yield %scaled0 : f32
+        } else {
+          %old0 = memref.load %C[%pc0] : memref<?xf32, strided<[1], offset: ?>, 1>
+          %r0 = math.fma %old0, %beta, %scaled0 : f32
+          scf.yield %r0 : f32
+        }
+        memref.store %out0, %C[%pc0] : memref<?xf32, strided<[1], offset: ?>, 1>
+      }
+      %sum1 = gpu.subgroup_reduce add %s#1 : (f32) -> f32
+      %in1 = arith.cmpi ult, %j1c, %N : index
+      %w1 = arith.andi %first, %in1 : i1
+      scf.if %w1 {
+        %jc1 = arith.muli %j1c, %scc : index
+        %pc1 = arith.addi %ic, %jc1 : index
+        %scaled1 = arith.mulf %sum1, %alpha : f32
+        %out1 = scf.if %no_c -> f32 {
+          scf.yield %scaled1 : f32
+        } else {
+          %old1 = memref.load %C[%pc1] : memref<?xf32, strided<[1], offset: ?>, 1>
+          %r1 = math.fma %old1, %beta, %scaled1 : f32
+          scf.yield %r1 : f32
+        }
+        memref.store %out1, %C[%pc1] : memref<?xf32, strided<[1], offset: ?>, 1>
+      }
+      %sum2 = gpu.subgroup_reduce add %s#2 : (f32) -> f32
+      %in2 = arith.cmpi ult, %j2c, %N : index
+      %w2 = arith.andi %first, %in2 : i1
+      scf.if %w2 {
+        %jc2 = arith.muli %j2c, %scc : index
+        %pc2 = arith.addi %ic, %jc2 : index
+        %scaled2 = arith.mulf %sum2, %alpha : f32
+        %out2 = scf.if %no_c -> f32 {
+          scf.yield %scaled2 : f32
+        } else {
+          %old2 = memref.load %C[%pc2] : memref<?xf32, strided<[1], offset: ?>, 1>
+          %r2 = math.fma %old2, %beta, %scaled2 : f32
+          scf.yield %r2 : f32
+        }
+        memref.store %out2, %C[%pc2] : memref<?xf32, strided<[1], offset: ?>, 1>
+      }
+      %sum3 = gpu.subgroup_reduce add %s#3 : (f32) -> f32
+      %in3 = arith.cmpi ult, %j3c, %N : index
+      %w3 = arith.andi %first, %in3 : i1
+      scf.if %w3 {
+        %jc3 = arith.muli %j3c, %scc : index
+        %pc3 = arith.addi %ic, %jc3 : index
+        %scaled3 = arith.mulf %sum3, %alpha : f32
+        %out3 = scf.if %no_c -> f32 {
+          scf.yield %scaled3 : f32
+        } else {
+          %old3 = memref.load %C[%pc3] : memref<?xf32, strided<[1], offset: ?>, 1>
+          %r3 = math.fma %old3, %beta, %scaled3 : f32
+          scf.yield %r3 : f32
+        }
+        memref.store %out3, %C[%pc3] : memref<?xf32, strided<[1], offset: ?>, 1>
+      }
+      %sum4 = gpu.subgroup_reduce add %s#4 : (f32) -> f32
+      %in4 = arith.cmpi ult, %j4c, %N : index
+      %w4 = arith.andi %first, %in4 : i1
+      scf.if %w4 {
+        %jc4 = arith.muli %j4c, %scc : index
+        %pc4 = arith.addi %ic, %jc4 : index
+        %scaled4 = arith.mulf %sum4, %alpha : f32
+        %out4 = scf.if %no_c -> f32 {
+          scf.yield %scaled4 : f32
+        } else {
+          %old4 = memref.load %C[%pc4] : memref<?xf32, strided<[1], offset: ?>, 1>
+          %r4 = math.fma %old4, %beta, %scaled4 : f32
+          scf.yield %r4 : f32
+        }
+        memref.store %out4, %C[%pc4] : memref<?xf32, strided<[1], offset: ?>, 1>
+      }
+      %sum5 = gpu.subgroup_reduce add %s#5 : (f32) -> f32
+      %in5 = arith.cmpi ult, %j5c, %N : index
+      %w5 = arith.andi %first, %in5 : i1
+      scf.if %w5 {
+        %jc5 = arith.muli %j5c, %scc : index
+        %pc5 = arith.addi %ic, %jc5 : index
+        %scaled5 = arith.mulf %sum5, %alpha : f32
+        %out5 = scf.if %no_c -> f32 {
+          scf.yield %scaled5 : f32
+        } else {
+          %old5 = memref.load %C[%pc5] : memref<?xf32, strided<[1], offset: ?>, 1>
+          %r5 = math.fma %old5, %beta, %scaled5 : f32
+          scf.yield %r5 : f32
+        }
+        memref.store %out5, %C[%pc5] : memref<?xf32, strided<[1], offset: ?>, 1>
+      }
+      %sum6 = gpu.subgroup_reduce add %s#6 : (f32) -> f32
+      %in6 = arith.cmpi ult, %j6c, %N : index
+      %w6 = arith.andi %first, %in6 : i1
+      scf.if %w6 {
+        %jc6 = arith.muli %j6c, %scc : index
+        %pc6 = arith.addi %ic, %jc6 : index
+        %scaled6 = arith.mulf %sum6, %alpha : f32
+        %out6 = scf.if %no_c -> f32 {
+          scf.yield %scaled6 : f32
+        } else {
+          %old6 = memref.load %C[%pc6] : memref<?xf32, strided<[1], offset: ?>, 1>
+          %r6 = math.fma %old6, %beta, %scaled6 : f32
+          scf.yield %r6 : f32
+        }
+        memref.store %out6, %C[%pc6] : memref<?xf32, strided<[1], offset: ?>, 1>
+      }
+      %sum7 = gpu.subgroup_reduce add %s#7 : (f32) -> f32
+      %in7 = arith.cmpi ult, %j7c, %N : index
+      %w7 = arith.andi %first, %in7 : i1
+      scf.if %w7 {
+        %jc7 = arith.muli %j7c, %scc : index
+        %pc7 = arith.addi %ic, %jc7 : index
+        %scaled7 = arith.mulf %sum7, %alpha : f32
+        %out7 = scf.if %no_c -> f32 {
+          scf.yield %scaled7 : f32
+        } else {
+          %old7 = memref.load %C[%pc7] : memref<?xf32, strided<[1], offset: ?>, 1>
+          %r7 = math.fma %old7, %beta, %scaled7 : f32
+          scf.yield %r7 : f32
+        }
+        memref.store %out7, %C[%pc7] : memref<?xf32, strided<[1], offset: ?>, 1>
+      }
+    }
+    gpu.return
+  }
 }

@@ -142,6 +142,11 @@ const LU_PANEL_THREADS: i64 = 512;
 /// 6.2 / 39.7 / 129, 64 8.8 / 59.3 / 189).
 const LU_PANEL_COLS: i64 = 16;
 
+/// The columns of an agx_chol_panel panel (blocked f32 potrf): each panel's trailing syrk is several launches, so wider
+/// than getrf's (M2 Max, n 512 / 1000 / 2048: 16 columns 3.8 / 11.3 / 45.7 ms, 32 3.4-3.8 / 10.3-11.3 / 38.0-38.8, 64
+/// 4.4 / 12.9 / 44.3).
+const CHOL_PANEL_COLS: i64 = 32;
+
 /// The columns of a panel of the blocked f32 getrf.
 const LU_BLOCK: i64 = 64;
 
@@ -360,32 +365,51 @@ unsafe fn potrf(h: &Handle, double: bool, uplo: cublasFillMode_t, n: c_int, a: *
     let lda_ = lda as i64;
     let block = if double || n_ <= LU_BLOCK { n_ } else { LU_BLOCK };
     let at = |r: i64, c: i64| (a as *mut f32).add((r + c * lda_) as usize) as *mut c_void;
-    for k in 0..n as i64 {
+    // f32 panels of CHOL_PANEL_COLS in one launch each (agx_chol_panel): a column at a time is three dependent launches
+    // (n 512: 7.5 ms, 2048: 41 ms; panels 3.4-3.7 / 38 ms). ZLUDA_AGX_CHOL_PANEL=0: a column at a time, panels of
+    // LU_BLOCK.
+    let panels = !double && n_ > CHOL_PANEL_COLS && std::env::var("ZLUDA_AGX_CHOL_PANEL").map_or(true, |v| v != "0");
+    let block = if panels { CHOL_PANEL_COLS } else { block };
+    let mut k = 0i64;
+    while k < n_ {
         let mut k_ = k;
         // the end of k's panel: the update stays in it
         let (j0, mut j1) = (k / block * block, (k / block * block + block).min(n_));
-        run(
-            h,
-            kernel(double, [c"agx_chol_diag", c"agx_chol_diag_f64"]),
-            &mut [arg(&mut pa), arg(&mut k_), arg(&mut rs), arg(&mut cs), arg(&mut pinfo)],
-            [1, 1],
-            [1, 1],
-        )?;
-        run(
-            h,
-            kernel(double, [c"agx_chol_scale", c"agx_chol_scale_f64"]),
-            &mut [arg(&mut pa), arg(&mut n_), arg(&mut k_), arg(&mut rs), arg(&mut cs), arg(&mut pinfo)],
-            [n_ - k - 1, 1],
-            [64, 1],
-        )?;
-        run(
-            h,
-            kernel(double, [c"agx_chol_update", c"agx_chol_update_f64"]),
-            &mut [arg(&mut pa), arg(&mut n_), arg(&mut k_), arg(&mut rs), arg(&mut cs), arg(&mut pinfo), arg(&mut j1)],
-            [n_ - k - 1, j1 - k - 1],
-            [16, 4],
-        )?;
-        if k + 1 != j1 || j1 >= n_ {
+        if panels {
+            let (mut j0_, mut jb) = (j0, j1 - j0);
+            run(
+                h,
+                c"agx_chol_panel",
+                &mut [arg(&mut pa), arg(&mut n_), arg(&mut j0_), arg(&mut jb), arg(&mut rs), arg(&mut cs), arg(&mut pinfo)],
+                [LU_PANEL_THREADS, 1],
+                [LU_PANEL_THREADS as u32, 1],
+            )?;
+            k = j1;
+        } else {
+            k += 1;
+            run(
+                h,
+                kernel(double, [c"agx_chol_diag", c"agx_chol_diag_f64"]),
+                &mut [arg(&mut pa), arg(&mut k_), arg(&mut rs), arg(&mut cs), arg(&mut pinfo)],
+                [1, 1],
+                [1, 1],
+            )?;
+            run(
+                h,
+                kernel(double, [c"agx_chol_scale", c"agx_chol_scale_f64"]),
+                &mut [arg(&mut pa), arg(&mut n_), arg(&mut k_), arg(&mut rs), arg(&mut cs), arg(&mut pinfo)],
+                [n_ - k_ - 1, 1],
+                [64, 1],
+            )?;
+            run(
+                h,
+                kernel(double, [c"agx_chol_update", c"agx_chol_update_f64"]),
+                &mut [arg(&mut pa), arg(&mut n_), arg(&mut k_), arg(&mut rs), arg(&mut cs), arg(&mut pinfo), arg(&mut j1)],
+                [n_ - k_ - 1, j1 - k_ - 1],
+                [16, 4],
+            )?;
+        }
+        if k != j1 || j1 >= n_ {
             continue;
         }
         // the panel j0..j1 is factored: A22 -= L21 L21^T on the stored triangle (U12^T U12 for upper), a syrk of the

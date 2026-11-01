@@ -471,6 +471,98 @@ gpu.module @agx_solver {
     gpu.return
   }
 
+  // The columns j0 .. j0 + jb of the n x n Cholesky factor (single precision
+  // only) in one workgroup, as agx_chol_diag / scale / update do column by
+  // column with the update kept to the panel: thread 0 takes the diagonal
+  // (info = k + 1 if it is not positive, cleared at column 0; nothing happens
+  // once info is set), then each thread scales and updates its rows r = k + 1
+  // + t, k + 1 + t + threads, ... L(i, j) is a[i rs + j cs]. Launch one
+  // workgroup.
+  gpu.func @agx_chol_panel(%a0: memref<1xf32, 1>, %n_: i64, %j0_: i64, %jb_: i64, %rs_: i64, %cs_: i64,
+                           %info0: memref<1xi32, 1>)
+      workgroup(%ok_s: memref<1xi32, #gpu.address_space<workgroup>>) kernel {
+    %i0 = arith.constant 0 : index
+    %i1 = arith.constant 1 : index
+    %z = arith.constant 0 : i32
+    %one = arith.constant 1 : i32
+    %f0 = arith.constant 0.0 : f32
+    %n = arith.index_cast %n_ : i64 to index
+    %j0 = arith.index_cast %j0_ : i64 to index
+    %jb = arith.index_cast %jb_ : i64 to index
+    %j1 = arith.addi %j0, %jb : index
+    %rs = arith.index_cast %rs_ : i64 to index
+    %cs = arith.index_cast %cs_ : i64 to index
+    %t = gpu.thread_id x
+    %nt = gpu.block_dim x
+    %t0 = arith.cmpi eq, %t, %i0 : index
+    scf.for %k = %j0 to %j1 step %i1 {
+      scf.if %t0 {
+        %k0 = arith.cmpi eq, %k, %i0 : index
+        scf.if %k0 {
+          func.call @agx_sv_sti(%info0, %i0, %z) : (memref<1xi32, 1>, index, i32) -> ()
+        }
+        %old = func.call @agx_sv_ldi(%info0, %i0) : (memref<1xi32, 1>, index) -> i32
+        %fine = arith.cmpi eq, %old, %z : i32
+        %go = scf.if %fine -> i32 {
+          %o = func.call @agx_sv_at(%k, %k, %rs, %cs) : (index, index, index, index) -> index
+          %d = func.call @agx_sv_ld(%a0, %o) : (memref<1xf32, 1>, index) -> f32
+          %pos = arith.cmpf ogt, %d, %f0 : f32
+          %r = scf.if %pos -> i32 {
+            %sq = math.sqrt %d : f32
+            func.call @agx_sv_st(%a0, %o, %sq) : (memref<1xf32, 1>, index, f32) -> ()
+            scf.yield %one : i32
+          } else {
+            %k1 = arith.addi %k, %i1 : index
+            %ki = arith.index_cast %k1 : index to i32
+            func.call @agx_sv_sti(%info0, %i0, %ki) : (memref<1xi32, 1>, index, i32) -> ()
+            scf.yield %z : i32
+          }
+          scf.yield %r : i32
+        } else {
+          scf.yield %z : i32
+        }
+        memref.store %go, %ok_s[%i0] : memref<1xi32, #gpu.address_space<workgroup>>
+      }
+      gpu.barrier
+      %goi = memref.load %ok_s[%i0] : memref<1xi32, #gpu.address_space<workgroup>>
+      %go = arith.cmpi ne, %goi, %z : i32
+      %od = func.call @agx_sv_at(%k, %k, %rs, %cs) : (index, index, index, index) -> index
+      %d = func.call @agx_sv_ld(%a0, %od) : (memref<1xf32, 1>, index) -> f32
+      %k1 = arith.addi %k, %i1 : index
+      %r0 = arith.addi %k1, %t : index
+      // scale this thread's rows of column k
+      scf.if %go {
+        scf.for %r = %r0 to %n step %nt {
+          %o = func.call @agx_sv_at(%r, %k, %rs, %cs) : (index, index, index, index) -> index
+          %v = func.call @agx_sv_ld(%a0, %o) : (memref<1xf32, 1>, index) -> f32
+          %q = arith.divf %v, %d : f32
+          func.call @agx_sv_st(%a0, %o, %q) : (memref<1xf32, 1>, index, f32) -> ()
+        }
+      }
+      gpu.barrier
+      // L(r, c) -= L(r, k) L(c, k) for k < c <= r, c in the panel
+      scf.if %go {
+        scf.for %r = %r0 to %n step %nt {
+          %ork = func.call @agx_sv_at(%r, %k, %rs, %cs) : (index, index, index, index) -> index
+          %lr = func.call @agx_sv_ld(%a0, %ork) : (memref<1xf32, 1>, index) -> f32
+          %nl = arith.negf %lr : f32
+          %r1 = arith.addi %r, %i1 : index
+          %ce = arith.minui %j1, %r1 : index
+          scf.for %c = %k1 to %ce step %i1 {
+            %orc = func.call @agx_sv_at(%r, %c, %rs, %cs) : (index, index, index, index) -> index
+            %ock = func.call @agx_sv_at(%c, %k, %rs, %cs) : (index, index, index, index) -> index
+            %v = func.call @agx_sv_ld(%a0, %orc) : (memref<1xf32, 1>, index) -> f32
+            %lc = func.call @agx_sv_ld(%a0, %ock) : (memref<1xf32, 1>, index) -> f32
+            %nv = math.fma %nl, %lc, %v : f32
+            func.call @agx_sv_st(%a0, %orc, %nv) : (memref<1xf32, 1>, index, f32) -> ()
+          }
+        }
+      }
+      gpu.barrier
+    }
+    gpu.return
+  }
+
   // ---- Cholesky (potrf), column k: L(i, j) is a[i rs + j cs] (rs 1 and
   // cs lda for the lower triangle, the other way round for the upper one,
   // whose U is L^T). Nothing happens once info is set.

@@ -70,6 +70,12 @@ wall time, peak RSS, object md5).
   llama.cpp's 10 MB module +0.9 s (26.5 -> 27.4 s, the stage runs in parallel), same peak memory; llama.cpp
   tg64 133.1 -> 134.5 t/s (two runs each, run-to-run spread +-1.3), pp128 equal. Within noise: left off (Cycles' compile
   paid 31 -> 44 s for it before).
+- **Light cleanup in AIR's address spaces, O3 per kernel** (`ZLUDA_AIR_AS_PIPELINE=light+` with
+  `ZLUDA_AIR_AGX_PIPELINE=o3`, experiment): llama.cpp's modules 44.1 -> 36.7 s (the 10 MB one 26.5 -> 22.1 s; peak
+  2.08 -> 2.44 GB, every compiling thread running O3), completions 4/4 exact; but GPU time not shown to be equal
+  (tg64 134.6 / 123.7 against 132.8, pp128 -2%; per kernel +1-4% everywhere, even in modules it does not change,
+  i.e. within the clock's variation). Not the default until a controlled comparison (the same kernels replayed
+  back to back) shows the code as fast.
 - Dead end: reading each kernel's module lazily from the portable AIR (getLazyBitcodeModule, materializing only the
   functions the kernel reaches, instead of parsing all 13 MB of Cycles per kernel): the same object, peak 6.1-6.3 GB
   against 6.3-6.7, the AGX stage 30.6-32.6 s against 26.6-32.1 (two runs each): within noise. Cycles' peak is the

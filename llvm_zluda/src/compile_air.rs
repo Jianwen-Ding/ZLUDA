@@ -292,7 +292,10 @@ pub fn compile_air(
             stage("the Metal pipeline in AIR's address spaces");
         }
         _ => {
-            run(&linked, c"default<O3>", &air, &options)?;
+            // ZLUDA_AIR_AS_PIPELINE=light+ (experiment): the cleanup of light+ instead of O3 here, the kernels' O3 left
+            // to the AGX pipeline (a large module's runs a kernel at a time, in parallel: ZLUDA_AIR_AGX_PIPELINE=o3)
+            let light = std::env::var("ZLUDA_AIR_AS_PIPELINE").is_ok_and(|v| v == "light+");
+            run(&linked, if light { LIGHT_PLUS } else { c"default<O3>" }, &air, &options)?;
             stage("O3 in AIR's address spaces");
         }
     }

@@ -1640,6 +1640,43 @@ To measure the gap: run Geekbench 7 Metal on macOS on the same M2 Max and the CU
 scores uploaded); and time the same kernels (GEMM, a separable convolution, the particle kernel) as Metal compute
 shaders on macOS and through ZLUDA, which separates compiler quality from driver overhead.
 
+## Geekbench validation limits
+
+The saved Geekbench 7.1.0 Linux ARM Preview runs in the Fedora container reached all eleven workload headings and
+recorded GPU launches, including convolution and GEMM kernels for the AI workloads. This establishes execution of
+those paths, but does not independently verify every workload's output or establish TensorRT compatibility.
+The October 24 shared-pipeline record reports 318,836 profiled launches and eleven error-701 tuning rejections;
+its result upload failed. Some scratch launch scripts also stop the application when it starts uploading, so their
+completion marker is not evidence of a published result.
+
+`CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES` (701) occurs when a candidate block size exceeds the kernel's register-based
+threadgroup limit. The driver rejects that launch before submitting it to the GPU. Geekbench's optimizer probes
+multiple block sizes, and the saved container logs contain rejections for `calculate_descriptors`, `miss`, and
+`hit_surface`, among others. A rejected tuning candidate does not by itself establish that the workload failed;
+check that subsequent launches run with a supported size.
+
+A November 1 host run reported `Failed to deserialize TensorRT engine` for Background Blur, Face Tracking, and
+Super Resolution, then continued through the remaining workloads and uploaded a result. Those TensorRT errors
+are absent from the inspected container logs. This repository supplies no TensorRT (`libnvinfer`) replacement,
+and successful PTX compilation or CUDA device detection does not establish support for serialized TensorRT engines.
+The cause of the different application path remains unresolved. Compare the Geekbench version and executable
+hash, launch arguments, environment, and resolved library paths before attributing the difference to containment.
+An uploaded result alone does not prove that every workload succeeded.
+
+For a comparison run, use the same Geekbench build, the matching ZLUDA driver and `zoc`, and absolute paths:
+
+```bash
+ZLUDA_AGX_ZOC=/absolute/path/to/zoc \
+ZLUDA_AGX_LOG=1 \
+LD_LIBRARY_PATH=/absolute/path/to/zluda-libraries \
+./geekbench7 --gpu CUDA > geekbench-zluda.log 2>&1
+```
+
+The library directory must contain `libcuda.so.1` pointing to `libnvcuda_agx.so`. Keep the full log, including
+errors and upload status, and record the selected libraries (for example, with `LD_DEBUG=libs` in a separate
+diagnostic run). Device name and compute capability are driver-reported compatibility properties, not an
+application validation result.
+
 ## Building a release for Asahi
 
 ```

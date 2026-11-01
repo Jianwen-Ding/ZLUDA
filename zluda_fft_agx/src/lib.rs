@@ -2,7 +2,8 @@
 //! written once for every AGX generation).
 //!
 //! Single and double precision: complex to complex transforms (C2C, Z2Z) of rank 1, 2 and 3 (strided and batched for
-//! rank 1), and real to complex / complex to real transforms (R2C, C2R, D2Z, Z2D) of rank 1. Power-of-two lengths run
+//! rank 1), and real to complex / complex to real transforms (R2C, C2R, D2Z, Z2D) of rank 1 (strided and batched) to 3
+//! (contiguous; C2R overwrites its input, as cuFFT's may). Power-of-two lengths run
 //! on radix-2 / radix-4 Stockham passes, other factors on passes of their radix (a direct transform for a prime
 //! length); the twiddles are computed on the host in double precision.
 //! Double precision runs the same kernels built for f64 (`<kernel>_f64`, in the backend's software double precision).
@@ -201,7 +202,7 @@ impl Shape {
         match self.kind {
             // the kernels read and write each sequence with one layout
             Kind::C2C if self.istride != self.ostride || self.idist != self.odist => Err(cufftError_t::NOT_SUPPORTED),
-            Kind::R2C | Kind::C2R if self.dims.len() > 1 || self.istride != 1 || self.ostride != 1 => {
+            Kind::R2C | Kind::C2R if self.istride != 1 || self.ostride != 1 => {
                 Err(cufftError_t::NOT_SUPPORTED)
             }
             _ => Ok(()),
@@ -382,6 +383,36 @@ fn radices(n: usize) -> Vec<usize> {
     out
 }
 
+/// The dimensions of a real transform's complex half: the last n / 2 + 1.
+fn half_dims(s: &Shape) -> Vec<usize> {
+    let mut d = s.dims.clone();
+    let last = d.len() - 1;
+    d[last] = d[last] / 2 + 1;
+    d
+}
+
+/// Complex transforms along dimensions `kend - 1` down to 0 of contiguous sequences of extent `dims` (s.batch of
+/// them), the first from src, all into dst. Dimension k uses table k and its Bluestein tables.
+#[allow(clippy::too_many_arguments)]
+fn c2c_dims(out: &mut Vec<Step>, sm: usize, s: &Shape, dims: &[usize], kend: usize, src: Buf, dst: Buf) {
+    let total: usize = dims.iter().product();
+    for k in (0..kend).rev() {
+        let from = if k == kend - 1 { src } else { dst };
+        let n = dims[k];
+        let inner: usize = dims[k + 1..].iter().product();
+        let outer: usize = dims[..k].iter().product();
+        if inner == 1 {
+            c2c_1d(out, sm, from, dst, k, blue_table(s, k), n, outer * s.batch, 1, n, 0, None);
+        } else {
+            for b in 0..s.batch {
+                for o in 0..outer {
+                    c2c_1d(out, sm, from, dst, k, blue_table(s, k), n, inner, inner, 1, b * total + o * n * inner, None);
+                }
+            }
+        }
+    }
+}
+
 /// The launches of a transform; `in_place` when the input and output are the same buffer (the passes then never
 /// read and write one buffer in one launch).
 pub fn steps(s: &Shape, in_place: bool) -> Vec<Step> {
@@ -397,45 +428,42 @@ pub fn steps(s: &Shape, in_place: bool) -> Vec<Step> {
                 c2c_1d(&mut out, sm, input, Buf::Out, 0, blue_table(s, 0), s.dims[0], s.batch, s.istride, s.idist, 0, None);
                 return out;
             }
-            let total = s.total();
-            for k in (0..r).rev() {
-                let src = if k == r - 1 { input } else { Buf::Out };
-                let n = s.dims[k];
-                let inner: usize = s.dims[k + 1..].iter().product();
-                let outer: usize = s.dims[..k].iter().product();
-                if inner == 1 {
-                    c2c_1d(&mut out, sm, src, Buf::Out, k, blue_table(s, k), n, outer * s.batch, 1, n, 0, None);
-                } else {
-                    for b in 0..s.batch {
-                        for o in 0..outer {
-                            c2c_1d(&mut out, sm, src, Buf::Out, k, blue_table(s, k), n, inner, inner, 1, b * total + o * n * inner, None);
-                        }
-                    }
-                }
-            }
+            c2c_dims(&mut out, sm, s, &s.dims, r, input, Buf::Out);
         }
+        // rank 2 and 3 (contiguous): the real transform along the last dimension, then complex transforms of the
+        // other dimensions over the half spectrum (dims with the last n / 2 + 1); C2R in the reverse order, in place
+        // in the input, which C2R overwrites
         Kind::R2C => {
-            let n = s.dims[0];
-            out.push(Step::RealToComplex { src: Buf::In, dst: Buf::A, n, count: s.batch, idist: s.idist });
-            c2c_1d(&mut out, sm, Buf::A, Buf::A, 0, blue_table(s, 0), n, s.batch, 1, n, 0, None);
+            let (r, n) = (s.dims.len(), s.dims[s.dims.len() - 1]);
+            let rows = s.total() / n * s.batch;
+            // one sequence per row: idist apart for rank 1, contiguous above
+            let idist = if r == 1 { s.idist } else { n };
+            let odist = if r == 1 { s.odist } else { n / 2 + 1 };
+            out.push(Step::RealToComplex { src: Buf::In, dst: Buf::A, n, count: rows, idist });
+            c2c_1d(&mut out, sm, Buf::A, Buf::A, r - 1, blue_table(s, r - 1), n, rows, 1, n, 0, None);
             out.push(Step::Copy {
                 src: Buf::A,
                 dst: Buf::Out,
                 m: n / 2 + 1,
-                count: s.batch,
+                count: rows,
                 istride: 1,
                 idist: n,
                 ostride: 1,
-                odist: s.odist,
+                odist,
                 ioffset: 0,
                 ooffset: 0,
             });
+            c2c_dims(&mut out, sm, s, &half_dims(s), r - 1, Buf::Out, Buf::Out);
         }
         Kind::C2R => {
-            let n = s.dims[0];
-            out.push(Step::Hermitian { src: Buf::In, dst: Buf::A, n, count: s.batch, idist: s.idist });
-            c2c_1d(&mut out, sm, Buf::A, Buf::A, 0, blue_table(s, 0), n, s.batch, 1, n, 0, None);
-            out.push(Step::RealPart { src: Buf::A, dst: Buf::Out, n, count: s.batch, odist: s.odist });
+            let (r, n) = (s.dims.len(), s.dims[s.dims.len() - 1]);
+            let rows = s.total() / n * s.batch;
+            let idist = if r == 1 { s.idist } else { n / 2 + 1 };
+            let odist = if r == 1 { s.odist } else { n };
+            c2c_dims(&mut out, sm, s, &half_dims(s), r - 1, Buf::In, Buf::In);
+            out.push(Step::Hermitian { src: Buf::In, dst: Buf::A, n, count: rows, idist });
+            c2c_1d(&mut out, sm, Buf::A, Buf::A, r - 1, blue_table(s, r - 1), n, rows, 1, n, 0, None);
+            out.push(Step::RealPart { src: Buf::A, dst: Buf::Out, n, count: rows, odist });
         }
     }
     out
@@ -1338,6 +1366,46 @@ mod tests {
     }
 
     #[test]
+    fn real_transforms_nd() {
+        for (dims, batch) in [(vec![4usize, 6], 2usize), (vec![5, 8], 1), (vec![3, 4, 6], 2), (vec![2, 3, 5], 1), (vec![101, 2], 1)] {
+            let s = Shape::contiguous(Kind::R2C, &dims, batch);
+            s.check().unwrap();
+            let (total, last) = (s.total(), dims[dims.len() - 1]);
+            let half = last / 2 + 1;
+            let mut seed = 13;
+            let real: Vec<f64> = (0..total * batch).map(|_| rnd(&mut seed)).collect();
+            let size = 2 * s.work_elements().max(s.blue_elements());
+            let mut bufs: HashMap<Buf, Vec<f64>> = [Buf::W0, Buf::W1, Buf::A, Buf::B].into_iter().map(|b| (b, vec![f64::NAN; size])).collect();
+            bufs.insert(Buf::In, real.clone());
+            bufs.insert(Buf::Out, vec![f64::NAN; 2 * s.odist * batch]);
+            emulate(&s, false, false, &mut bufs);
+            let spec = bufs[&Buf::Out].clone();
+            for c in 0..batch {
+                let x: Vec<C> = (0..total).map(|i| (real[c * total + i], 0.0)).collect();
+                let want = dft_nd(&x, &dims, false);
+                for i in 0..total {
+                    if i % last >= half {
+                        continue;
+                    }
+                    let o = c * s.odist + i / last * half + i % last;
+                    let g = (spec[2 * o], spec[2 * o + 1]);
+                    assert!((g.0 - want[i].0).abs() < 1e-3 && (g.1 - want[i].1).abs() < 1e-3, "r2c {dims:?}: {g:?} != {:?} at {i}", want[i]);
+                }
+            }
+            // and back: total times the input
+            let s2 = Shape::contiguous(Kind::C2R, &dims, batch);
+            s2.check().unwrap();
+            let mut bufs2: HashMap<Buf, Vec<f64>> = [Buf::W0, Buf::W1, Buf::A, Buf::B].into_iter().map(|b| (b, vec![f64::NAN; size])).collect();
+            bufs2.insert(Buf::In, spec);
+            bufs2.insert(Buf::Out, vec![f64::NAN; total * batch]);
+            emulate(&s2, true, false, &mut bufs2);
+            for (i, r) in real.iter().enumerate() {
+                assert!((bufs2[&Buf::Out][i] - total as f64 * r).abs() < 1e-2, "c2r {dims:?} at {i}");
+            }
+        }
+    }
+
+    #[test]
     fn layouts() {
         // log2(n) odd: one radix-2 pass, then radix-4
         assert_eq!(super::radices(32), [2, 4, 4]);
@@ -1357,7 +1425,7 @@ mod tests {
         assert_eq!(blue_m(1024 + 1), 4096);
         assert_eq!(Shape::contiguous(Kind::R2C, &[10], 2).odist, 6);
         assert_eq!(Shape::contiguous(Kind::C2R, &[10], 2).idist, 6);
-        assert_eq!(Shape::contiguous(Kind::R2C, &[4, 6], 1).check(), Err(cufftError_t::NOT_SUPPORTED));
+        assert_eq!(Shape::contiguous(Kind::R2C, &[4, 6], 1).check(), Ok(()));
         let bad = Shape { istride: 2, ..Shape::contiguous(Kind::C2C, &[8], 1) };
         assert_eq!(bad.check(), Err(cufftError_t::NOT_SUPPORTED));
         // two passes for n = 8192 (radix 2, then 4 x 6), ending in Out
@@ -1384,7 +1452,7 @@ mod tests {
         assert_eq!(work(cufftType::CUFFT_D2Z, &[30]), work(cufftType::CUFFT_R2C, &[30]).map(|w| 2 * w));
         assert_eq!(work(cufftType::CUFFT_Z2D, &[30]), work(cufftType::CUFFT_C2R, &[30]).map(|w| 2 * w));
         assert_eq!(work(cufftType::CUFFT_Z2Z, &[8, 6]), work(cufftType::CUFFT_C2C, &[8, 6]).map(|w| 2 * w));
-        assert_eq!(work(cufftType::CUFFT_D2Z, &[8, 6]), Err(cufftError_t::NOT_SUPPORTED), "real transforms are rank 1");
+        assert_eq!(work(cufftType::CUFFT_D2Z, &[8, 6]), work(cufftType::CUFFT_R2C, &[8, 6]).map(|w| 2 * w));
         let t = twiddles_f64(12);
         assert_eq!((t[0], t[1]), (1.0, -0.0));
         assert!((t[6] - 0.0).abs() < 1e-15 && (t[7] + 1.0).abs() < 1e-15, "exp(-2 pi i 3 / 12) = -i");

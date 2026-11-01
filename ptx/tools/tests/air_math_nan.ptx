@@ -1,0 +1,33 @@
+// Authored regression: strict AIR math calls canonicalize NaNs; plain loads/stores preserve bits.
+.version 6.5
+.target sm_30
+.address_size 64
+.visible .entry air_math_nan(.param .u64 input, .param .u64 output) {
+    .reg .u32 tid;
+    .reg .u64 in, out, off;
+    .reg .f32 x, r0, r1, r2, r3, r4;
+    mov.u32 tid, %tid.x;
+    ld.param.u64 in, [input];
+    ld.param.u64 out, [output];
+    mul.wide.u32 off, tid, 4;
+    add.u64 in, in, off;
+    ld.global.f32 x, [in];
+    mul.wide.u32 off, tid, 24;
+    add.u64 out, out, off;
+    ex2.approx.f32 r0, x;
+    st.global.f32 [out+0], r0;
+    lg2.approx.f32 r1, x;
+    st.global.f32 [out+4], r1;
+    sin.approx.f32 r2, x;
+    st.global.f32 [out+8], r2;
+    cos.approx.f32 r3, x;
+    st.global.f32 [out+12], r3;
+    rsqrt.approx.f32 r4, x;
+    st.global.f32 [out+16], r4;
+    st.global.f32 [out+20], x;
+    ret;
+}
+.buffer IN .u32 = { 0x7fc12345, 0x7fa00001, 0xffc00000, 0x7f800000, 0xff800000, 0x0 };
+.buffer OUT .u32 [36];
+.launch air_math_nan <<< 1, 6 >>> (IN, OUT);
+.expect OUT .u32 = { 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fc12345, 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fa00001, 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff, 0xffc00000, 0x7f800000, 0x7f800000, 0x7fffffff, 0x7fffffff, 0x0, 0x7f800000, 0x0, 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff, 0xff800000, 0x3f800000, 0xff800000, 0x0, 0x3f800000, 0x7f800000, 0x0 };

@@ -3119,8 +3119,14 @@ int LLVMZludaAirCanonicalNaNs(LLVMModuleRef M)
                 continue;
             bool arithmetic = isa<BinaryOperator>(I) || isa<UnaryOperator>(I) || isa<FPTruncInst>(I) ||
                               isa<FPExtInst>(I) || isa<SIToFPInst>(I) || isa<UIToFPInst>(I);
-            if (auto *CI = dyn_cast<CallInst>(&I))
-                arithmetic = CI->getCalledFunction() && CI->getCalledFunction()->isIntrinsic();
+            if (auto *CI = dyn_cast<CallInst>(&I)) {
+                Function *Callee = CI->getCalledFunction();
+                // AIR math builtins are ordinary declarations after intrinsic remapping.
+                // Their arithmetic results still require PTX's strict canonical NaN bits.
+                arithmetic = Callee && (Callee->isIntrinsic() ||
+                    is_contained({"air.fast_exp2.f32", "air.fast_log2.f32", "air.fast_sin.f32",
+                                  "air.fast_cos.f32", "air.fast_rsqrt.f32"}, Callee->getName()));
+            }
             if (arithmetic)
                 work.push_back(&I);
         }

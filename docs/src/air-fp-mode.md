@@ -101,3 +101,23 @@ addressing), sub-borrow (borrow results), and transc-edge (one-ULP difference). 
 translation; tex-mip hits the compiler timeout; perctamemory is partial after a rejected kernel. None is
 counted as a pass. Raw results: /scratch/ptx-call-rounding-core-{baseline,after}.json.
 This establishes neither full PTX coverage nor representative application performance.
+
+
+## Strict NaN canonicalization of AIR math calls
+
+Strict-mode canonicalization now recognizes the five ordinary AIR math declarations used by PTX exp2,
+log2, sine, cosine and reciprocal square root. They had been omitted because they are not LLVM intrinsic
+functions after remapping, allowing the backend's quiet-NaN payload to escape instead of PTX's canonical
+0x7fffffff. Arbitrary loads, stores and calls retain their existing bit behavior.
+
+The new authored air_math_nan regression covers quiet/signaling/negative NaNs, infinities, zero and raw
+load/store payload preservation. It fails with the original saved compiler and passes with the candidate.
+Both fmisc-0 and fmisc-1 now pass all eleven checks each. The imported strict suite remains 181 PASS out of
+184 files, with unchanged nonpassing statuses. Across 413 core fixtures plus three local regressions, the
+candidate has 410 PASS, 3 FAIL, 2 COMPILE-ERROR and 1 PARTIAL. Existing core status changes from the preceding
+checkpoint are only fmisc-0/1 FAIL -> PASS. Raw results: /scratch/ptx-math-nan-{focus,imported,core}.json.
+
+For the authored math fixture, default-mode AGX object output is byte-identical between the original saved
+compiler and candidate (SHA-256 08dac2ebca8cce2d6a0babf9f27942ff0ff3ec89cc709b5fcbeaebbb0ab6ddce).
+That is a code-identity check for one fixture, not a performance benchmark. Requested performance testing was
+not started before the user's request to wrap up. No throughput or compile-time improvement is claimed.

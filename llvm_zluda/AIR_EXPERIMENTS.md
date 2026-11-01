@@ -90,6 +90,11 @@ wall time, peak RSS, object md5).
   but is 9-14% slower on the M2 Max (gemmbench, f16 A/B: 4096^3 6.99 -> 6.35 TFLOPS, f16 C 7.18 -> 6.20, 4096 x
   512 x 4096 6.26 -> 5.66): 8 more fragments live per SIMD-group, while AGX already overlaps the loads with the
   products. Large GEMMs run at ~7 TFLOPS (about half the FMA peak); more needs a different tile, not pipelining.
+- Dead end, wider SIMD-group tiles: 32 x 64 per SIMD-group (4 x 8 matrices, 32 accumulators), two SIMD-groups per
+  64 x 64 workgroup tile (GEN_TILE_J=8 in a trial generator, 64-thread launches): correct (1024^3 max relative error
+  3.6e-6) but 7-25% slower (4096^3 6.99 -> 6.49 TFLOPS, 1024^3 5.38 -> 4.05, f16 C 7.18 -> 5.45): half the SIMD-groups
+  per workgroup hide less latency than the better load-to-product ratio gains. A larger tile would have to keep
+  four SIMD-groups per workgroup (a 128 x 64 or 128 x 128 workgroup tile and a new plan).
 - Dead end, dp4a: a signed dp4a is 18 AGX instructions (4 imadd; the bytes extracted by bfi + asr pairs, asr 24 for
   byte 3). The free 16-bit sign extension (MOD_SX) exists only on add / multiply-add sources (IADD_I32_FROM16,
   IMADD_*_FROM32), not on shifts, so byte 1 (sext of the low half, then asr 8) is two instructions as now: no

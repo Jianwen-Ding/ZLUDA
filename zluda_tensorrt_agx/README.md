@@ -109,6 +109,8 @@ target/release/ztrt-compile --format onnx --workspace 1073741824 model.onnx mode
 engine contains `ZTRTAGX2`, a little-endian u64 payload length, a u64 JSON metadata length,
 then metadata without weights. Remaining records contain a u32 tensor ID, u64 element count and little-endian
 IEEE f32 weight bytes. Duplicate records, invalid IDs/counts, nonfinite weights and truncated payloads are rejected.
+The engine caches only serialization header/metadata and size, without a duplicate serialized weight cache.
+Size queries are constant time; serialization writes graph weights directly into the caller buffer.
 The payload is bounded to 256 MiB. The serialized workspace ceiling is preserved and can be tightened at load time.
 Legacy independently generated `ZTRTAGX1` JSON engines remain readable. This format contains our graph and
 weights, not NVIDIA code. Serialization borrows weights and uses a fixed-size conversion buffer rather than

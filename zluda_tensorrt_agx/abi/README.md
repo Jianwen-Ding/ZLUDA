@@ -191,8 +191,8 @@ Zero, negative and over-reported read counts fail. The format tag and declared p
 engine, leaving trailing stream bytes untouched. Invalid interfaces are rejected before reads.
 
 The native reader decoder now parses bounded metadata and reads each binary weight record directly into its
-final host vector. It avoids staging the full serialized engine. The native engine still retains a serialized
-cache as well as graph weights; eliminating that persistent duplication remains optimization work. GPUDirect
+final host vector. It avoids staging the full serialized engine. The native engine caches only header/metadata and an exact serialized size; weights are written directly
+from the immutable graph into caller-owned serialization buffers. GPUDirect
 and deferred device loading remain unsupported. No NVIDIA engine format is decoded.
 The adapted interface declarations follow the Apache-2.0 [public reader declarations](https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/_static/c-api/_nv_infer_runtime_8h_source.html).
 

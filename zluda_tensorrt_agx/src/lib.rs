@@ -40,7 +40,7 @@ fn binary(v: i32) -> Result<Binary> { match v { 0 => Ok(Binary::Add), 1 => Ok(Bi
 
 pub struct Builder { graph: Graph, workspace_limit: usize }
 pub struct Runtime;
-pub struct Engine { plan: Arc<Plan>, names: Vec<CString>, serialized: Vec<u8>, resources: execute::ResourceCache }
+pub struct Engine { plan: Arc<Plan>, names: Vec<CString>, serialization_header: Vec<u8>, serialized_size: usize, resources: execute::ResourceCache }
 impl Engine {
     fn build(mut graph: Graph, workspace_limit: usize) -> Result<Self> {
         let workspace_limit = graph.workspace_limit.unwrap_or(workspace_limit).min(workspace_limit);
@@ -48,11 +48,12 @@ impl Engine {
         graph.refresh_shapes()?; graph.validate()?;
         graph.normalize_constant_outputs()?;
         let graph = graph.eliminate_dead_nodes();
-        let serialized = graph.serialize()?;
+        let serialization_header = graph.serialization_header()?;
+        let serialized_size = u64::from_le_bytes(serialization_header[8..16].try_into().unwrap()) as usize + 16;
         let names = graph.tensors.iter().map(|t| CString::new(t.name.as_str()).map_err(|e| e.to_string())).collect::<Result<Vec<_>>>()?;
         let plan = Plan::build(graph)?;
         if plan.workspace > workspace_limit { return Err(format!("workspace {} exceeds limit {workspace_limit}", plan.workspace)); }
-        Ok(Self { plan: Arc::new(plan), names, serialized, resources: Default::default() })
+        Ok(Self { plan: Arc::new(plan), names, serialization_header, serialized_size, resources: Default::default() })
     }
     fn tensor(&self, name: &str) -> Result<usize> { self.plan.graph.tensors.iter().position(|t| t.name == name).ok_or_else(|| format!("unknown tensor {name}")) }
 }
@@ -278,9 +279,10 @@ fn modify(g: &mut Graph, output: usize, f: impl FnOnce(&mut Op) -> Result<()>) -
 }
 #[no_mangle] pub unsafe extern "C" fn ztrtDestroyEngine(p: *mut Engine) { boundary((), || { if !p.is_null() { drop(Box::from_raw(p)); } Ok(()) }); }
 #[no_mangle] pub unsafe extern "C" fn ztrtSerializeEngine(p: *const Engine, data: *mut u8, capacity: usize) -> usize {
-    boundary(0, || { let e = object(p)?; if data.is_null() && capacity == 0 { return Ok(e.serialized.len()); }
-        if data.is_null() || capacity < e.serialized.len() { return Err("serialization buffer is too small or null".into()); }
-        std::ptr::copy_nonoverlapping(e.serialized.as_ptr(), data, e.serialized.len()); Ok(e.serialized.len())
+    boundary(0, || { let e = object(p)?; if data.is_null() && capacity == 0 { return Ok(e.serialized_size); }
+        if data.is_null() || capacity < e.serialized_size { return Err("serialization buffer is too small or null".into()); }
+        let output=std::slice::from_raw_parts_mut(data,e.serialized_size);
+        e.plan.graph.serialize_to(&e.serialization_header,output)?; Ok(e.serialized_size)
     })
 }
 #[no_mangle] pub unsafe extern "C" fn ztrtGetLayerCount(p: *const Engine) -> i32 { boundary(-1, || Ok(object(p)?.plan.steps.len() as i32)) }

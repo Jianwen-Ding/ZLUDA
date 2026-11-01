@@ -294,10 +294,10 @@ impl Graph {
         if available.len() != self.tensors.len() { return Err("graph has tensors without producers".into()); }
         Ok(())
     }
-    pub fn serialize(&self) -> Result<Vec<u8>> {
+    pub fn serialization_header(&self) -> Result<Vec<u8>> {
         self.validate()?;
         // Bound writes during serialization rather than allocating an unbounded JSON copy first.
-        // The header shares the allocation with the payload, avoiding another full-sized copy.
+        // Cache only the header/metadata, never a second copy of all weights.
         struct Writer(Vec<u8>);
         impl std::io::Write for Writer {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -311,7 +311,6 @@ impl Graph {
             }
             fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
         }
-        use std::io::Write;
         #[derive(Serialize)]
         struct TensorView<'a> { name: &'a str, shape: &'a [usize] }
         #[derive(Serialize)]
@@ -325,21 +324,41 @@ impl Graph {
         writer.0.extend(MAGIC); writer.0.extend([0u8; 16]);
         serde_json::to_writer(&mut writer, &view).map_err(|e| e.to_string())?;
         let metadata_size = writer.0.len() - 24;
+        let mut total=writer.0.len();
+        for tensor in &self.tensors {
+            if let Some(values)=&tensor.data {
+                total=values.len().checked_mul(4).and_then(|n|n.checked_add(12)).and_then(|n|total.checked_add(n))
+                    .filter(|&n|n<=MAX_ENGINE_BYTES+16).ok_or("engine exceeds size limit")?;
+            }
+        }
+        writer.0[8..16].copy_from_slice(&((total-16) as u64).to_le_bytes());
+        writer.0[16..24].copy_from_slice(&(metadata_size as u64).to_le_bytes());Ok(writer.0)
+    }
+    /// Header must be the matching, internally generated metadata for this immutable graph.
+    pub(crate) fn serialize_to(&self,header:&[u8],mut writer:impl std::io::Write)->Result<()> {
+        writer.write_all(header).map_err(|e|e.to_string())?;
         // Weight data is borrowed, never cloned into an intermediate graph or JSON array.
         for (id, tensor) in self.tensors.iter().enumerate() {
             if let Some(values) = &tensor.data {
                 writer.write_all(&(id as u32).to_le_bytes()).map_err(|e| e.to_string())?;
                 writer.write_all(&(values.len() as u64).to_le_bytes()).map_err(|e| e.to_string())?;
-                for chunk in values.chunks(1024) {
+                if cfg!(target_endian="little") {
+                    // f32 occupies four initialized bytes with no padding; borrow them directly.
+                    let bytes=unsafe{std::slice::from_raw_parts(values.as_ptr().cast::<u8>(),values.len()*4)};
+                    writer.write_all(bytes).map_err(|e|e.to_string())?;
+                } else { for chunk in values.chunks(1024) {
                     let mut bytes = [0u8; 4096];
                     for (i, value) in chunk.iter().enumerate() { bytes[i*4..i*4+4].copy_from_slice(&value.to_le_bytes()); }
                     writer.write_all(&bytes[..chunk.len()*4]).map_err(|e| e.to_string())?;
-                }
+                }}
             }
         }
-        let size = (writer.0.len() - 16) as u64;
-        writer.0[8..16].copy_from_slice(&size.to_le_bytes());
-        writer.0[16..24].copy_from_slice(&(metadata_size as u64).to_le_bytes()); Ok(writer.0)
+        Ok(())
+    }
+    pub fn serialize(&self)->Result<Vec<u8>> {
+        let header=self.serialization_header()?;
+        let size=u64::from_le_bytes(header[8..16].try_into().unwrap()) as usize+16;
+        let mut bytes=Vec::with_capacity(size);self.serialize_to(&header,&mut bytes)?;Ok(bytes)
     }
     /// Decode our own engine incrementally; never stage the complete binary weight payload.
     pub fn deserialize_reader(reader: &mut impl std::io::Read) -> Result<Self> {
@@ -529,6 +548,15 @@ mod tests {
         let json = serde_json::to_vec(&g).unwrap(); let mut legacy = b"ZTRTAGX1".to_vec();
         legacy.extend((json.len() as u64).to_le_bytes()); legacy.extend(json);
         assert_eq!(bits(&g), bits(&Graph::deserialize(&legacy).unwrap()));
+    }
+    #[test] fn direct_serialization_matches_header_size_and_preserves_destination_bounds() {
+        let g=graph();let bytes=g.serialize().unwrap();let header=g.serialization_header().unwrap();
+        assert_eq!(u64::from_le_bytes(header[8..16].try_into().unwrap()) as usize+16,bytes.len());
+        assert!(header.len()<bytes.len());
+        let mut output=vec![0xa5;bytes.len()+16];
+        g.serialize_to(&header,&mut output[..bytes.len()]).unwrap();
+        assert_eq!(&output[..bytes.len()],bytes.as_slice());assert_eq!(&output[bytes.len()..],&[0xa5;16]);
+        let mut short=vec![0;bytes.len()-1];assert!(g.serialize_to(&header,short.as_mut_slice()).is_err());
     }
     #[test] fn streaming_decoder_preserves_bits_bounds_and_record_validation() {
         use std::io::{Cursor,Read};

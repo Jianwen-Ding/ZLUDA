@@ -31,6 +31,20 @@ int main(){try{
         assert(context->enqueueV3(nullptr)&&context->synchronize());check(symbol<int(*)(void*,void const*,size_t)>(driver,"cuMemcpyDtoH_v2")(actual,dy,sizeof(actual)));
         for(int i=0;i<6;++i){float expected=op==ElementWiseOperation::kSUM?x[i]+2:op==ElementWiseOperation::kPROD?x[i]*2:op==ElementWiseOperation::kSUB?x[i]-2:op==ElementWiseOperation::kDIV?x[i]/2:op==ElementWiseOperation::kMAX?std::max(x[i],2.f):std::min(x[i],2.f);assert(std::abs(actual[i]-expected)<1e-5f);}
     }
+    for(auto op:{ReduceOperation::kSUM,ReduceOperation::kAVG,ReduceOperation::kPROD,ReduceOperation::kMAX,ReduceOperation::kMIN}){
+        std::unique_ptr<IBuilder> builder(createInferBuilder(logger));std::unique_ptr<INetworkDefinition> net(builder->createNetworkV2(0));
+        auto input=net->addInput("input",DataType::kFLOAT,Dims2(2,3));assert(input);auto result=net->addReduce(*input,op,2,false);assert(result);
+        result->getOutput(0)->setName("output");net->markOutput(*result->getOutput(0));
+        std::unique_ptr<IBuilderConfig> config(builder->createBuilderConfig());std::unique_ptr<IHostMemory> blob(builder->buildSerializedNetwork(*net,*config));assert(blob);
+        std::unique_ptr<IRuntime> runtime(createInferRuntime(logger));std::unique_ptr<ICudaEngine> engine(runtime->deserializeCudaEngine(blob->data(),blob->size()));assert(engine);
+        std::unique_ptr<IExecutionContext> context(engine->createExecutionContext());assert(context&&context->setInputTensorAddress("input",dx)&&context->setOutputTensorAddress("output",dy));
+        assert(context->enqueueV3(nullptr)&&context->synchronize());check(symbol<int(*)(void*,void const*,size_t)>(driver,"cuMemcpyDtoH_v2")(actual,dy,2*sizeof(float)));
+        for(int row=0;row<2;++row){
+            float expected=op==ReduceOperation::kPROD?1:op==ReduceOperation::kMAX?-std::numeric_limits<float>::infinity():op==ReduceOperation::kMIN?std::numeric_limits<float>::infinity():0;
+            for(int column=0;column<3;++column){auto value=x[row*3+column];expected=op==ReduceOperation::kPROD?expected*value:op==ReduceOperation::kMAX?std::max(expected,value):op==ReduceOperation::kMIN?std::min(expected,value):expected+value;}
+            if(op==ReduceOperation::kAVG){expected/=3;}assert(std::abs(actual[row]-expected)<1e-5f);
+        }
+    }
     auto free=symbol<int(*)(void*)>(driver,"cuMemFree_v2");check(free(dx));check(free(dy));dlclose(driver);
-    std::cout<<"PASS: six C++ public elementwise values, I/O role translation and GPU engine roundtrips\n";return 0;
+    std::cout<<"PASS: six elementwise and five reduction C++ mappings, I/O roles and GPU engine roundtrips\n";return 0;
 }catch(std::exception const& e){std::cerr<<e.what()<<'\n';return 1;}}

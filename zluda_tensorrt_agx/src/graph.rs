@@ -26,6 +26,10 @@ pub fn elements(shape: &[usize]) -> Result<usize> {
     if n > i32::MAX as usize { return Err("tensor exceeds 32-bit index range".into()); }
     Ok(n)
 }
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all="snake_case")]
+pub enum Reduction { #[default] Sum, Max, Min, Product }
+impl Reduction {fn is_sum(&self)->bool{*self==Self::Sum}}
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Unary { Relu, Sigmoid, Tanh, Identity, Sqrt, Exp, Log, Abs, Neg, Reciprocal }
@@ -51,7 +55,7 @@ pub enum Op {
     Softmax { input: usize, axis: isize },
     Gather { input: usize, axis: isize, indices: Vec<i64>, index_shape: Vec<usize> },
     LayerNorm { input: usize, axis: isize, epsilon: f32 },
-    Reduce { input: usize, axis: isize, mean: bool, keepdims: bool },
+    Reduce { input: usize, axis: isize, mean: bool, keepdims: bool, #[serde(default,skip_serializing_if="Reduction::is_sum")] kind: Reduction },
     Reshape { input: usize, shape: Vec<usize> },
     Transpose { input: usize, permutation: Vec<usize> },
     Concat { inputs: Vec<usize>, axis: isize },
@@ -115,7 +119,8 @@ impl Op {
                 let shape=get(*input)?;axis_index(*axis,shape.len())?;
                 if !epsilon.is_finite()||*epsilon<0.{return Err("invalid LayerNorm epsilon".into());}shape.to_vec()
             }
-            Self::Reduce { input, axis, keepdims, .. } => {
+            Self::Reduce { input, axis, keepdims, mean, kind } => {
+                if *mean && *kind!=Reduction::Sum{return Err("mean is only valid for sum reduction".into());}
                 let mut shape=get(*input)?.to_vec();let axis=axis_index(*axis,shape.len())?;
                 if *keepdims{shape[axis]=1;}else{shape.remove(axis);}shape
             }
@@ -548,6 +553,16 @@ mod tests {
         let json = serde_json::to_vec(&g).unwrap(); let mut legacy = b"ZTRTAGX1".to_vec();
         legacy.extend((json.len() as u64).to_le_bytes()); legacy.extend(json);
         assert_eq!(bits(&g), bits(&Graph::deserialize(&legacy).unwrap()));
+    }
+    #[test] fn reduction_kinds_preserve_legacy_metadata_and_reject_ambiguous_mean() {
+        let mut g=graph();let source=g.inputs[0];
+        let output=g.add_node(Op::Reduce{input:source,axis:1,mean:false,keepdims:false,kind:Reduction::Max}).unwrap();g.outputs=vec![output];
+        let bytes=g.serialize().unwrap();let restored=Graph::deserialize(&bytes).unwrap();
+        assert_eq!(restored.serialize().unwrap(),bytes);
+        assert!(g.add_node(Op::Reduce{input:source,axis:1,mean:true,keepdims:false,kind:Reduction::Min}).is_err());
+        let sum=Op::Reduce{input:source,axis:1,mean:true,keepdims:false,kind:Reduction::Sum};
+        let json=serde_json::to_string(&sum).unwrap();assert!(!json.contains("kind"));
+        assert!(matches!(serde_json::from_str::<Op>(&json).unwrap(),Op::Reduce{kind:Reduction::Sum,..}));
     }
     #[test] fn direct_serialization_matches_header_size_and_preserves_destination_bounds() {
         let g=graph();let bytes=g.serialize().unwrap();let header=g.serialization_header().unwrap();

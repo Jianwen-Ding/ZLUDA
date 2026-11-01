@@ -99,15 +99,15 @@ for training,var_values in [(1,np.ones(3,dtype='f')),(0,-np.ones(3,dtype='f'))]:
     data=model([('x',[2,3])],[('y',[2,3])],[op('BatchNormalization',['x','s','b','m','v'],'y',training_mode=training)],[constant('s',np.ones(3)),constant('b',np.zeros(3)),constant('m',np.zeros(3)),constant('v',var_values)])
     buf=C.create_string_buffer(data);assert not build_onnx(buf,len(data),1<<30)
 # Versioned reductions: axis attributes before Mean-18, constant axis inputs thereafter.
-for kind,version in [('ReduceSum',13),('ReduceSum',18),('ReduceMean',13),('ReduceMean',18)]:
+for kind,version in [(kind,version) for kind in ['ReduceSum','ReduceMean','ReduceMax','ReduceMin','ReduceProd'] for version in [13,18]]:
  for axes in [[0],[1],[-1],[0,2],[]]:
   for keep in [0,1]:
     x=rng.normal(size=(2,3,5)).astype('f');modern=kind=='ReduceSum' or version>=18
     nodes=[op(kind,['x','axes'] if modern else ['x'],'y',keepdims=keep,**({} if modern else {'axes':axes}))]
     init=[constant('axes',np.asarray(axes,dtype='int64'),7)] if modern else []
-    ref=(np.sum if kind=='ReduceSum' else np.mean)(x,axis=tuple(axes) if axes else None,keepdims=bool(keep))
+    ref={'ReduceSum':np.sum,'ReduceMean':np.mean,'ReduceMax':np.max,'ReduceMin':np.min,'ReduceProd':np.prod}[kind](x,axis=tuple(axes) if axes else None,keepdims=bool(keep))
     execute(model([('x',x.shape)],[('y',ref.shape)],nodes,init,opset=version),{'x':x},{'y':ref})
-for kind in ['ReduceSum','ReduceMean']:
+for kind in ['ReduceSum','ReduceMean','ReduceMax','ReduceMin','ReduceProd']:
     x=rng.normal(size=(2,3)).astype('f')
     execute(model([('x',x.shape)],[('y',x.shape)],[op(kind,['x'],'y',noop_with_empty_axes=1)],opset=18),{'x':x},{'y':x})
     x=np.asarray(3.25,dtype='f');execute(model([('x',[])],[('y',[])],[op(kind,['x'],'y')],opset=18),{'x':x},{'y':x})

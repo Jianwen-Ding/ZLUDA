@@ -168,7 +168,7 @@ pub fn import(data:&[u8])->Result<Graph>{
         }
         let expected = match kind.as_str() {
             "MatMul"|"Add"|"Mul"|"Sub"|"Div"|"Max"|"Min"|"Reshape"|"Gather" => 2..=2,
-            "ReduceSum" => 1..=2, "ReduceMean" if opset.unwrap()>=18 => 1..=2,
+            "ReduceSum" => 1..=2, "ReduceMean"|"ReduceMax"|"ReduceMin"|"ReduceProd" if opset.unwrap()>=18 => 1..=2,
             "LayerNormalization" => 2..=3, "BatchNormalization" => 5..=5, "Gemm"|"Conv" => 2..=3, "Constant" => 0..=0, "Concat" => 1..=MAX_TENSORS,
             _ => 1..=1,
         };
@@ -228,10 +228,10 @@ pub fn import(data:&[u8])->Result<Graph>{
                     g.add_node(Op::LayerNorm{input:x,axis:axis as isize,epsilon})?
                 }else{
                 let mut mean=x;
-                for a in (axis..shape.len()).rev(){mean=g.add_node(Op::Reduce{input:mean,axis:a as isize,mean:true,keepdims:true})?;}
+                for a in (axis..shape.len()).rev(){mean=g.add_node(Op::Reduce{input:mean,axis:a as isize,mean:true,keepdims:true,kind:Reduction::Sum})?;}
                 let centered=g.add_node(Op::ElementWise{a:x,b:mean,kind:Binary::Sub})?;
                 let mut variance=g.add_node(Op::ElementWise{a:centered,b:centered,kind:Binary::Mul})?;
-                for a in (axis..shape.len()).rev(){variance=g.add_node(Op::Reduce{input:variance,axis:a as isize,mean:true,keepdims:true})?;}
+                for a in (axis..shape.len()).rev(){variance=g.add_node(Op::Reduce{input:variance,axis:a as isize,mean:true,keepdims:true,kind:Reduction::Sum})?;}
                 let eps=g.add_input(format!("__onnx_ln_epsilon_{}",g.tensors.len()),vec![],Some(vec![epsilon]))?;
                 let variance=g.add_node(Op::ElementWise{a:variance,b:eps,kind:Binary::Add})?;
                 let denominator=g.add_node(Op::Activation{input:variance,kind:Unary::Sqrt})?;
@@ -305,7 +305,7 @@ pub fn import(data:&[u8])->Result<Graph>{
                 if let Some(i)=infer{if total%known!=0{return Err("Reshape size mismatch".into());}shape[i]=total/known;}
                 g.add_node(Op::Reshape{input:x,shape})?
             }
-            "ReduceSum"|"ReduceMean"=>{
+            "ReduceSum"|"ReduceMean"|"ReduceMax"|"ReduceMin"|"ReduceProd"=>{
                 let x=get(0)?;let source=g.tensors[x].shape.clone();let rank=source.len();
                 let modern=kind=="ReduceSum"||opset.unwrap()>=18;
                 let keep=take_int(&mut attrs,"keepdims",1)?;
@@ -325,7 +325,7 @@ pub fn import(data:&[u8])->Result<Graph>{
                     let mut y=x;
                     // Descending axes preserve remaining axis numbers when dimensions are removed.
                     for axis in (0..rank).rev().filter(|&i|reduce[i]) {
-                        y=g.add_node(Op::Reduce{input:y,axis:axis as isize,mean:kind=="ReduceMean",keepdims:keep!=0})?;
+                        y=g.add_node(Op::Reduce{input:y,axis:axis as isize,mean:kind=="ReduceMean",keepdims:keep!=0,kind:match kind.as_str(){"ReduceMax"=>Reduction::Max,"ReduceMin"=>Reduction::Min,"ReduceProd"=>Reduction::Product,_=>Reduction::Sum}})?;
                     }
                     y
                 }

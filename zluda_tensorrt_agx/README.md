@@ -53,7 +53,7 @@ the caller's distinct output buffer. The native
 MatMul operation requires matrix operands. ONNX Gemm remains
 rank-2 as required by its schema.
 
-Sum/mean reductions support static axes, negative axes, multiple axes, `keepdims`, and versioned empty-axis
+Sum, mean, maximum, minimum and product reductions support static axes, negative axes, multiple axes, `keepdims`, and versioned empty-axis
 semantics. Dedicated portable MLIR kernels read strided input directly, with standard subgroup reduction for
 long axes. They need no coefficient vectors or transpose operations. Multiple axes use successive reductions;
 intermediate outputs use the normal liveness-managed workspace. The C API exposes `ztrtBuilderAddReduce`, and
@@ -156,7 +156,7 @@ the AGX Performance Simulator:
 
 ```sh
 ZLUDA_AGX_CAPTURE=/tmp/inference-captures \
-ZLUDA_AGX_CAPTURE_KERNELS=agx_infer_gather,agx_infer_layer_norm,agx_infer_layer_norm_simd,agx_infer_reduce,agx_infer_reduce_simd,agx_infer_conv2d,agx_infer_binary,agx_infer_unary,agx_infer_softmax,agx_infer_softmax_simd,agx_infer_pool,agx_infer_transpose,agx_infer_concat \
+ZLUDA_AGX_CAPTURE_KERNELS=agx_infer_reduce_max,agx_infer_reduce_max_simd,agx_infer_reduce_min,agx_infer_reduce_min_simd,agx_infer_reduce_product,agx_infer_reduce_product_simd,agx_infer_gather,agx_infer_layer_norm,agx_infer_layer_norm_simd,agx_infer_reduce,agx_infer_reduce_simd,agx_infer_conv2d,agx_infer_binary,agx_infer_unary,agx_infer_softmax,agx_infer_softmax_simd,agx_infer_pool,agx_infer_transpose,agx_infer_concat \
 ZLUDA_AGX_CAPTURE_MAX=1 python3 zluda_tensorrt_agx/tests/test_gpu.py
 python3 zluda_tensorrt_agx/tests/test_sim.py /tmp/inference-captures --agx-run /path/to/agx_run
 ```
@@ -196,3 +196,9 @@ GPU resource preparation packs at most 1 MiB of small constant weights into its 
 larger weights upload directly from immutable graph storage. Metadata shares the small-constant device
 allocation, followed by aligned direct-upload weight regions. The device allocation remains shared per
 engine/CUDA context. See [resource preparation validation](validation/resource-preparation.md).
+
+
+Maximum/minimum/product reductions use dedicated serial and subgroup portable MLIR kernels. ONNX ReduceMax,
+ReduceMin and ReduceProd support version-13 attribute axes and version-18 constant input axes, alongside the
+existing sum/mean paths. Native C kind codes are 0=sum, 1=mean, 2=max, 3=min, 4=product; the C++ source wrapper
+translates its public enum explicitly. See [reduction validation](validation/reduction-kinds.md).

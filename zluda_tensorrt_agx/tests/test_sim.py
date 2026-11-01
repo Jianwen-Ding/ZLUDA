@@ -48,10 +48,11 @@ for folder in sorted(a.captures.iterdir()):
         epsilon=np.array([epsilon],dtype=np.uint32).view(np.float32)[0]
         v=view(x,n).reshape(rows,channels);d=v-v.mean(axis=1,keepdims=True)
         reference=(d/np.sqrt((d*d).mean(axis=1,keepdims=True)+epsilon)).reshape(-1)
-    elif name in ['agx_infer_reduce','agx_infer_reduce_simd']:
+    elif name.startswith('agx_infer_reduce'):
         x,y,rows,channels,inner,mean=args;n=rows
         value=view(x,rows*channels).reshape(rows//inner,channels,inner)
-        reference=(value.mean(axis=1) if mean else value.sum(axis=1)).reshape(-1)
+        function=np.max if '_max' in name else np.min if '_min' in name else np.prod if '_product' in name else np.mean if mean else np.sum
+        reference=function(value,axis=1).reshape(-1)
     elif name=='agx_infer_gather':
         x,y,indices,n,axis,count,inner=args
         selection=view(indices,count,np.int32);ids=np.arange(n);item=ids//inner
@@ -91,5 +92,5 @@ for folder in sorted(a.captures.iterdir()):
     else:raise AssertionError(name)
     np.testing.assert_allclose(view(y,n,after=True),reference,rtol=5e-4,atol=3e-5,equal_nan=True,err_msg=name)
     passed.append(name);print('PASS',name)
-assert len(set(passed))==13,passed
-print('PASS: thirteen portable inference kernels on the simulator')
+assert len(set(passed))==19,passed
+print('PASS: nineteen portable inference kernels on the simulator')

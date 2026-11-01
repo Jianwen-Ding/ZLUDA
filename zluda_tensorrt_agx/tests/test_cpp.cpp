@@ -56,7 +56,9 @@ int main(int argc,char** argv){
     auto avg=reduced->addReduce(*rx,ReduceOperation::kAVG,2,true);assert(avg);
     rd=avg->getOutput(0)->getDimensions();assert(rd.nbDims==3&&rd.d[1]==1);
     assert(!reduced->addReduce(*rx,ReduceOperation::kSUM,8,false));
-    assert(!reduced->addReduce(*rx,ReduceOperation::kPROD,1,false));
+    assert(reduced->addReduce(*rx,ReduceOperation::kPROD,1,false));
+    assert(reduced->addReduce(*rx,ReduceOperation::kMAX,1,false));assert(reduced->addReduce(*rx,ReduceOperation::kMIN,1,false));
+    assert(!reduced->addReduce(*rx,static_cast<ReduceOperation>(99),1,false));
     std::unique_ptr<INetworkDefinition> normNetwork(builder->createNetworkV2(0));
     auto nx=normNetwork->addInput("norm_input",DataType::kFLOAT,Dims2(2,4));assert(nx);
     float ns[4]={1,1,1,1},nb[4]={0,0,0,0};

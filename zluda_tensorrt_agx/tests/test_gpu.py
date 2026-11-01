@@ -130,6 +130,18 @@ for ash,bsh in [([],[]),([2,3],[]),([1,1,2,1,1,1,1,3],[1,1,1,1,1,1,1,3])]:
     a=tensor(g,'a',ash);b=tensor(g,'b',bsh,bv);ref=av+bv;y=node(g,ref.shape,'element_wise',a=a,b=b,kind='add');g['outputs']=[y]
     run(g,{'a':av},{f't{y}':ref},roundtrip=True)
 g=graph();v=np.arange(7,dtype='f');y=tensor(g,'constant_output',[7],v);g['outputs']=[y];run(g,{}, {'constant_output':v},roundtrip=True)
+# Additional reductions: serial/subgroup paths, strided axes, tails and exceptional values.
+for kind,fn in [('max',np.max),('min',np.min),('product',np.prod)]:
+ for shape,axis in [([2,7,3],1),([2,37,3],1),([5,33],-1),([2,3,5],0)]:
+    value=rng.uniform(.9,1.1,size=shape).astype('f')
+    for keep in [False,True]:
+        g=graph();x=tensor(g,'x',shape);ref=fn(value,axis=axis,keepdims=keep);y=node(g,ref.shape,'reduce',input=x,axis=axis,mean=False,keepdims=keep,kind=kind);g['outputs']=[y]
+        run(g,{'x':value},{f't{y}':ref},roundtrip=True)
+ for count in [7,37]:
+    value=np.full((3,count),1.,dtype='f');value[0,0]=np.nan;value[1,1]=np.inf;value[2,2]=-np.inf
+    with np.errstate(all='ignore'):ref=fn(value,axis=1)
+    g=graph();x=tensor(g,'x',value.shape);y=node(g,ref.shape,'reduce',input=x,axis=1,mean=False,keepdims=False,kind=kind);g['outputs']=[y]
+    run(g,{'x':value},{f't{y}':ref})
 # Constant uploads cover the exact staging limit and mixed direct/staged weight blocks.
 for count in [262144,262145]:
     g=graph();value=np.linspace(-1,1,count,dtype='f');x=tensor(g,'x',[count]);weights=np.full(count,.25,dtype='f')

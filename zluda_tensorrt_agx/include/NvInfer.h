@@ -186,8 +186,8 @@ public:
         return layer<IUnaryLayer>(ztrtBuilderAddActivation(mBuilder,x.id(),kind));
     }
     IReduceLayer* addReduce(ITensor& x,ReduceOperation op,uint32_t axes,bool keepDimensions) {
-        if(op!=ReduceOperation::kSUM && op!=ReduceOperation::kAVG){report(mLogger,"only sum and average reductions are supported");return nullptr;}
-        return layer<IReduceLayer>(ztrtBuilderAddReduce(mBuilder,x.id(),axes,op==ReduceOperation::kAVG?1:0,keepDimensions?1:0));
+        int kind=-1;switch(op){case ReduceOperation::kSUM:kind=0;break;case ReduceOperation::kAVG:kind=1;break;case ReduceOperation::kMAX:kind=2;break;case ReduceOperation::kMIN:kind=3;break;case ReduceOperation::kPROD:kind=4;break;default:report(mLogger,"unsupported reduction operation");return nullptr;}
+        return layer<IReduceLayer>(ztrtBuilderAddReduce(mBuilder,x.id(),axes,kind,keepDimensions?1:0));
     }
     IElementWiseLayer* addElementWise(ITensor& a,ITensor& b,ElementWiseOperation op) {
         int32_t kind;

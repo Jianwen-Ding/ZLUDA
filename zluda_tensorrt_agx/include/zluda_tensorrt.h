@@ -34,7 +34,7 @@ int32_t ztrtBuilderAddGather(ZtrtBuilder*, int32_t, int32_t, const int64_t*, siz
 /* Unscaled suffix normalization; finite nonnegative epsilon. */
 int32_t ztrtBuilderAddLayerNorm(ZtrtBuilder*, int32_t, int32_t, float);
 int32_t ztrtBuilderConfigureLayerNorm(ZtrtBuilder*, int32_t, float);
-/* axes bitmask, kind 0=sum or 1=mean, keepdims 0/1. */
+/* axes bitmask, kind 0=sum, 1=mean, 2=max, 3=min, 4=product, keepdims 0/1. */
 int32_t ztrtBuilderAddReduce(ZtrtBuilder*, int32_t, uint32_t, int32_t, int32_t);
 int32_t ztrtBuilderAddSoftmax(ZtrtBuilder*, int32_t, int32_t);
 int32_t ztrtBuilderAddReshape(ZtrtBuilder*, int32_t, const int64_t*, size_t);

@@ -93,7 +93,8 @@ def run(g,values,expected,rtol=3e-4,atol=3e-5,roundtrip=False,repeats=2,engine_o
             dc('cuMemcpyDtoH_v2',P(output.ctypes.data),pointers[name],S(output.nbytes))
             reference=np.asarray(expected[name],dtype=np.float32)
             np.testing.assert_allclose(output,reference,rtol=rtol,atol=atol,err_msg=name)
-            max_error=max(max_error,float(np.max(np.abs(output-reference))))
+            finite=np.isfinite(output)&np.isfinite(reference)
+            if np.any(finite):max_error=max(max_error,float(np.max(np.abs(output[finite]-reference[finite]))))
         cases+=1
         return {'workspace':workspace(e),'fused':fused(e)}
     finally:

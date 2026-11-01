@@ -129,9 +129,9 @@ impl Resources {
                     let channels:usize=shape[axis..].iter().product();
                     get(agx_libs::INFERENCE,if channels>=32 {c"agx_infer_layer_norm_simd"}else{c"agx_infer_layer_norm"})?;None
                 }
-                Op::Reduce { input, axis, .. } => {
+                Op::Reduce { input, axis, kind, .. } => {
                     let shape=&plan.graph.tensors[*input].shape;let axis=axis_index(*axis,shape.len())?;
-                    get(agx_libs::INFERENCE,if shape[axis]>=32 {c"agx_infer_reduce_simd"}else{c"agx_infer_reduce"})?;None
+                    get(agx_libs::INFERENCE,reduction_kernel(*kind,shape[axis]>=32))?;None
                 }
                 Op::Softmax { axis, .. } => {
                     let axis = axis_index(*axis, out.len())?;
@@ -161,6 +161,14 @@ impl Resources {
         for (i, offset) in constant_offsets { pointers[i] = constants.ptr.checked_add(offset).ok_or("constant address overflow")?; }
         for offset in metadata.iter_mut().flatten() { *offset = constants.ptr.checked_add(*offset).ok_or("metadata address overflow")?; }
         Ok(Self { pointers, metadata, binary_ranks, _constants: constants, functions })
+    }
+}
+fn reduction_kernel(kind:Reduction,simd:bool)->&'static CStr {
+    match (kind,simd) {
+        (Reduction::Sum,false)=>c"agx_infer_reduce",(Reduction::Sum,true)=>c"agx_infer_reduce_simd",
+        (Reduction::Max,false)=>c"agx_infer_reduce_max",(Reduction::Max,true)=>c"agx_infer_reduce_max_simd",
+        (Reduction::Min,false)=>c"agx_infer_reduce_min",(Reduction::Min,true)=>c"agx_infer_reduce_min_simd",
+        (Reduction::Product,false)=>c"agx_infer_reduce_product",(Reduction::Product,true)=>c"agx_infer_reduce_product_simd",
     }
 }
 pub struct Context {
@@ -333,12 +341,12 @@ impl Context {
                     self.launch(if simd{c"agx_infer_layer_norm_simd"}else{c"agx_infer_layer_norm"},rows as usize*if simd{32}else{1},
                         &mut[arg(&mut x),arg(&mut y),arg(&mut rows),arg(&mut channels),arg(&mut epsilon)],stream)?;
                 }
-                Op::Reduce { input, axis, mean, .. } => {
+                Op::Reduce { input, axis, mean, kind, .. } => {
                     let shape=&g.tensors[*input].shape;let axis=axis_index(*axis,shape.len())?;
                     let mut rows=n as i32;let mut channels=shape[axis] as i32;
                     let mut inner=shape[axis+1..].iter().product::<usize>() as i32;let mut average=i32::from(*mean);
                     let mut x=self.pointers[*input];let mut y=self.pointers[yid];
-                    let simd=channels>=32;let name=if simd{c"agx_infer_reduce_simd"}else{c"agx_infer_reduce"};
+                    let simd=channels>=32;let name=reduction_kernel(*kind,simd);
                     self.launch(name,n*if simd{32}else{1},&mut[arg(&mut x),arg(&mut y),arg(&mut rows),arg(&mut channels),arg(&mut inner),arg(&mut average)],stream)?;
                 }
                 Op::Softmax { input, axis } => {

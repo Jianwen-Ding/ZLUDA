@@ -77,6 +77,10 @@ wall time, peak RSS, object md5).
   registers: 46.1 -> 14.6 us and 53.8 -> 25.3 us per launch, llama.cpp pp128 445.6 -> 566.0 t/s, tg64 131.9 -> 133.9;
   completions exact, formalization suite unchanged. Found from the simulator's worst capture (-72%), whose gap
   turned out to be the stack.
+  Then also stores at run-time offsets (arrays of at most 8 elements), the `or disjoint` InstCombine makes of an
+  aligned array's address plus an offset, and phis of pointers of one offset (GVN's PRE): Geekbench's blend kernel
+  loses its 64-byte stack; of the corpus' 589 kernels 3 keep one (trace_bvh / trace_bvh_shadow: BVH traversal stacks;
+  calculate_descriptors: a 256-byte array). (The commit message of 59957a9 says 1,774 kernels: wrong, 589.)
   Geekbench (2 of its modules change): every workload completes, the same 10 expected errors, summed GPU time 27.13
   -> 26.94 s; its changed modules' kernels within their run-to-run spread (keypoint kernels are data-dependent).
 - Geekbench 7 GPU with all of the above: every workload completes (the block-size search's out-of-resources answers

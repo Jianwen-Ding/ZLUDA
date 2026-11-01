@@ -1,5 +1,7 @@
 // GPU execution through independently declared engine/context dispatch prefixes.
 #include "abi_probe.hpp"
+#include "runtime_probe.hpp"
+#include <vector>
 #include "zluda_tensorrt.h"
 #include <cassert>
 #include <cmath>
@@ -14,10 +16,16 @@ void check(int code){if(code)throw std::runtime_error("driver error "+std::to_st
 int main(int argc,char** argv){assert(argc==2);auto path=std::getenv("ZLUDA_AGX_LIBCUDA");assert(path);void* driver=dlopen(path,RTLD_NOW|RTLD_LOCAL);if(!driver)throw std::runtime_error(dlerror());
     check(symbol<int(*)(unsigned)>(driver,"cuInit")(0));void* primary=nullptr;
     check(symbol<int(*)(void**,int)>(driver,"cuDevicePrimaryCtxRetain")(&primary,0));check(symbol<int(*)(void*)>(driver,"cuCtxSetCurrent")(primary));
-    void* library=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL);if(!library)throw std::runtime_error(dlerror());auto wrap=symbol<void*(*)(void*,void*)>(library,"ztrtRtxWrapNativeEngine");Logger logger;
+    void* library=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL);if(!library)throw std::runtime_error(dlerror());auto createRuntime=symbol<void*(*)(void*,int32_t)>(library,"createInferRuntime_INTERNAL");Logger logger;
     char const source[]=R"({"tensors":[{"name":"input","shape":[2,3]},{"name":"weights","shape":[2,3],"data":[1,2,3,4,5,6]},{"name":"middle","shape":[2,3]},{"name":"output","shape":[6]}],"inputs":[0],"outputs":[3],"nodes":[{"output":2,"op":"element_wise","a":0,"b":1,"kind":"add"},{"output":3,"op":"reshape","input":2,"shape":[6]}]})";
     auto native=ztrtBuildJson(reinterpret_cast<uint8_t const*>(source),sizeof(source)-1,4096);assert(native);
-    auto engine=static_cast<probe::Engine*>(wrap(native,&logger));assert(engine);auto object=static_cast<probe::Context*>(engine->impl->createExecutionContext(0));assert(object);auto c=object->impl;assert(c&&c->getPImpl()==object&& &c->getEngine()==engine);
+    size_t bytes=ztrtSerializeEngine(native,nullptr,0);assert(bytes);std::vector<uint8_t> serialized(bytes);
+    assert(ztrtSerializeEngine(native,serialized.data(),bytes)==bytes);ztrtDestroyEngine(native);
+    auto runtime=static_cast<probe::Runtime*>(createRuntime(&logger,10701));assert(runtime);
+    assert(!runtime->impl->deserializeCudaEngine(serialized.data(),bytes-1));
+    auto engine=static_cast<probe::Engine*>(runtime->impl->deserializeCudaEngine(serialized.data(),bytes));assert(engine);
+    delete runtime; // Our engine owns its plan independently; caller bytes are no longer needed.
+    std::fill(serialized.begin(),serialized.end(),0);auto object=static_cast<probe::Context*>(engine->impl->createExecutionContext(0));assert(object);auto c=object->impl;assert(c&&c->getPImpl()==object&& &c->getEngine()==engine);
     assert(c->getOptimizationProfile()==0&&c->allInputDimensionsSpecified()&&c->inferShapes(0,nullptr)==0);
     auto shape=c->getTensorShape("input");assert(shape.nbDims==2&&shape.d[0]==2&&shape.d[1]==3);assert(c->setInputShape("input",shape));shape.d[0]=3;assert(!c->setInputShape("input",shape));
     auto strides=c->getTensorStrides("input");assert(strides.nbDims==2&&strides.d[0]==3&&strides.d[1]==1);assert(c->getTensorShape("missing").nbDims==-1);

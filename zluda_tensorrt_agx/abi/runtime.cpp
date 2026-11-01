@@ -1,5 +1,7 @@
-// Original runtime-factory/configuration prototype. Engine ABI is intentionally not yet exposed.
+// Original runtime adapter. Only independently serialized ZTRT engines are supported.
 #include "runtime_contract.hpp"
+#include "extensions.h"
+#include <memory>
 #include <atomic>
 #include <cstring>
 #include <mutex>
@@ -34,7 +36,23 @@ class RuntimeImpl final:public apiv::VRuntime {
 public:
     RuntimeImpl(IRuntime* o,ILogger* l):owner(o),logger(l),registry(l){}
     IRuntime* getPImpl() noexcept override{return owner;}
-    ICudaEngine* deserializeCudaEngine(void const*,std::size_t) noexcept override{error(logger,"ABI prototype: engine dispatch is not implemented; use the native ZTRT API");return nullptr;}
+    ICudaEngine* deserializeCudaEngine(void const* data,std::size_t size) noexcept override{
+        // Read only the format tag before deciding whether our own decoder may process the payload.
+        if(!data||size<16||size>((size_t(256)<<20)+16)){
+            error(logger,"invalid custom engine buffer size");return nullptr;
+        }
+        if(std::memcmp(data,"ZTRTAGX2",8)&&std::memcmp(data,"ZTRTAGX1",8)){
+            error(logger,"only independently serialized ZTRT engines are supported");return nullptr;
+        }
+        std::unique_ptr<ZtrtRuntime,decltype(&ztrtDestroyRuntime)> runtime(ztrtCreateRuntime(),ztrtDestroyRuntime);
+        if(!runtime){error(logger,ztrtGetLastError());return nullptr;}
+        std::unique_ptr<ZtrtEngine,decltype(&ztrtDestroyEngine)> model(
+            ztrtDeserializeEngine(runtime.get(),static_cast<uint8_t const*>(data),size,size_t(1)<<30),ztrtDestroyEngine);
+        if(!model){error(logger,ztrtGetLastError());return nullptr;}
+        auto result=static_cast<ICudaEngine*>(ztrtRtxWrapNativeEngine(model.get(),logger));
+        if(result){model.release();}
+        return result;
+    }
     void setDLACore(int32_t core) noexcept override{if(core!=0)error(logger,"ABI prototype: DLA is unavailable");}
     int32_t getDLACore() const noexcept override{return 0;}
     int32_t getNbDLACores() const noexcept override{return 0;}

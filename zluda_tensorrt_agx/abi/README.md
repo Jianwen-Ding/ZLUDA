@@ -71,10 +71,13 @@ Allocator/error-recorder/plugin/DLA/host-code/deferred-loading requests that can
 or logged explicitly. Directory strings remain valid until the next setter; callers must coordinate pointer use
 with mutation and keep the logger alive through runtime destruction.
 
-**All engine deserialization calls return null without inspecting any payload bytes.** Engine validity reports
-INVALID with no inferred diagnostics and the header-size query returns zero. Native engines enter through the explicit `ztrtRtxWrapNativeEngine` extension described below; standard runtime
-deserialization is still unsupported. Native engine objects are not returned directly through the public interface. External runtime and plugin loading do not load any files. The existing source API
-and native ZTRT inference library retain their working model execution path.
+`deserializeCudaEngine` accepts only our independently serialized ZTRTAGX1/ZTRTAGX2 engines.
+It checks buffer bounds and the eight-byte format tag before invoking our native decoder; unknown formats
+are rejected without decoding their payload. The caller must provide a readable buffer of the declared size.
+Engine validity remains conservatively INVALID with no inferred diagnostics and header-size zero; the
+header-only validity API is not implemented. Native engines can also enter through the explicit
+`ztrtRtxWrapNativeEngine` extension. External runtime and plugin loading do not load files.
+
 
 Build and run the separate dispatch-prefix probe:
 
@@ -85,7 +88,7 @@ python3 zluda_tensorrt_agx/tools/build_runtime_abi.py --output-dir /tmp/ztrt-run
 
 The probe compiles in another translation unit without including the adapter dispatch header. It checks
 factory/version negotiation, wrapper/dispatch prefix calls, logger callbacks, configuration persistence, empty
-registry behavior, payload-free rejection, and 1000 destruction cycles. Both ordinary and AddressSanitizer runs
+registry behavior, unknown-format rejection, and 1000 destruction cycles. Both ordinary and AddressSanitizer runs
 pass on Linux aarch64. This is a targeted binary-prefix test using independently declared call shapes, not a
 complete vendor-reference-header or cross-version ABI conformance test. Plugins, error recorders, complete
 engine/context interfaces, builder factories and reference-header client integration remain required work.
@@ -102,7 +105,7 @@ count, workspace and serialization. Unknown-name fallback values follow the revi
 FLOAT, location DEVICE, format LINEAR, empty format description and NONE I/O role. Component/vector queries
 return -1 for the unvectorized linear layout, following the documented contract. The native layer-count query
 reports planned graph steps, not a physical GPU launch count. The host-memory adapter owns custom ZTRTAGX2
-bytes independently of the engine wrapper. Standard runtime deserialization remains payload-blind and disabled.
+bytes independently of the engine wrapper. Runtime deserialization now supports these custom bytes through the same native decoder.
 
 The build helper requires our native library (standard target/release path, ZTRT_LIBRARY, or --native-library).
 It now runs a second independently declared dispatch-prefix probe. One hundred rounds wrap a native engine,
@@ -112,7 +115,7 @@ restored serialization is byte-identical. Metadata queries also pass with an una
 wrapping leaves ownership with the caller. Normal and AddressSanitizer builds pass without diagnostics.
 
 These probes still do not compile against a complete independently obtained, version-pinned reference header
-set. Broader engine/context execution coverage, standard native-format runtime loading, serializer options, refitting, inspection,
+set. Broader engine/context execution coverage, header-only engine validation, stream loading, serializer options, refitting, inspection,
 weight management and complete version-specific compatibility remain required work. The prototype does not
 alias libtensorrt_rtx.so and does not establish Geekbench support.
 
@@ -123,7 +126,7 @@ alias libtensorrt_rtx.so and does not establish Geekbench support.
 Supported calls include named I/O bindings, fixed shapes and contiguous strides, profile 0, synchronous
 `executeV2`, asynchronous `enqueueV3`, and context metadata. The public engine must outlive its contexts.
 External workspace, dynamic shape changes, allocator/profiler callbacks, auxiliary streams and debug
-instrumentation are explicitly unsupported. Standard runtime deserialization remains disabled.
+instrumentation are explicitly unsupported. Runtime deserialization supports only our custom engine format.
 
 Run the GPU probe with our own driver and compiler:
 
@@ -145,3 +148,17 @@ before reusing the execution context. If synchronizing that old stream returns I
 waits on the owning CUDA context before reusing workspace; other synchronization errors propagate.
 The ordinary path still waits only on the previous stream. The full native graph suite passes: 99 GPU graphs,
 109 ONNX models, and the stream/context lifecycle probe. Normal and adapter-ASan context probes pass.
+
+
+## Custom engine runtime loading
+
+The runtime buffer loader now returns public-style engine wrappers directly from our custom serializer.
+Native runtime/engine handles are guarded during failure; ownership transfers only after wrapper creation.
+The default workspace ceiling is 1 GiB and the serialized ceiling can further restrict it, as in the native API.
+No host code or plugin binaries are loaded. This adds no decoder for NVIDIA engine formats.
+
+The engine probe checks 100 byte-identical custom serialization/runtime-load cycles without a GPU,
+all truncated prefixes of its fixture, malformed payload/metadata lengths, unknown tags and oversized input.
+The GPU probe uses the runtime load path, destroys the runtime and overwrites caller bytes before executing
+inference, then checks streams and graph replay. Ordinary and adapter-ASan probes pass. These tests use
+only our own JSON model and serializer output. Full reference-header ABI validation remains outstanding.

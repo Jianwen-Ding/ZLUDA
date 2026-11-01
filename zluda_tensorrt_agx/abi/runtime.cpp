@@ -10,6 +10,25 @@
 namespace {
 using namespace nvinfer1;
 constexpr int32_t kContractVersion=10701; // RTX 1.7.1 public documentation snapshot, not Geekbench 1.6.
+constexpr int64_t kHeaderSize=24;
+constexpr uint64_t kMaxPayload=uint64_t(256)<<20;
+uint64_t readLE64(unsigned char const* bytes) noexcept{
+    uint64_t result=0;for(unsigned i=0;i<8;++i){result|=uint64_t(bytes[i])<<(i*8);}return result;
+}
+bool validCustomHeader(void const* data,int64_t size) noexcept{
+    if(!data||size<kHeaderSize)return false;
+    auto bytes=static_cast<unsigned char const*>(data);
+    bool binary=std::memcmp(bytes,"ZTRTAGX2",8)==0;
+    if(!binary&&std::memcmp(bytes,"ZTRTAGX1",8))return false;
+    auto payload=readLE64(bytes+8);
+    if(!payload||payload>kMaxPayload)return false;
+    if(binary){
+        if(payload<=8)return false;
+        auto metadata=readLE64(bytes+16);
+        if(!metadata||metadata>payload-8)return false;
+    }
+    return true;
+}
 void error(ILogger* logger,char const* message) noexcept {if(logger)logger->log(ILogger::Severity::kERROR,message);}
 class EmptyRegistry final:public IPluginRegistry {
     ILogger* logger;std::atomic<bool> search{true};
@@ -72,8 +91,12 @@ public:
     void setEngineHostCodeAllowed(bool allowed) noexcept override{if(allowed)error(logger,"ABI prototype: engine host code is unsupported");}
     bool getEngineHostCodeAllowed() const noexcept override{return false;}
     ICudaEngine* deserializeCudaEngineV2(IStreamReaderV2&) noexcept override{error(logger,"ABI prototype: stream engine loading is unsupported");return nullptr;}
-    int64_t getEngineHeaderSize() const noexcept override{return 0;}
-    EngineValidity getEngineValidity(void const*,int64_t,uint64_t* diagnostics) const noexcept override{if(diagnostics)*diagnostics=0;return EngineValidity::kINVALID;}
+    int64_t getEngineHeaderSize() const noexcept override{return kHeaderSize;}
+    EngineValidity getEngineValidity(void const* data,int64_t size,uint64_t* diagnostics) const noexcept override{
+        bool valid=validCustomHeader(data,size);
+        if(diagnostics){*diagnostics=valid?0:static_cast<uint64_t>(EngineInvalidityDiagnostics::kMALFORMED_ENGINE);}
+        return valid?EngineValidity::kVALID:EngineValidity::kINVALID;
+    }
     void setDeferredWeightsLoading(bool enabled) noexcept override{if(enabled)error(logger,"ABI prototype: deferred weights are unsupported");}
     bool getDeferredWeightsLoading() const noexcept override{return false;}
     bool setDLAWorkspaceAllocationStrategy(DLAWorkspaceAllocationStrategy) noexcept override{error(logger,"ABI prototype: DLA is unavailable");return false;}

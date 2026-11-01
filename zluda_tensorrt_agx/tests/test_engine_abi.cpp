@@ -37,7 +37,13 @@ int main(int argc,char** argv){assert(argc==2);void* lib=dlopen(argv[1],RTLD_NOW
         assert(ztrtGetConstantBytes(restored)==24);std::vector<uint8_t> copy(h->size());
         assert(ztrtSerializeEngine(restored,copy.data(),copy.size())==copy.size()&&std::memcmp(copy.data(),h->data(),copy.size())==0);
         auto publicRuntime=static_cast<probe::Runtime*>(createRuntime(&logger,10701));assert(publicRuntime);
+        uint64_t diagnostics=123;
+        assert(publicRuntime->impl->getEngineHeaderSize()==24);
+        assert(publicRuntime->impl->getEngineValidity(copy.data(),24,&diagnostics)==0&&diagnostics==0);
         if(iteration==0){
+            auto corruptBody=copy;corruptBody[24]=0;
+            assert(publicRuntime->impl->getEngineValidity(corruptBody.data(),24,&diagnostics)==0&&diagnostics==0);
+            assert(!publicRuntime->impl->deserializeCudaEngine(corruptBody.data(),corruptBody.size()));
             for(size_t length=0;length<copy.size();++length){assert(!publicRuntime->impl->deserializeCudaEngine(copy.data(),length));}
             auto broken=copy;broken[8]^=1;assert(!publicRuntime->impl->deserializeCudaEngine(broken.data(),broken.size()));
             broken=copy;for(size_t i=16;i<24;++i){broken[i]=255;}assert(!publicRuntime->impl->deserializeCudaEngine(broken.data(),broken.size()));

@@ -15,6 +15,7 @@ using IStreamReaderV2=v_1_0::IStreamReaderV2;
 using IPluginCreatorInterface=v_1_0::IPluginCreatorInterface;
 using IPluginResource=v_1_0::IPluginResource;
 enum class EngineValidity:int32_t { kVALID=0,kSUBOPTIMAL=1,kINVALID=2 };
+enum class EngineInvalidityDiagnostics:uint64_t { kMALFORMED_ENGINE=1ULL<<5 };
 enum class DLAWorkspaceAllocationStrategy:int32_t;
 using TempfileControlFlags=uint32_t;
 class IPluginRegistry {

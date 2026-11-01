@@ -74,8 +74,7 @@ with mutation and keep the logger alive through runtime destruction.
 `deserializeCudaEngine` accepts only our independently serialized ZTRTAGX1/ZTRTAGX2 engines.
 It checks buffer bounds and the eight-byte format tag before invoking our native decoder; unknown formats
 are rejected without decoding their payload. The caller must provide a readable buffer of the declared size.
-Engine validity remains conservatively INVALID with no inferred diagnostics and header-size zero; the
-header-only validity API is not implemented. Native engines can also enter through the explicit
+Header validity checks only our 24-byte custom header and reports the public MALFORMED_ENGINE bit for invalid headers. It does not validate the body or initialize a GPU. Native engines can also enter through the explicit
 `ztrtRtxWrapNativeEngine` extension. External runtime and plugin loading do not load files.
 
 
@@ -115,7 +114,7 @@ restored serialization is byte-identical. Metadata queries also pass with an una
 wrapping leaves ownership with the caller. Normal and AddressSanitizer builds pass without diagnostics.
 
 These probes still do not compile against a complete independently obtained, version-pinned reference header
-set. Broader engine/context execution coverage, header-only engine validation, stream loading, serializer options, refitting, inspection,
+set. Broader engine/context execution coverage, stream loading, serializer options, refitting, inspection,
 weight management and complete version-specific compatibility remain required work. The prototype does not
 alias libtensorrt_rtx.so and does not establish Geekbench support.
 
@@ -162,3 +161,22 @@ all truncated prefixes of its fixture, malformed payload/metadata lengths, unkno
 The GPU probe uses the runtime load path, destroys the runtime and overwrites caller bytes before executing
 inference, then checks streams and graph replay. Ordinary and adapter-ASan probes pass. These tests use
 only our own JSON model and serializer output. Full reference-header ABI validation remains outstanding.
+
+
+## Header-only validity
+
+`getEngineHeaderSize()` returns 24. `getEngineValidity()` reads at most those bytes, accepts our current
+binary format or legacy JSON format, and checks the nonzero payload length against the 256 MiB ceiling.
+For the binary format, metadata must be nonempty and fit inside the declared payload after its length field.
+Unknown tags, null/short buffers and invalid lengths return INVALID with MALFORMED_ENGINE (`1ULL << 5`);
+accepted headers return VALID with diagnostics zero. A null diagnostics pointer is supported.
+No CUDA/device/version requirements are encoded in this portable custom header, so this check makes no
+claim about available GPU memory or driver readiness. Actual graph/body validation occurs during loading.
+
+This follows the public [runtime validity contract](https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/_static/c-api/classnvinfer1_1_1_i_runtime.html)
+and the Apache-2.0 [diagnostic enum declaration](https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/_static/c-api/_nv_infer_runtime_8h_source.html).
+A protected-page probe places the 24-byte custom header immediately before inaccessible memory and checks
+both exact-header and larger declared sizes without touching the body. Tests cover both format tags,
+negative/short/null inputs, unknown versions, oversized payloads and impossible metadata lengths. A real
+serialized fixture also proves that a valid header with a corrupt body fails full deserialization. Runtime,
+metadata and GPU context probes pass ordinarily and with C++ adapter/probe AddressSanitizer instrumentation.

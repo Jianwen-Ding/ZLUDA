@@ -8,6 +8,8 @@
 #include <dlfcn.h>
 #include <iostream>
 #include <stdexcept>
+#include <sys/mman.h>
+#include <unistd.h>
 #include "runtime_probe.hpp"
 
 struct Logger final:nvinfer1::ILogger {int count=0;void log(Severity,char const*) noexcept override{++count;}};
@@ -26,9 +28,26 @@ int main(int argc,char** argv){assert(argc==2);void* lib=dlopen(argv[1],RTLD_NOW
         // Unknown valid buffers are rejected before custom payload decoding.
         char unknown[24]={};assert(!p->deserializeCudaEngine(unknown,sizeof(unknown)));
         assert(!p->deserializeCudaEngine(nullptr,4096));assert(!p->deserializeCudaEngine(unknown,7));uint64_t diagnostics=123;
-        assert(p->getEngineValidity(unknown,24,&diagnostics)==2&&diagnostics==0&&p->getEngineHeaderSize()==0);
+        assert(p->getEngineValidity(unknown,24,&diagnostics)==2&&diagnostics==(1ULL<<5)&&p->getEngineHeaderSize()==24);
         assert(!p->setDLAWorkspaceAllocationStrategy(0));assert(p->getDLAWorkspaceAllocationStrategy()==0);
         delete object;
     }
+    // A protected next page proves the validity call never reads beyond the 24-byte header.
+    auto object=static_cast<probe::Runtime*>(create(&logger,10701));assert(object);auto p=object->impl;
+    auto page=static_cast<size_t>(sysconf(_SC_PAGESIZE));assert(page>=24);
+    auto mapping=static_cast<unsigned char*>(mmap(nullptr,page*2,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0));assert(mapping!=MAP_FAILED);
+    assert(mprotect(mapping+page,page,PROT_NONE)==0);auto header=mapping+page-24;
+    std::memset(header,0,24);std::memcpy(header,"ZTRTAGX2",8);header[8]=64;header[16]=32;
+    uint64_t diagnostics=123;assert(p->getEngineValidity(header,24,&diagnostics)==0&&diagnostics==0);
+    assert(p->getEngineValidity(header,4096,nullptr)==0); // Body is deliberately inaccessible.
+    for(int64_t size=-1;size<24;++size){assert(p->getEngineValidity(header,size,&diagnostics)==2&&diagnostics==(1ULL<<5));}
+    assert(p->getEngineValidity(nullptr,24,&diagnostics)==2&&diagnostics==(1ULL<<5));
+    header[16]=0;assert(p->getEngineValidity(header,24,&diagnostics)==2&&diagnostics==(1ULL<<5));
+    header[16]=57;assert(p->getEngineValidity(header,24,nullptr)==2);
+    header[16]=32;header[8]=8;assert(p->getEngineValidity(header,24,nullptr)==2);
+    header[8]=64;header[15]=255;assert(p->getEngineValidity(header,24,nullptr)==2);header[15]=0;
+    header[7]='1';assert(p->getEngineValidity(header,24,&diagnostics)==0&&diagnostics==0);
+    header[7]='9';assert(p->getEngineValidity(header,24,&diagnostics)==2&&diagnostics==(1ULL<<5));
+    assert(munmap(mapping,page*2)==0);delete object;
     assert(logger.count>1000);dlclose(lib);std::cout<<"PASS: runtime factory/configuration prefix, callbacks, rejection paths and 1000 destruction cycles\n";
 }

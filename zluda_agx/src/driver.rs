@@ -807,9 +807,11 @@ impl Driver {
         let params: Vec<&[u8]> = r.params.iter().map(|p| &p[..]).collect();
         let pointers = module::checked_pointers(k, &params).unwrap_or_default();
         let bounds: Vec<(u64, u64)> = pointers.iter().map(|&p| self.allocation_bounds(p)).collect();
-        // the parameter block goes where no allocation is
-        const PARAM_BLOCK: u64 = 0x7f_0000_0000;
-        const TABLE: u64 = 0x7e_0000_0000;
+        // the parameter block goes where no allocation is, in the data heap: below the kernel's part of the VM, which
+        // is its last 32 GiB (0x78_0000_0000 on the M2 Max; the 0x7f / 0x7e addresses used before were in it, so a
+        // replay could not map them: "fixed address 0x7f00000000 not usable")
+        const PARAM_BLOCK: u64 = 0x70_0000_0000;
+        const TABLE: u64 = 0x6f_0000_0000;
         let allocations = self.live_allocations();
         let mut replay = m.replay(&r.kernel, &params, r.grid, r.block, r.shared, &bounds, &allocations, TABLE, PARAM_BLOCK)?;
         replay.add_textures(&self.ctx.vm);

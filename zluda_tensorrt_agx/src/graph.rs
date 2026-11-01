@@ -358,7 +358,7 @@ pub struct Step { pub node: Node, pub relu: bool }
 #[derive(Clone, Debug)]
 pub struct Plan {
     pub graph: Graph, pub steps: Vec<Step>, pub offsets: Vec<Option<usize>>, pub workspace: usize,
-    pub constant_bytes: usize, pub fused_activations: usize,
+    pub constant_bytes: usize, pub fused_activations: usize, pub aliases: Vec<usize>,
 }
 impl Plan {
     pub fn build(graph: Graph) -> Result<Self> {
@@ -378,20 +378,27 @@ impl Plan {
             }
             steps.push(Step { node: n.clone(), relu: false });
         }
+        let external: HashSet<usize> = graph.inputs.iter().chain(&graph.outputs).copied().collect();
+        let mut aliases: Vec<usize> = (0..graph.tensors.len()).collect();
+        for step in &steps {
+            if let Op::Reshape { input, .. } = step.node.operation {
+                if !external.contains(&step.node.output) { aliases[step.node.output] = aliases[input]; }
+            }
+        }
         let mut last = vec![0usize; graph.tensors.len()];
-        for (at, s) in steps.iter().enumerate() { for i in s.node.operation.inputs() { last[i] = last[i].max(at); } }
-        for &o in &graph.outputs { last[o] = steps.len(); }
+        for (at, s) in steps.iter().enumerate() { for i in s.node.operation.inputs() { last[aliases[i]] = last[aliases[i]].max(at); } }
+        for &o in &graph.outputs { last[aliases[o]] = steps.len(); }
         let mut offsets = vec![None; graph.tensors.len()];
         let mut free: Vec<(usize, usize)> = Vec::new();
         let mut live: HashMap<usize, (usize, usize)> = HashMap::new();
         let mut workspace = 0usize;
-        let external: HashSet<usize> = graph.inputs.iter().chain(&graph.outputs).copied().collect();
+
         // Outputs use caller buffers. Intermediates use best-fit reusable aligned slots.
         for (at, step) in steps.iter().enumerate() {
             let expired: Vec<_> = live.keys().copied().filter(|&i| last[i] < at).collect();
             for i in expired { free.push(live.remove(&i).unwrap()); }
             let id = step.node.output;
-            if external.contains(&id) { continue; }
+            if external.contains(&id) || aliases[id] != id { continue; }
             let bytes = graph.tensors[id].bytes()?.checked_add(255).ok_or("workspace overflow")? / 256 * 256;
             let slot = free.iter().enumerate().filter(|(_, s)| s.1 >= bytes).min_by_key(|(_, s)| s.1).map(|(i, _)| i);
             let (offset, size) = if let Some(i) = slot { free.swap_remove(i) } else {
@@ -400,7 +407,7 @@ impl Plan {
             offsets[id] = Some(offset); live.insert(id, (offset, size));
         }
         let constant_bytes = graph.tensors.iter().filter(|t| t.data.is_some()).try_fold(0usize, |a, t| -> Result<usize> { a.checked_add(t.bytes()?).ok_or("constant byte size overflow".into()) })?;
-        Ok(Self { graph, steps, offsets, workspace, constant_bytes, fused_activations: fused })
+        Ok(Self { graph, steps, offsets, workspace, constant_bytes, fused_activations: fused, aliases })
     }
 }
 
@@ -413,6 +420,22 @@ mod tests {
         let b = g.add_input("w".into(), vec![3, 2], Some(vec![1.; 6])).unwrap();
         let c = g.add_node(Op::MatMul { a, b, trans_a: false, trans_b: false }).unwrap();
         g.outputs.push(c); g
+    }
+    #[test] fn reshape_views_extend_root_lifetimes() {
+        let mut g=Graph::default();let x=g.add_input("x".into(),vec![2,3],None).unwrap();
+        let root=g.add_node(Op::Activation{input:x,kind:Unary::Tanh}).unwrap();
+        let view=g.add_node(Op::Reshape{input:root,shape:vec![6]}).unwrap();
+        let chain=g.add_node(Op::Reshape{input:view,shape:vec![3,2]}).unwrap();
+        let other=g.add_node(Op::Activation{input:x,kind:Unary::Relu}).unwrap();
+        let other=g.add_node(Op::Reshape{input:other,shape:vec![3,2]}).unwrap();
+        let y=g.add_node(Op::ElementWise{a:chain,b:other,kind:Binary::Add}).unwrap();g.outputs.push(y);
+        let p=Plan::build(g).unwrap();assert_eq!(p.aliases[chain],root);
+        assert_eq!(p.offsets[view],None);assert_eq!(p.offsets[chain],None);
+        assert_eq!(p.workspace,512); // Both source allocations must remain live until the final add.
+        let mut g=Graph::default();let x=g.add_input("x".into(),vec![2,3],None).unwrap();
+        let v=g.add_node(Op::Reshape{input:x,shape:vec![6]}).unwrap();
+        let y=g.add_node(Op::Activation{input:v,kind:Unary::Relu}).unwrap();g.outputs.push(y);
+        let p=Plan::build(g).unwrap();assert_eq!(p.workspace,0);assert_eq!(p.aliases[v],x);
     }
     #[test] fn format_roundtrip_and_rejection() {
         let g = graph(); let data = g.serialize().unwrap();

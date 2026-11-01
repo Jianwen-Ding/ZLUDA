@@ -3,7 +3,7 @@
 from support import *
 
 g=graph();x=tensor(g,'x',[2,3]);wv=np.arange(1,7,dtype='f').reshape(3,2);w=tensor(g,'w',[3,2],wv);b=tensor(g,'b',[2],np.array([1,-1],dtype='f'))
-y=node(g,[2,2],'mat_mul',a=x,b=w);y=node(g,[2,2],'element_wise',a=y,b=b,kind='add');y=node(g,[2,2],'activation',input=y,kind='relu');g['outputs']=[y]
+view=node(g,[2,3],'reshape',input=x,shape=[2,3]);y=node(g,[2,2],'mat_mul',a=view,b=w);y=node(g,[2,2],'element_wise',a=y,b=b,kind='add');y=node(g,[2,2],'activation',input=y,kind='relu');g['outputs']=[y]
 data=json.dumps(g).encode();source=C.create_string_buffer(data)
 assert not build(source,len(data),0)
 e=ck(build(source,len(data),256));assert workspace(e)==256
@@ -21,6 +21,12 @@ assert bind(c,f't{y}'.encode(),xp,16)==0
 assert enqueue(c,None)==-1
 assert bind(c,f't{y}'.encode(),yp,16)==0
 assert enqueue(c,None)==0 and sync(c)==0,err()
+# A view must refresh its root pointer after an input is rebound.
+x2=np.ascontiguousarray(xv+1,dtype='f');xp2=alloc(x2)
+assert bind(c,b'x',xp2,x2.nbytes)==0 and enqueue(c,None)==0 and sync(c)==0,err()
+out=np.empty((2,2),dtype='f');dc('cuMemcpyDtoH_v2',P(out.ctypes.data),yp,S(out.nbytes))
+np.testing.assert_allclose(out,np.maximum(x2@wv+np.array([1,-1]),0),atol=1e-5)
+assert bind(c,b'x',xp,xv.nbytes)==0
 stream=P();dc('cuStreamCreate',C.byref(stream),I(1))
 graph_handle=P();exec_handle=P()
 dc('cuStreamBeginCapture_v2',stream,I(0));assert enqueue(c,stream)==0,err()

@@ -147,3 +147,22 @@ No PTX compiler changes, target hints or new MLIR kernels were introduced.
 
 Public semantics: https://onnx.ai/onnx/operators/onnx__MatMul.html and
 https://onnx.ai/onnx/operators/onnx__Gemm.html
+
+## Zero-copy internal reshapes
+
+Internal contiguous reshapes now alias their root tensor. The memory planner propagates all view-consumer
+lifetimes to the root and allocates no separate view workspace. Enqueue refreshes view addresses after external
+bindings change. Output reshapes retain a copy into the caller's independent output buffer, preserving the
+nonoverlapping external-binding contract. Thus vector promotion copies are eliminated, while final squeeze
+copies remain when a reshape is itself a graph output.
+
+All 66 GPU graphs and 29 ONNX models pass. All 10 Rust tests pass, including chained-view root lifetime and
+workspace checks. The lifecycle test now passes input rebinding through a view as well as CUDA graph replay,
+cross-stream reuse and engine/context destruction checks.
+
+`tests/bench_views.py` compares reshape -> tanh against the saved pre-view SDK library, checking numerical
+output. `views-before.json` and `views-after.json` record 30 samples of four enqueues each. Workspace drops from
+1 KiB / 256 KiB / 4 MiB to zero for 256 / 65,536 / 1,048,576 elements. Initial median enqueue/sync measurements
+were 150.8 -> 51.5 us, 164.2 -> 62.1 us and 370.7 -> 86.7 us respectively. These compare checkpoints on an
+uncontrolled-clock system, not an isolated hardware throughput result; the directly established benefits are
+eliminating the reshape copy and its allocation. No target hints or GPU math/precision changes were introduced.

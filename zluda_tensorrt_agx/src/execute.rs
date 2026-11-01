@@ -189,6 +189,10 @@ impl Context {
             }
             self.bindings_validated = true;
         }
+        // Views track rebinding of external roots and reuse the root allocation's lifetime.
+        for (id, &root) in self.plan.aliases.iter().enumerate() {
+            if id != root { self.pointers[id] = self.pointers[root]; }
+        }
         if let Some(last) = self.last_stream.filter(|&last| last != stream.0 as usize) { gpu(engine::synchronize(CUstream(last as *mut _)))?; }
         self.last_stream = Some(stream.0 as usize);
         for (at, step) in self.plan.steps.iter().enumerate() {
@@ -196,7 +200,9 @@ impl Context {
             match &step.node.operation {
                 Op::Activation { input, kind } => self.unary(*input, yid, *kind, stream)?,
                 Op::ElementWise { a, b, kind } => self.binary(at, *a, *b, yid, *kind, step.relu, stream)?,
-                Op::Reshape { input, .. } => gpu(engine::copy(self.pointers[yid] as *mut _, self.pointers[*input] as *const _, n * 4, stream))?,
+                Op::Reshape { input, .. } => {
+                    if self.plan.aliases[yid] == yid { gpu(engine::copy(self.pointers[yid] as *mut _, self.pointers[*input] as *const _, n * 4, stream))?; }
+                }
                 Op::MatMul { a, b, trans_a, trans_b } => {
                     let ashape=&g.tensors[*a].shape;let bshape=&g.tensors[*b].shape;
                     let (ar,ac)=(ashape[ashape.len()-2],ashape[ashape.len()-1]);

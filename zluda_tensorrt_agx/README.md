@@ -28,7 +28,7 @@ In particular, do not install `libcudart.so` for this implementation. CUDA Drive
 The graph front end and dispatch/memory planner are Rust. GPU math is implemented in MLIR/AIR. Kernels compile
 when the library is built; model building does not need a running GPU or a compiler subprocess. Unreachable nodes
 and constants are removed, single-use elementwise/convolution + ReLU is fused, activation slots are reused by
-liveness, and weights and immutable metadata are packed into one shared device allocation per engine and CUDA context.
+liveness (including the lifetime of reshape views), and weights and immutable metadata are packed into one shared device allocation per engine and CUDA context.
 Convolution, bias and a single-use ReLU share one output kernel. Bindings cannot overlap. A context serializes reuse of its workspace across different streams, and its destructor
 waits for outstanding work before freeing owned buffers. The CUDA context must outlive its prepared engines and execution contexts.
 
@@ -40,7 +40,8 @@ execution, custom operators/plugins, control flow, asymmetric/automatic padding,
 vendor engines return explicit errors. This operator set is not the entire TensorRT API.
 
 MatMul uses one strided-batched GEMM for matching batches or a shared matrix. Mixed broadcast axes dispatch
-individual GEMMs without replicating input data. ONNX vector MatMul promotes/squeezes dimensions through reshape operations (currently device copies). The native
+individual GEMMs without replicating input data. ONNX vector MatMul promotes/squeezes dimensions through reshape operations. Internal reshapes are zero-copy views; reshapes bound as graph outputs still copy to
+the caller's distinct output buffer. The native
 MatMul operation requires matrix operands. ONNX Gemm remains
 rank-2 as required by its schema.
 

@@ -1,0 +1,19 @@
+{
+  "results": [
+    {
+      "elements": 256,
+      "workspace_bytes": 1024,
+      "median_enqueue_sync_us": 150.75075
+    },
+    {
+      "elements": 65536,
+      "workspace_bytes": 262144,
+      "median_enqueue_sync_us": 164.183125
+    },
+    {
+      "elements": 1048576,
+      "workspace_bytes": 4194304,
+      "median_enqueue_sync_us": 370.736125
+    }
+  ]
+}

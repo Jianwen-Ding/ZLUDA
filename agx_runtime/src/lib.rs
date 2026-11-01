@@ -533,7 +533,10 @@ impl Vm {
         }
         bo.map = map as *mut u8;
         bo.mmap_offset = mo.offset;
-        if zero {
+        // A new GEM object's pages are the kernel's zeroed shmem pages already (examples/zero_check.rs checks it,
+        // reused pages included): filling them here only touched every page of an allocation at once (a 4 GiB
+        // cuMemAlloc made resident and written before any use). AGX_ZERO_ALLOC=1 fills anyway.
+        if zero && zero_alloc() {
             bo.as_mut_slice().fill(0);
         }
         if va != 0 {
@@ -2172,4 +2175,10 @@ impl LoadedModule {
             self.dispatch(vm, queue, g14x, k, &halves, Vec::new(), threadgroups, local, dynamic_shared, &[], Some(words), &mut helper)?;
         Ok((fence, helper.0, helper.1))
     }
+}
+
+/// AGX_ZERO_ALLOC=1: fill new objects with zeros on the CPU, as before the kernel's zeroed pages were relied on.
+fn zero_alloc() -> bool {
+    static ZERO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ZERO.get_or_init(|| std::env::var("AGX_ZERO_ALLOC").is_ok_and(|v| v == "1"))
 }

@@ -32,6 +32,9 @@ fn with_f64_copy(text: &str, out: &Path, wide_ints: bool) {
     if wide_ints {
         copy = copy.replace("i32", "i64");
     }
+    // single precision only: functions with threadgroup buffers (the double precision lowering does not take f64
+    // workgroup memory); the functions are paragraphs (no blank lines inside them)
+    copy = copy.split("\n\n").filter(|f| !f.contains("#gpu.address_space<workgroup>")).collect::<Vec<_>>().join("\n\n");
     // @agx_name -> @agx_name_f64
     let mut renamed = String::with_capacity(copy.len());
     let mut rest = copy.as_str();

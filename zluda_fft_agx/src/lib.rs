@@ -103,6 +103,9 @@ pub enum Buf {
 pub enum Step {
     /// A Stockham pass of radix `r` with span `ns` (agx_fft_radix2 / agx_fft_radix4, other radices agx_fft_radixr).
     Radix { r: usize, src: Buf, dst: Buf, tw: usize, n: usize, ns: usize, count: usize, stride: usize, dist: usize, offset: usize },
+    /// A whole power-of-two transform in threadgroup memory (agx_fft_shared), `per` sequences per workgroup; src may
+    /// be dst.
+    Shared { src: Buf, dst: Buf, tw: usize, n: usize, per: usize, count: usize, stride: usize, dist: usize, offset: usize },
     Copy { src: Buf, dst: Buf, m: usize, count: usize, istride: usize, idist: usize, ostride: usize, odist: usize, ioffset: usize, ooffset: usize },
     RealToComplex { src: Buf, dst: Buf, n: usize, count: usize, idist: usize },
     Hermitian { src: Buf, dst: Buf, n: usize, count: usize, idist: usize },
@@ -175,9 +178,10 @@ impl Shape {
 }
 
 /// A 1-D complex transform of `count` sequences of length n (element `i` of sequence `c` at offset + c dist + i
-/// stride) from src to dst, which may be the same buffer. `tw` names the twiddles of length n.
+/// stride) from src to dst, which may be the same buffer. `tw` names the twiddles of length n; power-of-two lengths
+/// from 4 to `shared_max` run in threadgroup memory.
 #[allow(clippy::too_many_arguments)]
-fn c2c_1d(out: &mut Vec<Step>, src: Buf, dst: Buf, tw: usize, n: usize, count: usize, stride: usize, dist: usize, offset: usize) {
+fn c2c_1d(out: &mut Vec<Step>, shared_max: usize, src: Buf, dst: Buf, tw: usize, n: usize, count: usize, stride: usize, dist: usize, offset: usize) {
     let copy = |src, dst| Step::Copy {
         src,
         dst,
@@ -194,6 +198,12 @@ fn c2c_1d(out: &mut Vec<Step>, src: Buf, dst: Buf, tw: usize, n: usize, count: u
         if src != dst {
             out.push(copy(src, dst));
         }
+        return;
+    }
+    if n.is_power_of_two() && (4..=shared_max).contains(&n) {
+        // 256 threads per workgroup (measured best from 64 to 1024 for n = 16 to 1024)
+        let per = (256 / (n / 4)).clamp(1, shared_max / n).min(count);
+        out.push(Step::Shared { src, dst, tw, n, per, count, stride, dist, offset });
         return;
     }
     let radices = radices(n);
@@ -237,12 +247,15 @@ fn radices(n: usize) -> Vec<usize> {
 /// read and write one buffer in one launch).
 pub fn steps(s: &Shape, in_place: bool) -> Vec<Step> {
     let mut out = Vec::new();
+    // agx_fft_shared (single precision only): up to 2048 complex elements (512 threads; 1024 exceed its registers); ZLUDA_AGX_FFT_SHARED=0 runs the passes in device
+    // memory
+    let sm = if s.double || std::env::var("ZLUDA_AGX_FFT_SHARED").is_ok_and(|v| v == "0") { 0 } else { 2048 };
     let input = if in_place { Buf::Out } else { Buf::In };
     match s.kind {
         Kind::C2C => {
             let r = s.dims.len();
             if r == 1 {
-                c2c_1d(&mut out, input, Buf::Out, 0, s.dims[0], s.batch, s.istride, s.idist, 0);
+                c2c_1d(&mut out, sm, input, Buf::Out, 0, s.dims[0], s.batch, s.istride, s.idist, 0);
                 return out;
             }
             let total = s.total();
@@ -252,11 +265,11 @@ pub fn steps(s: &Shape, in_place: bool) -> Vec<Step> {
                 let inner: usize = s.dims[k + 1..].iter().product();
                 let outer: usize = s.dims[..k].iter().product();
                 if inner == 1 {
-                    c2c_1d(&mut out, src, Buf::Out, k, n, outer * s.batch, 1, n, 0);
+                    c2c_1d(&mut out, sm, src, Buf::Out, k, n, outer * s.batch, 1, n, 0);
                 } else {
                     for b in 0..s.batch {
                         for o in 0..outer {
-                            c2c_1d(&mut out, src, Buf::Out, k, n, inner, inner, 1, b * total + o * n * inner);
+                            c2c_1d(&mut out, sm, src, Buf::Out, k, n, inner, inner, 1, b * total + o * n * inner);
                         }
                     }
                 }
@@ -265,7 +278,7 @@ pub fn steps(s: &Shape, in_place: bool) -> Vec<Step> {
         Kind::R2C => {
             let n = s.dims[0];
             out.push(Step::RealToComplex { src: Buf::In, dst: Buf::A, n, count: s.batch, idist: s.idist });
-            c2c_1d(&mut out, Buf::A, Buf::A, 0, n, s.batch, 1, n, 0);
+            c2c_1d(&mut out, sm, Buf::A, Buf::A, 0, n, s.batch, 1, n, 0);
             out.push(Step::Copy {
                 src: Buf::A,
                 dst: Buf::Out,
@@ -282,7 +295,7 @@ pub fn steps(s: &Shape, in_place: bool) -> Vec<Step> {
         Kind::C2R => {
             let n = s.dims[0];
             out.push(Step::Hermitian { src: Buf::In, dst: Buf::A, n, count: s.batch, idist: s.idist });
-            c2c_1d(&mut out, Buf::A, Buf::A, 0, n, s.batch, 1, n, 0);
+            c2c_1d(&mut out, sm, Buf::A, Buf::A, 0, n, s.batch, 1, n, 0);
             out.push(Step::RealPart { src: Buf::A, dst: Buf::Out, n, count: s.batch, odist: s.odist });
         }
     }
@@ -644,9 +657,18 @@ mod imp {
         };
         let groups = |threads: usize, block: u32| (threads.div_ceil(block as usize)) as u32;
         let inv = inverse as i32;
+        // arguments: pointers, then i32 values
+        let launch = |f, mut ptrs: Vec<*mut c_void>, mut ints: Vec<i32>, grid: [u32; 2], block: [u32; 2]| {
+            let mut params: Vec<*mut c_void> = ptrs.iter_mut().map(|p| p as *mut *mut c_void as *mut c_void).collect();
+            params.extend(ints.iter_mut().map(|v| v as *mut i32 as *mut c_void));
+            engine::launch_kernel(f, grid, block, &mut params, stream).map_err(status)
+        };
         for step in steps(&shape, input == output) {
-            // arguments: pointers, then i32 values
-            let (f, ptrs, ints, grid, block): (_, Vec<*mut c_void>, Vec<i32>, [u32; 2], [u32; 2]) = match step {
+            // split: the batch along grid y in launches of up to 65535 sequences, as (the index of the count in the
+            // i32 arguments, bytes from one sequence to the next in src, in dst)
+            let rb = cb / 2;
+            #[allow(clippy::type_complexity)]
+            let (f, ptrs, ints, grid, block, split): (_, Vec<*mut c_void>, Vec<i32>, [u32; 2], [u32; 2], Option<(usize, usize, usize)>) = match step {
                 Step::Radix { r: r @ (2 | 4), src, dst, tw, n, ns, count, stride, dist, offset } => {
                     let bx = (n / r).clamp(1, 64) as u32;
                     let (f32_name, f64_name) =
@@ -657,8 +679,17 @@ mod imp {
                         vec![n as i32, ns as i32, count as i32, stride as i32, dist as i32, inv],
                         [groups(n / r, bx), count as u32],
                         [bx, 1],
+                        Some((2, cb * dist, cb * dist)),
                     )
                 }
+                Step::Shared { src, dst, tw, n, per, count, stride, dist, offset } => (
+                    func(c"agx_fft_shared", c"agx_fft_shared_f64")?,
+                    vec![ptr(src).byte_add(cb * offset), ptr(dst).byte_add(cb * offset), ptr(Buf::Tw(tw))],
+                    vec![n as i32, count as i32, stride as i32, dist as i32, inv],
+                    [groups(count, per as u32), 1],
+                    [(n / 4) as u32, per as u32],
+                    None,
+                ),
                 Step::Radix { r, src, dst, tw, n, ns, count, stride, dist, offset } => {
                     let bx = n.clamp(1, 64) as u32;
                     (
@@ -667,6 +698,7 @@ mod imp {
                         vec![n as i32, ns as i32, r as i32, count as i32, stride as i32, dist as i32, inv],
                         [groups(n, bx), count as u32],
                         [bx, 1],
+                        Some((3, cb * dist, cb * dist)),
                     )
                 }
                 Step::Copy { src, dst, m, count, istride, idist, ostride, odist, ioffset, ooffset } => (
@@ -675,6 +707,7 @@ mod imp {
                     vec![m as i32, count as i32, istride as i32, idist as i32, ostride as i32, odist as i32],
                     [groups(m, 16), count as u32],
                     [16, 1],
+                    Some((1, cb * idist, cb * odist)),
                 ),
                 Step::RealToComplex { src, dst, n, count, idist } => (
                     func(c"agx_fft_real_to_complex", c"agx_fft_real_to_complex_f64")?,
@@ -682,6 +715,7 @@ mod imp {
                     vec![n as i32, count as i32, idist as i32],
                     [groups(n, 16), count as u32],
                     [16, 1],
+                    Some((1, rb * idist, cb * n)),
                 ),
                 Step::Hermitian { src, dst, n, count, idist } => (
                     func(c"agx_fft_hermitian", c"agx_fft_hermitian_f64")?,
@@ -689,6 +723,7 @@ mod imp {
                     vec![n as i32, count as i32, idist as i32],
                     [groups(n, 16), count as u32],
                     [16, 1],
+                    Some((1, cb * idist, cb * n)),
                 ),
                 Step::RealPart { src, dst, n, count, odist } => (
                     func(c"agx_fft_real_part", c"agx_fft_real_part_f64")?,
@@ -696,13 +731,22 @@ mod imp {
                     vec![n as i32, count as i32, odist as i32],
                     [groups(n, 16), count as u32],
                     [16, 1],
+                    Some((1, cb * n, rb * odist)),
                 ),
             };
-            let mut ptrs = ptrs;
-            let mut ints = ints;
-            let mut params: Vec<*mut c_void> = ptrs.iter_mut().map(|p| p as *mut *mut c_void as *mut c_void).collect();
-            params.extend(ints.iter_mut().map(|v| v as *mut i32 as *mut c_void));
-            engine::launch_kernel(f, grid, block, &mut params, stream).map_err(status)?;
+            let Some((at, src_bytes, dst_bytes)) = split else {
+                launch(f, ptrs, ints, grid, block)?;
+                continue;
+            };
+            let count = ints[at] as usize;
+            for first in (0..count).step_by(65535) {
+                let (mut p, mut v) = (ptrs.clone(), ints.clone());
+                p[0] = p[0].byte_add(first * src_bytes);
+                p[1] = p[1].byte_add(first * dst_bytes);
+                let chunk = (count - first).min(65535);
+                v[at] = chunk as i32;
+                launch(f, p, v, [grid[0], chunk as u32], block)?;
+            }
         }
         Ok(())
     }
@@ -784,6 +828,17 @@ mod tests {
         out
     }
 
+    /// agx_fft_shared: the radix-2 / radix-4 passes of a power of two, in threadgroup memory.
+    fn shared_fft(x: &[C], tw: &[f64], inverse: bool) -> Vec<C> {
+        let mut x = x.to_vec();
+        let mut ns = 1;
+        for r in radices(x.len()) {
+            x = stockham_pass(&x, tw, inverse, r, ns);
+            ns *= r;
+        }
+        x
+    }
+
     /// cos / sin of multiples of pi / 2 as the exact 0 and +-1 the kernels' butterflies use.
     trait Exact {
         fn round_ties_even_if_tiny(self) -> f64;
@@ -800,6 +855,19 @@ mod tests {
         let get = |b: &HashMap<Buf, Vec<f64>>, buf: Buf, i: usize| -> C { (b[&buf][2 * i], b[&buf][2 * i + 1]) };
         for st in steps(s, in_place) {
             match st {
+                Step::Shared { src, dst, tw: t, n, count, stride, dist, offset, .. } => {
+                    let mut writes = Vec::new();
+                    for c in 0..count {
+                        let base = offset + c * dist;
+                        let x: Vec<C> = (0..n).map(|i| get(bufs, src, base + i * stride)).collect();
+                        writes.extend(shared_fft(&x, &tw[t], inverse).into_iter().enumerate().map(|(i, v)| (base + i * stride, v)));
+                    }
+                    let d = bufs.get_mut(&dst).unwrap();
+                    for (i, v) in writes {
+                        d[2 * i] = v.0;
+                        d[2 * i + 1] = v.1;
+                    }
+                }
                 Step::Radix { r, src, dst, tw: t, n, ns, count, stride, dist, offset } => {
                     let mut writes = Vec::new();
                     for c in 0..count {
@@ -958,6 +1026,20 @@ mod tests {
             let mut b2 = bufs.clone();
             for x in &st {
                 match *x {
+                    Step::Shared { src, dst, n, count, stride, dist, offset, .. } => {
+                        let twd: Vec<f64> = tw.iter().map(|&v| v as f64).collect();
+                        let mut w = Vec::new();
+                        for c in 0..count {
+                            let base = offset + c * dist;
+                            let x: Vec<C> = (0..n).map(|i| (b2[&src][2 * (base + i * stride)], b2[&src][2 * (base + i * stride) + 1])).collect();
+                            w.extend(shared_fft(&x, &twd, false).into_iter().enumerate().map(|(i, v)| (base + i * stride, v)));
+                        }
+                        let d = b2.get_mut(&dst).unwrap();
+                        for (i, v) in w {
+                            d[2 * i] = v.0;
+                            d[2 * i + 1] = v.1;
+                        }
+                    }
                     Step::Radix { r, src, dst, n, ns, count, stride, dist, offset, .. } => {
                         assert_ne!(src, dst);
                         let twd: Vec<f64> = tw.iter().map(|&v| v as f64).collect();
@@ -1047,9 +1129,14 @@ mod tests {
     #[test]
     fn layouts() {
         // log2(n) odd: one radix-2 pass, then radix-4
-        let st = steps(&Shape::contiguous(Kind::C2C, &[32], 1), false);
-        let radices: Vec<usize> = st.iter().filter_map(|s| if let Step::Radix { r, .. } = s { Some(*r) } else { None }).collect();
-        assert_eq!(radices, [2, 4, 4]);
+        assert_eq!(super::radices(32), [2, 4, 4]);
+        // powers of two up to 2048 in threadgroup memory, 64 threads per workgroup at least
+        let st = steps(&Shape::contiguous(Kind::C2C, &[32], 100), false);
+        assert!(matches!(st[..], [Step::Shared { n: 32, per: 32, count: 100, src: Buf::In, dst: Buf::Out, .. }]));
+        let st = steps(&Shape::contiguous(Kind::C2C, &[2048], 3), true);
+        assert!(matches!(st[..], [Step::Shared { per: 1, src: Buf::Out, dst: Buf::Out, .. }]));
+        let st = steps(&Shape { double: true, ..Shape::contiguous(Kind::C2C, &[2048], 3) }, false);
+        assert!(st.iter().all(|s| matches!(s, Step::Radix { .. })), "single precision only");
         assert_eq!(super::radices(1000), [2, 4, 5, 5, 5]);
         assert_eq!(super::radices(1536), [2, 4, 4, 4, 4, 3]);
         assert_eq!(super::radices(2 * 1009), [2, 1009]);
@@ -1059,9 +1146,9 @@ mod tests {
         assert_eq!(Shape::contiguous(Kind::R2C, &[4, 6], 1).check(), Err(cufftError_t::NOT_SUPPORTED));
         let bad = Shape { istride: 2, ..Shape::contiguous(Kind::C2C, &[8], 1) };
         assert_eq!(bad.check(), Err(cufftError_t::NOT_SUPPORTED));
-        // two passes for n = 8 (radix 2 then 4), ending in Out
-        let st = steps(&Shape::contiguous(Kind::C2C, &[8], 1), false);
-        assert_eq!(st.iter().filter(|s| matches!(s, Step::Radix { .. })).count(), 2);
+        // two passes for n = 8192 (radix 2, then 4 x 6), ending in Out
+        let st = steps(&Shape::contiguous(Kind::C2C, &[8192], 1), false);
+        assert_eq!(st.iter().filter(|s| matches!(s, Step::Radix { .. })).count(), 7);
         assert!(matches!(st.last(), Some(Step::Radix { dst: Buf::Out, .. })));
     }
 

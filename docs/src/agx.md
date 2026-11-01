@@ -1296,6 +1296,12 @@ lowers AIR with `agx-lower-air`) for every G13/G14 chip by the LLVM fork's
 driver API of the process's `libcuda.so.1` (`ZLUDA_AGX_LIBCUDA` overrides
 it), as NVIDIA's does.
 
+* Rechecked with a warm GPU clock (`tools/gemmbench.c` now queues ~0.3 s of
+  work first): the row kernels for 3 to 63 columns (`ZLUDA_AGX_GEMM_DOTROWS=0`
+  turns them off), f16, 11008 x 8 x 4096 1672 -> 851 us, 4096 x 32 x 4096 3760
+  -> 1391 us, 4096 x 4 x 4096 322 -> 300 us; split-K for f16 inputs with f32
+  results where the output has few tiles, 256 x 256 x 11008 1060 -> 306 us (no
+  change at 512 x 512 x 4096 and larger outputs, which it leaves alone).
 * Handles, streams, pointer modes (host and device alpha / beta), math modes
   (all compute in f32) and workspaces (unused).
 * `cublasSgemm`, `cublasHgemm`, their strided batched forms, and

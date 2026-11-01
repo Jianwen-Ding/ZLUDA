@@ -34,8 +34,11 @@ int main(int argc, char **argv) {
     CK(cudnnCreateFilterDescriptor(&wd)); CK(cudnnSetFilter4dDescriptor(wd, 0, 0, k, c, r, r));
     CK(cudnnCreateConvolutionDescriptor(&cd)); CK(cudnnSetConvolution2dDescriptor(cd, pad, pad, 1, 1, 1, 1, 1, 0));
     float one = 1, zero = 0;
-    CK(cudnnConvolutionForward(d, &one, xd, (void *)x, wd, (void *)wt, cd, 0, NULL, 0, &zero, yd, (void *)y));
-    CK(cuCtxSynchronize());
+    // warm the GPU clock first: ~0.3 s of the same work queued in bursts (one call measures a partly idle clock)
+    for (double w = now(); now() - w < 0.3;) {
+        for (int i = 0; i < 10; i++) CK(cudnnConvolutionForward(d, &one, xd, (void *)x, wd, (void *)wt, cd, 0, NULL, 0, &zero, yd, (void *)y));
+        CK(cuCtxSynchronize());
+    }
     double t = now();
     for (int i = 0; i < it; i++) CK(cudnnConvolutionForward(d, &one, xd, (void *)x, wd, (void *)wt, cd, 0, NULL, 0, &zero, yd, (void *)y));
     double host = now() - t; CK(cuCtxSynchronize()); double all = now() - t;

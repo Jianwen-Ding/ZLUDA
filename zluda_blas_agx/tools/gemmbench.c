@@ -37,8 +37,8 @@ int main(int argc, char **argv) {
     const void *al = c16 ? (void *)&one16 : (void *)&one, *be = c16 ? (void *)&zero16 : (void *)&zero;
     // ggml: C (m x n) = A^T B, A = weights (k x m), B = activations (k x n)
 #define GEMM() CK(cublasGemmEx(bl, OP_T, OP_N, m, n, k, al, (void *)a, R_16F, k, (void *)b, R_16F, k, be, (void *)c, c16 ? R_16F : R_32F, m, c16 ? COMPUTE_16F : COMPUTE_32F, ALGO_DEFAULT))
-    for (int i = 0; i < 5; i++) GEMM();
-    CK(cuCtxSynchronize());
+    // warm the GPU clock first: ~0.3 s of the same work queued in bursts (a few calls measure a partly idle clock)
+    for (double w = now(); now() - w < 0.3;) { for (int i = 0; i < 20; i++) GEMM(); CK(cuCtxSynchronize()); }
     CUevent e0, e1; CK(cuEventCreate(&e0, 0)); CK(cuEventCreate(&e1, 0));
     double t0 = now(); CK(cuEventRecord(e0, 0));
     for (int i = 0; i < iters; i++) GEMM();

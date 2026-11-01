@@ -32,6 +32,25 @@ public:
     Config(ICudaEngine* e,ILogger* l,int32_t strategy){mImpl=new ConfigImpl(this,e,l);mImpl->setExecutionContextAllocationStrategy(static_cast<ExecutionContextAllocationStrategy>(strategy));}
     ~Config() noexcept override{delete mImpl;}
 };
+class SerializationImpl final:public apiv::VSerializationConfig {
+    SerializationFlags flags=0;ILogger* logger;
+    bool known(SerializationFlag f) const noexcept{return int32_t(f)>=0&&int32_t(f)<3;}
+public:
+    explicit SerializationImpl(ILogger* l):logger(l){}
+    bool setFlags(SerializationFlags value) noexcept override{
+        if(value&~7U){if(logger)logger->log(ILogger::Severity::kERROR,"unknown serialization flags");return false;}
+        flags=value;return true;
+    }
+    SerializationFlags getFlags() const noexcept override{return flags;}
+    bool clearFlag(SerializationFlag f) noexcept override{if(!known(f))return false;flags&=~(1U<<int32_t(f));return true;}
+    bool setFlag(SerializationFlag f) noexcept override{if(!known(f))return false;flags|=1U<<int32_t(f);return true;}
+    bool getFlag(SerializationFlag f) const noexcept override{return known(f)&&(flags&(1U<<int32_t(f)));}
+};
+class SerializationConfig final:public ISerializationConfig {
+public:
+    explicit SerializationConfig(ILogger* logger){mImpl=new SerializationImpl(logger);}
+    ~SerializationConfig() noexcept override{delete mImpl;}
+};
 }
 nvinfer1::IRuntimeConfig* ztrtAbiCreateConfig(nvinfer1::ICudaEngine* engine,nvinfer1::ILogger* logger,int32_t strategy) noexcept{
     try{return new Config(engine,logger,strategy);}catch(...){if(logger)logger->log(nvinfer1::ILogger::Severity::kERROR,"runtime config allocation failed");return nullptr;}
@@ -43,4 +62,11 @@ nvinfer1::IRuntimeConfig* ztrtAbiCloneConfig(nvinfer1::IRuntimeConfig* source,nv
     auto result=ztrtAbiCreateConfig(engine,logger,impl->allocation);
     if(result)result->mImpl->setDynamicShapesKernelSpecializationStrategy(static_cast<nvinfer1::DynamicShapesKernelSpecializationStrategy>(impl->specialization));
     return result;
+}
+
+nvinfer1::ISerializationConfig* ztrtAbiCreateSerializationConfig(nvinfer1::ILogger* logger) noexcept{
+    try{return new SerializationConfig(logger);}catch(...){if(logger)logger->log(nvinfer1::ILogger::Severity::kERROR,"serialization config allocation failed");return nullptr;}
+}
+bool ztrtAbiGetSerializationFlags(nvinfer1::ISerializationConfig& config,uint32_t& flags) noexcept{
+    auto impl=dynamic_cast<SerializationImpl*>(config.mImpl);if(!impl)return false;flags=impl->getFlags();return true;
 }

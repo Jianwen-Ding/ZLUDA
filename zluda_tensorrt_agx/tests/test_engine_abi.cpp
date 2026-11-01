@@ -31,7 +31,7 @@ int main(int argc,char** argv){assert(argc==2);void* lib=dlopen(argv[1],RTLD_NOW
         assert(e->getProfileShape("input",0,2).nbDims==2&&e->getProfileShape("input",1,0).nbDims==-1);
         assert(e->getTensorBytesPerComponentV2("input",0)==-1&&e->getTensorBytesPerComponentV2("input",1)==-1);
         assert(e->getTensorFormatDesc("input")&&e->getDeviceMemorySizeV2()==256&&e->getDeviceMemorySizeForProfileV2(1)==-1);
-        assert(!e->createExecutionContext(1)&&!e->createSerializationConfig()&&!e->setWeightStreamingBudgetV2(1));
+        assert(!e->createExecutionContext(1)&&!e->setWeightStreamingBudgetV2(1));
         auto config=static_cast<probe::Config*>(e->createRuntimeConfig());assert(config&&config->impl->getPImpl()==config);
         auto settings=config->impl;assert(settings->getExecutionContextAllocationStrategy()==0);
         settings->setExecutionContextAllocationStrategy(2);assert(settings->getExecutionContextAllocationStrategy()==2);
@@ -48,7 +48,24 @@ int main(int argc,char** argv){assert(argc==2);void* lib=dlopen(argv[1],RTLD_NOW
             assert(!other->impl->createExecutionContextWithRuntimeConfig(config));delete other;
         }
         delete config;
-        auto memory=e->serialize();assert(memory);delete engine; // Returned custom bytes outlive the engine wrapper.
+        auto serialization=static_cast<probe::SerializationConfig*>(e->createSerializationConfig());assert(serialization);
+        auto options=serialization->impl;assert(options->getFlags()==0);
+        for(int flag:{0,1,2}){assert(options->setFlag(flag)&&options->getFlag(flag));}
+        assert(options->getFlags()==7&&!e->serializeWithConfig(serialization));
+        assert(!options->setFlag(-1)&&!options->setFlag(32)&&!options->clearFlag(99)&&!options->getFlag(-1));
+        assert(!options->setFlags(8)&&!options->setFlags(0x80000000U)&&options->getFlags()==7);
+        probe::SerializationConfig foreign;foreign.impl=nullptr;assert(!e->serializeWithConfig(&foreign));
+        assert(options->setFlags(1)&&!e->serializeWithConfig(serialization));
+        assert(options->setFlags(4)&&!e->serializeWithConfig(serialization));
+        assert(options->setFlags(7));
+        assert(options->clearFlag(0)&&options->clearFlag(2)&&options->getFlags()==2);
+        auto configured=e->serializeWithConfig(serialization);assert(configured);
+        assert(options->setFlags(0));auto defaultConfigured=e->serializeWithConfig(serialization);assert(defaultConfigured);
+        auto memory=e->serialize();assert(memory);
+        for(auto result:{configured,defaultConfigured}){
+            assert(result->impl->size()==memory->impl->size()&&std::memcmp(result->impl->data(),memory->impl->data(),memory->impl->size())==0);delete result;
+        }
+        delete serialization;delete engine; // Returned custom bytes outlive the engine wrapper.
         auto h=memory->impl;assert(h->type()==nvinfer1::DataType::kINT8&&h->size()>24&&std::memcmp(h->data(),"ZTRTAGX2",8)==0);
         auto runtime=ztrtCreateRuntime();assert(runtime);auto restored=ztrtDeserializeEngine(runtime,static_cast<uint8_t const*>(h->data()),h->size(),4096);assert(restored);
         assert(ztrtGetConstantBytes(restored)==24);std::vector<uint8_t> copy(h->size());

@@ -114,7 +114,7 @@ restored serialization is byte-identical. Metadata queries also pass with an una
 wrapping leaves ownership with the caller. Normal and AddressSanitizer builds pass without diagnostics.
 
 These probes still do not compile against a complete independently obtained, version-pinned reference header
-set. Broader engine/context execution coverage, incremental decoding/device streaming, serializer options, refitting, inspection,
+set. Broader engine/context execution coverage, incremental decoding/device streaming, weight-stripped/refit serialization options, refitting, inspection,
 weight management and complete version-specific compatibility remain required work. The prototype does not
 alias libtensorrt_rtx.so and does not establish Geekbench support.
 
@@ -265,3 +265,26 @@ rejection before GPU access, specialization values, cache/graph rejection, cross
 ownership cycles. The GPU probe checks default creation, config-selected caller scratch, source-config
 mutation/destruction, snapshot persistence, inference results and sequential shared-scratch execution.
 Normal and C++ adapter/probe-ASan builds pass. The native backend is not ASan-instrumented.
+
+
+## Serialization configuration
+
+`createSerializationConfig()` now returns a caller-owned wrapper with the reviewed five-method
+`VSerializationConfig` dispatch. Flags default to zero. `setFlags`, `getFlags`, `setFlag`, `clearFlag` and
+`getFlag` handle the public enum positions EXCLUDE_WEIGHTS=0, EXCLUDE_LEAN_RUNTIME=1 and INCLUDE_REFIT=2.
+Unknown bits or enum positions fail without changing the flag state; shifts are performed only after bounds
+checks. Configuration accepts the three defined flags for introspection, but engine serialization rejects
+EXCLUDE_WEIGHTS and INCLUDE_REFIT because stripped/refittable engines are not implemented yet.
+
+`serializeWithConfig` supports flags zero or EXCLUDE_LEAN_RUNTIME only. Our independent engine format never
+embeds an executable runtime, so exclusion leaves the bytes unchanged. The host-memory result retains its
+independent ownership. Unknown config implementations fail rather than being cast to unchecked private data.
+This does not add support for proprietary serialized engines, weight refitting or NVIDIA runtime packaging.
+
+The adapted declarations follow the Apache-2.0 [public serialization dispatch](https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/_static/c-api/_nv_infer_impl_8h_source.html)
+and [public flag declarations](https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/_static/c-api/_nv_infer_runtime_8h_source.html).
+The separate ABI-prefix probe tests all three flag positions, negative/out-of-range positions, unknown low
+and high bit masks, rejected-state preservation, unknown config rejection, individually unsupported options,
+and byte-identical default/exclude-runtime serialization across 100 native-engine round trips. Normal and
+C++ adapter/probe-ASan runs pass, including the existing GPU context probe. Full independently pinned
+reference-header ABI validation remains incomplete.

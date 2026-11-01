@@ -140,3 +140,16 @@ public:
 };
 struct Config {virtual ~Config() noexcept=default;ConfigDispatch* impl;};
 }
+
+namespace probe {
+class SerializationDispatch {
+public:
+    virtual ~SerializationDispatch() noexcept=default;
+    virtual bool setFlags(uint32_t) noexcept=0;
+    virtual uint32_t getFlags() const noexcept=0;
+    virtual bool clearFlag(int32_t) noexcept=0;
+    virtual bool setFlag(int32_t) noexcept=0;
+    virtual bool getFlag(int32_t) const noexcept=0;
+};
+struct SerializationConfig {virtual ~SerializationConfig() noexcept=default;SerializationDispatch* impl;};
+}

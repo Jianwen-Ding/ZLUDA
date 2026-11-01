@@ -63,8 +63,13 @@ public:
     TensorFormat getTensorFormatV2(char const* n,int32_t p) const noexcept override{return p==0?getTensorFormat(n):static_cast<TensorFormat>(0);}
     char const* getTensorFormatDescV2(char const* n,int32_t p) const noexcept override{return p==0?getTensorFormatDesc(n):"";}
     int32_t getTensorVectorizedDimV2(char const*,int32_t) const noexcept override{return -1;}
-    ISerializationConfig* createSerializationConfig() noexcept override{error(logger,"ABI prototype: serialization configuration is unsupported");return nullptr;}
-    IHostMemory* serializeWithConfig(ISerializationConfig&) const noexcept override{error(logger,"ABI prototype: serialization configuration is unsupported");return nullptr;}
+    ISerializationConfig* createSerializationConfig() noexcept override{return ztrtAbiCreateSerializationConfig(logger);}
+    IHostMemory* serializeWithConfig(ISerializationConfig& config) const noexcept override{
+        uint32_t flags=0;if(!ztrtAbiGetSerializationFlags(config,flags)){error(logger,"foreign serialization configuration");return nullptr;}
+        if(flags&5U){error(logger,"weight exclusion and refit serialization are unsupported");return nullptr;}
+        // Our format never embeds a lean runtime, so excluding it needs no payload change.
+        return serialize();
+    }
     IRefitter* createRefitter(ILogger&) noexcept override{error(logger,"ABI prototype: refitting is unsupported");return nullptr;}
     int64_t getStreamableWeightsSize() const noexcept override{return 0;}
     bool isDebugTensor(char const*) const noexcept override{return false;}

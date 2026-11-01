@@ -263,3 +263,24 @@ public:
     apiv::VRuntimeConfig* mImpl=nullptr;
 };
 }
+
+namespace nvinfer1 {
+using SerializationFlags=uint32_t;
+enum class SerializationFlag:int32_t { kEXCLUDE_WEIGHTS=0,kEXCLUDE_LEAN_RUNTIME=1,kINCLUDE_REFIT=2 };
+namespace apiv {
+class VSerializationConfig {
+public:
+    virtual ~VSerializationConfig() noexcept=default;
+    virtual bool setFlags(SerializationFlags) noexcept=0;
+    virtual SerializationFlags getFlags() const noexcept=0;
+    virtual bool clearFlag(SerializationFlag) noexcept=0;
+    virtual bool setFlag(SerializationFlag) noexcept=0;
+    virtual bool getFlag(SerializationFlag) const noexcept=0;
+};
+}
+class ISerializationConfig {
+public:
+    virtual ~ISerializationConfig() noexcept=default;
+    apiv::VSerializationConfig* mImpl=nullptr;
+};
+}

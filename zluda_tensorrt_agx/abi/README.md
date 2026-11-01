@@ -42,7 +42,7 @@ cannot substitute for an independently compiled full-reference-header client ABI
 | --- | --- | --- |
 | Public enums, data layouts and callbacks | Initial subset aligned | Complete version-specific interface audit and independent client tests |
 | Public C factory/version exports | Isolated 1.7.1 configuration prototype | Client resolves documented exports and version negotiation works |
-| Runtime/engine/context dispatch objects | Runtime configuration prefix only; engine/context dispatch absent | Full applicable public pImpl/vtable contracts, ownership and error behavior verified |
+| Runtime/engine/context dispatch objects | Runtime configuration and engine metadata/serialization adapter; context dispatch absent | Full applicable public pImpl/vtable contracts, ownership and error behavior verified |
 | Builder/network/layer dispatch objects | Source wrapper subset only | Reference-header model construction, configuration and destruction work |
 | Custom engine serialization | Native ZTRTAGX2 works | Roundtrip through public runtime ABI and independent client, without NVIDIA format assumptions |
 | Precision and shape coverage | Primarily static f32 | Required dtypes, shape tensors, profiles and dynamic execution validated |
@@ -62,7 +62,7 @@ serializer is not a decoder for that format. No opaque vendor engine is used as 
 `libtensorrt_agx_runtime_abi.so`. It exports `createInferRuntime_INTERNAL` and `getInferLibVersion`, with the
 reviewed RTX 1.7.1 contract number 10701. It accepts only that number; other versions, including 1.6, are rejected.
 This number identifies the prototype's interface target, not a claim that the implementation is NVIDIA TensorRT.
-It is not installed under NVIDIA's library names and is not linked into the main inference library yet.
+It is not installed under NVIDIA's library names and is not linked into the main inference library yet. The adapter now links against our native library to wrap native engine handles.
 
 The wrapper has a virtual destructor and implementation pointer. The dispatch declarations follow the reviewed
 public method order, including getPImpl, configuration, logger and plugin-registry access. Positive thread limits,
@@ -72,16 +72,15 @@ or logged explicitly. Directory strings remain valid until the next setter; call
 with mutation and keep the logger alive through runtime destruction.
 
 **All engine deserialization calls return null without inspecting any payload bytes.** Engine validity reports
-INVALID with no inferred diagnostics and the header-size query returns zero. Even our native engine format is
-not exposed through this experimental engine ABI yet: returning native engine objects with an incompatible
-layout would be incorrect. External runtime and plugin loading do not load any files. The existing source API
+INVALID with no inferred diagnostics and the header-size query returns zero. Native engines enter through the explicit `ztrtRtxWrapNativeEngine` extension described below; standard runtime
+deserialization is still unsupported. Native engine objects are not returned directly through the public interface. External runtime and plugin loading do not load any files. The existing source API
 and native ZTRT inference library retain their working model execution path.
 
 Build and run the separate dispatch-prefix probe:
 
 ```sh
-python3 zluda_tensorrt_agx/tools/build_runtime_abi.py --output-dir /tmp/ztrt-runtime-abi
-python3 zluda_tensorrt_agx/tools/build_runtime_abi.py --output-dir /tmp/ztrt-runtime-abi-asan --sanitize
+python3 zluda_tensorrt_agx/tools/build_runtime_abi.py --output-dir /tmp/ztrt-runtime-abi --native-library /path/to/libtensorrt_agx.so
+python3 zluda_tensorrt_agx/tools/build_runtime_abi.py --output-dir /tmp/ztrt-runtime-abi-asan --native-library /path/to/libtensorrt_agx.so --sanitize
 ```
 
 The probe compiles in another translation unit without including the adapter dispatch header. It checks
@@ -90,3 +89,30 @@ registry behavior, payload-free rejection, and 1000 destruction cycles. Both ord
 pass on Linux aarch64. This is a targeted binary-prefix test using independently declared call shapes, not a
 complete vendor-reference-header or cross-version ABI conformance test. Plugins, error recorders, complete
 engine/context interfaces, builder factories and reference-header client integration remain required work.
+
+## Native engine metadata and serialization adapter
+
+`engine.cpp` adds the `ztrtRtxWrapNativeEngine` extension declared in `extensions.h`. It accepts an engine handle
+created by our native C API, validates the borrowed versioned logger, and transfers ownership only on success.
+No NVIDIA engine bytes enter this path. The returned wrapper has a public-style engine dispatch object for
+static f32 metadata queries and custom serialization. Context creation and unsupported features return explicit
+failures; this is not yet execution through the public engine/context ABI.
+
+Implemented queries cover I/O names and roles, shapes, static profile 0, f32/device/linear layout, name/layer
+count, workspace and serialization. Unknown-name fallback values follow the reviewed public docs: datatype
+FLOAT, location DEVICE, format LINEAR, empty format description and NONE I/O role. Component/vector queries
+return -1 for the unvectorized linear layout, following the documented contract. The native layer-count query
+reports planned graph steps, not a physical GPU launch count. The host-memory adapter owns custom ZTRTAGX2
+bytes independently of the engine wrapper. Standard runtime deserialization remains payload-blind and disabled.
+
+The build helper requires our native library (standard target/release path, ZTRT_LIBRARY, or --native-library).
+It now runs a second independently declared dispatch-prefix probe. One hundred rounds wrap a native engine,
+query metadata (including a by-value 72-byte Dims result), serialize, destroy the engine, deserialize the still
+live bytes through our native API, wrap the restored engine and destroy both wrapper and host memory. The fixture includes weights and the
+restored serialization is byte-identical. Metadata queries also pass with an unavailable CUDA driver. Failed
+wrapping leaves ownership with the caller. Normal and AddressSanitizer builds pass without diagnostics.
+
+These probes still do not compile against a complete independently obtained, version-pinned reference header
+set. Engine/context execution, standard native-format runtime loading, serializer options, refitting, inspection,
+weight management and complete version-specific compatibility remain required work. The prototype does not
+alias libtensorrt_rtx.so and does not establish Geekbench support.

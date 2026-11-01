@@ -62,5 +62,6 @@ assert enqueue(c,None)==0 and sync(c)==0,err();close(c)
 while allocations:dc('cuMemFree_v2',allocations.pop())
 # Null object errors stay on the C boundary, without panics or device accesses.
 assert api('ztrtGetNbIOTensors',I,P)(None)==-1
+assert api('ztrtGetLayerCount',I,P)(None)==-1
 assert serialize(None,None,0)==0
 print('PASS: CUDA graph replay, cross-stream workspace ordering, context restoration, shared resources, engine lifetime, budget persistence and null handles')

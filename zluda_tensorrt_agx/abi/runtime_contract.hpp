@@ -5,6 +5,7 @@
 #pragma once
 #include "NvInferRuntimeBase.h"
 #include <cstddef>
+struct CUstream_st;
 namespace nvinfer1 {
 class IRuntime; class ICudaEngine;
 namespace v_1_0 { class IGpuAllocator; class IErrorRecorder; class IStreamReaderV2; class IPluginCreatorInterface; class IPluginResource; }
@@ -72,4 +73,83 @@ class IRuntime {
 public: virtual ~IRuntime() noexcept=default;
 protected: apiv::VRuntime* mImpl=nullptr;
 };
+}
+// Public engine/host-memory dispatch declarations; see the same Apache-2.0 provenance above.
+namespace nvinfer1 {
+class IHostMemory;class IExecutionContext;class IEngineInspector;class ISerializationConfig;class IRefitter;class IRuntimeConfig;class IWeightsManager;
+enum class ExecutionContextAllocationStrategy:int32_t;
+enum class EngineCapability:int32_t;
+enum class ProfilingVerbosity:int32_t;
+enum class TensorLocation:int32_t;
+enum class TensorFormat:int32_t;
+enum class OptProfileSelector:int32_t;
+enum class HardwareCompatibilityLevel:int32_t;
+enum class EngineStat:int32_t;
+namespace apiv {
+class VHostMemory:public VRoot {
+public:
+    virtual void* data() const noexcept=0;
+    virtual std::size_t size() const noexcept=0;
+    virtual DataType type() const noexcept=0;
+};
+class VCudaEngine:public VRoot {
+public:
+    virtual ICudaEngine* getPImpl() noexcept=0;
+    virtual int32_t getNbLayers() const noexcept=0;
+    virtual IHostMemory* serialize() const noexcept=0;
+    virtual IExecutionContext* createExecutionContext(ExecutionContextAllocationStrategy) noexcept=0;
+    virtual bool isRefittable() const noexcept=0;
+    virtual char const* getName() const noexcept=0;
+    virtual int32_t getNbOptimizationProfiles() const noexcept=0;
+    virtual EngineCapability getEngineCapability() const noexcept=0;
+    virtual void setErrorRecorder(IErrorRecorder*) noexcept=0;
+    virtual IErrorRecorder* getErrorRecorder() const noexcept=0;
+    virtual uint32_t getTacticSources() const noexcept=0;
+    virtual ProfilingVerbosity getProfilingVerbosity() const noexcept=0;
+    virtual IEngineInspector* createEngineInspector() const noexcept=0;
+    virtual Dims getTensorShape(char const*) const noexcept=0;
+    virtual DataType getTensorDataType(char const*) const noexcept=0;
+    virtual TensorLocation getTensorLocation(char const*) const noexcept=0;
+    virtual bool isShapeInferenceIO(char const*) const noexcept=0;
+    virtual TensorIOMode getTensorIOMode(char const*) const noexcept=0;
+    virtual int32_t getTensorBytesPerComponent(char const*) const noexcept=0;
+    virtual int32_t getTensorComponentsPerElement(char const*) const noexcept=0;
+    virtual TensorFormat getTensorFormat(char const*) const noexcept=0;
+    virtual char const* getTensorFormatDesc(char const*) const noexcept=0;
+    virtual int32_t getTensorVectorizedDim(char const*) const noexcept=0;
+    virtual Dims getProfileShape(char const*,int32_t,OptProfileSelector) const noexcept=0;
+    virtual int32_t getNbIOTensors() const noexcept=0;
+    virtual char const* getIOTensorName(int32_t) const noexcept=0;
+    virtual HardwareCompatibilityLevel getHardwareCompatibilityLevel() const noexcept=0;
+    virtual int32_t getNbAuxStreams() const noexcept=0;
+    virtual int32_t getTensorBytesPerComponentV2(char const*,int32_t) const noexcept=0;
+    virtual int32_t getTensorComponentsPerElementV2(char const*,int32_t) const noexcept=0;
+    virtual TensorFormat getTensorFormatV2(char const*,int32_t) const noexcept=0;
+    virtual char const* getTensorFormatDescV2(char const*,int32_t) const noexcept=0;
+    virtual int32_t getTensorVectorizedDimV2(char const*,int32_t) const noexcept=0;
+    virtual ISerializationConfig* createSerializationConfig() noexcept=0;
+    virtual IHostMemory* serializeWithConfig(ISerializationConfig&) const noexcept=0;
+    virtual IRefitter* createRefitter(ILogger&) noexcept=0;
+    virtual int64_t getStreamableWeightsSize() const noexcept=0;
+    virtual bool isDebugTensor(char const*) const noexcept=0;
+    virtual bool setWeightStreamingBudgetV2(int64_t) noexcept=0;
+    virtual int64_t getWeightStreamingBudgetV2() const noexcept=0;
+    virtual int64_t getWeightStreamingAutomaticBudget() const noexcept=0;
+    virtual int64_t getWeightStreamingScratchMemorySize() const noexcept=0;
+    virtual int64_t getDeviceMemorySizeV2() const noexcept=0;
+    virtual int64_t getDeviceMemorySizeForProfileV2(int32_t) const noexcept=0;
+    virtual int64_t const* getProfileTensorValuesV2(char const*,int32_t,OptProfileSelector) const noexcept=0;
+    virtual IExecutionContext* createExecutionContextWithRuntimeConfig(IRuntimeConfig*) noexcept=0;
+    virtual IRuntimeConfig* createRuntimeConfig() noexcept=0;
+    virtual int64_t getEngineStat(EngineStat) const noexcept=0;
+    virtual char const* getAliasedInputTensor(char const*) const noexcept=0;
+    virtual bool areWeightsLoaded() const noexcept=0;
+    virtual bool loadWeights(void const*,int64_t) noexcept=0;
+    virtual bool loadWeightsAsync(IStreamReaderV2&,CUstream_st*) noexcept=0;
+    virtual bool unloadWeights() noexcept=0;
+    virtual IWeightsManager* createWeightsManager() noexcept=0;
+};
+}
+class IHostMemory {public:virtual ~IHostMemory() noexcept=default;protected:apiv::VHostMemory* mImpl=nullptr;};
+class ICudaEngine {public:virtual ~ICudaEngine() noexcept=default;protected:apiv::VCudaEngine* mImpl=nullptr;};
 }

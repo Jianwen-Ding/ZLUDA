@@ -312,3 +312,28 @@ This establishes only the tested prototype prefix, not complete reference-header
 execution through it. No NVIDIA SDK/runtime or proprietary binaries were downloaded, inspected or loaded.
 No Rust inference, PTX or MLIR kernel implementation changed in this checkpoint, and no speedup is claimed.
 Build commands and method scope are in [abi/README.md](../abi/README.md).
+
+## Native engine dispatch metadata and host serialization
+
+The isolated adapter now links our native library and offers an explicit own extension to wrap valid native
+engine handles. It supplies public-style engine and host-memory wrapper/dispatch objects for static f32 I/O
+metadata and custom serialization. Ownership transfers only when wrapping succeeds. Unsupported context
+creation, inspector/refit/weight-streaming/configuration methods return explicit failures. Standard runtime
+factory deserialization remains disabled without inspecting payloads; no NVIDIA engine format support added.
+
+An independently declared second probe tests the engine dispatch prefix through workspace/profile queries,
+including by-value Dims return ABI, public enum values, unknown-name fallbacks and custom host-memory methods.
+It runs 100 ownership/serialization cycles: create native graph -> wrap -> serialize -> destroy engine wrapper ->
+read still-live bytes -> restore through native API -> wrap restored handle -> destroy wrappers and host memory.
+Both normal and AddressSanitizer builds pass with no diagnostics, alongside the earlier 1000-cycle runtime probe.
+These are targeted binary-prefix probes, not full independent-reference-header conformance tests.
+
+Only one native C metadata accessor was added (planned layer count); PTX/MLIR/kernel execution was unchanged.
+The adapter still cannot execute GPU workloads through the public context ABI or support Geekbench's RTX 1.6.
+Public engine semantics were checked against
+https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/_static/c-api/classnvinfer1_1_1_i_cuda_engine.html
+
+The engine fixture includes a 24-byte weight tensor. Restored serialization is byte-identical to the host-memory
+buffer after original engine destruction. Metadata-only probing also passes with ZLUDA_AGX_LIBCUDA pointing
+to a nonexistent driver, confirming that this path does not need GPU initialization. All 11 native Rust unit
+tests and lifecycle checks pass after the additive layer-count API entry point.

@@ -261,6 +261,7 @@ fn modify(g: &mut Graph, output: usize, f: impl FnOnce(&mut Op) -> Result<()>) -
         std::ptr::copy_nonoverlapping(e.serialized.as_ptr(), data, e.serialized.len()); Ok(e.serialized.len())
     })
 }
+#[no_mangle] pub unsafe extern "C" fn ztrtGetLayerCount(p: *const Engine) -> i32 { boundary(-1, || Ok(object(p)?.plan.steps.len() as i32)) }
 #[no_mangle] pub unsafe extern "C" fn ztrtGetNbIOTensors(p: *const Engine) -> i32 { boundary(-1, || { let e = object(p)?; Ok((e.plan.graph.inputs.len() + e.plan.graph.outputs.len()) as i32) }) }
 #[no_mangle] pub unsafe extern "C" fn ztrtGetIOTensorName(p: *const Engine, index: i32) -> *const c_char {
     boundary(std::ptr::null(), || { let e = object(p)?; let i = e.plan.graph.inputs.iter().chain(&e.plan.graph.outputs).nth(id(index)?).ok_or("I/O index outside engine")?; Ok(e.names[*i].as_ptr()) })

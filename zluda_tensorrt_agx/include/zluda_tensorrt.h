@@ -59,6 +59,8 @@ ZtrtEngine* ztrtDeserializeEngine(const ZtrtRuntime*, const uint8_t*, size_t, si
 void ztrtDestroyEngine(ZtrtEngine*);
 /* With NULL data and zero capacity, returns required bytes. Never partially writes. */
 size_t ztrtSerializeEngine(const ZtrtEngine*, uint8_t*, size_t);
+/* Planned graph steps, including view descriptors; not a physical GPU launch count. */
+int32_t ztrtGetLayerCount(const ZtrtEngine*);
 int32_t ztrtGetNbIOTensors(const ZtrtEngine*);
 const char* ztrtGetIOTensorName(const ZtrtEngine*, int32_t);
 int32_t ztrtGetTensorIOMode(const ZtrtEngine*, const char*);

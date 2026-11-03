@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+lib="$root/target/agx"
+if [[ ! -f "$lib/libcuda.so.1" || ! -x "$lib/zoc" ]]; then
+    echo "Missing ZLUDA installation in $lib (libcuda.so.1 and zoc required)." >&2
+    exit 1
+fi
+if [[ $# == 0 ]]; then
+    echo "Usage: $0 COMMAND [ARG ...]" >&2
+    exit 2
+fi
+export LD_LIBRARY_PATH="$lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export ZLUDA_AGX_ZOC="$lib/zoc"
+exec "$@"

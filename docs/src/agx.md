@@ -1601,6 +1601,10 @@ buffer registration, groups and the asynchronous-error query are supported.
 
 ## Blender Cycles headless status
 
+**Current status (2026-11-03):** Cycles compiles and renders, but instanced geometry is missing from GPU renders, so
+they do not match the CPU and render scores are not meaningful yet. See `llvm_zluda/AIR_EXPERIMENTS.md`. The rest of this
+section is the earlier history.
+
 Blender 5.1.0 ARM64 starts in background mode on the M2 Max and enumerates ZLUDA's CUDA device after its system X11
 library dependencies are supplied. Its Cycles build chooses a bundled `sm_86` cubin, which the AGX driver cannot load.
 Hiding that cubin makes Blender select its PTX fallback (13 MiB, 75 kernels, 383 functions, 1,593 calls). A one-sample

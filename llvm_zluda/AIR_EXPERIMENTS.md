@@ -415,3 +415,27 @@ Blender Open Data strict: junkshop 97 -> 153 (default 160), classroom 82 -> 128 
 samples/min. The opt-in ZLUDA_ROUNDING_STRICT_TEXTURES=f32 is no longer needed for speed on these scenes.
 Regenerating the texture block needs a clang: /scratch/clang-build (clang and NVPTX built from the tree); splice
 only that block (the other blocks keep clang 18's output) and drop repeated declarations.
+
+## Blender Cycles drops instanced geometry on the GPU, 2026-11-03 (open, investigation postponed)
+
+- **Cycles renders run but are wrong.** 16-sample renders against the CPU in Blender 5.1.0: classroom loses its desks,
+  chairs and ceiling lamps (mean difference 19.3 of 255), monster loses the monster and the child's face (13.1).
+  Unique geometry is right. Earlier checks compared GPU images with each other, so they missed it: the October 31
+  strict classroom image has the same holes. **Open Data scores recorded before this fix (monster, classroom,
+  junkshop) are of scenes with geometry missing; do not use them as render performance.**
+- **Minimal case:** a scene of a plane and three unique spheres matches the CPU exactly (difference 0). With the spheres
+  sharing one mesh they all disappear. Scripts, which take `-- DEVICE MODE OUT` with MODE `uniq`, `inst` or `scale`:
+  `docker-scratch/blender-src/instancing-repro/scene.py`, and `audit.py` to count a scene's instances.
+- **Ruled out:** the compiler version (October 30 `zoc` gives the same image), the driver version (October 31, November 1
+  and HEAD builds), and with `ZLUDA_AGX_SPECIALIZE=0`, `ZLUDA_AGX_UNIFORM_CONSTANTS=0`, `ZLUDA_AGX_LAUNCH_BATCH=0`,
+  `ZLUDA_AGX_GRAPH_BATCH=0`, `ZLUDA_AGX_SOFTWARE_TEXTURES=1`, `ZLUDA_AGX_HAZARD_BARRIERS=1` and
+  `ZLUDA_AGX_USC_BARRIER=1` the image does not change at all.
+- **Next:** the path entered only for instances in Cycles' BVH2 traversal (`kernel/bvh/traversal.h`: the negative
+  `prim_addr` leaf, `object_node`, `bvh_instance_push`, its pointers to the ray's private copies). Debug with kernels
+  built from Cycles' source (`Builds/blender-cycles-5.1.1`), not by inspecting PTX bundled in a prebuilt application.
+- **Compile time:** `zludaModeField` solved a function's web of modes again for each operation, over 18 minutes on Cycles;
+  solved once per function, 47 s. Against the October 30 `zoc` (37.8 s, 1.26 GB, 16.0 MB object) it still takes 7.0 GB and
+  writes 44.3 MB. `85ef7ed`'s entry mode is not the cause; the cause is not known.
+- **Geekbench:** with `libtensorrt_rtx.so` absent all eleven workloads run on the CUDA fallback, 26.29 s of GPU time. With
+  it present Background Blur, Face Tracking and Super Resolution still fail to deserialize their engines. Reported scores:
+  68805 through ZLUDA, 41822 on the same chip through Mesa's OpenCL. No workload's output has been verified.

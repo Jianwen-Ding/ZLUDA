@@ -770,3 +770,19 @@ cannot change anything until the worst functions come down. check_tree_gprs.py (
 - **A wrong "refuted" outlived its test**: see the register cap note above. A flag recorded as refuted at 128 registers has not been
   refuted at 80. Occupancy changes what matters.
 
+### Reloading spills instead of storing them: small (2026-11-03, static counts, cap 80, callee-saved 48)
+
+Over all 75 kernel modules (1,323 function instances): 34,730 spill stores, of which **24,739 (71%) are callee-save traffic** (exactly 1:1 save/restore, inflated by callee-saved 48), leaving 9,991 real spills.
+
+| Candidate | Stores | % of real | Needs |
+| --- | --- | --- | --- |
+| kernel_params load through a uniform base | 170 | 1.7% | isReMaterializable on device loads |
+| + callee kernel_params load, base still live | 57 | 2.3% cumulative | accept invariant loads without dereferenceable (AGXGlobalDataArgs loses it) |
+| + scene array load, operands live | 125 | 3.5% cumulative | invariant info the IR does not have; no clean general proof found |
+| + callees read global data from a uniform | 652 | 10.0% cumulative | calling-convention change; whether uniforms stay readable across call is unverified |
+| ALU with operands live at every reload | 897 | 9.0% | flag cheap ALU ops rematerializable; removes the memory access entirely |
+| mov_imm, single definition | 4 | 0.04% | nothing: 415 more are phi inputs that cannot be rematerialized |
+
+Load remat saves only the store, since each reload becomes a device load: about 3 of 49 cycles per pair on the schedule model (a model, not a measurement). No remat change has been built or tested.
+Order to try: lower callee-saved first, then ALU remat, then the kernel_params tiers. Scripts and data: /scratch/NOTES/spill-analysis (spillan.py). An early version dropped block labels with trailing comments and made mov_imm look like 621 removable stores: check a classifier against MIR.
+

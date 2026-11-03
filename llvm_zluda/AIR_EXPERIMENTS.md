@@ -143,7 +143,7 @@ Baseline with instances fixed: junkshop 193, classroom 146, monster 245. Same im
   junkshop 179, classroom 148. Compile 1.16 GB, 23 s, object 9.5 MB. llama.cpp pp128 425-441, tg64 125-135 t/s across runs,
   4/4 completions as on the CPU. Geekbench, alternating the compiler from before these changes with this one on the same
   day: 26.98, 26.12 s -> 25.60, 25.75 s of GPU time (later runs 25.6-26.8). Older sessions' 24.8-25.3 s are not comparable.
-- **Refuted, register cap (-agx-default-max-gprs)**: occupancy is not the limit. 128: 194, 96: 161, 72: 131, 56: 96.
+- **WRONG CONCLUSION, later reversed: register cap (-agx-default-max-gprs)**: recorded here as "occupancy is not the limit" from 128: 194, 96: 161, 72: 131, 56: 96. That test was flawed: the call ABI then reserved r1-r36, so a cap of 96 left about 59 usable registers and spills swamped the gain. With only r0, r1 and the links reserved a cap of 80 gives +15-20%: see "Occupancy" below. Lesson: a refuted result is only as good as what else the test changed.
 - **Refuted, more inlining**: -inline-threshold 500 and 2000 are within noise and cost compile time. -air-keep-function-cost
   does not change AGX code at all (17.9129 MB at 5000, 80000, 320000): what O3 leaves uninlined stays a real call.
 - **Refuted, backend options**: on classroom and junkshop -agx-uniform-constants, -agx-max-unskipped-instrs=2 and 8,
@@ -576,3 +576,29 @@ Blender Open Data strict: junkshop 97 -> 153 (default 160), classroom 82 -> 128 
 samples/min. The opt-in ZLUDA_ROUNDING_STRICT_TEXTURES=f32 is no longer needed for speed on these scenes.
 Regenerating the texture block needs a clang: /scratch/clang-build (clang and NVPTX built from the tree); splice
 only that block (the other blocks keep clang 18's output) and drop repeated declarations.
+
+## Occupancy (register cap), 2026-11-03
+
+How kernels came to declare 128: the greedy allocator pays nothing for r127 over r40, the backend learned the count only
+afterwards, and a kernel with calls declared everything since a callee may use anything. The per-function limit existed, but
+only PTX that asked for it (.maxnreg) got one.
+
+Samples/min at -agx-default-max-gprs (callee-saved 32, 30 s of Blender Open Data; 0 GPU faults):
+
+| Cap | classroom | junkshop | monster |
+| --- | --- | --- | --- |
+| 128 | 204 | 247 | 290 |
+| 96 | 217 | 276 | 325 |
+| 80 | 233 | 283 | 349 |
+| 72 | 234 | 265 | 355 |
+| 64 | 234 | 264 | 354 |
+| 56 | 226 | 240 | 333 |
+| 48 | 201 | 227 | 293 |
+
+- Callee-saved 16 against 32: within noise at every cap.
+- A kernel must declare the cap (not 128) for this to work: an early try of the cap did nothing because kernels with calls
+  still declared 128 whatever the cap.
+- The callee-saved set must sit under the cap, built at run time; with the old fixed top block it was above it.
+- Frames grow as registers shrink: the 12 KB stack first try fails at cap 80 (sample_f32_outlined), and the driver
+  then compiles twice (warm-up 26 s to 52 s). 16 KB fits.
+- Block size (cuOccupancyMaxPotentialBlockSize capped at 32-192 threads): no gain at 128 registers; 32 was slightly worse.

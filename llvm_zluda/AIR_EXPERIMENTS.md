@@ -154,6 +154,10 @@ Baseline with instances fixed: junkshop 193, classroom 146, monster 245. Same im
 - **Refuted, stack spacing**: 12 KB against 32 KB per thread is the same speed (a memory gain, above).
 - **What is left is spread out**: replaying shade_surface (junkshop, 30.8M instructions, agx_run --trace-pcs), the largest
   part is mov_imm 9%, fmul 9%, stack_load 7%, jmp_exec_none 7%, wait 7%, and no function but the interpreter over 15%.
+- **Refuted, the GPU clock in a render**: a lone launch runs 2.4-3.2x slower than with the GPU kept busy, but a render is not held back by
+  that. A small kernel kept running in another process: classroom 204 -> 198, junkshop 245 -> 238, and back without it. Keeping
+  the clock up from the driver would not help this workload; it may help applications with long gaps between launches.
+- **Refuted, allocator cost of callee-saved registers**: -regalloc-csr-first-time-cost 5, 50 and 500 are within 1%.
 - **Refuted, launch overhead**: launch batching changes nothing (197.9 vs 197.4). 18.8 s GPU in about 19.7 s of launches:
   this is GPU-bound. An earlier "19% not GPU" was wrong, its span included 3.5 s of scene setup.
 

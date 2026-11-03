@@ -74,7 +74,8 @@ Mistakes in how the work was done:
 - **A wrong suspicion, the seed**: Cycles' seed seemed to do nothing (at most 1-2/255 at 16 samples, CPU and GPU), and this was
   put down to the host. The classroom file forces it: set to 12345 it reads back as 1 after the render (the log line that
   said otherwise printed before that), while the default cube responds normally (max 69). Read a setting back after the
-  render before trusting it. How the file forces it was not looked into.
+  render before trusting it. No drivers or render handlers: the value holds through a view layer update and reverts only in
+  the render, and the scene has an action (SceneAction), so almost certainly keyframed; the keyframe itself was not listed.
 
 ## Instanced geometry missing: a miscompiled host, not ZLUDA (2026-11-03)
 

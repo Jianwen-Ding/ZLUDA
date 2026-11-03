@@ -71,8 +71,10 @@ Mistakes in how the work was done:
   whole-module compilation with a module-wide frame layout (AGXFrameLowering, reverted) took 188 s at 1.48 GB, no
   better than ZLUDA_AGX_JOBS=1 (188 s, 1.26 GB), and the object was still 37 MB. The old "1338 copies, 5.3 MB unique"
   figure no longer describes this build. Look at symbol sizes first.
-- **Unexplained, not chased**: Cycles' seed has almost no effect in this host, on the CPU and the GPU alike (0 against 7 or
-  123456: at most 1-2/255 at 16 samples), so not ZLUDA. Do not use a second seed as a noise floor.
+- **A wrong suspicion, the seed**: Cycles' seed seemed to do nothing (at most 1-2/255 at 16 samples, CPU and GPU), and this was
+  put down to the host. The classroom file forces it: set to 12345 it reads back as 1 after the render (the log line that
+  said otherwise printed before that), while the default cube responds normally (max 69). Read a setting back after the
+  render before trusting it. How the file forces it was not looked into.
 
 ## Instanced geometry missing: a miscompiled host, not ZLUDA (2026-11-03)
 

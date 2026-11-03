@@ -2306,19 +2306,23 @@ LLVM_C_EXTERN_C_BEGIN
 // made: through phis and selects (the mode where control flow joins) and the front end's updates of the mode
 // (and / or with constants, the bits of one field replaced). A phi's value is the agreement of its incoming
 // values, found by iterating to a fixed point over the phis and selects reached (a cycle agrees with whatever
-// enters it). None where the bits differ or are not known. Linear in the values reached, per mask.
-static std::optional<uint64_t> zludaModeField(Value *Root, uint64_t RootMask)
+// enters it). None where the bits differ or are not known. Linear in the values reached, per mask, over all the
+// calls with one Solved: what a call reaches is closed under its operands, so its results stay final while the phis,
+// selects and updates of the mode are not changed. (A function's operations share one web of modes: solved again for
+// each of them, Blender Cycles spent over 18 minutes here.)
+using ZludaModeFields = DenseMap<std::pair<Value *, uint64_t>, uint64_t>;
+static std::optional<uint64_t> zludaModeField(Value *Root, uint64_t RootMask, ZludaModeFields &Solved)
 {
     // lattice: Top (no information yet), a value, Bottom (differs / unknown)
     constexpr uint64_t Top = UINT64_MAX - 1, Bottom = UINT64_MAX;
-    DenseMap<std::pair<Value *, uint64_t>, uint64_t> state;
+    ZludaModeFields state;
     SmallVector<std::pair<Value *, uint64_t>, 32> order;
     // the values and masks reached
     SmallVector<std::pair<Value *, uint64_t>, 32> stack{{Root, RootMask}};
     while (!stack.empty())
     {
         auto key = stack.pop_back_val();
-        if (!state.try_emplace(key, Top).second)
+        if (Solved.contains(key) || !state.try_emplace(key, Top).second)
             continue;
         order.push_back(key);
         auto [V, Mask] = key;
@@ -2344,7 +2348,10 @@ static std::optional<uint64_t> zludaModeField(Value *Root, uint64_t RootMask)
             stack.push_back({Sel->getFalseValue(), Mask});
         }
     }
-    auto get = [&](Value *V, uint64_t Mask) { return state.lookup({V, Mask}); };
+    auto get = [&](Value *V, uint64_t Mask) {
+        auto it = Solved.find({V, Mask});
+        return it != Solved.end() ? it->second : state.lookup({V, Mask});
+    };
     auto meet = [&](uint64_t a, uint64_t b) {
         if (a == Top)
             return b;
@@ -2355,7 +2362,8 @@ static std::optional<uint64_t> zludaModeField(Value *Root, uint64_t RootMask)
     for (bool changed = true; changed;)
     {
         changed = false;
-        for (auto key : order)
+        // (operands before their users, mostly: a chain of phis settles in one round instead of one per link)
+        for (auto key : reverse(order))
         {
             auto [V, Mask] = key;
             uint64_t v = Bottom;
@@ -2398,6 +2406,7 @@ static std::optional<uint64_t> zludaModeField(Value *Root, uint64_t RootMask)
         }
     }
     uint64_t r = get(Root, RootMask);
+    Solved.insert(state.begin(), state.end());
     return r >= Top ? std::nullopt : std::optional<uint64_t>(r);
 }
 
@@ -2718,12 +2727,12 @@ static Value *zludaApproxAsPlain(ConstrainedFPIntrinsic *C)
 // round(x), half away from zero, for every x: rounding toward zero never carries x + 0.5 past the next integer,
 // from 2^23 on x is an integer the addition gives back, and zeros, flushed denormals, infinities and NaN agree
 // (AGXStrictFP.cpp's lowerRoundf); or x + 0.5 where x is not below zero. m is the mode reaching C; null when C is not that.
-static Value *zludaAirRoundf(ConstrainedFPIntrinsic *C, Value *m)
+static Value *zludaAirRoundf(ConstrainedFPIntrinsic *C, Value *m, ZludaModeFields &Solved)
 {
     if (C->getIntrinsicID() != Intrinsic::experimental_constrained_fadd || !C->getType()->isFloatTy() ||
         C->use_empty())
         return nullptr;
-    auto rounding = zludaModeField(m, 3);
+    auto rounding = zludaModeField(m, 3, Solved);
     if (!rounding || *rounding != 0)
         return nullptr;
     for (User *U : C->users())
@@ -2925,13 +2934,14 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
                         again = true;
                     }
         }
+        ZludaModeFields solved;
         // Strict f32 emulation must not leave a function-wide FTZ attribute overriding an
         // instruction that restores IEEE mode. Keep all-FTZ functions on their existing fast path.
         if (strict && (initialMode & 0x10)) {
             bool needsIEEE = llvm::any_of(ops, [&](ConstrainedFPIntrinsic *C) {
                 if (!C->getType()->getScalarType()->isFloatTy())
                     return false;
-                auto bit = zludaModeField(at[C]->getOperand(0), 0x10);
+                auto bit = zludaModeField(at[C]->getOperand(0), 0x10, solved);
                 return !bit || !*bit;
             });
             if (needsIEEE) {
@@ -2948,7 +2958,7 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
             // CUDA's roundf, trunc(x + copysign(0.5, x)) with the addition rounded toward zero (add.rz, then
             // cvt.rzi): round(x), which AIR and AGX have, instead of the directed addition's software emulation and
             // flushes (as AGXLowerFPEnv's lowerRoundf on the Agx target, which those flushes hide from it)
-            if (Value *r = zludaAirRoundf(C, m))
+            if (Value *r = zludaAirRoundf(C, m, solved))
             {
                 C->replaceAllUsesWith(r);
                 C->eraseFromParent();
@@ -2969,7 +2979,7 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
                 uint64_t bit = half ? 0x20 : 0x10;
                 unsigned width = half ? 16 : 32;
                 uint64_t expMask = half ? 0x7c00 : 0x7f800000, signMask = half ? 0x8000 : 0x80000000;
-                auto flushBit = zludaModeField(m, bit);
+                auto flushBit = zludaModeField(m, bit, solved);
                 // (the front end writes .ftz as the function's denormal mode, preserve-sign)
                 if (F.getDenormalMode(half ? APFloat::IEEEhalf() : APFloat::IEEEsingle()).Output !=
                     DenormalMode::IEEE)
@@ -2981,7 +2991,7 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
                 // (In strict mode too where the function flushes f32 denormals, .ftz: the IEEE f32 emulation
                 // leaves such functions to the hardware, AIREmulateF64's ieeeF32. Flushed always, Cycles' strict
                 // functions were too large for O3 to inline: 1629 calls in shade_light_nee instead of 156.)
-                auto rounding = zludaModeField(m, 3);
+                auto rounding = zludaModeField(m, 3, solved);
                 bool flushingFn = F.getDenormalMode(APFloat::IEEEsingle()).Output != DenormalMode::IEEE;
                 bool hardware = !half && (!strict || flushingFn) && rounding && (*rounding & 3) == 1;
                 if (!hardware && (!flushBit || *flushBit))
@@ -3018,7 +3028,7 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
             auto withRounding = [&](CallInst *CI, unsigned r) {
                 CI->setArgOperand(idx, MetadataAsValue::get(Ctx, MDString::get(Ctx, names[r])));
             };
-            if (auto bits = zludaModeField(m, 3ull << shift))
+            if (auto bits = zludaModeField(m, 3ull << shift, solved))
             {
                 unsigned r = (*bits >> shift) & 3;
                 // the approximations (sin.approx, ...) rounding to nearest as the plain intrinsic, keeping afn: the

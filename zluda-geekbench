@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Runs Geekbench's GPU benchmark through ZLUDA on its CUDA fallback: from a temporary copy without the bundled
+# libtensorrt_rtx.so, whose engines ZLUDA cannot load. The Geekbench folder is not changed.
+# Offline unless --upload is given: Geekbench prints a score only after uploading it to the public Geekbench Browser.
+set -euo pipefail
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+upload=0
+if [[ ${1:-} == --upload ]]; then
+    upload=1
+    shift
+fi
+if [[ $# != 1 ]]; then
+    echo "Usage: $0 [--upload] GEEKBENCH_DIR" >&2
+    exit 2
+fi
+copy="$(mktemp -d)"
+trap 'rm -rf -- "$copy"' EXIT
+for file in geekbench7 geekbench_aarch64 geekbench.plxr geekbench-workload.plxr; do
+    cp -a -- "$1/$file" "$copy/"
+done
+cd "$copy"
+if [[ $upload == 1 ]]; then
+    "$root/zluda-run" ./geekbench7 --gpu CUDA
+else
+    "$root/zluda-run" unshare -rn ./geekbench7 --gpu CUDA
+fi

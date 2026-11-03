@@ -33,8 +33,7 @@ enum { TEX_MAGIC = 0x54585854, SAMPLER_MAGIC = 0x5343504d, SURF_MAGIC = 0x535454
 // texture: 1 base, 2 type code, 3 channels, 4 filter, 5 address mode,
 // 6 normalized, 7 read-normalized, 8 layers, 9..11 dims, 12 levels,
 // 13 flags (bit 0 depth, bit 1 cube, bits 8-15 samples of a multi-sample texture), 14 row pitch (0: dense; not in the model), 15 mip filter,
-// 16 hardware descriptors (zluda_agx texture.rs: bit 63 present, 62 integer results, 61 2D, 60 a point sampler for the
-// texels of linear filtering, 32..47 texture_sample's
+// 16 hardware descriptors (zluda_agx texture.rs: bit 63 present, 62 integer results, 61 2D, 32..47 texture_sample's
 // sampler index (heap index + 28), 0..31 texture heap offset; not in the model)
 // sampler: 1 filter, 2 address mode, 3 normalized, 4 mip filter, 5 min lod,
 // 6 max lod (1/256 units, signed)
@@ -680,40 +679,6 @@ static inline v4u32 exact_unorm_sample(desc_t t, struct sampling *sm, int rank, 
 // hardware descriptors.
 v4u32 __zluda_ptx_impl_agx_tex_unit(uint64_t native, float x, float y);
 
-// Linear filtering as sample_f32 does it (the model's 1/256 weights and index arithmetic), with the texels from the texture
-// unit: point sampled at their centres, which gives the same values (see zluda_agx texture.rs), in one instruction
-// instead of a load and a decoding of the format for every channel.
-static inline rgbaf unit_texel(uint64_t native, int64_t i, int64_t j, float n0, float n1, int norm) {
-    if (i < 0 || j < 0)
-        return (rgbaf){0, 0, 0, 0};
-    float cx = (float)i + 0.5f, cy = (float)j + 0.5f;
-    v4u32 v = __zluda_ptx_impl_agx_tex_unit(native, norm == 1 ? cx / n0 : cx, norm == 1 ? cy / n1 : cy);
-    union {
-        v4u32 u;
-        rgbaf f;
-    } r = {v};
-    return r.f;
-}
-
-static inline rgbaf unit_linear(desc_t t, uint64_t native, int addr, int norm, float x, float y, int rank) {
-    int64_t n0 = lv_dim(t, 0, 0), n1 = lv_dim(t, 0, 1);
-    float xb = pos_f32(x, n0, norm, -0.5f), yb = rank >= 2 ? pos_f32(y, n1, norm, -0.5f) : 0.0f;
-    float fx = __builtin_floorf(xb), fy = __builtin_floorf(yb);
-    int64_t i0 = ad_idx(addr, (int64_t)fx, n0), i1 = ad_idx(addr, (int64_t)fx + 1, n0);
-    int64_t j0 = rank >= 2 ? ad_idx(addr, (int64_t)fy, n1) : 0;
-    int64_t j1 = rank >= 2 ? ad_idx(addr, (int64_t)fy + 1, n1) : 0;
-    float wx = __builtin_floorf((xb - fx) * 256.0f + 0.5f) * (1.0f / 256.0f);
-    float wy = rank >= 2 ? __builtin_floorf((yb - fy) * 256.0f + 0.5f) * (1.0f / 256.0f) : 0.0f;
-    float m0 = (float)n0, m1 = (float)n1;
-    rgbaf acc = (1.0f - wx) * (1.0f - wy) * unit_texel(native, i0, j0, m0, m1, norm);
-    acc += wx * (1.0f - wy) * unit_texel(native, i1, j0, m0, m1, norm);
-    if (rank >= 2) {
-        acc += (1.0f - wx) * wy * unit_texel(native, i0, j1, m0, m1, norm);
-        acc += wx * wy * unit_texel(native, i1, j1, m0, m1, norm);
-    }
-    return acc;
-}
-
 // A texture the unit cannot sample (only those reach this from tex.1d / tex.2d): once, not at every tex. The format is
 // decoded per channel, which is a lot of code to repeat where it is rarely run.
 __attribute__((noinline)) rgbaf sample_f32_outlined(desc_t t, int filter, int addr, int norm, float x, float y, int rank) {
@@ -731,15 +696,8 @@ API v4u32 __zluda_ptx_impl_agx_tex(desc_t t, desc_t s, int geom, int lod_mode, i
     if (unit) {
         uint64_t native = tw(t, 16);
         if ((native >> 63) && (int)((native >> 62) & 1) == (dtype != 0) &&
-            (int)((native >> 61) & 1) == (geom == G_2D)) {
-            if (!((native >> 60) & 1))
-                return __zluda_ptx_impl_agx_tex_unit(native, bits_to_float(c0), bits_to_float(c1));
-            // a point sampler, for texels of linear filtering
-            struct sampling sm = sampling_of(t, s);
-            rgbaf r = unit_linear(t, native, sm.addr, sm.norm, bits_to_float(c0), bits_to_float(c1), geom == G_2D ? 2 : 1);
-            v4u32 out = {float_bits(r[0]), float_bits(r[1]), float_bits(r[2]), float_bits(r[3])};
-            return out;
-        }
+            (int)((native >> 61) & 1) == (geom == G_2D))
+            return __zluda_ptx_impl_agx_tex_unit(native, bits_to_float(c0), bits_to_float(c1));
         if (dtype == 0) {
             struct sampling sm = sampling_of(t, s);
             union {

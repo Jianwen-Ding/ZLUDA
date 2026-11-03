@@ -1,6 +1,6 @@
 //! `agx_texture_check OUT [options]`: samples a random texture at 2^20 coordinates, some far outside the texture,
 //! through the CUDA driver API of zluda_agx, and writes the results to OUT (and the coordinates and texels to
-//! OUT.coords / OUT.texels). Run it once with ZLUDA_AGX_HARDWARE_TEXTURES=1 (the texture unit, for the forms that get
+//! OUT.coords / OUT.texels). Run it once by default (the texture unit, for the forms that get
 //! hardware descriptors) and once without (the software sampler) and compare the files (agx_texture_compare.py).
 //!
 //! Options (the default: a 1024 x 512 RGBA8 array, normalized coordinates, wrap, linear filtering asked for, read as

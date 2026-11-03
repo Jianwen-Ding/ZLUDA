@@ -635,16 +635,16 @@ software sampler; `ptx/tools/agx_texture_sweep.sh` compares the two (M2 Max, 202
   floats), f16 and f32; 1, 2 and 4 channels; wrap, clamp, mirror and border; normalized and unnormalized
   coordinates; 1D, 2D and pitch-linear. Point-sampled textures (and textures read as integers, which are point
   sampled) therefore use the texture unit by default.
-- **Linear filtering differs** from CUDA's weights (9-bit fixed point, 8 fractional bits, CUDA Programming Guide,
-  "Linear Filtering"): with unnormalized coordinates within about 8e-6 for f32 and u16 texels and 1.2e-4 for 8-bit
-  ones; with normalized coordinates up to 0.1-0.3% of the texel range, at any texture size; f16 results are rounded
-  to half precision. So by default a linearly filtered texture keeps the model's weights and index arithmetic in software
-  and takes its texels from the unit's point sampling, at their centres: bit-identical to the software sampler in 11 forms
-  checked on the GPU (`agx_texture_check`, 2^22 values each: u8, u16, f16 and f32, 1 and 4 channels, wrap, clamp, mirror,
-  border, normalized or not), and on Blender Open Data 2-12% faster. `ZLUDA_AGX_HARDWARE_TEXTURES=1` uses the unit's own
-  filtering, a further 2-5% at the cost above.
+- **Linear filtering differs** from the model's weights (9-bit fixed point, 8 fractional bits, CUDA Programming Guide,
+  "Linear Filtering"). Default mode uses the unit's filtering for its speed; the model's exact filtering is strict
+  mode's (`ZLUDA_ROUNDING_STRICT=1`, `--strict-fp`), whose kernels do not use the unit (bit-identical with
+  `ZLUDA_AGX_SOFTWARE_TEXTURES` on the GPU). Largest absolute difference from strict mode, 2^22 values, far-out coordinates
+  included: 8-bit 1.2e-4, u16 7.8e-6, f32 3.8e-6, and f16 16 where results are large, as the unit rounds them to half
+  precision. The f32 software sampler, which only textures the unit cannot sample reach now, is closer in range (8-bit
+  clamp 1.2e-7, f16 unnormalized 0.008) and further at far-out coordinates (8-bit wrap 3.2e-3, u16 3.1e-3, f32 0.118, f16
+  64), where single precision positions can move a weight by a whole 1/256.
 
-`ZLUDA_AGX_SOFTWARE_TEXTURES` keeps every texture in software.
+`ZLUDA_AGX_SOFTWARE_TEXTURES` keeps every texture in software outside strict mode too.
 
 Textures read as integers (`CU_TRSF_READ_AS_INTEGER` on 8- and 16-bit formats, and 32-bit integer formats) are point
 sampled even when linear filtering is asked for: CUDA documents linear filtering only for textures that return

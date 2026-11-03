@@ -105,8 +105,8 @@ differences small, signed error about 0).
 
 ## Compile memory, the result (2026-11-03, Blender Cycles' stock kernel)
 
-6.53 GB 44 s, object 44 MB -> 1.86 GB 31 s, object 19 MB, 106 s of CPU, with GPU time improving, not traded. In order of
-effect: the software texture fallback out of line (`sample_f32_outlined`, 3.65 -> 1.86 GB: it was inlined at every tex,
+6.53 GB 44 s, object 44 MB -> 1.16 GB 23 s, object 9.5 MB, 51 s of CPU, with GPU time improving, not traded. In order of
+effect: the software texture fallback out of line (`sample_f32_outlined`, 3.65 -> 1.86 GB, then 1.16 GB with the unit filtering: it was inlined at every tex,
 and only textures the unit cannot sample reach it now), no 64-bit remainders in the sampler (4.96 -> 3.65), jobs on the
 fast cores only (5.92 -> 4.96), lazy bitcode (6.53 -> 5.92). The cost was the code expanded per tex, not LLVM. An
 out-pointer cannot be passed across a real call ("Cannot select: FrameIndex"): the fallback returns its four floats.
@@ -124,20 +124,22 @@ Baseline with instances fixed: junkshop 193, classroom 146, monster 245. Same im
   flush. -> 204, 161, 261. **The existing LLVMZludaAirDropMinMaxFixups had silently stopped working**: it ran before the
   fix-ups took the form it matches (light+ replaced O3 as the first pipeline) and matched llvm.fabs, not air.fabs. A pass
   that returns a count should have that count checked by a test.
-- **Linear filtering with texels from the texture unit** (`NATIVE_TEXELS`), the model's weights kept in software: decoding
-  each channel's format at run time was the cost. -> 228, 176, 266, images unchanged (classroom at 1024 samples: the same
-  difference from the CPU, 0.1665). The unit's own filtering gives 238, 184, 272 but moves that to 0.2277: opt-in only.
+- **Linear filtering on the texture unit in default mode, exact filtering in strict mode** (the user's decision). Decoding each
+  channel's format at run time was the cost. Tried first, then removed: the unit's point samples with software weights
+  (228, 176, 266; bit-identical to the f32 software sampler, 11 forms). With the unit's filtering 246, 204, 286, and
+  compile 1.16 GB, 9.5 MB. **"Hardware differs up to 0.3%" in older notes compared it with the f32 software sampler, not the
+  model**: against strict mode the unit is within 1.2e-4, and the f32 sampler's far-out positions are what was 0.3% off.
+  Compare with the reference, not the nearest other implementation. See docs/src/agx.md for the numbers per format.
 - **A 64-bit remainder per axis per texel** in the sampler's mod_pos: no speed change, as wrapping is rare at run time, but
   compile 4.96 -> 3.65 GB. Static size and dynamic cost are separate questions: check both.
-- **Result**: junkshop 193 -> 229, classroom 146 -> 176, monster 245 -> 268-271 samples per minute (+19%, +21%, +10%), the
-  images as before. llama.cpp pp128 435, tg64 131 t/s, 4/4 completions as on the CPU. Geekbench, alternating the compiler
-  from before these changes with this one on the same day: 26.98, 26.12 s -> 25.60, 25.75 s of GPU time. Older sessions'
-  24.8-25.3 s are not comparable: compare on the same day.
-- **Stack per thread, a memory result**: kernels with calls reserved all 32 KB addressable, as called functions' frames are
-  unknown when a kernel is compiled. Cycles' fit in 12 KB. The scratch buffer scales with it and is real memory whether
-  touched or not: system memory at peak of a junkshop render 21.9 -> 15.2 GB, process RSS unchanged at 7.9 (so RSS does not
-  show it). Throughput the same, so stack spacing was not a cost. The driver tries 12 KB and falls back to all of it when
-  the backend refuses (ZLUDA_AGX_STACK_TRY; forced at 2048 bytes: the fallback ran, 51 s, same image).
+- **Called functions keep the top 48 registers** (llvm-project, -agx-callee-saved): no register survived a call, so everything
+  live across one went to memory. 0 / 16 / 48 / 64 / 80: classroom 176 / 191 / 197 / 196 / 193, and 15% less compile CPU.
+  The first try faulted on the GPU (Bad address, 8 recorded in gpu_safety): a kernel's register count came from its
+  register masks, which no longer showed what its callees use. A kernel with calls now declares 128.
+- **Result**: junkshop 193 -> 247, classroom 146 -> 204, monster 245 -> 290 samples per minute (+28%, +40%, +18%). Strict mode:
+  junkshop 179, classroom 148. Compile 1.16 GB, 23 s, object 9.5 MB. llama.cpp pp128 425-441, tg64 125-135 t/s across runs,
+  4/4 completions as on the CPU. Geekbench, alternating the compiler from before these changes with this one on the same
+  day: 26.98, 26.12 s -> 25.60, 25.75 s of GPU time (later runs 25.6-26.8). Older sessions' 24.8-25.3 s are not comparable.
 - **Refuted, register cap (-agx-default-max-gprs)**: occupancy is not the limit. 128: 194, 96: 161, 72: 131, 56: 96.
 - **Refuted, more inlining**: -inline-threshold 500 and 2000 are within noise and cost compile time. -air-keep-function-cost
   does not change AGX code at all (17.9129 MB at 5000, 80000, 320000): what O3 leaves uninlined stays a real call.

@@ -100,6 +100,23 @@ Classroom GPU against CPU by samples, at the same seed: 16 mean 0.34 / max 139, 
 chair edges remains in the 4096 map, cause unknown. Junkshop and monster were compared at 16 samples only (mean
 differences small, signed error about 0).
 
+## GPU time of Blender Cycles, what moved it (2026-11-03, stock PTX, samples per minute)
+
+Baseline with instances fixed: junkshop 193, classroom 146, monster 245. Same images and PTX suite at each step.
+
+- **Call registers no longer reserved**: r2..r36 were out of register allocation in all code with calls. Calls and returns
+  now use their argument and result registers explicitly (glued copies, implicit uses), and a function keeps only the
+  links of its depth and shallower. 193 -> 198, 146 -> 151, 242 -> 246, repeated twice. The pop after a call was marked
+  isBarrier, which it is not: invisible until a result stayed in its register and the pop ended a block.
+- **Min / max read only by compares**: the slab test's took four instructions each (fcmpsel, or, fcmpsel eq, fmul by 1.0
+  to flush), about 36 extra per BVH node. A compare cannot tell -0 from +0 or see a NaN's payload, and the GPU's compares
+  flush. -> 204, 161, 261. **The existing LLVMZludaAirDropMinMaxFixups had silently stopped working**: it ran before the
+  fix-ups took the form it matches (light+ replaced O3 as the first pipeline) and matched llvm.fabs, not air.fabs. A pass
+  that returns a count should have that count checked by a test.
+- **Refuted, register cap (-agx-default-max-gprs)**: occupancy is not the limit. 128: 194, 96: 161, 72: 131, 56: 96.
+- **Refuted, launch overhead**: launch batching changes nothing (197.9 vs 197.4). 18.8 s GPU in about 19.7 s of launches:
+  this is GPU-bound. An earlier "19% not GPU" was wrong, its span included 3.5 s of scene setup.
+
 ## Compile memory: what it is (2026-11-03, stock PTX, per kernel with real calls)
 
 Of 36.4 MB of AGX code, 34 MB is 14 functions of about 2.4 MB each: Cycles' shader interpreter with its cases inlined, one

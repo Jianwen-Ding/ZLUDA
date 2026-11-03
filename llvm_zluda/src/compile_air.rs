@@ -221,8 +221,8 @@ pub fn compile_air(
     }
     // PTX's rounding modifiers as the static rounding of each operation (AIR has no mode register)
     unsafe { LLVMZludaAirDropCompareFlushes(linked.get()) };
-    // and the fix-ups of float min / max that only other min / max read
-    unsafe { LLVMZludaAirDropMinMaxFixups(linked.get()) };
+    // and the fix-ups of float min / max that only other min / max or compares read
+    unsafe { LLVMZludaAirDropMinMaxFixups(linked.get(), !strict_fp as i32) };
     unsafe { LLVMZludaAirStaticRounding(linked.get(), strict_fp as i32) };
     // the AIR primitives internal once nothing creates new calls of them, so that the unused ones go
     let mut f = unsafe { llvm_sys::core::LLVMGetFirstFunction(linked.get()) };
@@ -284,6 +284,10 @@ pub fn compile_air(
         }
         _ => {
             run(&linked, c"default<O3>", &air, &options)?;
+            // the fix-ups again, in the form this optimization leaves them (light+ above leaves most in another)
+            if unsafe { LLVMZludaAirDropMinMaxFixups(linked.get(), !strict_fp as i32) } > 0 {
+                run(&linked, c"function(instcombine<no-verify-fixpoint>,simplifycfg)", &air, &options)?;
+            }
             stage("O3 in AIR's address spaces");
         }
     }

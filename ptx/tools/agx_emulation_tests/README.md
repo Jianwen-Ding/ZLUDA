@@ -14,7 +14,8 @@ PTX-formalization test format (`.buffer` / `.launch` / `.expect`), with expected
 
 `gen_all.sh DIR` writes the larger generated sets (several MB): f64 add / sub / mul, fma and div / sqrt (random,
 edge, denormal, overflow and cancellation operands; with `ZEROS=1` 40% zeros), float fma rounded toward zero / up
-/ down, the f64 conversions to and from f32 and 32- / 64-bit integers, and 2048 64-bit div / rem pairs.
+/ down, the f64 conversions to and from f32 and 32- / 64-bit integers, rounding to integral values (cvt.rmi / rpi / rzi / rni),
+and 2048 64-bit div / rem pairs.
 
     ptx/tools/agx_emulation_tests/gen_all.sh /tmp/emu
     python3 ptx/tools/agx_ptx_formalization_check.py --zoc target/debug/zoc --agx-run .../agx_run --target air \

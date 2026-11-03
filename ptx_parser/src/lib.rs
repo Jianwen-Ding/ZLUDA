@@ -5474,6 +5474,9 @@ fn shared_space(space: Option<StateSpace>) -> StateSpace {
         Some(StateSpace::Shared | StateSpace::SharedCta | StateSpace::SharedCluster) => {
             StateSpace::Shared
         }
+        // .param::func and .param::entry (upstream LLVM's NVPTX backend writes them) name the same parameters as
+        // .param: the function they are in says which
+        Some(StateSpace::ParamFunc | StateSpace::ParamEntry) => StateSpace::Param,
         Some(space) => space,
         None => StateSpace::Generic,
     }

@@ -41,6 +41,167 @@ section. GPU times are from the M2 Max behind the AIR service; "suite" is PTX-fo
   is now the slow part. Not over-inlining: shade_surface_mnee packaged alone keeps 162 functions, and
   `-air-keep-function-cost` 20000 / 5000 / 2000 left it byte-identical (its large functions are kept already).
 
+## What went wrong, 2026-11-03 (Blender Cycles session): read before repeating it
+
+Policy, from the user: running nvcc-generated PTX through ZLUDA is fine; decompiling or reverse engineering it, or
+disassembling cubins, is not. A regular Blender must work against the driver, with no application-specific code in
+ZLUDA or LLVM.
+
+Mistakes in how the work was done:
+
+- **Replaced Blender's kernel out of an over-strict reading of the EULA note.** Stock PTX was set aside for a kernel
+  built with clang, which cost most of an hour and changed the benchmark's input. Ask, or check the policy above,
+  before changing what is being measured. The clang build still exists (ptx/tools/cycles_clang, /scratch/cycles-clang)
+  but is not the benchmark.
+- **Reported a comparison that had not run.** This container has no `diff`, and `diff -rq ... 2>/dev/null | grep -v`
+  printed nothing, which read as "identical". Never send a checking tool's stderr to /dev/null. Use
+  `git diff --no-index` or Python's filecmp. (Redone with filecmp: Blender 5.1's bundled kernel/ and util/ are
+  identical to Cycles tag v5.1.0, apart from one extra OptiX file.) Also missing here: `which`, `/usr/bin/time`
+  (a pipeline ending in grep then shows nothing at all), numpy outside Blender's Python, gdb, lldb.
+- **Hid files in the Blender install to work around a driver problem.** Moving the cubins to lib-hidden-cubins hid
+  the bug for weeks: a stock install failed. Fixed in the driver: it reports compute capability 8.0, which Blender ships
+  no cubin for. **First try, 8.7 (no GPU has it), broke llama.cpp**: cublasCreate fails on an unknown architecture, found
+  only by running the other benchmarks. Run llama.cpp and Geekbench too before calling a driver change done.
+- **Theorized about the instanced-mesh BVH leaves from reading the source**, with no new evidence. Reading bvh2.cpp,
+  build.cpp and geometry_bvh.cpp finds no path to (2, 4, 0, 0): the source is right. The answer was in the compiled
+  host (below).
+- **Three wrong guesses at compile memory, each stated before it was measured**: (1) every job parsing the whole
+  module: lazy bitcode loading gave only 6.53 -> 5.92 GB; (2) allocator arenas keeping freed memory:
+  MALLOC_ARENA_MAX=1 gave 5.89 GB at twice the CPU; (3) the same called functions compiled in every kernel:
+  whole-module compilation with a module-wide frame layout (AGXFrameLowering, reverted) took 188 s at 1.48 GB, no
+  better than ZLUDA_AGX_JOBS=1 (188 s, 1.26 GB), and the object was still 37 MB. The old "1338 copies, 5.3 MB unique"
+  figure no longer describes this build. Look at symbol sizes first.
+- **A wrong suspicion, the seed**: Cycles' seed seemed to do nothing (at most 1-2/255 at 16 samples, CPU and GPU), and this was
+  put down to the host. The classroom file forces it: set to 12345 it reads back as 1 after the render (the log line that
+  said otherwise printed before that), while the default cube responds normally (max 69). Read a setting back after the
+  render before trusting it. No drivers or render handlers: the value holds through a view layer update and reverts only in
+  the render, and the scene has an action (SceneAction), so almost certainly keyframed; the keyframe itself was not listed.
+
+## Instanced geometry missing: a miscompiled host, not ZLUDA (2026-11-03)
+
+The aarch64 Blender 5.1.0 build (ae6d847d66fa, .comment names GCC 14.2.1) miscompiles `BVH2::pack_instances`:
+
+    41e2168: ldr q30, [x0], #16             // int4 data = leaf_nodes_offset[i]
+    41e216c: add v30.2s, v31.2s, v30.2s     // data.x += prim_offset; data.y += prim_offset
+    41e2170: str q30, [x1], #16
+
+A .2s operation clears the upper half of the register, so every instanced mesh's leaf loses its visibility and primitive
+type: the (2, 4, 0, 0) above, skipped by the traversal. Cycles' source is correct. Top-level leaves do not pass through
+this loop, which is why only instances disappeared. GCC 15.2 compiles a small replica correctly (ldp d30, d29), and it
+was not reproduced with a compiler here, so it is not established as a GCC bug. A scan of the whole .text finds this
+one instance of the pattern.
+
+Nothing belongs in ZLUDA or LLVM for this. Workaround: /scratch/.../blender-instfix, the same binary with bit 30 set in
+the word at 0x41e216c (file offset 0x3de216c, 0x0ebe87fe -> 0x4ebe87fe, add .4s; v31's upper half is already 0). The
+original binary is kept and the bench scripts use the copy. A rebuild with a fixed compiler is the real fix.
+**Every Blender score from before this is for scenes with geometry missing.** Against the CPU (16 samples, 25%):
+linked and collection instances now max 0; classroom mean 19.3 -> 0.34. Open Data, samples per minute (stock PTX):
+monster 245 (was 466), junkshop 193 (160), classroom 146 (133).
+
+Classroom GPU against CPU by samples, at the same seed: 16 mean 0.34 / max 139, 128 0.28 / 54, 1024 0.17 / 13, 4096
+0.098 / 4, signed error about 0 throughout: no measured bias. ZLUDA_ROUNDING_STRICT=1 does not reduce the difference
+(0.3455; 0.1712 against 0.1665 at 1024), and the CPU on BVH2 against Embree is 0.0004, so it is neither rounding nor BVH
+layout. The faint trace along chair edges in the 4096 map is noise: the signed error averaged over blocks of 1, 4, 8, 16
+and 32 pixels has rms 0.28, 0.071, 0.036, 0.017, 0.009, halving as uncorrelated noise does (blockdiff.py), a tenth of
+the image's own sampling noise (1024 against 4096 samples: rms 3.0014 on the GPU, 3.0006 on the CPU). Junkshop and monster were compared at 16 samples only (mean
+differences small, signed error about 0).
+
+## Compile memory, the result (2026-11-03, Blender Cycles' stock kernel)
+
+6.53 GB 44 s, object 44 MB -> 1.16 GB 23 s, object 9.5 MB, 51 s of CPU, with GPU time improving, not traded. In order of
+effect: the software texture fallback out of line (`sample_f32_outlined`, 3.65 -> 1.86 GB, then 1.16 GB with the unit filtering: it was inlined at every tex,
+and only textures the unit cannot sample reach it now), no 64-bit remainders in the sampler (4.96 -> 3.65), jobs on the
+fast cores only (5.92 -> 4.96), lazy bitcode (6.53 -> 5.92). The cost was the code expanded per tex, not LLVM. An
+out-pointer cannot be passed across a real call ("Cannot select: FrameIndex"): the fallback returns its four floats.
+
+## GPU time of Blender Cycles, what moved it (2026-11-03, stock PTX, samples per minute)
+
+Baseline with instances fixed: junkshop 193, classroom 146, monster 245. Same images and PTX suite at each step.
+
+- **Call registers no longer reserved**: r2..r36 were out of register allocation in all code with calls. Calls and returns
+  now use their argument and result registers explicitly (glued copies, implicit uses), and a function keeps only the
+  links of its depth and shallower. 193 -> 198, 146 -> 151, 242 -> 246, repeated twice. The pop after a call was marked
+  isBarrier, which it is not: invisible until a result stayed in its register and the pop ended a block.
+- **Min / max read only by compares**: the slab test's took four instructions each (fcmpsel, or, fcmpsel eq, fmul by 1.0
+  to flush), about 36 extra per BVH node. A compare cannot tell -0 from +0 or see a NaN's payload, and the GPU's compares
+  flush. -> 204, 161, 261. **The existing LLVMZludaAirDropMinMaxFixups had silently stopped working**: it ran before the
+  fix-ups took the form it matches (light+ replaced O3 as the first pipeline) and matched llvm.fabs, not air.fabs. A pass
+  that returns a count should have that count checked by a test.
+- **Linear filtering on the texture unit in default mode, exact filtering in strict mode** (the user's decision). Decoding each
+  channel's format at run time was the cost. Tried first, then removed: the unit's point samples with software weights
+  (228, 176, 266; bit-identical to the f32 software sampler, 11 forms). With the unit's filtering 246, 204, 286, and
+  compile 1.16 GB, 9.5 MB. **"Hardware differs up to 0.3%" in older notes compared it with the f32 software sampler, not the
+  model**: against strict mode the unit is within 1.2e-4, and the f32 sampler's far-out positions are what was 0.3% off.
+  Compare with the reference, not the nearest other implementation. See docs/src/agx.md for the numbers per format.
+- **A 64-bit remainder per axis per texel** in the sampler's mod_pos: no speed change, as wrapping is rare at run time, but
+  compile 4.96 -> 3.65 GB. Static size and dynamic cost are separate questions: check both.
+- **Called functions keep the top 48 registers** (llvm-project, -agx-callee-saved): no register survived a call, so everything
+  live across one went to memory. 0 / 16 / 48 / 64 / 80: classroom 176 / 191 / 197 / 196 / 193, and 15% less compile CPU.
+  The first try faulted on the GPU (Bad address, 8 recorded in gpu_safety): a kernel's register count came from its
+  register masks, which no longer showed what its callees use. A kernel with calls now declares 128.
+- **Result**: junkshop 193 -> 247, classroom 146 -> 204, monster 245 -> 290 samples per minute (+28%, +40%, +18%). Strict mode:
+  junkshop 179, classroom 148. Compile 1.16 GB, 23 s, object 9.5 MB. llama.cpp pp128 425-441, tg64 125-135 t/s across runs,
+  4/4 completions as on the CPU. Geekbench, alternating the compiler from before these changes with this one on the same
+  day: 26.98, 26.12 s -> 25.60, 25.75 s of GPU time (later runs 25.6-26.8). Older sessions' 24.8-25.3 s are not comparable.
+- **WRONG CONCLUSION, later reversed: register cap (-agx-default-max-gprs)**: recorded here as "occupancy is not the limit" from 128: 194, 96: 161, 72: 131, 56: 96. That test was flawed: the call ABI then reserved r1-r36, so a cap of 96 left about 59 usable registers and spills swamped the gain. With only r0, r1 and the links reserved a cap of 80 gives +15-20%: see "Occupancy" below. Lesson: a refuted result is only as good as what else the test changed.
+- **Refuted, more inlining**: -inline-threshold 500 and 2000 are within noise and cost compile time. -air-keep-function-cost
+  does not change AGX code at all (17.9129 MB at 5000, 80000, 320000): what O3 leaves uninlined stays a real call.
+- **Refuted, backend options**: on classroom and junkshop -agx-uniform-constants, -agx-max-unskipped-instrs=2 and 8,
+  -agx-atomic-optimizer, -agx-element-aligned-vectors, -agx-mem-cluster=32 and -agx-launch-divisors are all within about 1%.
+- **Refuted, register allocator options**: -exhaustive-register-search, -enable-local-reassign, -greedy-reverse-local-assignment and
+  -agx-postra-cluster-wait=0 are within 1%; -split-spill-mode=size is 1-2% worse; -enable-misched=false costs 7%, so the
+  machine scheduler earns its time. -consider-local-interval-cost and -disable-spill-hoist gave no result (not looked into).
+- **Refuted, stack spacing**: 12 KB against 32 KB per thread is the same speed (a memory gain, above).
+- **What is left is spread out**: replaying shade_surface (junkshop, 30.8M instructions, agx_run --trace-pcs), the largest
+  part is mov_imm 9%, fmul 9%, stack_load 7%, jmp_exec_none 7%, wait 7%, and no function but the interpreter over 15%.
+- **Refuted, the GPU clock in a render**: a lone launch runs 2.4-3.2x slower than with the GPU kept busy, but a render is not held back by
+  that. A small kernel kept running in another process: classroom 204 -> 198, junkshop 245 -> 238, and back without it. Keeping
+  the clock up from the driver would not help this workload; it may help applications with long gaps between launches.
+- **Refuted, allocator cost of callee-saved registers**: -regalloc-csr-first-time-cost 5, 50 and 500 are within 1%.
+- **Refuted, launch overhead**: launch batching changes nothing (197.9 vs 197.4). 18.8 s GPU in about 19.7 s of launches:
+  this is GPU-bound. An earlier "19% not GPU" was wrong, its span included 3.5 s of scene setup.
+
+## Compile memory: what it is (2026-11-03, stock PTX, per kernel with real calls)
+
+Of 36.4 MB of AGX code, 34 MB is 14 functions of about 2.4 MB each: Cycles' shader interpreter with its cases inlined, one
+per template variant, already inlined in the PTX. Compiling one holds about 0.5 GB, so the peak is simply how many run
+at once. Time (llc, whole module, 131 s): instruction selection 22%, StructurizeCFG 19%, register allocation 16%, of
+which global splitting 11 s. No pass dominates.
+
+Jobs against peak and wall: 1: 1.26 GB 188 s; 2: 1.71 GB 101 s; 4: 2.84 GB 63 s; 6: 3.94 GB 54 s; 8: 4.97 GB 45 s;
+12: 5.89 GB 48 s. Past the 8 performance cores, jobs only hold memory for longer on efficiency cores, so the default is
+now the fastest cores' count: 6.53 GB 44 s -> 4.96 GB 44.8 s, the object byte-identical. For less memory still,
+ZLUDA_AGX_JOBS trades it for time as above. Merging identical functions at IR level is untested: `opt -passes=mergefunc`
+on stock.opt.ll did not finish in 280 s.
+
+Also a dead end: llc cannot read stock.portable.air ("Invalid call record"), and -time-passes through
+ZLUDA_AGX_LLVM_ARGS prints nothing. Profile with llc on zoc's stock.opt.ll (run zoc without --object-only).
+
+Dead ends and traps:
+
+- **Standalone Cycles host: not buildable here.** Its required OpenImageIO, OpenEXR, Imath, pugixml and TBB headers
+  are absent, and Blender's lib/ has only the .so files. No network to fetch them: https to github.com,
+  projects.blender.org, pypi.org and Fedora mirrors fails, ssh.github.com:443 is refused, sudo needs a password.
+  `dnf repoquery` still answers, from its cache, and `dnf download` then fails, so a repoquery result does not mean
+  packages can be had. Sources arrive only when the user puts them in /scratch.
+- **`pgrep -f NAME` and `pkill -f NAME` match their own shell's command line**: a wait loop never ended (a finished test
+  suite sat waited on for several minutes), and pkill killed the command running it. Use -x, or wait on the output.
+- **Pushing was refused all session** (all four keys). /scratch/save-repos.sh after each commit, and retry.
+- **A commit needs an identity**: none is configured. Use GIT_AUTHOR_* / GIT_COMMITTER_* for one command, not git config.
+- **Copying ext/HiGHS from /scratch/ZLUDA brings its .git file**, which breaks `git status` ("not a git repository:
+  ext/HiGHS/../../.git/modules/ext/HiGHS"). Delete that file. The .bc files in a fresh checkout are LFS pointers: copy
+  them from /scratch/air-pipeline/lfs and mark them skip-worktree.
+- **A fix can exist only in the build tree.** /scratch/llvm-agx-main had the stack pseudo source value fix that
+  llvm-project lacked. Compare the two trees before relying on either.
+- **Building Cycles' kernel with clang, what failed first**: __clang_cuda_intrinsics.h needs CUDA's own definitions;
+  system headers break it (-nostdlibinc, with empty stubs); `restrict` is not C++ (__restrict); ballot needs
+  `-Xclang -target-feature -Xclang +ptx87`; `sat.f32` is not a PTX instruction; ZLUDA's parser takes
+  `tex.2d... {r,g,b,a}, [t, {x, y}]` only. The prelude's math is our own approximations, so a difference from the CPU
+  render may come from it.
+- **Unfinished: compile memory of the clang-built kernel.** The AGX stage reached 8.3 GB on one remaining kernel, with
+  the other threads done, when it was stopped (55 of 75 timed in the second run, which was also stopped; which kernel
+  is not known). The stock PTX compiles in 53 s. Do not compare clang-kernel numbers with stock ones.
+
 ## Real calls in the AGX backend (`-agx-experimental-leaf-calls`), 2026-10-30
 
 The way out of Cycles' AGX memory: shade_shadow with its large helpers kept as called functions compiles in 14 s at
@@ -415,3 +576,66 @@ Blender Open Data strict: junkshop 97 -> 153 (default 160), classroom 82 -> 128 
 samples/min. The opt-in ZLUDA_ROUNDING_STRICT_TEXTURES=f32 is no longer needed for speed on these scenes.
 Regenerating the texture block needs a clang: /scratch/clang-build (clang and NVPTX built from the tree); splice
 only that block (the other blocks keep clang 18's output) and drop repeated declarations.
+
+## Occupancy (register cap), 2026-11-03
+
+How kernels came to declare 128: the greedy allocator pays nothing for r127 over r40, the backend learned the count only
+afterwards, and a kernel with calls declared everything since a callee may use anything. The per-function limit existed, but
+only PTX that asked for it (.maxnreg) got one.
+
+Samples/min at -agx-default-max-gprs (callee-saved 32, 30 s of Blender Open Data; 0 GPU faults):
+
+| Cap | classroom | junkshop | monster |
+| --- | --- | --- | --- |
+| 128 | 204 | 247 | 290 |
+| 96 | 217 | 276 | 325 |
+| 80 | 233 | 283 | 349 |
+| 72 | 234 | 265 | 355 |
+| 64 | 234 | 264 | 354 |
+| 56 | 226 | 240 | 333 |
+| 48 | 201 | 227 | 293 |
+
+- Callee-saved 16 against 32: within noise at every cap.
+- A kernel must declare the cap (not 128) for this to work: an early try of the cap did nothing because kernels with calls
+  still declared 128 whatever the cap.
+- The callee-saved set must sit under the cap, built at run time; with the old fixed top block it was above it.
+- Frames grow as registers shrink: the 12 KB stack first try fails at cap 80 (sample_f32_outlined), and the driver
+  then compiles twice (warm-up 26 s to 52 s). 16 KB fits.
+- Block size (cuOccupancyMaxPotentialBlockSize capped at 32-192 threads): no gain at 128 registers; 32 was slightly worse.
+
+### Options at cap 80 (2026-11-03, sweep8)
+
+Samples/min, classroom / junkshop / monster, cap 80 and 16 KB stack unless stated, 0 GPU faults. **Power caveat:** an 18 W USB-C
+charger against about 60 W of load, battery draining from 46% to 21%: compare within this table, do not compare it with other
+tables or take it as the final number. Base ran first, and its monster (332) may be low: a monster gain under about 4% may be noise.
+
+| Option | classroom | junkshop | monster | Verdict |
+| --- | --- | --- | --- | --- |
+| base: -agx-callee-saved=32 | 230 | 269 | 332 | |
+| -agx-callee-saved=48 (the default) | 221 | 254 | 323 | worse: 48 leaves almost nothing free under a cap of 80 |
+| -agx-callee-saved=16 | 236 | 278 | 335 | best on classroom, junkshop; values under 16 not tried |
+| ZLUDA_AGX_STACK_TRY=0 (full stack) | 230 | 270 | 331 | no gain over 16 KB |
+| ZLUDA_AGX_MAX_BLOCK=64 | 229 | 273 | 337 | |
+| ZLUDA_AGX_MAX_BLOCK=128 | 232 | 274 | 344 | |
+| ZLUDA_AGX_MAX_BLOCK=192 | 233 | 275 | 345 | best block size |
+| ZLUDA_AGX_MAX_BLOCK=320 | 233 | 276 | 339 | |
+| -agx-sched-target-gprs=48 | 237 | 271 | 352 | a real gain; much less than hoped |
+| -agx-sink-remat | 231 | 272 | 333 | **refuted**, no gain |
+| -agx-callee-saved-stride=8 | 230 | 274 | 346 | unclear: may be noise |
+| -agx-uniform-constants | 230 | 270 | 328 | **refuted** at cap 80, no gain |
+
+The combination has not been run. -agx-declare-tree-gprs has had no render test: every kernel's tree still reaches the cap, so it
+cannot change anything until the worst functions come down. check_tree_gprs.py (/scratch/air-pipeline) checks it offline first.
+
+### What went wrong in these sweeps (for the next agent)
+
+- **sweep6 forgot -agx-callee-saved**, so ran at the default of 48, and made every option look wrong against the earlier sweep.
+  Pin every option you are not testing.
+- **The laptop lost AC at about 17:50 UTC with nobody noticing**, then a weak charger replaced it. sweep6 and sweep7 are invalid
+  (the last 9 runs of sweep7 fell to 75-170 samples/min), and two conclusions drawn from them were withdrawn. run.sh now refuses on
+  battery, but **"AC online" does not mean enough power**: macsmc-ac/online was 1 and status "Charging" while the battery supplied
+  41 W. Read power2_input (AC input) during a run; it was about 56 W with the good charger, 18 W with the weak one.
+  Total system power and AC input: /sys/class/hwmon/hwmon1/power{1,2}_input.
+- **A wrong "refuted" outlived its test**: see the register cap note above. A flag recorded as refuted at 128 registers has not been
+  refuted at 80. Occupancy changes what matters.
+

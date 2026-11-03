@@ -49,8 +49,10 @@ def convert(clang, source, prefix, metadata_base, declared, defined):
         line = line.replace('spir_func ', '')
         # every helper is always inlined (#3 of the hand-written part), so that the constant
         # arguments fold and the local arrays become registers
+        # (except those written `_outlined`: code too large to repeat at each use, rarely run)
         if line.startswith('define '):
-            line = re.sub(r'\)(\s+(?:local_unnamed_addr|unnamed_addr))?\s+#\d+ \{$', r')\1 #3 {', line)
+            attrs = r')\1 noinline {' if '_outlined(' in line else r')\1 #3 {'
+            line = re.sub(r'\)(\s+(?:local_unnamed_addr|unnamed_addr))?\s+#\d+ \{$', attrs, line)
         else:
             line = re.sub(r'\)(\s+(?:local_unnamed_addr|unnamed_addr))?\s+#\d+', r')\1', line)
         line = re.sub(r' #\d+$', '', line)

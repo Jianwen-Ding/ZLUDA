@@ -208,7 +208,26 @@ static inline rgba texel(desc_t t, struct q *q, int64_t i, int64_t j, int64_t k,
 
 static inline int64_t floor_i(double x) { return (int64_t)__builtin_floor(x); }
 
-static inline int64_t mod_pos(int64_t a, int64_t n) { return ((a % n) + n) % n; }
+// a mod n in [0, n), for n > 0. A 64-bit remainder is hundreds of AGX instructions, and this is inlined for every axis of
+// every texel of a filtered sample: in range nothing, a 32-bit remainder when both fit, and only coordinates beyond them
+// (rare, and never in the fast paths) a small exact loop.
+static inline int64_t mod_pos(int64_t a, int64_t n) {
+    if ((uint64_t)a < (uint64_t)n)
+        return a;
+    if (a == (int32_t)a && n == (int32_t)n) {
+        int32_t r = (int32_t)a % (int32_t)n;
+        return r < 0 ? (int64_t)r + n : r;
+    }
+    uint64_t u = a < 0 ? -(uint64_t)a : (uint64_t)a, r = 0;
+#pragma clang loop unroll(disable) vectorize(disable)
+    for (int i = 63; i >= 0; i--) {
+        // r < n <= 2^62: no overflow
+        r = (r << 1) | ((u >> i) & 1);
+        if (r >= (uint64_t)n)
+            r -= (uint64_t)n;
+    }
+    return a < 0 && r ? n - (int64_t)r : (int64_t)r;
+}
 
 // index with the address mode applied (-1: border)
 static inline int64_t ad_idx(int mode, int64_t i, int64_t n) {
@@ -660,6 +679,12 @@ static inline v4u32 exact_unorm_sample(desc_t t, struct sampling *sm, int rank, 
 // hardware descriptors.
 v4u32 __zluda_ptx_impl_agx_tex_unit(uint64_t native, float x, float y);
 
+// A texture the unit cannot sample (only those reach this from tex.1d / tex.2d): once, not at every tex. The format is
+// decoded per channel, which is a lot of code to repeat where it is rarely run.
+__attribute__((noinline)) rgbaf sample_f32_outlined(desc_t t, int filter, int addr, int norm, float x, float y, int rank) {
+    return sample_f32(t, filter, addr, norm, x, y, rank);
+}
+
 // tex[.base|.level|.grad].geom.v4.dtype.ctype d, [t {, s}, {c0..c3}] {, lod | , dPdx, dPdy} {, offsets} {, ref}
 // lod_mode: 0 none (.base too), 1 .level, 2 .grad. `unit`: the form may use the texture unit (tex.1d / tex.2d with
 // float coordinates, automatic lod, no sampler, offsets or depth compare, outside --strict-fp), which it does on a
@@ -679,7 +704,7 @@ API v4u32 __zluda_ptx_impl_agx_tex(desc_t t, desc_t s, int geom, int lod_mode, i
                 uint32_t u;
                 float f;
             } x = {c0}, y = {c1};
-            rgbaf r = sample_f32(t, sm.filter, sm.addr, sm.norm, x.f, y.f, geom == G_2D ? 2 : 1);
+            rgbaf r = sample_f32_outlined(t, sm.filter, sm.addr, sm.norm, x.f, y.f, geom == G_2D ? 2 : 1);
             v4u32 out = {float_bits(r[0]), float_bits(r[1]), float_bits(r[2]), float_bits(r[3])};
             return out;
         }

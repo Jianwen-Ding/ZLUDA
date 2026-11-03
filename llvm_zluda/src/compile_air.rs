@@ -221,8 +221,8 @@ pub fn compile_air(
     }
     // PTX's rounding modifiers as the static rounding of each operation (AIR has no mode register)
     unsafe { LLVMZludaAirDropCompareFlushes(linked.get()) };
-    // and the fix-ups of float min / max that only other min / max read
-    unsafe { LLVMZludaAirDropMinMaxFixups(linked.get()) };
+    // and the fix-ups of float min / max that only other min / max or compares read
+    unsafe { LLVMZludaAirDropMinMaxFixups(linked.get(), !strict_fp as i32) };
     unsafe { LLVMZludaAirStaticRounding(linked.get(), strict_fp as i32) };
     // the AIR primitives internal once nothing creates new calls of them, so that the unused ones go
     let mut f = unsafe { llvm_sys::core::LLVMGetFirstFunction(linked.get()) };
@@ -284,6 +284,10 @@ pub fn compile_air(
         }
         _ => {
             run(&linked, c"default<O3>", &air, &options)?;
+            // the fix-ups again, in the form this optimization leaves them (light+ above leaves most in another)
+            if unsafe { LLVMZludaAirDropMinMaxFixups(linked.get(), !strict_fp as i32) } > 0 {
+                run(&linked, c"function(instcombine<no-verify-fixpoint>,simplifycfg)", &air, &options)?;
+            }
             stage("O3 in AIR's address spaces");
         }
     }
@@ -446,7 +450,7 @@ pub fn compile_air(
                                 let one_kernel = || -> Result<(Vec<u8>, Vec<u8>), String> {
                                     let kctx = Context::new();
                                     let kdiagnostics = Diagnostics::new(&kctx);
-                                    let whole = Module::try_from_bitcode(&kctx, &portable, None)
+                                    let whole = Module::try_from_bitcode_lazy(&kctx, &portable)
                                         .ok_or("the portable AIR could not be read back for a kernel's AGX code")?;
                                     let one = Module::from_raw(unsafe {
                                         LLVMZludaAirKernelModule(whole.get(), name.as_ptr())
@@ -552,7 +556,7 @@ fn inline_everything(module: &Module) {
 /// (Linux's MemAvailable; 4 where it cannot be read, the default before).
 fn default_jobs() -> usize {
     const JOB_BYTES: u64 = 3 << 29;
-    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let cores = fast_cores().unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
     let available_kb = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| {
         m.lines().find_map(|l| l.strip_prefix("MemAvailable:")?.trim().strip_suffix("kB")?.trim().parse::<u64>().ok())
     });
@@ -560,6 +564,25 @@ fn default_jobs() -> usize {
         Some(kb) => cores.min((kb * 1024 / JOB_BYTES) as usize).max(1),
         None => cores.min(4),
     }
+}
+
+/// The cores of the highest maximum frequency, where cores differ. A compilation on an efficiency core holds its
+/// memory for longer and does not finish sooner: on the M2 Max (8 + 4), Blender Cycles' 75 kernels on 8 threads took
+/// 45 s at 5.0 GB and on 12 took 44-49 s at 5.9 GB.
+fn fast_cores() -> Option<usize> {
+    let online = std::thread::available_parallelism().ok()?.get();
+    let mut frequencies = Vec::new();
+    for entry in std::fs::read_dir("/sys/devices/system/cpu").ok()? {
+        let path = entry.ok()?.path();
+        let name = path.file_name()?.to_str()?.to_string();
+        if name.strip_prefix("cpu").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) {
+            if let Ok(text) = std::fs::read_to_string(path.join("cpufreq/cpuinfo_max_freq")) {
+                frequencies.push(text.trim().parse::<u64>().ok()?);
+            }
+        }
+    }
+    let fastest = *frequencies.iter().max()?;
+    Some(frequencies.iter().filter(|&&f| f == fastest).count().min(online))
 }
 
 /// The names of the kernels (functions with the air-kernel attribute) of `module`.

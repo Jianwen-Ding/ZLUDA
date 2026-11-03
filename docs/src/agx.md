@@ -635,12 +635,16 @@ software sampler; `ptx/tools/agx_texture_sweep.sh` compares the two (M2 Max, 202
   floats), f16 and f32; 1, 2 and 4 channels; wrap, clamp, mirror and border; normalized and unnormalized
   coordinates; 1D, 2D and pitch-linear. Point-sampled textures (and textures read as integers, which are point
   sampled) therefore use the texture unit by default.
-- **Linear filtering differs** from CUDA's weights (9-bit fixed point, 8 fractional bits, CUDA Programming Guide,
-  "Linear Filtering"): with unnormalized coordinates within about 8e-6 for f32 and u16 texels and 1.2e-4 for 8-bit
-  ones; with normalized coordinates up to 0.1-0.3% of the texel range, at any texture size; f16 results are rounded
-  to half precision. Linearly filtered textures use the unit only with `ZLUDA_AGX_HARDWARE_TEXTURES=1`.
+- **Linear filtering differs** from the model's weights (9-bit fixed point, 8 fractional bits, CUDA Programming Guide,
+  "Linear Filtering"). Default mode uses the unit's filtering for its speed; the model's exact filtering is strict
+  mode's (`ZLUDA_ROUNDING_STRICT=1`, `--strict-fp`), whose kernels do not use the unit (bit-identical with
+  `ZLUDA_AGX_SOFTWARE_TEXTURES` on the GPU). Largest absolute difference from strict mode, 2^22 values, far-out coordinates
+  included: 8-bit 1.2e-4, u16 7.8e-6, f32 3.8e-6, and f16 16 where results are large, as the unit rounds them to half
+  precision. The f32 software sampler, which only textures the unit cannot sample reach now, is closer in range (8-bit
+  clamp 1.2e-7, f16 unnormalized 0.008) and further at far-out coordinates (8-bit wrap 3.2e-3, u16 3.1e-3, f32 0.118, f16
+  64), where single precision positions can move a weight by a whole 1/256.
 
-`ZLUDA_AGX_SOFTWARE_TEXTURES` keeps every texture in software.
+`ZLUDA_AGX_SOFTWARE_TEXTURES` keeps every texture in software outside strict mode too.
 
 Textures read as integers (`CU_TRSF_READ_AS_INTEGER` on 8- and 16-bit formats, and 32-bit integer formats) are point
 sampled even when linear filtering is asked for: CUDA documents linear filtering only for textures that return
@@ -1602,11 +1606,10 @@ buffer registration, groups and the asynchronous-error query are supported.
 ## Blender Cycles headless status
 
 Blender 5.1.0 ARM64 starts in background mode on the M2 Max and enumerates ZLUDA's CUDA device after its system X11
-library dependencies are supplied. Its Cycles build chooses a bundled `sm_86` cubin, which the AGX driver cannot load.
-Hiding that cubin makes Blender select its PTX fallback (13 MiB, 75 kernels, 383 functions, 1,593 calls). A one-sample
-32×32 render did not finish compiling the module within 600 seconds. The AGX LLVM backend currently inlines every
-function because code generation has no callable-function ABI; direct and register call/return encodings have now been
-added to LLVM MC, but LLVM IR calls are still inlined. No Blender GPU render time or Metal comparison is available.
+library dependencies are supplied. The driver reports compute capability 8.0, a real architecture that Cycles ships no
+machine-code kernel for, so an unmodified Cycles loads its PTX (13 MiB, 75 kernels). With 8.6 it picked a cubin, which the
+driver cannot load; a version no GPU has (8.7) broke cuBLAS's creation in llama.cpp. Linked duplicates and collection instances still render wrongly: see
+`llvm_zluda/AIR_EXPERIMENTS.md`.
 The probe details and retained simulator checks are in the playground's
 `results/2026-10-23-blender-call-compile/README.md`.
 The legacy `cuDevicePrimaryCtxRelease` entry point is exported as an alias of the implemented v2 form for Blender's

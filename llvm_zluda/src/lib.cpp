@@ -2543,12 +2543,19 @@ namespace
             if (!S || S->getFalseValue() != N)
                 continue;
             const APFloat *min = nullptr;
+            Value *abs = nullptr;
             bool tiny = false;
+            // (air.fabs where the AIR primitives have replaced llvm.fabs)
+            auto isAbsOf = [](Value *A, Value *X) {
+                if (match(A, m_Intrinsic<Intrinsic::fabs>(m_Specific(X))))
+                    return true;
+                auto *C = dyn_cast<CallInst>(A);
+                return C && C->getCalledFunction() && C->getCalledFunction()->getName() == "air.fabs.f32" &&
+                       C->getArgOperand(0) == X;
+            };
             if (match(S->getTrueValue(), m_Intrinsic<Intrinsic::copysign>(m_PosZeroFP(), m_Specific(N))))
-                tiny = (match(S->getCondition(), m_SpecificFCmp(FCmpInst::FCMP_OLT,
-                                                                m_Intrinsic<Intrinsic::fabs>(m_Specific(N)),
-                                                                m_APFloat(min))) &&
-                        min->isSmallestNormalized() && !min->isNegative()) ||
+                tiny = (match(S->getCondition(), m_SpecificFCmp(FCmpInst::FCMP_OLT, m_Value(abs), m_APFloat(min))) &&
+                        isAbsOf(abs, N) && min->isSmallestNormalized() && !min->isNegative()) ||
                        match(S->getCondition(), m_SpecificFCmp(FCmpInst::FCMP_OEQ, m_Specific(N), m_PosZeroFP()));
             // of a result not below zero (a max with 0): select(N < FLT_MIN, 0, N)
             else if (match(S->getTrueValue(), m_PosZeroFP()))
@@ -2582,8 +2589,11 @@ namespace
 // unchanged, and its flush, being monotone, gives what flushing its operands would; and of those that only
 // conversions to integers read. The flush alone goes where f32 arithmetic that reads denormals as zero (the
 // function's input mode) reads the value. Run after the first
-// optimization, which settles the fix-ups' form. Returns the number of min / max whose fix-ups went.
-int LLVMZludaAirDropMinMaxFixups(LLVMModuleRef M)
+// optimization, which settles the fix-ups' form. Also, outside strict floating point (`compares_flush`): those that only
+// f32 compares read, which the GPU's compares flush denormals for, and which no NaN's payload changes. Then, in any
+// mode, a min / max whose only readers cannot tell -0 from +0 (compares, conversions to integers, other such min / max)
+// is marked nsz: one hardware min / max, with no ordering of zeros. Returns the number of min / max whose fix-ups went.
+int LLVMZludaAirDropMinMaxFixups(LLVMModuleRef M, int compares_flush)
 {
     Module *Mod = unwrap(M);
     int count = 0;
@@ -2629,11 +2639,12 @@ int LLVMZludaAirDropMinMaxFixups(LLVMModuleRef M)
             // the canonical NaN goes where every reader makes NaNs canonical, gives none or converts to integers;
             // the flush where every reader flushes too (a min / max with a flush, or f32 arithmetic reading
             // denormals as zero) or converts to integers
+            auto compare = [&](User *U) { return compares_flush && isa<FCmpInst>(U); };
             bool canonical = !m.canonical || all_of(m.out->users(), [&](User *U) {
-                return toInteger(U) || outs.count(U);
+                return toInteger(U) || compare(U) || outs.count(U);
             });
             bool flush = !m.flush || all_of(m.out->users(), [&](User *U) {
-                return toInteger(U) || flushingArithmetic(U) || flushing.count(U);
+                return toInteger(U) || compare(U) || flushingArithmetic(U) || flushing.count(U);
             });
             if (canonical && flush)
                 drop.push_back({m, m.op});
@@ -2655,6 +2666,25 @@ int LLVMZludaAirDropMinMaxFixups(LLVMModuleRef M)
                 dead.push_back(m.canonical);
         }
         RecursivelyDeleteTriviallyDeadInstructionsPermissive(dead);
+        // the sign of a zero result, where nothing reads it: the largest such set, by removing those with another reader
+        SmallPtrSet<Value *, 16> unsigned_zero;
+        for (auto &m : all)
+            unsigned_zero.insert(m.op);
+        for (bool changed = true; changed;)
+        {
+            changed = false;
+            for (auto &m : all)
+                if (unsigned_zero.count(m.op) && !all_of(m.op->users(), [&](User *U) {
+                        return isa<FCmpInst>(U) || toInteger(U) || unsigned_zero.count(U);
+                    }))
+                {
+                    unsigned_zero.erase(m.op);
+                    changed = true;
+                }
+        }
+        for (Value *V : unsigned_zero)
+            if (!V->use_empty())
+                cast<Instruction>(V)->setHasNoSignedZeros(true);
     }
     return count;
 }
@@ -3585,6 +3615,10 @@ LLVM_C_EXTERN_C_BEGIN
 LLVMModuleRef LLVMZludaAirKernelModule(LLVMModuleRef M, const char *name)
 {
     Module *Mod = unwrap(M);
+    // A lazily read module (Module::try_from_bitcode_lazy) has function bodies only once materialized: below, only
+    // the reached ones are, so that a kernel's compilation does not hold the whole program
+    if (Error E = Mod->materializeMetadata())
+        report_fatal_error(std::move(E));
     // The functions the kernel reaches (through calls, function pointers, constants and global initializers): only
     // those are defined in the copy, which AGX code generation inlines into each other (every function of Cycles'
     // module in each kernel's copy made it as large as the whole compilation).
@@ -3607,6 +3641,9 @@ LLVMModuleRef LLVMZludaAirKernelModule(LLVMModuleRef M, const char *name)
                 if (F->hasFnAttribute("air-kernel") && F->getName() != name)
                     continue;
                 Reached.insert(F);
+                if (F->isMaterializable())
+                    if (Error E = const_cast<Function *>(F)->materialize())
+                        report_fatal_error(std::move(E));
                 for (const Instruction &I : instructions(*F))
                     for (const Value *Op : I.operands())
                         if (isa<Constant>(Op))
@@ -3617,6 +3654,12 @@ LLVMModuleRef LLVMZludaAirKernelModule(LLVMModuleRef M, const char *name)
                     Work.push_back(Op);
         }
     }
+    // CloneModule wants a materialized module: the bodies not reached become declarations, unread
+    for (Function &F : *Mod)
+        if (F.isMaterializable() && !Reached.contains(&F))
+            F.setIsMaterializable(false);
+    if (Error E = Mod->materializeAll())
+        report_fatal_error(std::move(E));
     ValueToValueMapTy VMap;
     std::unique_ptr<Module> New = CloneModule(*Mod, VMap, [&](const GlobalValue *GV) {
         auto *F = dyn_cast<Function>(GV);

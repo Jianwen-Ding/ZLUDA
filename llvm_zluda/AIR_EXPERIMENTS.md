@@ -113,6 +113,11 @@ Baseline with instances fixed: junkshop 193, classroom 146, monster 245. Same im
   flush. -> 204, 161, 261. **The existing LLVMZludaAirDropMinMaxFixups had silently stopped working**: it ran before the
   fix-ups took the form it matches (light+ replaced O3 as the first pipeline) and matched llvm.fabs, not air.fabs. A pass
   that returns a count should have that count checked by a test.
+- **Linear filtering with texels from the texture unit** (`NATIVE_TEXELS`), the model's weights kept in software: decoding
+  each channel's format at run time was the cost. -> 228, 176, 266, images unchanged (classroom at 1024 samples: the same
+  difference from the CPU, 0.1665). The unit's own filtering gives 238, 184, 272 but moves that to 0.2277: opt-in only.
+- **A 64-bit remainder per axis per texel** in the sampler's mod_pos: no speed change, as wrapping is rare at run time, but
+  compile 4.96 -> 3.65 GB. Static size and dynamic cost are separate questions: check both.
 - **Refuted, register cap (-agx-default-max-gprs)**: occupancy is not the limit. 128: 194, 96: 161, 72: 131, 56: 96.
 - **Refuted, launch overhead**: launch batching changes nothing (197.9 vs 197.4). 18.8 s GPU in about 19.7 s of launches:
   this is GPU-bound. An earlier "19% not GPU" was wrong, its span included 3.5 s of scene setup.

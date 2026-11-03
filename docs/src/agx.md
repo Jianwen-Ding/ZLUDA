@@ -638,7 +638,11 @@ software sampler; `ptx/tools/agx_texture_sweep.sh` compares the two (M2 Max, 202
 - **Linear filtering differs** from CUDA's weights (9-bit fixed point, 8 fractional bits, CUDA Programming Guide,
   "Linear Filtering"): with unnormalized coordinates within about 8e-6 for f32 and u16 texels and 1.2e-4 for 8-bit
   ones; with normalized coordinates up to 0.1-0.3% of the texel range, at any texture size; f16 results are rounded
-  to half precision. Linearly filtered textures use the unit only with `ZLUDA_AGX_HARDWARE_TEXTURES=1`.
+  to half precision. So by default a linearly filtered texture keeps the model's weights and index arithmetic in software
+  and takes its texels from the unit's point sampling, at their centres: bit-identical to the software sampler in 11 forms
+  checked on the GPU (`agx_texture_check`, 2^22 values each: u8, u16, f16 and f32, 1 and 4 channels, wrap, clamp, mirror,
+  border, normalized or not), and on Blender Open Data 2-12% faster. `ZLUDA_AGX_HARDWARE_TEXTURES=1` uses the unit's own
+  filtering, a further 2-5% at the cost above.
 
 `ZLUDA_AGX_SOFTWARE_TEXTURES` keeps every texture in software.
 

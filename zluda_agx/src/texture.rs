@@ -23,11 +23,13 @@ pub(crate) const TEXTURE_MAGIC: u64 = 0x5458_5854;
 const SURFACE_MAGIC: u64 = 0x5354_5446;
 const DESCRIPTOR_BYTES: u64 = 256;
 /// Word 16 of a texture descriptor: bit 63 set for a texture with hardware descriptors, bit 62 when it samples to
-/// integers, bit 61 when it is 2D (`tex.2d`; else `tex.1d`), the sampler index at bit 32 and the texture heap
-/// offset in the low 32 bits.
+/// integers, bit 61 when it is 2D (`tex.2d`; else `tex.1d`), bit 60 as `NATIVE_TEXELS`, the sampler index at bit 32
+/// and the texture heap offset in the low 32 bits.
 const NATIVE: u64 = 1 << 63;
 const NATIVE_INTEGER: u64 = 1 << 62;
 const NATIVE_2D: u64 = 1 << 61;
+/// A linearly filtered texture whose texels the texture unit fetches (a point sampler) for the software weights.
+const NATIVE_TEXELS: u64 = 1 << 60;
 
 /// A CUDA array (a level of a mipmapped array is one too, borrowing its memory).
 pub(crate) struct Array {
@@ -280,15 +282,15 @@ unsafe fn write_texture(d: &mut Driver, img: &Image, t: &CUDA_TEXTURE_DESC) -> R
     // GPU (agx_texture_check, M2 Max, 2026-10-31: u8 / u16 / s8 / s16 / f16 / f32, 1, 2 and 4 channels, wrap, clamp,
     // mirror and border, normalized or not, 1D, 2D and pitch-linear; 2^22 values each), so point-sampled textures use
     // it by default. Its linear filtering differs from CUDA's 1/256 weights (up to 0.3% of the texel range with
-    // normalized coordinates; f16 results rounded to half), so linearly filtered ones only with
+    // normalized coordinates; f16 results rounded to half), so linearly filtered ones keep the software weights and
+    // index arithmetic, with their texels from the unit's point sampling (Blender Open Data: as fast as all but
+    // the unit's own filtering, the results the software sampler's), or are filtered by the unit with
     // ZLUDA_AGX_HARDWARE_TEXTURES=1. ZLUDA_AGX_SOFTWARE_TEXTURES keeps every texture in software.
-    let hardware = if std::env::var_os("ZLUDA_AGX_SOFTWARE_TEXTURES").is_some() {
-        false
-    } else {
-        std::env::var_os("ZLUDA_AGX_HARDWARE_TEXTURES").is_some() || !filters_linearly(img, t)
-    };
+    let hardware = std::env::var_os("ZLUDA_AGX_SOFTWARE_TEXTURES").is_none();
+    let unit_filters = std::env::var_os("ZLUDA_AGX_HARDWARE_TEXTURES").is_some();
+    let texels = filters_linearly(img, t) && !unit_filters;
     if hardware {
-        let why = match native_descriptors(img, t) {
+        let why = match native_descriptors(img, t, !texels) {
             None => Some("not a form the texture unit samples as the software sampler does"),
             Some((texture, sampler, integer, rank)) => match d.ctx.vm.add_texture(&texture).map_err(from_io)? {
                 None => Some("texture heap full"),
@@ -297,6 +299,7 @@ unsafe fn write_texture(d: &mut Driver, img: &Image, t: &CUDA_TEXTURE_DESC) -> R
                         native = NATIVE
                             | if integer { NATIVE_INTEGER } else { 0 }
                             | if rank == 2 { NATIVE_2D } else { 0 }
+                            | if texels { NATIVE_TEXELS } else { 0 }
                             | (index as u64 + SAMPLER_HEAP_BASE) << 32
                             | offset as u64;
                         None
@@ -344,14 +347,14 @@ fn put(bytes: &mut [u8], start: usize, size: usize, value: u64) {
 /// and layer, at most 16384 texels wide and high, its address and row pitch multiples of 16 bytes, read either as
 /// floats (float and half formats, normalized 8- and 16-bit integers) or as integers without filtering, with
 /// normalized coordinates or with clamp (and, for four channels, border) addressing. Returns (texture, sampler, integer results, rank).
-fn native_descriptors(img: &Image, t: &CUDA_TEXTURE_DESC) -> Option<([u8; 24], [u8; 8], bool, u32)> {
+fn native_descriptors(img: &Image, t: &CUDA_TEXTURE_DESC, unit_filters: bool) -> Option<([u8; 24], [u8; 8], bool, u32)> {
     use CUarray_format_enum as F;
     let bytes = element_bytes(img.format)?;
     let texel = bytes * img.channels as usize;
     let rank: usize = if img.dims[1] > 1 || img.pitch != 0 { 2 } else { 1 };
     let pitch = if img.pitch != 0 { img.pitch } else { img.dims[0] * texel };
     let normalized = t.flags & CU_TRSF_NORMALIZED_COORDINATES != 0;
-    let linear = filters_linearly(img, t);
+    let linear = unit_filters && filters_linearly(img, t);
     let small_integer = matches!(bytes, 1 | 2) && img.format != F::CU_AD_FORMAT_HALF;
     let read_normalized = small_integer && t.flags & CU_TRSF_READ_AS_INTEGER == 0;
     let float = matches!(img.format, F::CU_AD_FORMAT_HALF | F::CU_AD_FORMAT_FLOAT) || read_normalized;
@@ -769,7 +772,7 @@ mod tests {
         t.filterMode = CUfilter_mode::CU_TR_FILTER_MODE_LINEAR;
         t.flags = CU_TRSF_NORMALIZED_COORDINATES;
         let img = unsafe { image(&r) }.unwrap();
-        let (tex, sampler, integer, rank) = native_descriptors(&img, &t).unwrap();
+        let (tex, sampler, integer, rank) = native_descriptors(&img, &t, true).unwrap();
         let bits = |b: &[u8], start: usize, size: usize| (0..size).map(|i| ((b[(start + i) / 8] >> ((start + i) % 8)) as u64 & 1) << i).sum::<u64>();
         // 2D, linear layout, RGBA8 unorm, identity swizzle, 30 x 20, address >> 4, (pitch - 16) >> 4
         assert_eq!((bits(&tex, 0, 4), bits(&tex, 4, 2), bits(&tex, 6, 7), bits(&tex, 13, 3)), (2, 0, 0x28, 0));
@@ -781,16 +784,16 @@ mod tests {
         // integers are point sampled (linear filtering asked for or not), with integer results; mirror needs
         // normalized coordinates; a 3D image is not linear
         t.flags |= CU_TRSF_READ_AS_INTEGER;
-        let (tex, sampler, integer, _) = native_descriptors(&img, &t).unwrap();
+        let (tex, sampler, integer, _) = native_descriptors(&img, &t, true).unwrap();
         assert_eq!((bits(&tex, 13, 3), bits(&sampler, 23, 4), integer), (2, 0, true));
         t.flags = 0;
         t.filterMode = CUfilter_mode::CU_TR_FILTER_MODE_POINT;
-        assert!(native_descriptors(&img, &t).is_none());
+        assert!(native_descriptors(&img, &t, true).is_none());
         t.addressMode = [CUaddress_mode::CU_TR_ADDRESS_MODE_CLAMP; 3];
-        let (_, sampler, ..) = native_descriptors(&img, &t).unwrap();
+        let (_, sampler, ..) = native_descriptors(&img, &t, true).unwrap();
         assert_eq!((bits(&sampler, 23, 4), bits(&sampler, 29, 9), bits(&sampler, 38, 1)), (0, 0, 1));
         let img3 = Image { dims: [4, 4, 4], ..img };
-        assert!(native_descriptors(&img3, &t).is_none());
+        assert!(native_descriptors(&img3, &t, true).is_none());
     }
 
     #[test]

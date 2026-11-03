@@ -1802,11 +1802,12 @@ pub(crate) unsafe fn cuDeviceTotalMem_v2(bytes: *mut usize, dev: CUdevice) -> CU
     out(bytes, t)
 }
 
-/// CUDA compute capability reported for AGX: what ZLUDA's PTX front end accepts, as a version no GPU has. The driver
-/// loads PTX and not machine code, and an application that ships a binary per architecture picks it from this number:
-/// with a real one (8.6) it picks machine code and fails to load it. Nothing is built for 8.7, so such an application
-/// takes its PTX, while checks of the form "at least 8.x" see what they would on 8.6.
-const CC: (c_int, c_int) = (8, 7);
+/// CUDA compute capability reported for AGX: within what ZLUDA's PTX front end accepts, and a real architecture, as
+/// libraries check it (cuBLAS's creation fails on a version no GPU has, 8.7). The driver loads PTX and not machine code,
+/// and an application that ships a binary per architecture picks it from this number and fails to load it: 8.0 is a
+/// data-center architecture that those for graphics cards leave out (Blender's with 8.6, 8.9 and 12.0), which then
+/// take their PTX.
+const CC: (c_int, c_int) = (8, 0);
 
 pub(crate) unsafe fn cuDeviceComputeCapability(major: *mut c_int, minor: *mut c_int, dev: CUdevice) -> CUresult {
     check_device(dev)?;

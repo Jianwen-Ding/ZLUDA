@@ -1606,9 +1606,9 @@ buffer registration, groups and the asynchronous-error query are supported.
 ## Blender Cycles headless status
 
 Blender 5.1.0 ARM64 starts in background mode on the M2 Max and enumerates ZLUDA's CUDA device after its system X11
-library dependencies are supplied. The driver reports compute capability 8.7, which no GPU has, so an unmodified Cycles
-finds no machine-code kernel for it and loads its PTX (13 MiB, 75 kernels); a real capability made it pick a cubin,
-which the driver cannot load. Linked duplicates and collection instances still render wrongly: see
+library dependencies are supplied. The driver reports compute capability 8.0, a real architecture that Cycles ships no
+machine-code kernel for, so an unmodified Cycles loads its PTX (13 MiB, 75 kernels). With 8.6 it picked a cubin, which the
+driver cannot load; a version no GPU has (8.7) broke cuBLAS's creation in llama.cpp. Linked duplicates and collection instances still render wrongly: see
 `llvm_zluda/AIR_EXPERIMENTS.md`.
 The probe details and retained simulator checks are in the playground's
 `results/2026-10-23-blender-call-compile/README.md`.

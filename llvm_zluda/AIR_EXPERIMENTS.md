@@ -59,8 +59,9 @@ Mistakes in how the work was done:
   identical to Cycles tag v5.1.0, apart from one extra OptiX file.) Also missing here: `which`, `/usr/bin/time`
   (a pipeline ending in grep then shows nothing at all), numpy outside Blender's Python, gdb, lldb.
 - **Hid files in the Blender install to work around a driver problem.** Moving the cubins to lib-hidden-cubins hid
-  the bug for weeks: a stock install failed. Fixed in the driver instead, by reporting compute capability 8.7 (no GPU
-  has it, so no application ships machine code for it, and PTX is chosen). Test on an unmodified install.
+  the bug for weeks: a stock install failed. Fixed in the driver: it reports compute capability 8.0, which Blender ships
+  no cubin for. **First try, 8.7 (no GPU has it), broke llama.cpp**: cublasCreate fails on an unknown architecture, found
+  only by running the other benchmarks. Run llama.cpp and Geekbench too before calling a driver change done.
 - **Theorized about the instanced-mesh BVH leaves from reading the source**, with no new evidence. Reading bvh2.cpp,
   build.cpp and geometry_bvh.cpp finds no path to (2, 4, 0, 0): the source is right. The answer was in the compiled
   host (below).

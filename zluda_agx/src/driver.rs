@@ -830,6 +830,19 @@ impl Driver {
                 }
             }
         }
+        // the texture descriptors that tables among them point to (Cycles' image info)
+        let mut descriptors: Vec<(u64, Vec<u8>)> = Vec::new();
+        for (_, b) in regions.iter().filter(|(_, b)| b.len() <= 16 << 20) {
+            for w in b.chunks_exact(8) {
+                if let Some((start, bytes)) = self.ctx.allocation(u64::from_le_bytes(w.try_into().unwrap())) {
+                    let texture = bytes.len() >= 16 && u64::from_le_bytes(bytes[..8].try_into().unwrap()) == TEXTURE_MAGIC;
+                    if texture && !regions.iter().chain(&descriptors).any(|(va, _)| *va == start) {
+                        descriptors.push((start, bytes.to_vec()));
+                    }
+                }
+            }
+        }
+        regions.extend(descriptors);
         // the texels of the texture objects among them (word 1 of a texture descriptor)
         let mut i = 0;
         while i < regions.len() {

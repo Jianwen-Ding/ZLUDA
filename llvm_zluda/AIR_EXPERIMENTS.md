@@ -41,6 +41,52 @@ section. GPU times are from the M2 Max behind the AIR service; "suite" is PTX-fo
   is now the slow part. Not over-inlining: shade_surface_mnee packaged alone keeps 162 functions, and
   `-air-keep-function-cost` 20000 / 5000 / 2000 left it byte-identical (its large functions are kept already).
 
+## What went wrong, 2026-11-03 (Blender Cycles session): read before repeating it
+
+Policy, from the user: running nvcc-generated PTX through ZLUDA is fine; decompiling or reverse engineering it, or
+disassembling cubins, is not. A regular Blender must work against the driver, with no application-specific code in
+ZLUDA or LLVM.
+
+Mistakes in how the work was done:
+
+- **Replaced Blender's kernel out of an over-strict reading of the EULA note.** Stock PTX was set aside for a kernel
+  built with clang, which cost most of an hour and changed the benchmark's input. Ask, or check the policy above,
+  before changing what is being measured. The clang build still exists (ptx/tools/cycles_clang, /scratch/cycles-clang)
+  but is not the benchmark.
+- **Reported a comparison that had not run.** This container has no `diff`, and `diff -rq ... 2>/dev/null | grep -v`
+  printed nothing, which read as "identical". Never send a checking tool's stderr to /dev/null. Use
+  `git diff --no-index` or Python's filecmp. (Redone with filecmp: Blender 5.1's bundled kernel/ and util/ are
+  identical to Cycles tag v5.1.0, apart from one extra OptiX file.) Also missing here: `which`, `/usr/bin/time`
+  (a pipeline ending in grep then shows nothing at all), numpy outside Blender's Python, gdb, lldb.
+- **Hid files in the Blender install to work around a driver problem.** Moving the cubins to lib-hidden-cubins hid
+  the bug for weeks: a stock install failed. Fixed in the driver instead, by reporting compute capability 8.7 (no GPU
+  has it, so no application ships machine code for it, and PTX is chosen). Test on an unmodified install.
+- **Theorized about the instanced-mesh BVH leaves from reading the source**, with no new evidence. Reading bvh2.cpp,
+  build.cpp and geometry_bvh.cpp finds no path to (2, 4, 0, 0). Get data from the running host instead.
+
+Dead ends and traps:
+
+- **Standalone Cycles host: not buildable here.** Its required OpenImageIO, OpenEXR, Imath, pugixml and TBB headers
+  are absent, and Blender's lib/ has only the .so files. No network to fetch them: https to github.com,
+  projects.blender.org, pypi.org and Fedora mirrors fails, ssh.github.com:443 is refused, sudo needs a password.
+  `dnf repoquery` still answers, from its cache, and `dnf download` then fails, so a repoquery result does not mean
+  packages can be had. Sources arrive only when the user puts them in /scratch.
+- **Pushing was refused all session** (all four keys). /scratch/save-repos.sh after each commit, and retry.
+- **A commit needs an identity**: none is configured. Use GIT_AUTHOR_* / GIT_COMMITTER_* for one command, not git config.
+- **Copying ext/HiGHS from /scratch/ZLUDA brings its .git file**, which breaks `git status` ("not a git repository:
+  ext/HiGHS/../../.git/modules/ext/HiGHS"). Delete that file. The .bc files in a fresh checkout are LFS pointers: copy
+  them from /scratch/air-pipeline/lfs and mark them skip-worktree.
+- **A fix can exist only in the build tree.** /scratch/llvm-agx-main had the stack pseudo source value fix that
+  llvm-project lacked. Compare the two trees before relying on either.
+- **Building Cycles' kernel with clang, what failed first**: __clang_cuda_intrinsics.h needs CUDA's own definitions;
+  system headers break it (-nostdlibinc, with empty stubs); `restrict` is not C++ (__restrict); ballot needs
+  `-Xclang -target-feature -Xclang +ptx87`; `sat.f32` is not a PTX instruction; ZLUDA's parser takes
+  `tex.2d... {r,g,b,a}, [t, {x, y}]` only. The prelude's math is our own approximations, so a difference from the CPU
+  render may come from it.
+- **Unfinished: compile memory of the clang-built kernel.** The AGX stage reached 8.3 GB on one remaining kernel, with
+  the other threads done, when it was stopped (55 of 75 timed in the second run, which was also stopped; which kernel
+  is not known). The stock PTX compiles in 53 s. Do not compare clang-kernel numbers with stock ones.
+
 ## Real calls in the AGX backend (`-agx-experimental-leaf-calls`), 2026-10-30
 
 The way out of Cycles' AGX memory: shade_shadow with its large helpers kept as called functions compiles in 14 s at

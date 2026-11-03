@@ -60,6 +60,173 @@ gpu.module @agx_solver {
     gpu.return
   }
 
+  // Factors the panel of columns j0 .. j0 + jb (single precision only) of an
+  // m-row matrix in one workgroup (up to 1024 threads), as agx_lu_pivot / swap /
+  // scale / update do column by column with the update kept to the panel and
+  // the swaps to its columns (agx_lu_laswp applies them to the others): per
+  // column, each thread's largest |a[r, k]| over its rows (r = k + t, k + t +
+  // threads, ...; the first of equal ones), a SIMD-group and then a workgroup
+  // reduction to the pivot, the swap, then each thread scales and updates its
+  // rows. ipiv[k] = 1 + the pivot row; info = k + 1 for the first zero pivot
+  // (cleared at column 0). Launch one workgroup.
+  gpu.func @agx_lu_panel(%a0: memref<1xf32, 1>, %m_: i64, %lda_: i64, %j0_: i64, %jb_: i64,
+                         %ipiv0: memref<1xi32, 1>, %info0: memref<1xi32, 1>)
+      workgroup(%sv: memref<32xf32, #gpu.address_space<workgroup>>, %si: memref<33xi32, #gpu.address_space<workgroup>>) kernel {
+    %i0 = arith.constant 0 : index
+    %i1 = arith.constant 1 : index
+    %i32 = arith.constant 32 : index
+    // the threads of the workgroup (a multiple of 32, at most 1024) and its SIMD-groups
+    %i1024 = gpu.block_dim x
+    %nsg = arith.divui %i1024, %i32 : index
+    %z = arith.constant 0 : i32
+    %big = arith.constant 2147483647 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %f0 = arith.constant 0.0 : f32
+    %fm1 = arith.constant -1.0 : f32
+    %m = arith.index_cast %m_ : i64 to index
+    %lda = arith.index_cast %lda_ : i64 to index
+    %j0 = arith.index_cast %j0_ : i64 to index
+    %jb = arith.index_cast %jb_ : i64 to index
+    %j1 = arith.addi %j0, %jb : index
+    %t = gpu.thread_id x
+    %lane = arith.remui %t, %i32 : index
+    %sg = arith.divui %t, %i32 : index
+    %t0 = arith.cmpi eq, %t, %i0 : index
+    %l0 = arith.cmpi eq, %lane, %i0 : index
+    scf.for %k = %j0 to %j1 step %i1 {
+      %colk = arith.muli %k, %lda : index
+      // this thread's largest |a[r, k]|, r >= k (the first of equal ones; -1 for none)
+      %rs = arith.addi %k, %t : index
+      %best:2 = scf.for %r = %rs to %m step %i1024 iter_args(%bv = %fm1, %bi = %big) -> (f32, i32) {
+        %o = arith.addi %colk, %r : index
+        %v = func.call @agx_sv_ld(%a0, %o) : (memref<1xf32, 1>, index) -> f32
+        %av = math.absf %v : f32
+        %gt = arith.cmpf ogt, %av, %bv : f32
+        %ri = arith.index_cast %r : index to i32
+        %nv = arith.select %gt, %av, %bv : f32
+        %ni = arith.select %gt, %ri, %bi : i32
+        scf.yield %nv, %ni : f32, i32
+      }
+      %gmax = gpu.subgroup_reduce maxnumf %best#0 : (f32) -> f32
+      %is = arith.cmpf oeq, %best#0, %gmax : f32
+      %cand = arith.select %is, %best#1, %big : i32
+      %gidx = gpu.subgroup_reduce minui %cand : (i32) -> i32
+      scf.if %l0 {
+        memref.store %gmax, %sv[%sg] : memref<32xf32, #gpu.address_space<workgroup>>
+        memref.store %gidx, %si[%sg] : memref<33xi32, #gpu.address_space<workgroup>>
+      }
+      gpu.barrier
+      scf.if %t0 {
+        %w:2 = scf.for %q = %i0 to %nsg step %i1 iter_args(%wv = %fm1, %wi = %big) -> (f32, i32) {
+          %qv = memref.load %sv[%q] : memref<32xf32, #gpu.address_space<workgroup>>
+          %qi = memref.load %si[%q] : memref<33xi32, #gpu.address_space<workgroup>>
+          %gt = arith.cmpf ogt, %qv, %wv : f32
+          %eq = arith.cmpf oeq, %qv, %wv : f32
+          %lt = arith.cmpi ult, %qi, %wi : i32
+          %tie = arith.andi %eq, %lt : i1
+          %take = arith.ori %gt, %tie : i1
+          %nv = arith.select %take, %qv, %wv : f32
+          %ni = arith.select %take, %qi, %wi : i32
+          scf.yield %nv, %ni : f32, i32
+        }
+        memref.store %w#1, %si[%i32] : memref<33xi32, #gpu.address_space<workgroup>>
+        %p1 = arith.addi %w#1, %c1_i32 : i32
+        func.call @agx_sv_sti(%ipiv0, %k, %p1) : (memref<1xi32, 1>, index, i32) -> ()
+        %k0 = arith.cmpi eq, %k, %i0 : index
+        scf.if %k0 {
+          func.call @agx_sv_sti(%info0, %i0, %z) : (memref<1xi32, 1>, index, i32) -> ()
+        }
+        %zero = arith.cmpf oeq, %w#0, %f0 : f32
+        %old = func.call @agx_sv_ldi(%info0, %i0) : (memref<1xi32, 1>, index) -> i32
+        %none = arith.cmpi eq, %old, %z : i32
+        %set = arith.andi %zero, %none : i1
+        scf.if %set {
+          %k1 = arith.addi %k, %i1 : index
+          %ki = arith.index_cast %k1 : index to i32
+          func.call @agx_sv_sti(%info0, %i0, %ki) : (memref<1xi32, 1>, index, i32) -> ()
+        }
+      }
+      gpu.barrier
+      // the swap of rows k and p in the panel's columns (a thread per column)
+      %pi = memref.load %si[%i32] : memref<33xi32, #gpu.address_space<workgroup>>
+      %p = arith.index_cast %pi : i32 to index
+      %c = arith.addi %j0, %t : index
+      %in = arith.cmpi ult, %c, %j1 : index
+      %diff = arith.cmpi ne, %p, %k : index
+      %sw = arith.andi %in, %diff : i1
+      scf.if %sw {
+        %col = arith.muli %c, %lda : index
+        %ok = arith.addi %col, %k : index
+        %op = arith.addi %col, %p : index
+        %vk = func.call @agx_sv_ld(%a0, %ok) : (memref<1xf32, 1>, index) -> f32
+        %vp = func.call @agx_sv_ld(%a0, %op) : (memref<1xf32, 1>, index) -> f32
+        func.call @agx_sv_st(%a0, %ok, %vp) : (memref<1xf32, 1>, index, f32) -> ()
+        func.call @agx_sv_st(%a0, %op, %vk) : (memref<1xf32, 1>, index, f32) -> ()
+      }
+      gpu.barrier
+      // scale (unless the pivot is 0) and update this thread's rows r > k
+      %od = arith.addi %colk, %k : index
+      %piv = func.call @agx_sv_ld(%a0, %od) : (memref<1xf32, 1>, index) -> f32
+      %nz = arith.cmpf une, %piv, %f0 : f32
+      %k1 = arith.addi %k, %i1 : index
+      %r0 = arith.addi %k1, %t : index
+      scf.for %r = %r0 to %m step %i1024 {
+        %o = arith.addi %colk, %r : index
+        %v = func.call @agx_sv_ld(%a0, %o) : (memref<1xf32, 1>, index) -> f32
+        %qv = arith.divf %v, %piv : f32
+        %l = arith.select %nz, %qv, %v : f32
+        scf.if %nz {
+          func.call @agx_sv_st(%a0, %o, %l) : (memref<1xf32, 1>, index, f32) -> ()
+        }
+        scf.for %cc = %k1 to %j1 step %i1 {
+          %colc = arith.muli %cc, %lda : index
+          %okc = arith.addi %colc, %k : index
+          %orc = arith.addi %colc, %r : index
+          %u = func.call @agx_sv_ld(%a0, %okc) : (memref<1xf32, 1>, index) -> f32
+          %x = func.call @agx_sv_ld(%a0, %orc) : (memref<1xf32, 1>, index) -> f32
+          %nl = arith.negf %l : f32
+          %y = math.fma %nl, %u, %x : f32
+          func.call @agx_sv_st(%a0, %orc, %y) : (memref<1xf32, 1>, index, f32) -> ()
+        }
+      }
+      gpu.barrier
+    }
+    gpu.return
+  }
+
+  // The row swaps of a panel (ipiv[k] for k in j0 .. j0 + jb, in order) on the
+  // columns outside it (single precision only; a thread per column of n).
+  gpu.func @agx_lu_laswp(%a0: memref<1xf32, 1>, %n_: i64, %lda_: i64, %j0_: i64, %jb_: i64, %ipiv0: memref<1xi32, 1>) kernel {
+    %i1 = arith.constant 1 : index
+    %n = arith.index_cast %n_ : i64 to index
+    %lda = arith.index_cast %lda_ : i64 to index
+    %j0 = arith.index_cast %j0_ : i64 to index
+    %jb = arith.index_cast %jb_ : i64 to index
+    %j1 = arith.addi %j0, %jb : index
+    %c = gpu.global_id x
+    %live = arith.cmpi ult, %c, %n : index
+    %before = arith.cmpi ult, %c, %j0 : index
+    %after = arith.cmpi uge, %c, %j1 : index
+    %out = arith.ori %before, %after : i1
+    %go = arith.andi %live, %out : i1
+    scf.if %go {
+      %col = arith.muli %c, %lda : index
+      scf.for %k = %j0 to %j1 step %i1 {
+        %p = func.call @agx_sv_piv(%ipiv0, %k) : (memref<1xi32, 1>, index) -> index
+        %diff = arith.cmpi ne, %p, %k : index
+        scf.if %diff {
+          %ok = arith.addi %col, %k : index
+          %op = arith.addi %col, %p : index
+          %vk = func.call @agx_sv_ld(%a0, %ok) : (memref<1xf32, 1>, index) -> f32
+          %vp = func.call @agx_sv_ld(%a0, %op) : (memref<1xf32, 1>, index) -> f32
+          func.call @agx_sv_st(%a0, %ok, %vp) : (memref<1xf32, 1>, index, f32) -> ()
+          func.call @agx_sv_st(%a0, %op, %vk) : (memref<1xf32, 1>, index, f32) -> ()
+        }
+      }
+    }
+    gpu.return
+  }
+
   // ---- LU with partial pivoting (getrf), column k of an m x n matrix
 
   // ipiv[k] = 1 + the row of the largest |a[i, k]|, i >= k; info = k + 1 for
@@ -304,6 +471,98 @@ gpu.module @agx_solver {
     gpu.return
   }
 
+  // The columns j0 .. j0 + jb of the n x n Cholesky factor (single precision
+  // only) in one workgroup, as agx_chol_diag / scale / update do column by
+  // column with the update kept to the panel: thread 0 takes the diagonal
+  // (info = k + 1 if it is not positive, cleared at column 0; nothing happens
+  // once info is set), then each thread scales and updates its rows r = k + 1
+  // + t, k + 1 + t + threads, ... L(i, j) is a[i rs + j cs]. Launch one
+  // workgroup.
+  gpu.func @agx_chol_panel(%a0: memref<1xf32, 1>, %n_: i64, %j0_: i64, %jb_: i64, %rs_: i64, %cs_: i64,
+                           %info0: memref<1xi32, 1>)
+      workgroup(%ok_s: memref<1xi32, #gpu.address_space<workgroup>>) kernel {
+    %i0 = arith.constant 0 : index
+    %i1 = arith.constant 1 : index
+    %z = arith.constant 0 : i32
+    %one = arith.constant 1 : i32
+    %f0 = arith.constant 0.0 : f32
+    %n = arith.index_cast %n_ : i64 to index
+    %j0 = arith.index_cast %j0_ : i64 to index
+    %jb = arith.index_cast %jb_ : i64 to index
+    %j1 = arith.addi %j0, %jb : index
+    %rs = arith.index_cast %rs_ : i64 to index
+    %cs = arith.index_cast %cs_ : i64 to index
+    %t = gpu.thread_id x
+    %nt = gpu.block_dim x
+    %t0 = arith.cmpi eq, %t, %i0 : index
+    scf.for %k = %j0 to %j1 step %i1 {
+      scf.if %t0 {
+        %k0 = arith.cmpi eq, %k, %i0 : index
+        scf.if %k0 {
+          func.call @agx_sv_sti(%info0, %i0, %z) : (memref<1xi32, 1>, index, i32) -> ()
+        }
+        %old = func.call @agx_sv_ldi(%info0, %i0) : (memref<1xi32, 1>, index) -> i32
+        %fine = arith.cmpi eq, %old, %z : i32
+        %go = scf.if %fine -> i32 {
+          %o = func.call @agx_sv_at(%k, %k, %rs, %cs) : (index, index, index, index) -> index
+          %d = func.call @agx_sv_ld(%a0, %o) : (memref<1xf32, 1>, index) -> f32
+          %pos = arith.cmpf ogt, %d, %f0 : f32
+          %r = scf.if %pos -> i32 {
+            %sq = math.sqrt %d : f32
+            func.call @agx_sv_st(%a0, %o, %sq) : (memref<1xf32, 1>, index, f32) -> ()
+            scf.yield %one : i32
+          } else {
+            %k1 = arith.addi %k, %i1 : index
+            %ki = arith.index_cast %k1 : index to i32
+            func.call @agx_sv_sti(%info0, %i0, %ki) : (memref<1xi32, 1>, index, i32) -> ()
+            scf.yield %z : i32
+          }
+          scf.yield %r : i32
+        } else {
+          scf.yield %z : i32
+        }
+        memref.store %go, %ok_s[%i0] : memref<1xi32, #gpu.address_space<workgroup>>
+      }
+      gpu.barrier
+      %goi = memref.load %ok_s[%i0] : memref<1xi32, #gpu.address_space<workgroup>>
+      %go = arith.cmpi ne, %goi, %z : i32
+      %od = func.call @agx_sv_at(%k, %k, %rs, %cs) : (index, index, index, index) -> index
+      %d = func.call @agx_sv_ld(%a0, %od) : (memref<1xf32, 1>, index) -> f32
+      %k1 = arith.addi %k, %i1 : index
+      %r0 = arith.addi %k1, %t : index
+      // scale this thread's rows of column k
+      scf.if %go {
+        scf.for %r = %r0 to %n step %nt {
+          %o = func.call @agx_sv_at(%r, %k, %rs, %cs) : (index, index, index, index) -> index
+          %v = func.call @agx_sv_ld(%a0, %o) : (memref<1xf32, 1>, index) -> f32
+          %q = arith.divf %v, %d : f32
+          func.call @agx_sv_st(%a0, %o, %q) : (memref<1xf32, 1>, index, f32) -> ()
+        }
+      }
+      gpu.barrier
+      // L(r, c) -= L(r, k) L(c, k) for k < c <= r, c in the panel
+      scf.if %go {
+        scf.for %r = %r0 to %n step %nt {
+          %ork = func.call @agx_sv_at(%r, %k, %rs, %cs) : (index, index, index, index) -> index
+          %lr = func.call @agx_sv_ld(%a0, %ork) : (memref<1xf32, 1>, index) -> f32
+          %nl = arith.negf %lr : f32
+          %r1 = arith.addi %r, %i1 : index
+          %ce = arith.minui %j1, %r1 : index
+          scf.for %c = %k1 to %ce step %i1 {
+            %orc = func.call @agx_sv_at(%r, %c, %rs, %cs) : (index, index, index, index) -> index
+            %ock = func.call @agx_sv_at(%c, %k, %rs, %cs) : (index, index, index, index) -> index
+            %v = func.call @agx_sv_ld(%a0, %orc) : (memref<1xf32, 1>, index) -> f32
+            %lc = func.call @agx_sv_ld(%a0, %ock) : (memref<1xf32, 1>, index) -> f32
+            %nv = math.fma %nl, %lc, %v : f32
+            func.call @agx_sv_st(%a0, %orc, %nv) : (memref<1xf32, 1>, index, f32) -> ()
+          }
+        }
+      }
+      gpu.barrier
+    }
+    gpu.return
+  }
+
   // ---- Cholesky (potrf), column k: L(i, j) is a[i rs + j cs] (rs 1 and
   // cs lda for the lower triangle, the other way round for the upper one,
   // whose U is L^T). Nothing happens once info is set.
@@ -433,6 +692,133 @@ gpu.module @agx_solver {
           : (memref<1xf32, 1>, index, memref<1xf32, 1>, index, index, i1, i1, i1) -> ()
       func.call @agx_sv_trsv(%a0, %lda, %b0, %boff, %n, %lower, %false, %lower)
           : (memref<1xf32, 1>, index, memref<1xf32, 1>, index, index, i1, i1, i1) -> ()
+    }
+    gpu.return
+  }
+
+  // The reflectors of columns j0 .. j0 + jb (single precision only) of an
+  // m-row matrix in one workgroup, as agx_qr_house / agx_qr_apply do column by
+  // column with the reflections kept to the panel: per column a workgroup sum
+  // of squares, thread 0's beta and tau (zero tau and nothing scaled for a
+  // zero column below the diagonal), the scaling of v by all threads, then
+  // each SIMD-group applies the reflector to its columns (c = k + 1 + group,
+  // + groups, ...; its lanes take every 32nd row and sum with a shuffle tree).
+  // Launch one workgroup.
+  gpu.func @agx_qr_panel(%a0: memref<1xf32, 1>, %m_: i64, %lda_: i64, %j0_: i64, %jb_: i64,
+                         %tau0: memref<1xf32, 1>)
+      workgroup(%sw: memref<35xf32, #gpu.address_space<workgroup>>) kernel {
+    %i0 = arith.constant 0 : index
+    %i1 = arith.constant 1 : index
+    %i32 = arith.constant 32 : index
+    %i33 = arith.constant 33 : index
+    %i34 = arith.constant 34 : index
+    %f0 = arith.constant 0.0 : f32
+    %f1 = arith.constant 1.0 : f32
+    %m = arith.index_cast %m_ : i64 to index
+    %lda = arith.index_cast %lda_ : i64 to index
+    %j0 = arith.index_cast %j0_ : i64 to index
+    %jb = arith.index_cast %jb_ : i64 to index
+    %j1 = arith.addi %j0, %jb : index
+    %t = gpu.thread_id x
+    %nt = gpu.block_dim x
+    %nsg = arith.divui %nt, %i32 : index
+    %lane = arith.remui %t, %i32 : index
+    %sg = arith.divui %t, %i32 : index
+    %t0 = arith.cmpi eq, %t, %i0 : index
+    %l0 = arith.cmpi eq, %lane, %i0 : index
+    scf.for %k = %j0 to %j1 step %i1 {
+      %col = arith.muli %k, %lda : index
+      %od = arith.addi %col, %k : index
+      %k1 = arith.addi %k, %i1 : index
+      // the sum of squares below the diagonal
+      %r0 = arith.addi %k1, %t : index
+      %part = scf.for %i = %r0 to %m step %nt iter_args(%acc = %f0) -> f32 {
+        %o = arith.addi %col, %i : index
+        %v = func.call @agx_sv_ld(%a0, %o) : (memref<1xf32, 1>, index) -> f32
+        %a1 = math.fma %v, %v, %acc : f32
+        scf.yield %a1 : f32
+      }
+      %gs = gpu.subgroup_reduce add %part : (f32) -> f32
+      scf.if %l0 {
+        memref.store %gs, %sw[%sg] : memref<35xf32, #gpu.address_space<workgroup>>
+      }
+      gpu.barrier
+      scf.if %t0 {
+        %ss = scf.for %q = %i0 to %nsg step %i1 iter_args(%acc = %f0) -> f32 {
+          %x = memref.load %sw[%q] : memref<35xf32, #gpu.address_space<workgroup>>
+          %a1 = arith.addf %acc, %x : f32
+          scf.yield %a1 : f32
+        }
+        %alpha = func.call @agx_sv_ld(%a0, %od) : (memref<1xf32, 1>, index) -> f32
+        %zero = arith.cmpf oeq, %ss, %f0 : f32
+        %res:2 = scf.if %zero -> (f32, f32) {
+          func.call @agx_sv_st(%tau0, %k, %f0) : (memref<1xf32, 1>, index, f32) -> ()
+          scf.yield %f0, %f0 : f32, f32
+        } else {
+          %all = math.fma %alpha, %alpha, %ss : f32
+          %norm = math.sqrt %all : f32
+          %neg = arith.negf %norm : f32
+          %beta = math.copysign %neg, %alpha : f32
+          %bma = arith.subf %beta, %alpha : f32
+          %tau = arith.divf %bma, %beta : f32
+          %amb = arith.subf %alpha, %beta : f32
+          %scal = arith.divf %f1, %amb : f32
+          func.call @agx_sv_st(%a0, %od, %beta) : (memref<1xf32, 1>, index, f32) -> ()
+          func.call @agx_sv_st(%tau0, %k, %tau) : (memref<1xf32, 1>, index, f32) -> ()
+          scf.yield %tau, %scal : f32, f32
+        }
+        memref.store %res#0, %sw[%i33] : memref<35xf32, #gpu.address_space<workgroup>>
+        memref.store %res#1, %sw[%i34] : memref<35xf32, #gpu.address_space<workgroup>>
+      }
+      gpu.barrier
+      %tau = memref.load %sw[%i33] : memref<35xf32, #gpu.address_space<workgroup>>
+      %scal = memref.load %sw[%i34] : memref<35xf32, #gpu.address_space<workgroup>>
+      %live = arith.cmpf une, %tau, %f0 : f32
+      // v = the column below the diagonal, scaled
+      scf.if %live {
+        scf.for %i = %r0 to %m step %nt {
+          %o = arith.addi %col, %i : index
+          %v = func.call @agx_sv_ld(%a0, %o) : (memref<1xf32, 1>, index) -> f32
+          %sv = arith.mulf %v, %scal : f32
+          func.call @agx_sv_st(%a0, %o, %sv) : (memref<1xf32, 1>, index, f32) -> ()
+        }
+      }
+      gpu.barrier
+      // x -= tau (x[k] + v . x) (e_k + v) for the panel's columns after k, a SIMD-group per column
+      scf.if %live {
+        %c0 = arith.addi %k1, %sg : index
+        %rl = arith.addi %k1, %lane : index
+        scf.for %c = %c0 to %j1 step %nsg {
+          %xc = arith.muli %c, %lda : index
+          %dot = scf.for %i = %rl to %m step %i32 iter_args(%acc = %f0) -> f32 {
+            %ov = arith.addi %col, %i : index
+            %ox = arith.addi %xc, %i : index
+            %v = func.call @agx_sv_ld(%a0, %ov) : (memref<1xf32, 1>, index) -> f32
+            %x = func.call @agx_sv_ld(%a0, %ox) : (memref<1xf32, 1>, index) -> f32
+            %a1 = math.fma %v, %x, %acc : f32
+            scf.yield %a1 : f32
+          }
+          %d = gpu.subgroup_reduce add %dot : (f32) -> f32
+          %oxk = arith.addi %xc, %k : index
+          %xk = func.call @agx_sv_ld(%a0, %oxk) : (memref<1xf32, 1>, index) -> f32
+          %w0 = arith.addf %xk, %d : f32
+          %w = arith.mulf %w0, %tau : f32
+          %nw = arith.negf %w : f32
+          scf.for %i = %rl to %m step %i32 {
+            %ov = arith.addi %col, %i : index
+            %ox = arith.addi %xc, %i : index
+            %v = func.call @agx_sv_ld(%a0, %ov) : (memref<1xf32, 1>, index) -> f32
+            %x = func.call @agx_sv_ld(%a0, %ox) : (memref<1xf32, 1>, index) -> f32
+            %nx = math.fma %nw, %v, %x : f32
+            func.call @agx_sv_st(%a0, %ox, %nx) : (memref<1xf32, 1>, index, f32) -> ()
+          }
+          scf.if %l0 {
+            %nxk = arith.subf %xk, %w : f32
+            func.call @agx_sv_st(%a0, %oxk, %nxk) : (memref<1xf32, 1>, index, f32) -> ()
+          }
+        }
+      }
+      gpu.barrier
     }
     gpu.return
   }
@@ -790,6 +1176,107 @@ gpu.module @agx_solver {
           %cnt = memref.reinterpret_cast %count0 to offset: [0], sizes: [%big2], strides: [1]
               : memref<1xi32, 1> to memref<?xi32, strided<[1]>, 1>
           %old = memref.atomic_rmw addi %one, %cnt[%i0] : (i32, memref<?xi32, strided<[1]>, 1>) -> i32
+        }
+      }
+    }
+    gpu.return
+  }
+
+  // agx_jacobi_round with a SIMD-group per pair (single precision only): its
+  // lanes take every 32nd row (neighbouring lanes, neighbouring elements), the
+  // sums by shuffles. Launch 32 threads per pair.
+  gpu.func @agx_jacobi_round_sg(%a0: memref<1xf32, 1>, %m_: i64, %n_: i64, %lda_: i64, %v0: memref<1xf32, 1>,
+                             %vr_: i64, %ldv_: i64, %r_: i64, %count0: memref<1xi32, 1>, %tol: f32) kernel {
+    %i0 = arith.constant 0 : index
+    %i1 = arith.constant 1 : index
+    %i2 = arith.constant 2 : index
+    %f0 = arith.constant 0.0 : f32
+    %f1 = arith.constant 1.0 : f32
+    %f2 = arith.constant 2.0 : f32
+    %one = arith.constant 1 : i32
+    %m = arith.index_cast %m_ : i64 to index
+    %n = arith.index_cast %n_ : i64 to index
+    %lda = arith.index_cast %lda_ : i64 to index
+    %vr = arith.index_cast %vr_ : i64 to index
+    %ldv = arith.index_cast %ldv_ : i64 to index
+    %r = arith.index_cast %r_ : i64 to index
+    %odd = arith.remui %n, %i2 : index
+    %nn = arith.addi %n, %odd : index
+    %half = arith.divui %nn, %i2 : index
+    %nn_1 = arith.subi %nn, %i1 : index
+    // a SIMD-group per pair: lanes over the rows
+    %i32 = arith.constant 32 : index
+    %gid = gpu.global_id x
+    %t = arith.divui %gid, %i32 : index
+    %lane = arith.remui %gid, %i32 : index
+    %l0 = arith.cmpi eq, %lane, %i0 : index
+    %live0 = arith.cmpi ult, %t, %half : index
+    scf.if %live0 {
+      %t0 = arith.cmpi eq, %t, %i0 : index
+      %rt = arith.addi %r, %t : index
+      %pa = arith.remui %rt, %nn_1 : index
+      %rn = arith.addi %r, %nn_1 : index
+      %rmt = arith.subi %rn, %t : index
+      %qa = arith.remui %rmt, %nn_1 : index
+      %p = arith.select %t0, %nn_1, %pa : index
+      %q = arith.select %t0, %r, %qa : index
+      %in_p = arith.cmpi ult, %p, %n : index
+      %in_q = arith.cmpi ult, %q, %n : index
+      %live = arith.andi %in_p, %in_q : i1
+      scf.if %live {
+        %cp = arith.muli %p, %lda : index
+        %cq = arith.muli %q, %lda : index
+        %part:3 = scf.for %i = %lane to %m step %i32 iter_args(%al = %f0, %be = %f0, %ga = %f0) -> (f32, f32, f32) {
+          %op = arith.addi %cp, %i : index
+          %oq = arith.addi %cq, %i : index
+          %x = func.call @agx_sv_ld(%a0, %op) : (memref<1xf32, 1>, index) -> f32
+          %y = func.call @agx_sv_ld(%a0, %oq) : (memref<1xf32, 1>, index) -> f32
+          %al1 = math.fma %x, %x, %al : f32
+          %be1 = math.fma %y, %y, %be : f32
+          %ga1 = math.fma %x, %y, %ga : f32
+          scf.yield %al1, %be1, %ga1 : f32, f32, f32
+        }
+        %s0 = gpu.subgroup_reduce add %part#0 : (f32) -> f32
+        %s1 = gpu.subgroup_reduce add %part#1 : (f32) -> f32
+        %s2 = gpu.subgroup_reduce add %part#2 : (f32) -> f32
+        %ab = arith.mulf %s0, %s1 : f32
+        %nab = math.sqrt %ab : f32
+        %lim = arith.mulf %nab, %tol : f32
+        %ag = math.absf %s2 : f32
+        %rot = arith.cmpf ogt, %ag, %lim : f32
+        scf.if %rot {
+          // zeta = (beta - alpha) / (2 gamma), t = sign(zeta) / (|zeta| + sqrt(1 + zeta^2))
+          %bma = arith.subf %s1, %s0 : f32
+          %g2 = arith.mulf %s2, %f2 : f32
+          %zeta = arith.divf %bma, %g2 : f32
+          %az = math.absf %zeta : f32
+          %z2 = math.fma %zeta, %zeta, %f1 : f32
+          %sq = math.sqrt %z2 : f32
+          %den = arith.addf %az, %sq : f32
+          %tt0 = arith.divf %f1, %den : f32
+          %tt = math.copysign %tt0, %zeta : f32
+          %t2 = math.fma %tt, %tt, %f1 : f32
+          %st2 = math.sqrt %t2 : f32
+          %c = arith.divf %f1, %st2 : f32
+          %s = arith.mulf %c, %tt : f32
+          scf.for %i = %lane to %m step %i32 {
+            %op = arith.addi %cp, %i : index
+            %oq = arith.addi %cq, %i : index
+            func.call @agx_sv_rot(%a0, %op, %oq, %c, %s) : (memref<1xf32, 1>, index, index, f32, f32) -> ()
+          }
+          %vp = arith.muli %p, %ldv : index
+          %vq = arith.muli %q, %ldv : index
+          scf.for %i = %lane to %vr step %i32 {
+            %op = arith.addi %vp, %i : index
+            %oq = arith.addi %vq, %i : index
+            func.call @agx_sv_rot(%v0, %op, %oq, %c, %s) : (memref<1xf32, 1>, index, index, f32, f32) -> ()
+          }
+          %big2 = arith.constant 4611686018427387904 : index
+          %cnt = memref.reinterpret_cast %count0 to offset: [0], sizes: [%big2], strides: [1]
+              : memref<1xi32, 1> to memref<?xi32, strided<[1]>, 1>
+          scf.if %l0 {
+            %old = memref.atomic_rmw addi %one, %cnt[%i0] : (i32, memref<?xi32, strided<[1]>, 1>) -> i32
+          }
         }
       }
     }

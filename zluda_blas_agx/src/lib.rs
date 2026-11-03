@@ -456,18 +456,27 @@ mod imp {
     /// The smallest n for which sgemm with op(A) = A^T transposes A first (see gemm).
     const PRETRANSPOSE_MIN_N: c_int = 256;
 
-    /// Slices of K for a single f32 product (1: no split): with at most 16 output tiles of 64 x 64 and K >= 1024,
-    /// enough slices for ~64 workgroups, each at least 256 of K, at most 16.
-    fn split_k(m: u64, n: u64, k: u64) -> u64 {
+    /// Slices of K for a single product with f32 C (f32 or f16 A and B; 1: no split): with at most 16 output tiles of
+    /// 64 x 64 and K >= `min_k`, enough slices for ~64 workgroups, each at least 256 of K, at most 16.
+    fn split_k(m: u64, n: u64, k: u64, min_k: u64) -> u64 {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var("ZLUDA_AGX_GEMM_SPLITK").map_or(true, |v| v != "0")) {
             return 1;
         }
         let tiles = (m / 64) * (n / 64);
-        if tiles == 0 || tiles > 16 || k < 1024 {
+        if tiles == 0 || tiles > 16 || k < min_k {
             return 1;
         }
         (64 / tiles).min(k / 256).min(16).max(1)
+    }
+
+    /// The shortest K that split_k splits for `types` (ZLUDA_AGX_GEMM_SPLITK_MIN_K for both): 1024 for f32 A and B;
+    /// 512 for f16 A and B with f32 C (cublasGemmEx as ggml calls it, M2 Max: 896 x 64 x 896 116 -> 81 us,
+    /// 128 x 512 x 896 99 -> 82 us; 256 gains nothing more).
+    fn split_k_min_k(types: Types) -> u64 {
+        static K: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        let set = *K.get_or_init(|| std::env::var("ZLUDA_AGX_GEMM_SPLITK_MIN_K").ok().and_then(|v| v.parse().ok()));
+        set.unwrap_or(if types == Types::S { 1024 } else { 512 })
     }
 
     fn pretranspose_enabled() -> bool {
@@ -516,7 +525,8 @@ mod imp {
         let (mut a, mut lda, mut ta) = (a, lda, ta);
         let pre = types == Types::S && ta && batch == 1 && n >= PRETRANSPOSE_MIN_N && m >= 64 && k >= 64
             && pretranspose_enabled();
-        let slices = if types == Types::S && batch == 1 { split_k(m as u64, n as u64, k as u64) } else { 1 };
+        // (the partial products are f32 for f32 and f16 A and B, which agx_ssum_slices adds to C when it is f32 too)
+        let slices = if matches!(types, Types::S | Types::HtoS) && batch == 1 { split_k(m as u64, n as u64, k as u64, split_k_min_k(types)) } else { 1 };
         let pre_bytes = if pre { m as usize * k as usize * 4 } else { 0 };
         let part_bytes = if slices > 1 { slices as usize * m as usize * n as usize * 4 } else { 0 };
         let base = if pre_bytes + part_bytes > 0 { scratch(h, pre_bytes + part_bytes)? } else { std::ptr::null_mut() };
@@ -561,8 +571,9 @@ mod imp {
                 g.k = k - done;
                 g.beta = 1.0;
                 g.batch = 1;
-                g.a = a.cast::<f32>().add(step_a(done) as usize).cast();
-                g.b = b.cast::<f32>().add(step_b(done) as usize).cast();
+                let elem = if types == Types::S { 4 } else { 2 };
+                g.a = a.byte_add(step_a(done) as usize * elem);
+                g.b = b.byte_add(step_b(done) as usize * elem);
                 engine::gemm(&g, h.stream).map_err(status)?;
             }
             let (mut p, mut cc) = (part as *const c_void, c);
@@ -1129,6 +1140,29 @@ mod imp {
                 ],
                 [n * 32, 1],
                 [128, 1],
+            );
+        }
+        // few rows: the columns in chunks (agx_sgemv_split, partial sums in the handle's scratch, then agx_sgemv_sum in
+        // chunk order) so that ~64K threads run; a thread per row walked all n columns (1024 x 16384: 2.04 ms, 33 GB/s)
+        let chunks = (65536 / m.max(1)).clamp(1, (n / 64).max(1));
+        // (from 8192 rows a thread per row fills the GPU: 16384 x 1024 192 us one pass, 272 split)
+        if m < 8192 && chunks > 1 && incx == 1 && incy == 1 && std::env::var("ZLUDA_AGX_GEMV_SPLIT").map_or(true, |v| v != "0") {
+            let mut chunk = (n + chunks - 1) / chunks;
+            let mut nchunks = (n + chunk - 1) / chunk;
+            let mut part = scratch(h, (m * nchunks) as usize * std::mem::size_of::<T>())?;
+            blas_launch(
+                h,
+                T::kernel(c"agx_sgemv_split", c"agx_sgemv_split_f64"),
+                &mut [arg(&mut a), arg(&mut x), arg(&mut part), arg(&mut m), arg(&mut n), arg(&mut lda), arg(&mut chunk)],
+                [m, nchunks],
+                [64, 1],
+            )?;
+            return blas_launch(
+                h,
+                T::kernel(c"agx_sgemv_sum", c"agx_sgemv_sum_f64"),
+                &mut [arg(&mut part), arg(&mut y), arg(&mut m), arg(&mut nchunks), arg(&mut alpha), arg(&mut beta)],
+                [m, 1],
+                [64, 1],
             );
         }
         let mut trans = 0i64;

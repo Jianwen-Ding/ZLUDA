@@ -301,6 +301,40 @@ mod imp {
 
     struct Handle {
         stream: cudaStream_t,
+        /// Device buffers for the temporaries of the handle's calls (`temp`): (address, bytes, the stream that last
+        /// used it, in use). A buffer returns here when its call is done with it instead of being freed, which waited
+        /// for the GPU at every convolution through im2col (and allocated anew: object creation zeroes its pages).
+        pool: std::cell::RefCell<Vec<(*mut c_void, usize, cudaStream_t, bool)>>,
+        /// f32 ones (address, count) for summing a filter gradient's per-image parts with a GEMM; it only grows (a
+        /// new buffer, written before any work uses it), so its contents never change under queued work
+        ones: std::cell::Cell<(*mut c_void, usize)>,
+        /// the same in f16
+        ones16: std::cell::Cell<(*mut c_void, usize)>,
+    }
+
+    impl Handle {
+        fn new() -> Handle {
+            Handle { stream: cuda_types::cuda::CUstream(std::ptr::null_mut()), pool: Default::default(), ones: Default::default(), ones16: Default::default() }
+        }
+    }
+
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            for &(p, _, stream, _) in self.pool.get_mut().iter() {
+                unsafe {
+                    let _ = engine::synchronize(stream);
+                    let _ = engine::free(p);
+                }
+            }
+            for (ones, _) in [self.ones.get(), self.ones16.get()] {
+                if !ones.is_null() {
+                    unsafe {
+                        let _ = engine::synchronize(self.stream);
+                        let _ = engine::free(ones);
+                    }
+                }
+            }
+        }
     }
 
     fn status(e: engine::Error) -> cudnnError_t {
@@ -368,7 +402,7 @@ mod imp {
         if !engine::available() {
             return Err(cudnnError_t::NOT_INITIALIZED);
         }
-        out(h, Box::into_raw(Box::new(Handle { stream: cuda_types::cuda::CUstream(std::ptr::null_mut()) })) as cudnnHandle_t)
+        out(h, Box::into_raw(Box::new(Handle::new())) as cudnnHandle_t)
     }
 
     pub(crate) unsafe fn cudnnDestroy(h: cudnnHandle_t) -> cudnnStatus_t {
@@ -1101,19 +1135,30 @@ mod imp {
         let elements = crs * pq;
         let groups = u32::try_from((elements as u64).div_ceil(256)).ok()?;
         let size = if half { 2 } else { 4 };
+        // a forward convolution's images in chunks: each image's columns at its place in one buffer, then one strided
+        // batched GEMM for the chunk (a GEMM per image left most of the GPU idle for small images: 16 x 128 x 28 x 28,
+        // 3x3, 3.48 ms); the buffer at most 64 MiB (or one image's)
+        let chunk = if filter { 1 } else { ((64i64 << 20) / (elements * size)).clamp(1, n as i64) as i32 };
+        if filter && n > 1 && std::env::var("ZLUDA_AGX_DNN_WGRAD_BATCH").map_or(true, |v| v != "0") {
+            if let Some(r) = filter_batched(h, s, half, x, w, y, alpha, beta, elements, groups) {
+                return Some(r);
+            }
+        }
         Some((|| {
-            let col = temp(h, elements * size)?;
+            let col = temp(h, elements * size * chunk as i64)?;
             let name = if half { c"agx_conv2d_im2col_f16" } else { c"agx_conv2d_im2col_f32" };
-            let f = conv_function(name, index32(s, elements))?;
+            let f = conv_function(name, index32(s, elements * chunk as i64))?;
             let (alpha, beta) = (*(alpha as *const f32) as f64, *(beta as *const f32) as f64);
-            for image in 0..n {
+            let types = if half { agx_libs::Types::H } else { agx_libs::Types::S };
+            for first in (0..n).step_by(chunk as usize) {
+                let count = chunk.min(n - first);
+                // the chunk's images in one launch: image first + (grid y), its columns one image's size further
                 let mut colp = col.0;
-                let mut shape: [i32; 22] = std::array::from_fn(|i| if i < 21 { s[i] } else { image });
+                let mut shape: [i32; 22] = std::array::from_fn(|i| if i < 21 { s[i] } else { first });
                 let mut params: Vec<*mut c_void> = vec![&mut x as *mut _ as *mut c_void, &mut colp as *mut _ as *mut c_void];
                 params.extend(shape.iter_mut().map(|v| v as *mut i32 as *mut c_void));
-                engine::launch_kernel(f, [groups, 1], [256, 1], &mut params, h.stream).map_err(status)?;
-                let y_n = y.byte_offset(image as isize * s[21] as isize * size as isize);
-                let types = if half { agx_libs::Types::H } else { agx_libs::Types::S };
+                engine::launch_kernel(f, [groups, count as u32], [256, 1], &mut params, h.stream).map_err(status)?;
+                let y_n = y.byte_offset(first as isize * s[21] as isize * size as isize);
                 let g = if filter {
                     engine::Gemm {
                         types,
@@ -1123,7 +1168,7 @@ mod imp {
                         n: k as u64,
                         k: pq as u64,
                         alpha,
-                        beta: if image == 0 { beta } else { 1.0 },
+                        beta: if first == 0 { beta } else { 1.0 },
                         a: col.0,
                         lda: pq as u64,
                         stride_a: 0,
@@ -1147,14 +1192,14 @@ mod imp {
                         beta,
                         a: col.0,
                         lda: pq as u64,
-                        stride_a: 0,
+                        stride_a: elements,
                         b: w,
                         ldb: crs as u64,
                         stride_b: 0,
                         c: y_n,
                         ldc: pq as u64,
-                        stride_c: 0,
-                        batch: 1,
+                        stride_c: s[21] as i64,
+                        batch: count as u64,
                     }
                 };
                 engine::gemm(&g, h.stream).map_err(status)?;
@@ -1163,9 +1208,121 @@ mod imp {
         })())
     }
 
+    /// The filter gradient of im2col_gemm's convolutions for a chunk of images at a time: one im2col launch for
+    /// the chunk, one strided batched GEMM giving each image's part dy[n] col_n^T (C R S x K) in a temporary, then a
+    /// GEMM against ones that sums the parts into dw with alpha and beta (an image at a time was an im2col launch and
+    /// a GEMM per image). Chunks of up to 64 MiB of col and of parts; None when one image is all that fits. In f16 the
+    /// parts are f16 (each rounded once, the sum computed in f32 and rounded once; an image at a time rounded dw
+    /// after every image).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn filter_batched(
+        h: &Handle,
+        s: &[i32; 25],
+        half: bool,
+        mut x: *const c_void,
+        w: *mut c_void,
+        dy: *mut c_void,
+        alpha: *const c_void,
+        beta: *const c_void,
+        elements: i64,
+        groups: u32,
+    ) -> Option<cudnnStatus_t> {
+        let size: i64 = if half { 2 } else { 4 };
+        let types = if half { agx_libs::Types::H } else { agx_libs::Types::S };
+        let [n, ch, _, _, k, r, sw, p, q, ..] = *s;
+        let (pq, crs) = (p as i64 * q as i64, ch as i64 * r as i64 * sw as i64);
+        let part = crs * k as i64;
+        let chunk = ((64i64 << 20) / (elements * size)).min((64i64 << 20) / (part * size)).clamp(1, n as i64) as i32;
+        if chunk < 2 {
+            return None;
+        }
+        Some((|| {
+            let col = temp(h, elements * size * chunk as i64)?;
+            let parts = temp(h, part * size * chunk as i64)?;
+            let cell = if half { &h.ones16 } else { &h.ones };
+            let (ones, have) = cell.get();
+            let ones = if have >= chunk as usize {
+                ones
+            } else {
+                let o = engine::alloc(size as usize * chunk as usize).map_err(status)?;
+                // 1.0 in f32 or f16 (0x3c00)
+                let v: Vec<u8> = if half {
+                    std::iter::repeat_n(0x3c00u16.to_le_bytes(), chunk as usize).flatten().collect()
+                } else {
+                    std::iter::repeat_n(1.0f32.to_le_bytes(), chunk as usize).flatten().collect()
+                };
+                engine::write(o, v.as_ptr() as *const c_void, v.len()).map_err(status)?;
+                if !ones.is_null() {
+                    // queued work may still read the old one
+                    engine::synchronize(h.stream).map_err(status)?;
+                    engine::free(ones).map_err(status)?;
+                }
+                cell.set((o, chunk as usize));
+                o
+            };
+            let name = if half { c"agx_conv2d_im2col_f16" } else { c"agx_conv2d_im2col_f32" };
+            let f = conv_function(name, index32(s, elements * chunk as i64))?;
+            let (alpha, beta) = (*(alpha as *const f32) as f64, *(beta as *const f32) as f64);
+            for first in (0..n).step_by(chunk as usize) {
+                let count = chunk.min(n - first);
+                let mut colp = col.0;
+                let mut shape: [i32; 22] = std::array::from_fn(|i| if i < 21 { s[i] } else { first });
+                let mut params: Vec<*mut c_void> = vec![&mut x as *mut _ as *mut c_void, &mut colp as *mut _ as *mut c_void];
+                params.extend(shape.iter_mut().map(|v| v as *mut i32 as *mut c_void));
+                engine::launch_kernel(f, [groups, count as u32], [256, 1], &mut params, h.stream).map_err(status)?;
+                // part[i] (C R S x K, ld C R S) = col_i (C R S x PQ)^T-major times dy[first + i] (PQ x K)
+                let each = engine::Gemm {
+                    types,
+                    ta: true,
+                    tb: false,
+                    m: crs as u64,
+                    n: k as u64,
+                    k: pq as u64,
+                    alpha: 1.0,
+                    beta: 0.0,
+                    a: col.0,
+                    lda: pq as u64,
+                    stride_a: elements,
+                    b: dy.byte_offset(first as isize * s[21] as isize * size as isize),
+                    ldb: pq as u64,
+                    stride_b: s[21] as i64,
+                    c: parts.0,
+                    ldc: crs as u64,
+                    stride_c: part,
+                    batch: count as u64,
+                };
+                engine::gemm(&each, h.stream).map_err(status)?;
+                // dw (C R S K) = alpha (parts (C R S K x count) ones) + beta dw, beta 1 after the first chunk
+                let sum = engine::Gemm {
+                    types,
+                    ta: false,
+                    tb: false,
+                    m: part as u64,
+                    n: 1,
+                    k: count as u64,
+                    alpha,
+                    beta: if first == 0 { beta } else { 1.0 },
+                    a: parts.0,
+                    lda: part as u64,
+                    stride_a: 0,
+                    b: ones,
+                    ldb: count as u64,
+                    stride_b: 0,
+                    c: w,
+                    ldc: part as u64,
+                    stride_c: 0,
+                    batch: 1,
+                };
+                engine::gemm(&sum, h.stream).map_err(status)?;
+            }
+            Ok(())
+        })())
+    }
+
     /// The data gradient of a convolution with one group and dense dy planes, large enough for the matrix unit: per
     /// image, col (C R S x P Q, f32) = w^T (C R S x K) dy[n] (K x PQ) on agx_libs' GEMM (column-major col^T =
-    /// dy[n]^T w, B transposed), then `agx_conv2d_col2im_*` gathers dx[n] from col. None when it does not apply.
+    /// dy[n]^T w, B transposed; batched over a chunk of images), then `agx_conv2d_col2im_*` gathers dx[n] from col
+    /// (the chunk in one launch). None when it does not apply.
     #[allow(clippy::too_many_arguments)]
     unsafe fn col2im_gemm(
         h: &Handle,
@@ -1187,11 +1344,15 @@ mod imp {
         let groups = u32::try_from((ch as u64 * hh as u64 * wd as u64).div_ceil(256)).ok()?;
         let size = if half { 2 } else { 4 };
         Some((|| {
-            let col = temp(h, crs * pq * 4)?;
+            // the images in chunks of up to 64 MiB of col (f32): one batched GEMM and one gather per chunk
+            let elements = crs * pq;
+            let chunk = ((64i64 << 20) / (elements * 4)).clamp(1, n as i64) as i32;
+            let col = temp(h, elements * 4 * chunk as i64)?;
             let name = if half { c"agx_conv2d_col2im_f16" } else { c"agx_conv2d_col2im_f32" };
-            let f = conv_function(name, index32(s, crs * pq))?;
+            let f = conv_function(name, index32(s, elements * chunk as i64))?;
             let (mut alpha, mut beta) = (*(alpha as *const f32), *(beta as *const f32));
-            for image in 0..n {
+            for first in (0..n).step_by(chunk as usize) {
+                let count = chunk.min(n - first);
                 let g = engine::Gemm {
                     types: if half { agx_libs::Types::HtoS } else { agx_libs::Types::S },
                     ta: false,
@@ -1201,25 +1362,25 @@ mod imp {
                     k: k as u64,
                     alpha: 1.0,
                     beta: 0.0,
-                    a: dy.byte_offset(image as isize * ys0 as isize * size),
+                    a: dy.byte_offset(first as isize * ys0 as isize * size),
                     lda: pq as u64,
-                    stride_a: 0,
+                    stride_a: ys0 as i64,
                     b: w,
                     ldb: crs as u64,
                     stride_b: 0,
                     c: col.0,
                     ldc: pq as u64,
-                    stride_c: 0,
-                    batch: 1,
+                    stride_c: elements,
+                    batch: count as u64,
                 };
                 engine::gemm(&g, h.stream).map_err(status)?;
                 let mut colp = col.0;
-                let mut shape: [i32; 22] = std::array::from_fn(|i| if i < 21 { s[i] } else { image });
+                let mut shape: [i32; 22] = std::array::from_fn(|i| if i < 21 { s[i] } else { first });
                 let mut params: Vec<*mut c_void> = vec![&mut colp as *mut _ as *mut c_void, &mut dx as *mut _ as *mut c_void];
                 params.extend(shape.iter_mut().map(|v| v as *mut i32 as *mut c_void));
                 params.push(&mut alpha as *mut f32 as *mut c_void);
                 params.push(&mut beta as *mut f32 as *mut c_void);
-                engine::launch_kernel(f, [groups, 1], [256, 1], &mut params, h.stream).map_err(status)?;
+                engine::launch_kernel(f, [groups, count as u32], [256, 1], &mut params, h.stream).map_err(status)?;
             }
             Ok(())
         })())
@@ -1938,20 +2099,40 @@ mod imp {
         Ok(())
     }
 
-    /// Device memory released after the handle's stream finishes with it.
-    struct Temp(*mut c_void, cudaStream_t);
+    /// Device memory for one call's temporary, from the handle's pool: back in the pool when dropped, for the work
+    /// queued on the handle's stream after it (stream order keeps that work after the work that used it).
+    /// (The handle outlives its calls, which hold their temporaries.)
+    struct Temp(*mut c_void, *const Handle, usize);
 
     impl Drop for Temp {
         fn drop(&mut self) {
-            unsafe {
-                let _ = engine::synchronize(self.1);
-                let _ = engine::free(self.0);
-            }
+            let h = unsafe { &*self.1 };
+            let mut pool = h.pool.borrow_mut();
+            pool[self.2].2 = h.stream;
+            pool[self.2].3 = false;
         }
     }
 
     unsafe fn temp(h: &Handle, bytes: i64) -> Result<Temp, cudnnError_t> {
-        Ok(Temp(engine::alloc(bytes.max(4) as usize).map_err(status)?, h.stream))
+        let bytes = bytes.max(4) as usize;
+        let mut pool = h.pool.borrow_mut();
+        // the smallest free buffer that is large enough, else a new one
+        let free = (0..pool.len()).filter(|&i| !pool[i].3 && pool[i].1 >= bytes).min_by_key(|&i| pool[i].1);
+        let i = match free {
+            Some(i) => {
+                // used last on another stream: that stream's work on it first
+                if pool[i].2 .0 != h.stream.0 {
+                    engine::synchronize(pool[i].2).map_err(status)?;
+                }
+                i
+            }
+            None => {
+                pool.push((engine::alloc(bytes).map_err(status)?, bytes, h.stream, false));
+                pool.len() - 1
+            }
+        };
+        pool[i].3 = true;
+        Ok(Temp(pool[i].0, h as *const Handle, i))
     }
 
     #[allow(clippy::too_many_arguments)]

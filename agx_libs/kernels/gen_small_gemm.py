@@ -17,13 +17,110 @@ import sys
 
 KERNELS = {  # file: [(name, A and B type, C type, accumulator and scalar type)]
     "sgemm.mlir": [("agx_sgemm_generic", "f32", "f32", "f32"), ("agx_dgemm_generic", "f64", "f64", "f64"),
-                   ("agx_sgemm_dot", "f32", "f32", "f32"), ("agx_dgemm_dot", "f64", "f64", "f64")],
+                   ("agx_sgemm_dot", "f32", "f32", "f32"), ("agx_dgemm_dot", "f64", "f64", "f64"),
+                   ("agx_sgemm_dotrows", "f32", "f32", "f32"), ("agx_dgemm_dotrows", "f64", "f64", "f64")],
     "hgemm.mlir": [("agx_hgemm_generic_cf16", "f16", "f16", "f32"), ("agx_hgemm_generic_cf32", "f16", "f32", "f32"),
-                   ("agx_hgemm_dot_cf16", "f16", "f16", "f32"), ("agx_hgemm_dot_cf32", "f16", "f32", "f32")],
+                   ("agx_hgemm_dot_cf16", "f16", "f16", "f32"), ("agx_hgemm_dot_cf32", "f16", "f32", "f32"),
+                   ("agx_hgemm_dotrows_cf16", "f16", "f16", "f32"), ("agx_hgemm_dotrows_cf32", "f16", "f32", "f32")],
 }
 
 
+# Columns of C the row kernels compute at once (DOT_ROWS_SIDE in agx_libs/src/lib.rs).
+ROWS = 8
+
+
+def rows_kernel(name, ab, c, acc):
+    """A SIMD-group per row of C computing all its (at most ROWS) columns: the lanes split K (one step at a time: four
+    at a time, 32 loads of op(B) in flight, was twice as slow), each loads op(A)'s element once and multiplies it with the ROWS columns of op(B) (columns past N read column N - 1, not stored), then
+    each column's sum is reduced across the SIMD-group and lane 0 writes it. op(A) is read once instead of once per
+    column of C as by the dot kernel."""
+    mem = lambda t: f"memref<?x{t}, strided<[1], offset: ?>, 1>"
+    o = []
+    w = o.append
+    w(f"  gpu.func @{name}(%a0: memref<1x{ab}, 1>, %b0: memref<1x{ab}, 1>,")
+    w(f"      %c0: memref<1x{c}, 1>, %M: index, %N: index, %K: index, %sar: index, %sac: index,")
+    w(f"      %sbr: index, %sbc: index, %scr: index, %scc: index, %sa: index, %sb: index, %sc: index,")
+    w(f"      %alpha: {acc}, %beta: {acc}) kernel {{")
+    for v in [0, 1, 32]:
+        w(f"    %i{v} = arith.constant {v} : index")
+    w("    %big = arith.constant 4611686018427387904 : index")
+    w("    %z = gpu.block_id y")
+    for n in ["a", "b", "c"]:
+        w(f"    %o{n} = arith.muli %z, %s{n} : index")
+    for n, t in [("A", ab), ("B", ab), ("C", c)]:
+        w(f"    %{n} = memref.reinterpret_cast %{n.lower()}0 to offset: [%o{n.lower()}], sizes: [%big], strides: [1]")
+        w(f"        : memref<1x{t}, 1> to {mem(t)}")
+    w(f"    %f0 = arith.constant 0.0 : {acc}")
+    w("    %g = gpu.global_id x")
+    w("    %i = arith.divui %g, %i32 : index")
+    w("    %lane = gpu.lane_id")
+    w("    // the same for the whole SIMD-group, which reduces together")
+    w("    %live = arith.cmpi ult, %i, %M : index")
+    w("    scf.if %live {")
+    w("      %ia = arith.muli %i, %sar : index")
+    w("      %nl = arith.subi %N, %i1 : index")
+    for j in range(ROWS):
+        w(f"      %j{j}c = arith.constant {j} : index")
+        w(f"      %j{j} = arith.minui %j{j}c, %nl : index")
+        w(f"      %jb{j} = arith.muli %j{j}, %sbc : index")
+    accs = ", ".join(f"%r{j}_ = %f0" for j in range(ROWS))
+    tys = ", ".join([acc] * ROWS)
+    w(f"      %s:{ROWS} = scf.for %k = %lane to %K step %i32 iter_args({accs}) -> ({tys}) {{")
+    w("        %ka = arith.muli %k, %sac : index")
+    w("        %pa = arith.addi %ia, %ka : index")
+    w("        %kb = arith.muli %k, %sbr : index")
+    x = "%x" if ab == acc else "%xn"
+    w(f"        {x} = memref.load %A[%pa] : {mem(ab)}")
+    if ab != acc:
+        w(f"        %x = arith.extf %xn : {ab} to {acc}")
+    outs = []
+    for j in range(ROWS):
+        w(f"        %pb{j} = arith.addi %kb, %jb{j} : index")
+        y = f"%y{j}" if ab == acc else f"%yn{j}"
+        w(f"        {y} = memref.load %B[%pb{j}] : {mem(ab)}")
+        if ab != acc:
+            w(f"        %y{j} = arith.extf %yn{j} : {ab} to {acc}")
+        w(f"        %d{j} = math.fma %x, %y{j}, %r{j}_ : {acc}")
+        outs.append(f"%d{j}")
+    w(f"        scf.yield {', '.join(outs)} : {tys}")
+    w("      }")
+    w("      %first = arith.cmpi eq, %lane, %i0 : index")
+    w("      %ic = arith.muli %i, %scr : index")
+    w(f"      %no_c = arith.cmpf oeq, %beta, %f0 : {acc}")
+    for j in range(ROWS):
+        w(f"      %sum{j} = gpu.subgroup_reduce add %s#{j} : ({acc}) -> {acc}")
+        w(f"      %in{j} = arith.cmpi ult, %j{j}c, %N : index")
+        w(f"      %w{j} = arith.andi %first, %in{j} : i1")
+        w(f"      scf.if %w{j} {{")
+        w(f"        %jc{j} = arith.muli %j{j}c, %scc : index")
+        w(f"        %pc{j} = arith.addi %ic, %jc{j} : index")
+        w(f"        %scaled{j} = arith.mulf %sum{j}, %alpha : {acc}")
+        w(f"        %out{j} = scf.if %no_c -> {acc} {{")
+        w(f"          scf.yield %scaled{j} : {acc}")
+        w("        } else {")
+        if c == acc:
+            w(f"          %old{j} = memref.load %C[%pc{j}] : {mem(c)}")
+        else:
+            w(f"          %oldn{j} = memref.load %C[%pc{j}] : {mem(c)}")
+            w(f"          %old{j} = arith.extf %oldn{j} : {c} to {acc}")
+        w(f"          %r{j} = math.fma %old{j}, %beta, %scaled{j} : {acc}")
+        w(f"          scf.yield %r{j} : {acc}")
+        w("        }")
+        if c == acc:
+            w(f"        memref.store %out{j}, %C[%pc{j}] : {mem(c)}")
+        else:
+            w(f"        %outn{j} = arith.truncf %out{j} : {acc} to {c}")
+            w(f"        memref.store %outn{j}, %C[%pc{j}] : {mem(c)}")
+        w("      }")
+    w("    }")
+    w("    gpu.return")
+    w("  }")
+    return o
+
+
 def kernel(name, ab, c, acc):
+    if "_dotrows" in name:
+        return rows_kernel(name, ab, c, acc)
     dot = "_dot" in name
     mem = lambda t: f"memref<?x{t}, strided<[1], offset: ?>, 1>"
     o = []
@@ -153,9 +250,11 @@ def main():
             start = next((i for i, l in enumerate(L) if re.match(r"  gpu\.func @%s\(" % name, l)), None)
             if start is None:
                 end = max(i for i, l in enumerate(L) if l == "}")  # the module's end
-                doc = ["", f"  // As agx_{name.split('_')[1]}_generic{name[len('agx_xgemm_dot'):]}, with a SIMD-group per "
+                doc = (["", f"  // A SIMD-group per row of C computing its (at most 8) columns, A read once (gen_small_gemm.py):",
+                        "  // for C with at most 8 columns and op(A) contiguous along K."] if "_dotrows" in name else
+                       ["", f"  // As agx_{name.split('_')[1]}_generic{name[len('agx_xgemm_dot'):]}, with a SIMD-group per "
                            "element of C whose lanes split K",
-                       "  // (gen_small_gemm.py): for C with a side of at most 8, A or B contiguous along K."]
+                        "  // (gen_small_gemm.py): for C with a side of at most 8, A or B contiguous along K."])
                 L[end:end] = doc + body
             else:
                 end = next(i for i in range(start, len(L)) if L[i] == "  }")

@@ -134,6 +134,19 @@ unsafe fn solves(h: &Handle, double: bool, n: i64, nrhs: i64, a: *const c_void, 
 /// right-hand side.
 const SOLVE_BLOCKED_MIN: i64 = 64;
 
+/// The threads of agx_lu_panel's workgroup (1024 do not launch: registers).
+const LU_PANEL_THREADS: i64 = 512;
+
+/// The columns of an agx_lu_panel panel: a panel runs on one core, column by column, so narrow panels and more of the
+/// work in the trailing GEMM (M2 Max, n 512 / 2048 / 4096: 8 columns 6.4 / 37.7 / 143 ms, 16 5.2 / 33.3 / 116, 32
+/// 6.2 / 39.7 / 129, 64 8.8 / 59.3 / 189).
+const LU_PANEL_COLS: i64 = 16;
+
+/// The columns of an agx_chol_panel panel (blocked f32 potrf): each panel's trailing syrk is several launches, so wider
+/// than getrf's (M2 Max, n 512 / 1000 / 2048: 16 columns 3.8 / 11.3 / 45.7 ms, 32 3.4-3.8 / 10.3-11.3 / 38.0-38.8, 64
+/// 4.4 / 12.9 / 44.3).
+const CHOL_PANEL_COLS: i64 = 32;
+
 /// The columns of a panel of the blocked f32 getrf.
 const LU_BLOCK: i64 = 64;
 
@@ -157,6 +170,60 @@ unsafe fn getrf(h: &Handle, double: bool, m: c_int, n: c_int, a: *mut c_void, ld
     let mn = m.min(n) as i64;
     let block = if double || mn <= LU_BLOCK { mn } else { LU_BLOCK };
     let at = |r: i64, c: i64| (a as *mut f32).add((r + c * lda as i64) as usize) as *mut c_void;
+    // f32 panels of LU_PANEL_COLS in one launch each (agx_lu_panel, a workgroup of LU_PANEL_THREADS) and their swaps on
+    // the other columns in another (agx_lu_laswp): a column at a time is four dependent launches (n 512: 24.5 ms, 4096:
+    // 849 ms, ~12 us per launch). ZLUDA_AGX_LU_PANEL=0: a column at a time, panels of LU_BLOCK.
+    if !double && mn > LU_PANEL_COLS && std::env::var("ZLUDA_AGX_LU_PANEL").map_or(true, |v| v != "0") {
+        for j0 in (0..mn).step_by(LU_PANEL_COLS as usize) {
+            let (mut j0_, mut jb) = (j0, LU_PANEL_COLS.min(mn - j0));
+            run(
+                h,
+                c"agx_lu_panel",
+                &mut [arg(&mut pa), arg(&mut m_), arg(&mut lda_), arg(&mut j0_), arg(&mut jb), arg(&mut pi), arg(&mut pinfo)],
+                [LU_PANEL_THREADS, 1],
+                [LU_PANEL_THREADS as u32, 1],
+            )?;
+            run(
+                h,
+                c"agx_lu_laswp",
+                &mut [arg(&mut pa), arg(&mut n_), arg(&mut lda_), arg(&mut j0_), arg(&mut jb), arg(&mut pi)],
+                [n_, 1],
+                [64, 1],
+            )?;
+            let (j1, rest) = (j0 + jb, n_ - j0 - jb);
+            if rest <= 0 {
+                continue;
+            }
+            // U12 = L11^-1 A12 (unit lower), then A22 -= A21 U12
+            let a12 = at(j0, j1);
+            let u12 = engine::Trsm { right: false, upper: false, trans: false, unit: true, m: jb, n: rest, alpha: 1.0, a: at(j0, j0), lda: lda_, b: a12, ldb: lda_, double: false };
+            engine::trsm(&u12, h.stream).map_err(status)?;
+            if m_ > j1 {
+                let g = engine::Gemm {
+                    types: agx_libs::Types::S,
+                    ta: false,
+                    tb: false,
+                    m: (m_ - j1) as u64,
+                    n: rest as u64,
+                    k: jb as u64,
+                    alpha: -1.0,
+                    beta: 1.0,
+                    a: at(j1, j0),
+                    lda: lda_ as u64,
+                    stride_a: 0,
+                    b: a12,
+                    ldb: lda_ as u64,
+                    stride_b: 0,
+                    c: at(j1, j1),
+                    ldc: lda_ as u64,
+                    stride_c: 0,
+                    batch: 1,
+                };
+                engine::gemm(&g, h.stream).map_err(status)?;
+            }
+        }
+        return Ok(());
+    }
     for k in 0..mn {
         let mut k_ = k;
         // the end of k's panel: the update stays in it
@@ -298,32 +365,51 @@ unsafe fn potrf(h: &Handle, double: bool, uplo: cublasFillMode_t, n: c_int, a: *
     let lda_ = lda as i64;
     let block = if double || n_ <= LU_BLOCK { n_ } else { LU_BLOCK };
     let at = |r: i64, c: i64| (a as *mut f32).add((r + c * lda_) as usize) as *mut c_void;
-    for k in 0..n as i64 {
+    // f32 panels of CHOL_PANEL_COLS in one launch each (agx_chol_panel): a column at a time is three dependent launches
+    // (n 512: 7.5 ms, 2048: 41 ms; panels 3.4-3.7 / 38 ms). ZLUDA_AGX_CHOL_PANEL=0: a column at a time, panels of
+    // LU_BLOCK.
+    let panels = !double && n_ > CHOL_PANEL_COLS && std::env::var("ZLUDA_AGX_CHOL_PANEL").map_or(true, |v| v != "0");
+    let block = if panels { CHOL_PANEL_COLS } else { block };
+    let mut k = 0i64;
+    while k < n_ {
         let mut k_ = k;
         // the end of k's panel: the update stays in it
         let (j0, mut j1) = (k / block * block, (k / block * block + block).min(n_));
-        run(
-            h,
-            kernel(double, [c"agx_chol_diag", c"agx_chol_diag_f64"]),
-            &mut [arg(&mut pa), arg(&mut k_), arg(&mut rs), arg(&mut cs), arg(&mut pinfo)],
-            [1, 1],
-            [1, 1],
-        )?;
-        run(
-            h,
-            kernel(double, [c"agx_chol_scale", c"agx_chol_scale_f64"]),
-            &mut [arg(&mut pa), arg(&mut n_), arg(&mut k_), arg(&mut rs), arg(&mut cs), arg(&mut pinfo)],
-            [n_ - k - 1, 1],
-            [64, 1],
-        )?;
-        run(
-            h,
-            kernel(double, [c"agx_chol_update", c"agx_chol_update_f64"]),
-            &mut [arg(&mut pa), arg(&mut n_), arg(&mut k_), arg(&mut rs), arg(&mut cs), arg(&mut pinfo), arg(&mut j1)],
-            [n_ - k - 1, j1 - k - 1],
-            [16, 4],
-        )?;
-        if k + 1 != j1 || j1 >= n_ {
+        if panels {
+            let (mut j0_, mut jb) = (j0, j1 - j0);
+            run(
+                h,
+                c"agx_chol_panel",
+                &mut [arg(&mut pa), arg(&mut n_), arg(&mut j0_), arg(&mut jb), arg(&mut rs), arg(&mut cs), arg(&mut pinfo)],
+                [LU_PANEL_THREADS, 1],
+                [LU_PANEL_THREADS as u32, 1],
+            )?;
+            k = j1;
+        } else {
+            k += 1;
+            run(
+                h,
+                kernel(double, [c"agx_chol_diag", c"agx_chol_diag_f64"]),
+                &mut [arg(&mut pa), arg(&mut k_), arg(&mut rs), arg(&mut cs), arg(&mut pinfo)],
+                [1, 1],
+                [1, 1],
+            )?;
+            run(
+                h,
+                kernel(double, [c"agx_chol_scale", c"agx_chol_scale_f64"]),
+                &mut [arg(&mut pa), arg(&mut n_), arg(&mut k_), arg(&mut rs), arg(&mut cs), arg(&mut pinfo)],
+                [n_ - k_ - 1, 1],
+                [64, 1],
+            )?;
+            run(
+                h,
+                kernel(double, [c"agx_chol_update", c"agx_chol_update_f64"]),
+                &mut [arg(&mut pa), arg(&mut n_), arg(&mut k_), arg(&mut rs), arg(&mut cs), arg(&mut pinfo), arg(&mut j1)],
+                [n_ - k_ - 1, j1 - k_ - 1],
+                [16, 4],
+            )?;
+        }
+        if k != j1 || j1 >= n_ {
             continue;
         }
         // the panel j0..j1 is factored: A22 -= L21 L21^T on the stored triangle (U12^T U12 for upper), a syrk of the
@@ -449,26 +535,43 @@ unsafe fn geqrf(h: &Handle, double: bool, m: c_int, n: c_int, a: *mut c_void, ld
     let block = if need > 0 && !work.is_null() && lwork as i64 >= need { QR_BLOCK } else { i64::MAX };
     let mn = m.min(n) as i64;
     let f = |p: *mut c_void, i: i64| (p as *mut f32).add(i as usize) as *mut c_void;
-    for k in 0..mn {
+    // f32 panels (blocked, QR_BLOCK columns) in one launch each (agx_qr_panel): a column at a time is a reflector on
+    // one thread and an apply (4096 x 256: 373 ms, 1.45 ms a column). ZLUDA_AGX_QR_PANEL=0: a column at a time.
+    let panels = !double && block != i64::MAX && std::env::var("ZLUDA_AGX_QR_PANEL").map_or(true, |v| v != "0");
+    let mut k = 0i64;
+    while k < mn {
         let mut k_ = k;
         // the end of k's panel: the reflections stay in it
         let j0 = if block == i64::MAX { 0 } else { k / block * block };
         let mut j1 = if block == i64::MAX { n_ } else { (j0 + block).min(mn) };
-        run(
-            h,
-            kernel(double, [c"agx_qr_house", c"agx_qr_house_f64"]),
-            &mut [arg(&mut pa), arg(&mut m_), arg(&mut k_), arg(&mut lda_), arg(&mut pt)],
-            [1, 1],
-            [1, 1],
-        )?;
-        run(
-            h,
-            kernel(double, [c"agx_qr_apply", c"agx_qr_apply_f64"]),
-            &mut [arg(&mut pa), arg(&mut m_), arg(&mut j1), arg(&mut k_), arg(&mut lda_), arg(&mut pt)],
-            [j1 - k - 1, 1],
-            [64, 1],
-        )?;
-        if k + 1 != j1 || j1 >= n_ {
+        if panels {
+            let (mut j0_, mut jb) = (j0, j1 - j0);
+            run(
+                h,
+                c"agx_qr_panel",
+                &mut [arg(&mut pa), arg(&mut m_), arg(&mut lda_), arg(&mut j0_), arg(&mut jb), arg(&mut pt)],
+                [LU_PANEL_THREADS, 1],
+                [LU_PANEL_THREADS as u32, 1],
+            )?;
+            k = j1;
+        } else {
+            k += 1;
+            run(
+                h,
+                kernel(double, [c"agx_qr_house", c"agx_qr_house_f64"]),
+                &mut [arg(&mut pa), arg(&mut m_), arg(&mut k_), arg(&mut lda_), arg(&mut pt)],
+                [1, 1],
+                [1, 1],
+            )?;
+            run(
+                h,
+                kernel(double, [c"agx_qr_apply", c"agx_qr_apply_f64"]),
+                &mut [arg(&mut pa), arg(&mut m_), arg(&mut j1), arg(&mut k_), arg(&mut lda_), arg(&mut pt)],
+                [j1 - k_ - 1, 1],
+                [64, 1],
+            )?;
+        }
+        if k != j1 || j1 >= n_ {
             continue;
         }
         let (jb, mv, n2) = (j1 - j0, m_ - j0, n_ - j1);
@@ -938,7 +1041,11 @@ unsafe fn jacobi(
     ldv: i64,
     count: *mut c_void,
 ) -> Result<bool, cusolverStatus_t> {
-    let round = kernel(double, [c"agx_jacobi_round", c"agx_jacobi_round_f64"]);
+    // f32: a SIMD-group per column pair (agx_jacobi_round_sg), whose lanes read neighbouring rows; a thread per pair
+    // read each pair's columns alone (n 512 gesvd: 1.29 s). ZLUDA_AGX_JACOBI_SG=0: a thread per pair.
+    let sg = !double && std::env::var("ZLUDA_AGX_JACOBI_SG").map_or(true, |v| v != "0");
+    let round = if sg { c"agx_jacobi_round_sg" } else { kernel(double, [c"agx_jacobi_round", c"agx_jacobi_round_f64"]) };
+    let (per_pair, block) = if sg { (32, 128) } else { (1, 32) };
     let tol = jacobi_tol(double);
     for _ in 0..60 {
         set_info(h, count.cast(), 0)?;
@@ -961,8 +1068,8 @@ unsafe fn jacobi(
                     arg(&mut pc),
                     tol.arg(double),
                 ],
-                [(n + 1) / 2, 1],
-                [32, 1],
+                [(n + 1) / 2 * per_pair, 1],
+                [block, 1],
             )?;
         }
         engine::synchronize(h.stream).map_err(status)?;

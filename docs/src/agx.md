@@ -52,6 +52,16 @@ instructions over the PTX-formalization tests), which is kept only while
 `zluda_agx` still compiles with it. **`--target agx` is superseded**: new work
 goes to `--target air`.
 
+`--agx-only` (what `zluda_agx` passes, and what every `zoc --serve` request implies) makes the AGX object alone: no
+AIR for Metal and no portable AIR output, whose copy of the module and passes cost time and memory for nothing on
+Asahi. A large module that the driver compiles a kernel at a time (`ZLUDA_AGX_PER_KERNEL=1`) is compiled in parts when
+it has only kernels (no `.func` definitions, at least 64 entries: llama.cpp's 10 MB module of 317 kernels): its PTX is
+split by kernels, each part keeping the module's variables, the parts compile on threads of their own and their
+objects merge (22 s and 2.4 GB -> 6 s and 1.2 GB; `ZLUDA_AGX_PARTS=0` / `N`). Modules of such independent kernels
+also get a light cleanup in AIR's address spaces and O3 a kernel at a time instead of the whole module's O3
+(`ZLUDA_AIR_AS_PIPELINE=o3` / `light+` to choose); modules whose kernels share functions (Blender Cycles) keep the
+whole-module O3.
+
 The older route, from PTX to the AGX backend without AIR:
 
 ```
@@ -1042,13 +1052,12 @@ Destroyed streams keep their queue (up to 32) for the next `cuStreamCreate`: cre
 rings and timestamp buffer) costs ~1 ms, and applications that create and destroy a stream per operation (Geekbench 7:
 ~7,800 times a run) spent ~10 s of a 156 s run in it.
 
-Graph launches use one compute command per kernel by default. Batching remains opt-in with
-`ZLUDA_AGX_GRAPH_BATCH=1` while evaluating workload cost tradeoffs. Every batched dispatch now emits
-the CDM barrier even when shader code is cached: the old cached-code fast path could omit ordering
-between dependent kernels and corrupt Qwen output. The repaired path matches CPU output on the four
-llama integration prompts. In warm Qwen tests it improves prompt throughput but reduces generation
-throughput, so it is not enabled by default.
-With that option, kernel launches of a graph (`cuGraphLaunch`) are gathered into the control stream of one compute command, each
+Graph launches are batched by default (`ZLUDA_AGX_GRAPH_BATCH=0` makes one compute command per kernel; llama.cpp
+prompt processing 335 -> 413 t/s, Geekbench 7 +2-3.5%, Blender unchanged on the AIR route). Every batched dispatch
+emits the CDM barrier even when shader code is cached: the old cached-code fast path could omit ordering between
+dependent kernels and corrupt Qwen output; the repaired path matches CPU output on the four llama integration
+prompts. Device-to-device copies inside a graph run as copy kernels in its batch (llama.cpp generation 47 -> 125 t/s).
+Kernel launches of a graph (`cuGraphLaunch`) are gathered into the control stream of one compute command, each
 dispatch followed by the barrier after a launch, up to 64 per command; any other operation of the graph submits the
 launches gathered first. One command per launch costs ~20-30 us of host time (the submit ioctl) and ~15-20 us between
 commands on the GPU; gathered, 64 small launches take ~34 us of host time and ~5-7 us each on the GPU
@@ -1057,15 +1066,15 @@ Launches of checked kernels, captured launches and kernels that use the stack or
 `ZLUDA_AGX_GRAPH_BATCH=0` submits one command per launch; with `ZLUDA_AGX_PROFILE`, the launches of a command share
 its time equally.
 
-`ZLUDA_AGX_LAUNCH_BATCH=1` (off by default, not yet measured on hardware) gathers ordinary launches (`cuLaunchKernel`,
-`cuLaunchKernelEx`, `cuLaunchCooperativeKernel`) the same way, but only while the GPU is busy: a launch whose stream's
-queue has finished its work (one syncobj query) is submitted at once, and later launches of the same stream join a
-batch until it is submitted. Every other API call submits the gathered launches before it does anything (as do
-context destruction and device reset), so they keep their order with copies, events, queries, host functions,
-synchronization and other streams. The cost of the policy: launches gathered while the program then only computes
-on the CPU wait for its next API call, and a program that polls host memory a kernel writes, with no API call
-meanwhile, would never see them run. Whether it pays (graph batching traded generation throughput for prompt
-throughput in Qwen) has to be measured on the M2 Max.
+Ordinary launches (`cuLaunchKernel`, `cuLaunchKernelEx`, `cuLaunchCooperativeKernel`) are gathered the same way while
+the GPU is busy (`ZLUDA_AGX_LAUNCH_BATCH=0` turns it off): a launch whose stream's queue has finished its work (one
+syncobj query) is submitted at once, and later launches of the same stream join a batch until it is submitted. Every
+other API call submits the gathered launches before it does anything (as do context destruction and device reset), so
+they keep their order with copies, events, queries, host functions, synchronization and other streams; and a flusher
+thread, running only while launches are gathered, submits them within ~30 us of their queue going idle, so a program
+that meanwhile only computes on the CPU, or polls host memory a kernel writes, does not keep them waiting. M2 Max:
+2000 back-to-back launches of a small kernel 17.9 -> 3.2 us each (a 1520-workgroup one 22.9 -> 10.0 us); llama.cpp
+pp128 547-551 -> 562-567 t/s, generation equal; Blender's images the same.
 
 Graph replay borrows its stored operation list rather than copying every node and its argument bytes on each replay.
 In a Geekbench 7 GPU run on the M2 Max, `cuGraphLaunch` accumulated 2.12 s over 8,854 calls (0.239 ms/call), versus
@@ -1075,6 +1084,18 @@ different kernel choices, so they are a workload comparison rather than an isola
 A queue remembers the last timeline point it successfully waited on and checked for GPU faults. Synchronizing that
 same point again needs no DRM wait or status query. On the M2 Max, 50,000 empty `cuCtxSynchronize` calls after one
 completed launch take 122 ns each instead of 2,076 ns; a new launch still advances the point and is waited on.
+
+Asynchronous device-to-device copies and memsets (`cuMemcpyDtoDAsync`, `cuMemcpyAsync` between device memory,
+`cuMemsetD8/16/32Async`) whose stream still has work run as built-in copy and fill kernels on that stream, in its
+order, without waiting for the GPU (llama.cpp's device copies 220 -> 9 us of host time each; `ZLUDA_AGX_GPU_COPIES=0`
+turns it off). On an idle stream, and for the synchronous forms, memory operations are on the CPU, through the
+mapping of each allocation (unified memory): a memset fills a slice
+of bytes, 16-bit halves or 32-bit words (a fill a pattern copy at a time, its length known only at run time, ran at
+~0.45 GB/s: llama.cpp's start-up spent 1.75 of 2.5 s in two 384 MiB `cudaMemsetAsync` of its KV cache; now ~50 GB/s,
+start-up 0.72 s); device-to-device copies are one `memmove`. New allocations are not filled on the CPU: the kernel's
+pages of a new GEM object are zeroed already (`agx_runtime` example `zero_check`; `AGX_ZERO_ALLOC=1` fills anyway).
+An allocation commits its memory at once: creating a 512 MiB object takes ~20 ms (the kernel zeroing it), binding it
+~15 ms more, and the CPU's first touch of each 16 KiB page ~0.6 us (playground 2026-11-01-gem-zeroed-pages).
 
 `ZLUDA_AGX_API_STATS=FILE` appends, about once a second, a JSON line with the Unix time in milliseconds (`t`) and per
 CUDA function the calls so far and the host time spent in them (`[calls, ns]`, cumulative).
@@ -1175,6 +1196,21 @@ ZLUDA_AGX_ZOC=target/debug/zoc target/debug/agx_cuda_smoke
   (`cuMemAllocAsync`, which allocates at once, and `cuMemFreeAsync`, which
   waits for all work) are supported. `cuMemHostRegister` is not: Asahi cannot
   map existing user memory into the GPU.
+* Allocation cache: `cuMemFree` waits for the context's work, so a freed
+  `cuMemAlloc` object is idle; it is kept for reuse (by an allocation of 1 to
+  1.25 times its size, the smallest that fits) instead of being destroyed.
+  Creating, binding and mapping an object and destroying it cost 17 us at
+  4 KiB, 134 us at 1 MiB and 6.6 ms at 64 MiB; reused, 0.3 us
+  (`zluda_agx/tools/rtbench.c`, which also times copies, synchronizations and
+  events). At most 512 MiB stays cached (`ZLUDA_AGX_ALLOC_CACHE`, in MiB; 0 turns
+  it off), objects up to half that; the oldest go first, the cache empties when
+  an allocation fails, and `cuMemGetInfo` counts it as free. A reused object
+  keeps its old contents, as CUDA's allocations may (`AGX_ZERO_ALLOC=1` zeroes
+  it).
+* Host copies (`cuMemcpyHtoD` / `DtoH` / non-overlapping `DtoD` on the CPU
+  mapping) of 4 MiB and more run on up to 4 threads (`ZLUDA_AGX_COPY_THREADS`):
+  one thread moves 16 MiB in ~450-560 us (30-35 GB/s), four in ~260-500 us
+  (runs vary).
 * Scratch: kernels that spill or use `.local` memory get per-thread stack
   memory as Mesa sets it up (AGX Performance Simulator
   `tasks/ptx-re-blockers.md`, B1, measured on the M2 Max): each command that
@@ -1275,6 +1311,12 @@ lowers AIR with `agx-lower-air`) for every G13/G14 chip by the LLVM fork's
 driver API of the process's `libcuda.so.1` (`ZLUDA_AGX_LIBCUDA` overrides
 it), as NVIDIA's does.
 
+* Rechecked with a warm GPU clock (`tools/gemmbench.c` now queues ~0.3 s of
+  work first): the row kernels for 3 to 63 columns (`ZLUDA_AGX_GEMM_DOTROWS=0`
+  turns them off), f16, 11008 x 8 x 4096 1672 -> 851 us, 4096 x 32 x 4096 3760
+  -> 1391 us, 4096 x 4 x 4096 322 -> 300 us; split-K for f16 inputs with f32
+  results where the output has few tiles, 256 x 256 x 11008 1060 -> 306 us (no
+  change at 512 x 512 x 4096 and larger outputs, which it leaves alone).
 * Handles, streams, pointer modes (host and device alpha / beta), math modes
   (all compute in f32) and workspaces (unused).
 * `cublasSgemm`, `cublasHgemm`, their strided batched forms, and
@@ -1318,7 +1360,13 @@ it), as NVIDIA's does.
   (`agx_libs/kernels/blas.mlir`): `cublasSaxpy`, `Sscal`, `Scopy`, `Sswap`,
   `Sdot`, `Sasum`, `Snrm2`, `Isamax`, `Isamin`, `Sgemv` and `Sger`, with
   negative increments as BLAS defines them. `Sgemv` with a transposed A
-  gives each element of y a SIMD-group reading its column together. Reductions are deterministic:
+  gives each element of y a SIMD-group reading its column together; without
+  transposition, fewer than 8192 rows and unit increments split the columns
+  into chunks (~64K threads: `agx_sgemv_split` writes partial sums to the
+  handle's scratch, `agx_sgemv_sum` adds them in order), where a thread per row
+  walked every column: 1024 x 16384 2046 -> 217 us, 4096^2 553 -> 271 us, 64 x
+  8192 1070 -> 82 us (`tools/l2bench.c`; `ZLUDA_AGX_GEMV_SPLIT=0`: a thread per
+  row). Reductions are deterministic:
   1024 threads keep fixed partials that one thread combines in order. `nrm2`
   keeps a scaled sum of squares (LAPACK's `slassq`), so it does not overflow
   when the squares would. In host pointer mode a reduction waits for the
@@ -1328,7 +1376,10 @@ it), as NVIDIA's does.
   boundaries, and one launch does the 64 x 64 diagonal blocks), `Ssymm` and `Strmm` (in place when C is B, through a
   copy; with A of 64 rows or more and C of at least 64 x 64 elements, A is made full in a scratch buffer the handle
   keeps, symmetric or with zeros outside the triangle, and one GEMM on the tile kernels does the product) and `Strsm`
-  (one thread per column of B, or per row for the right side, solving by substitution; with A above 64 rows, by blocks
+  (a SIMD-group per column of B, or per row for the right side, solving by substitution with the vector in registers,
+  each solved element shuffled to the lanes, `agx_strsm_sg`; one thread per vector walking it in memory took 68 of
+  82 ms of a 4096 x 64 solve, now 30.0 -> 6.3 ms at 4096, 7.7 -> 2.4 ms at 1024, all 16 variants checked by
+  `tools/trsmcheck.c`; `ZLUDA_AGX_TRSM_SG=0`: a thread per vector, which `Dtrsm` keeps; with A above 64 rows, by blocks
   of 64 rows of op(A), each solved that way and then taken out of the rest of B with a GEMM on the tile kernels, the
   first of which also applies alpha; `Dtrsm` the same way on the generic f64 GEMM), and `cublasSgemmBatched` (the pointer arrays are read back once the stream is
   idle, then one GEMM per entry).
@@ -1390,13 +1441,36 @@ convolutions with one group and dense output planes, with K, C R S and
 P Q at least 16, write each image's im2col matrix (C R S x P Q,
 `agx_conv2d_im2col_*`) to a temporary buffer and run y[n] = w col on the GEMM
 path (in the cost model about 11 times cheaper per output than the direct
-kernel for a 3x3, 64-channel layer); the call then waits for its stream
-before it frees the buffer. `cudnnConvolutionBackwardFilter` does the same
-for one group and dense dy planes: dw = sum over n of dy[n] col^T, the
-images after the first added with beta 1. `cudnnConvolutionBackwardData`
+kernel for a 3x3, 64-channel layer). The images go in chunks of up to 64 MiB
+of columns: one im2col launch per chunk (image = first + grid y) and one
+strided batched GEMM; temporaries come from a per-handle pool, reused in
+stream order without waiting. Warm, fp32 3x3, every result bit-identical
+(`tools/convbench.c`): 8 x 64 x 56 x 56 -> 64 6.05 -> 0.66 ms, 1 x 64 x 56 x 56
+2.14 -> 0.13 ms, 4 x 32 x 112 x 112 6.92 -> 0.67 ms, 16 x 128 x 28 x 28 -> 128
+6.18 -> 1.17 ms, 32 x 64 x 14 x 14 -> 128 3.36 -> 0.50 ms, 64 x 32 x 8 x 8 -> 64
+0.38 -> 0.09 ms (against the build before the pool; the last step, one im2col
+launch per chunk instead of per image, took the host's time per call from
+0.6-0.8 ms to ~0.02 ms on the many-image shapes). `cudnnConvolutionBackwardFilter` does the same
+for one group and dense dy planes: dw = sum over n of dy[n] col^T. A
+chunk of images (up to 64 MiB of col and of parts) is one im2col launch, one
+strided batched GEMM giving each image's part, and a GEMM against a vector of
+ones (kept by the handle) that sums the parts into dw with alpha and beta
+(`ZLUDA_AGX_DNN_WGRAD_BATCH=0`: an image at a time): warm, 3x3,
+equal to a CPU reference (`convbench ... bf`), 64 x 32 x 8 x 8 2.07 -> 0.27 ms,
+8 x 64 x 56 x 56 3.37 -> 0.95 ms, 32 x 64 x 14 x 14 1.85 -> 0.76 ms, 16 x 128 x
+28 x 28 2.24 -> 1.43 ms. In f16 the parts are f16 (each rounded once, the
+sum computed in f32 and rounded once, where an image at a time rounded dw
+after every image): 64 x 32 x 8 x 8 2.01 -> 0.25 ms, 32 x 64 x 14 x 14 1.77
+-> 0.75 ms, 8 x 64 x 56 x 56 2.93 -> 0.87 ms, 16 x 128 x 28 x 28 2.00 -> 1.27
+ms, with the error against a double-precision reference 1.1-3.1e-3 -> 2.5-4.7e-4
+of the largest value (`convbench ... bf h`). `cudnnConvolutionBackwardData`
 (one group, dense dy planes) forms col = w^T dy[n] in f32 on the GEMM path
 and gathers dx[n] from it (`agx_conv2d_col2im_*`, each element of dx written
-once, rounded once for f16). Convolutions of backend-API operation graphs
+once, rounded once for f16), a chunk of images (up to 64 MiB of col) per
+batched GEMM and per gather launch: warm, fp32 3x3, bit-identical and equal to
+a CPU reference (`convbench ... bd`), 64 x 32 x 8 x 8 2.37 -> 0.12 ms, 32 x 64 x
+14 x 14 1.60 -> 0.26 ms, 16 x 128 x 28 x 28 1.42 -> 0.88 ms, 8 x 64 x 56 x 56
+0.73 -> 0.53 ms (it was a GEMM and a gather per image). Convolutions of backend-API operation graphs
 take the same paths.
 
 The other common legacy operations run on `agx_libs/kernels/dnn.mlir`, for
@@ -1444,16 +1518,44 @@ RNNs, LRN and dropout are not implemented yet.
 Single and double precision (C2C / Z2Z, R2C / D2Z, C2R / Z2D): complex to
 complex transforms of rank 1 to 3 (rank 1 also
 strided and batched through `cufftPlanMany`, with the same input and output
-layout), and real to complex / complex to real transforms of rank 1,
-batched, in or out of place. Power-of-two lengths use radix-4 Stockham passes
-(after one radix-2 pass when log2 n is odd), alternating two work buffers; other lengths use a direct transform. The
+layout), and real to complex / complex to real transforms of rank 1
+(batched, in or out of place) to 3 (contiguous): the real transform along the last dimension, then complex
+transforms of the others over the half spectrum (C2R the other way round, in place in its input, which it
+overwrites as cuFFT's may; `tools/rfft2.c` checks 2-D R2C / D2Z against a CPU DFT and the round trip).
+Element-wise and pass launches use ~256-thread workgroups (several short sequences along y): the packing kernels
+ran 16-thread workgroups, 2-D R2C 1024 x 1024 559 -> 328 us, C2R 648 -> 342 us, 2048 x 2048 2065 -> 1190 us.
+Timing note: the figures above from before this paragraph were measured with 20-50 iterations, partly at an idle
+GPU clock (16 x 65536: 263 us at 10 iterations, 83 us warm); `fftbench.c` and `rfft2.c` now queue ~0.3 s of work
+first. Warm, the threadgroup-memory transform against the passes: 16 x 65536 454 -> 83 us, 256 x 4096 212 -> 120,
+1024 x 1024 267 -> 140, 2048 x 512 314 -> 163; Bluestein against radix-p: 37 x 8192 388 / 232 (radix-p), 67 x 4096
+422 / 308 (radix-p), 101 x 2048 235 / 293, 1009 x 64 90 / 736. Spreading the sequences of a column transform over
+neighbouring lanes (dist 1) measured no gain and is not used. The kernel declares 8 KiB of threadgroup memory (256 threads x 4 elements
+always fit it for n <= 1024) and a 16 KiB copy (`agx_fft_shared_2048`) serves n = 2048: with 32 KiB a core held 2
+of its workgroups, now 3 (registers limit it next); 16 x 65536 83 -> 72 us, 256 x 4096 120 -> 100, 1024 x 1024 139
+-> 116, 2-D R2C 1024 x 1024 330 -> 289 us, n = 2048 unchanged. Power-of-two lengths use radix-4 Stockham passes
+(after one radix-2 pass when log2 n is odd), alternating two work buffers; each odd prime factor adds a pass of
+its radix (`agx_fft_radixr`, one thread per output, r complex multiply-adds each). Lengths whose largest prime
+factor is above 100 use Bluestein's algorithm instead: the transform as a convolution of length m (a power of two of
+at least 2 n - 1) on two power-of-two transforms, with the chirp and the kernel's transform computed on the host in
+double precision (`agx_fft_chirp_in`, `agx_fft_pointwise`, `agx_fft_chirp_out`, work buffer B of m per sequence);
+radix-p passes are faster up to p = 67, Bluestein from 131. Batched C2C: 1009 x 64 965 -> 142-220 us, 8191 x 8
+15969 -> 268 us, 4099 x 16 7047 -> 330 us, errors 1e-6 -> 1e-7; Z2Z 1009 x 64 30.8 -> 1.7 ms
+(`ZLUDA_AGX_FFT_BLUESTEIN_MIN` sets the factor). On the M2 Max (`zluda_fft_agx/tools/fftbench.c`, batched C2C): n = 1000 x 256 5038 -> 253 us (1024: 125 us),
+3000 x 64 12913 -> 284 us, 1536 x 128 5936 -> 148 us, with 10x smaller errors than the direct transform. Single
+precision powers of two from 4 to 2048 run as one kernel in threadgroup memory instead (`agx_fft_shared`: n / 4 threads
+per sequence, 256 threads per workgroup, the first radix-2 stage done on the loaded values, the last radix-4 pass
+storing to device memory; the double precision lowering does not take f64 threadgroup buffers, so `build.rs` leaves
+it out of the f64 copies): 1024 x 256 107-138 -> 61-77 us, 1024 x 2048 535-566 -> 340-470 us, 16 x 131072 1201 ->
+377 us (`ZLUDA_AGX_FFT_SHARED=0` for the passes). Its workgroups go along grid x; along y measured the same
+(apple-documentation-playground novel-results/2026-11-01-grid-orientation; the 641 us in the message of commit
+411a3f6 was run-to-run spread, ~25% for this benchmark). Launches take up to 65535 sequences along grid y, the rest in
+further launches. The
 twiddles are computed on the host in double precision and uploaded with the
 plan. Double precision runs copies of the same kernels built for `f64`
 (generated by `agx_libs/build.rs`, named `<kernel>_f64`), in the backend's
 software double precision, with double precision twiddles. The plan
 allocates its own work buffers (`cufftSetWorkArea` is accepted and unused).
-Like cuFFT, inverse transforms are not normalized. Multi-dimensional real
-transforms, callbacks and the Xt API return `CUFFT_NOT_SUPPORTED`. The kernels are tested on the simulator
+Like cuFFT, inverse transforms are not normalized. Callbacks and the Xt API return `CUFFT_NOT_SUPPORTED`. The kernels are tested on the simulator
 for agx-g13g and agx-g14c, and the plans' launch sequences (ping-pong
 buffers, in-place copies, the passes of each dimension) are checked in unit
 tests against a direct DFT.
@@ -1472,7 +1574,19 @@ of their transpose:
   `cusparseSpMM` on CSR matrices with `opA` non-transposed and `opB` either
   way, on column- or row-major dense matrices. Non-transposed CSR SpMV and
   SpMM use one thread per output element; the transposed and COO products
-  scale `y` by `beta` first and then add with atomic adds.
+  scale `y` by `beta` first and then add with atomic adds. f32 CSR SpMV with
+  32-bit indices and 8 or more entries per row on average gives each row a
+  group of lanes instead (`agx_csr_spmv_vec_i32`: one lane per 8 entries of
+  the mean row, a power of two from 4 to 32, summed with shuffles), so
+  neighbouring lanes read neighbouring entries: warm, `tools/spmvbench.c`
+  (exact against the CPU), 1M rows x 16 entries 1082 -> 453 us, 256K x 64
+  1152 -> 384, 64K x 256 1170 -> 380, 4K x 2048 836 -> 217 us, 300-360 GB/s
+  (`ZLUDA_AGX_SPMV_VEC=0`: a thread per row). SpMM with a row-major B runs C's columns along the
+  SIMD-group's lanes (a 1-D grid of rows x n threads), so a group reads one
+  row of A once and neighbouring elements of B and C: `tools/spmmbench.c`
+  (exact against the CPU), 262144 rows x 16 entries and 8 / 16 / 64 columns
+  1069 / 2747 / 10860 -> 457 / 880 / 3448 us, 65536 x 64 x 32 5270 -> 1470 us
+  (`ZLUDA_AGX_SPMM_JFAST=0`: rows along the lanes, as column-major B keeps).
 - Sparse vectors (`cusparseCreateSpVec`): `cusparseSpVV` (256 partial sums in
   its workspace, added in order, so the result is deterministic),
   `cusparseAxpby`, `cusparseGather`, `cusparseScatter` and `cusparseRot`.
@@ -1533,12 +1647,22 @@ in the application's PTX and needs no library.
 their `_bufferSize` queries. The factorizations run one
 column at a time — a single-thread pivot or reflector step, then a parallel
 update of the rest of the matrix — and the solves run one thread per
-right-hand side. The f32 getrf with more than 64 columns to factor works by
-panels of 64 columns: the columns of a panel as above with the update kept to
-the panel, then the BLAS triangular solve for the panel's rows of U and one
-GEMM on the tile kernels for the rest of the matrix (the same pivots, the
-products summed in another order). The f32 potrf above 64 rows does the same
-by panels, the rest of the triangle updated with each panel by a syrk on the
+right-hand side. The f32 getrf with more than 16 columns to factor works by
+panels of 16 columns, each factored in one launch (`agx_lu_panel`: a workgroup
+of 512 threads, per column a SIMD-group and workgroup reduction to the pivot,
+the swap, then each thread scales and updates its rows of the panel), its swaps
+applied to the other columns in another (`agx_lu_laswp`), then the BLAS
+triangular solve for the panel's rows of U and one GEMM on the tile kernels for
+the rest of the matrix (the same pivots, the products summed in another order).
+A column at a time was four dependent launches per column (~12 us each): n 512
+/ 1000 / 2048 / 4096 24.2 / 69.7 / 237 / 852 -> 5.2 / 12.9 / 33.3 / 116 ms
+(`tools/lubench.c`, the A x = b residual unchanged; 64-column panels: 189 ms at
+4096, a panel runs on one core). `ZLUDA_AGX_LU_PANEL=0`: a column at a time. The f32 potrf above 32 rows works
+by panels of 32 columns, each factored in one launch (`agx_chol_panel`, a
+workgroup of 512 threads, instead of three launches per column: n 512 / 1000 /
+2048 7.5 / 15.5 / 41 -> 3.6 / 10.4 / 39 ms, `tools/cholbench.c`, residual and
+info unchanged; at larger n the trailing syrk dominates; `ZLUDA_AGX_CHOL_PANEL=0`:
+a column at a time, panels of 64), the rest of the triangle updated with each panel by a syrk on the
 tile GEMM (the other triangle is not written); after a non-positive minor the
 later kernels do nothing, but that panel's update still reaches the trailing
 matrix. getrs and potrs above 64 rows (f32 and f64) solve on the blocked trsm (shared
@@ -1546,7 +1670,12 @@ with cuBLAS in `agx_libs::engine::trsm`; f64 updates on the generic f64 GEMM), w
 by their own kernel, instead of one thread per right-hand side. The f32 geqrf
 with more than 32 rows and columns works by panels of 32 columns when given the
 workspace its `_bufferSize` now asks for (32 (m + 64 + 2n) elements): the panel
-column by column as above, then the panel's block reflector (compact WY:
+in one launch (`agx_qr_panel`, a workgroup of 512 threads: per column a
+workgroup sum of squares, the reflector, then each SIMD-group applies it to its
+columns; a column at a time was a one-thread reflector and an apply: 4096 x 256
+374 -> 24.6 ms, 2048^2 817 -> 102 ms, 512^2 61.7 -> 13.9 ms, Q^T A against R 1.4-5.7x
+closer, `tools/qrbench.c`; `ZLUDA_AGX_QR_PANEL=0`: a column at a time), then the
+panel's block reflector (compact WY:
 `Q = I - V T V^T`, T built from `V^T V`) applied to the rest of A with GEMMs on
 the tile kernels. A smaller workspace runs the unblocked factorization. The f32
 ormqr and orgqr with Q of order 64 or more and at least 4 reflectors apply Q the
@@ -1554,7 +1683,11 @@ same way, by blocks of 32 reflectors (in the order Q, Q^T and the side need),
 in the workspace their `_bufferSize` now asks for (orgqr: its reflector copy
 plus that); before, one thread per column or row of C applied every reflector. `devInfo` reports the first zero pivot (getrf) or the first
 non-positive leading minor (potrf) as LAPACK does. `gesvd` and `syevd` use
-one-sided Jacobi: each round rotates disjoint column pairs in parallel, and
+one-sided Jacobi: each round rotates disjoint column pairs in parallel (in f32
+a SIMD-group per pair, `agx_jacobi_round_sg`, its lanes over the rows; a thread
+per pair read each pair's columns alone: n 64 / 256 / 512 gesvd 24.4 / 311 /
+1287 -> 7.8 / 57 / 207 ms, syevd 19.0 / 270 / 1117 -> 7.2 / 65 / 240 ms, same
+accuracy, `tools/eigbench.c`; `ZLUDA_AGX_JACOBI_SG=0`: a thread per pair), and
 sweeps repeat until one rotates nothing (`devInfo` 1 if 60 sweeps do not get
 there); `syevd` runs it on `A + |A|_F I`, whose singular vectors are A's
 eigenvectors, and takes the eigenvalues as Rayleigh quotients. The columns of U

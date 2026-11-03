@@ -26,6 +26,11 @@ impl<T> Contexts<T> {
         self.states.get_mut(&h)
     }
 
+    /// Every live context's state (the batch flusher, which has no current context).
+    pub(crate) fn states_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.states.values_mut()
+    }
+
     pub(crate) fn contains(&self, h: usize) -> bool {
         self.states.contains_key(&h)
     }

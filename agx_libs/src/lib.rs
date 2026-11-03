@@ -81,6 +81,9 @@ pub enum Plan {
     Generic { dims: [u64; 9], grid: [u32; 2] },
     /// `agx_sgemm_dot`: the arguments of `Generic`, a SIMD-group per element of C (`groups` threadgroups of 128).
     Dot { dims: [u64; 9], groups: u32 },
+    /// `agx_sgemm_dotrows`: the arguments of `Generic`, a SIMD-group per row of C computing its (at most
+    /// `DOT_ROWS_SIDE`) columns, op(A) read once (`groups` threadgroups of 128).
+    DotRows { dims: [u64; 9], groups: u32 },
 }
 
 /// One launch of a GEMM: its plan, the element offsets of its A, B and C from the GEMM's, and whether it adds to C
@@ -97,6 +100,15 @@ pub const GENERIC_BLOCK: [u32; 2] = [16, 8];
 /// Up to this many columns (or rows) of C, with op(A) (or op(B)) contiguous along K, a product runs on the dot kernel.
 pub const DOT_SIDE: u64 = 8;
 
+/// The columns of C the row kernels compute (`agx_*gemm_dotrows`, gen_small_gemm.py's ROWS).
+pub const DOT_ROWS_SIDE: u64 = 8;
+
+/// ZLUDA_AGX_GEMM_DOTROWS=0: the dot kernel (a SIMD-group per element of C) for 3 to 8 columns too.
+fn dot_rows_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ZLUDA_AGX_GEMM_DOTROWS").map_or(true, |v| v != "0"))
+}
+
 fn generic(ta: bool, tb: bool, m: u64, n: u64, k: u64, lda: u64, ldb: u64, ldc: u64) -> Plan {
     // element (i, k) of op(A): A[i + k lda], or A[k + i lda] transposed; (k, j) of op(B) likewise; C[i + j ldc]
     let sa = if ta { [lda, 1] } else { [1, lda] };
@@ -105,6 +117,14 @@ fn generic(ta: bool, tb: bool, m: u64, n: u64, k: u64, lda: u64, ldb: u64, ldc: 
     // A GEMV-shaped product: a thread per element of C would leave most lanes idle (or read K apart from each
     // other); the dot kernel's lanes read the long operand along K together.
     let threads = m.saturating_mul(n).saturating_mul(32);
+    // 3 to 8 columns with op(A) contiguous along K (a GEMV of a few vectors, as a batch of up to 8 tokens): a
+    // SIMD-group per row computes all of them, reading op(A) once instead of once per column (M2 Max, f16 A and f32 C:
+    // 151936 x 8 x 896 7.10 -> 2.74 ms, 4864 x 8 x 896 253 -> 113 us, 4864 x 4 x 896 140 -> 110 us, 4864 x 3 x 896 110 ->
+    // 109 us; with 2 columns its 8 accumulators cost more than the dot kernel's second read: 81 -> 109 us)
+    let row_threads = m.saturating_mul(32);
+    if k >= 32 && ta && (3..=DOT_ROWS_SIDE).contains(&n) && row_threads.div_ceil(128) <= u32::MAX as u64 && dot_rows_enabled() {
+        return Plan::DotRows { dims, groups: row_threads.div_ceil(128) as u32 };
+    }
     if k >= 32 && ((n <= DOT_SIDE && ta) || (m <= DOT_SIDE && !tb)) && threads.div_ceil(128) <= u32::MAX as u64 {
         return Plan::Dot { dims, groups: threads.div_ceil(128) as u32 };
     }
@@ -124,6 +144,18 @@ fn generic(ta: bool, tb: bool, m: u64, n: u64, k: u64, lda: u64, ldb: u64, ldc: 
 pub fn plan(ta: bool, tb: bool, m: u64, n: u64, k: u64, lda: u64, ldb: u64, ldc: u64, tile: bool, aligned: bool) -> Vec<Part> {
     let part = |plan, offsets, accumulate| Part { plan, offsets, accumulate };
     let (m64, n64, k8) = (m / 64 * 64, n / 64 * 64, k / 8 * 8);
+    // 9 to 63 columns with op(A) contiguous along K: the row kernel on each 8 of them (the generic kernel read op(A)
+    // along K one thread per element of C: 896 x 16 x 896 167 us)
+    if n64 == 0 && n > DOT_ROWS_SIDE && ta && k >= 32 && dot_rows_enabled() {
+        let col_b = |j: u64| if tb { j } else { j * ldb };
+        return (0..n)
+            .step_by(DOT_ROWS_SIDE as usize)
+            .map(|j0| {
+                let cols = (n - j0).min(DOT_ROWS_SIDE);
+                part(generic(ta, tb, m, cols, k, lda, ldb, ldc), [0, col_b(j0), j0 * ldc], false)
+            })
+            .collect();
+    }
     if m64 == 0 || n64 == 0 || k8 == 0 || !tile {
         return vec![part(generic(ta, tb, m, n, k, lda, ldb, ldc), [0; 3], false)];
     }
@@ -299,6 +331,7 @@ pub mod engine {
         tile: [[[[CUfunction; 2]; 2]; 2]; 3],
         generic: [CUfunction; 4],
         dot: [CUfunction; 4],
+        dotrows: [CUfunction; 4],
         /// f32 and f16 D.
         epilogue: [CUfunction; 2],
     }
@@ -348,6 +381,12 @@ pub mod engine {
                 get(hm, b"agx_hgemm_dot_cf16\0")?,
                 get(hm, b"agx_hgemm_dot_cf32\0")?,
                 get(sm, b"agx_dgemm_dot\0")?,
+            ],
+            dotrows: [
+                get(sm, b"agx_sgemm_dotrows\0")?,
+                get(hm, b"agx_hgemm_dotrows_cf16\0")?,
+                get(hm, b"agx_hgemm_dotrows_cf32\0")?,
+                get(sm, b"agx_dgemm_dotrows\0")?,
             ],
             epilogue: [get(em, b"agx_epilogue_f32\0")?, get(em, b"agx_epilogue_f16\0")?],
         };
@@ -496,6 +535,7 @@ pub mod engine {
                 }
                 Plan::Generic { dims, grid } => (kernels.generic[types.index()], &dims[..], [grid[0], grid[1], entries], GENERIC_BLOCK),
                 Plan::Dot { dims, groups } => (kernels.dot[types.index()], &dims[..], [*groups, entries, 1], [128, 1]),
+                Plan::DotRows { dims, groups } => (kernels.dotrows[types.index()], &dims[..], [*groups, entries, 1], [128, 1]),
             };
             let mut dims = dims.to_vec();
             dims.extend([sa, sb, sc].map(|s| s as u64));
@@ -558,7 +598,12 @@ pub mod engine {
         if t.m == 0 || t.n == 0 {
             return Ok(());
         }
-        let f = function(BLAS, if t.double { c"agx_strsm_f64" } else { c"agx_strsm" })?;
+        // f32: a SIMD-group per vector with it in registers (agx_strsm_sg, systems of at most TRSM_BLOCK); a thread
+        // per vector walked it in memory (4096 x 64 left: 68 of 82 ms in the diagonal blocks). ZLUDA_AGX_TRSM_SG=0: a
+        // thread per vector.
+        let sg = !t.double && std::env::var("ZLUDA_AGX_TRSM_SG").map_or(true, |v| v != "0");
+        let f = function(BLAS, if t.double { c"agx_strsm_f64" } else if sg { c"agx_strsm_sg" } else { c"agx_strsm" })?;
+        let per = if sg { 32 } else { 1 };
         // element bytes
         let e = if t.double { 8 } else { 4 };
         // the per-thread system is lower triangular when an even number of the stored lower triangle, the
@@ -569,7 +614,7 @@ pub mod engine {
             let (mut a, mut b, mut m, mut n, mut alpha32, mut alpha64) = (a, b, m, n, alpha as f32, alpha);
             let (mut lda, mut ldb, mut lower) = (t.lda, t.ldb, lower);
             let (mut right, mut upper, mut trans, mut unit) = (t.right as i64, t.upper as i64, t.trans as i64, t.unit as i64);
-            let threads = if t.right { m } else { n } as u64;
+            let threads = if t.right { m } else { n } as u64 * per;
             let mut params = [&mut a as *mut _ as *mut c_void, &mut b as *mut _ as *mut c_void, &mut m as *mut _ as *mut c_void,
                               &mut n as *mut _ as *mut c_void, &mut lda as *mut _ as *mut c_void, &mut ldb as *mut _ as *mut c_void,
                               &mut right as *mut _ as *mut c_void, &mut upper as *mut _ as *mut c_void,
@@ -707,7 +752,8 @@ mod tests {
                 }
             }
             Plan::Generic { dims: [m, n, k, sar, sac, sbr, sbc, scr, scc], .. }
-            | Plan::Dot { dims: [m, n, k, sar, sac, sbr, sbc, scr, scc], .. } => {
+            | Plan::Dot { dims: [m, n, k, sar, sac, sbr, sbc, scr, scc], .. }
+            | Plan::DotRows { dims: [m, n, k, sar, sac, sbr, sbc, scr, scc], .. } => {
                 for i in 0..*m as usize {
                     for j in 0..*n as usize {
                         let s: f32 = (0..*k as usize)
@@ -803,10 +849,11 @@ mod tests {
         for (fat, names) in [
             (SGEMM, &["agx_sgemm_tile64", "agx_sgemm_tile64_ta", "agx_sgemm_tile64_tb", "agx_sgemm_tile64_tatb",
                       "agx_sgemm_tile64_u", "agx_sgemm_tile64_u_tatb",
-                      "agx_sgemm_generic", "agx_dgemm_generic", "agx_sgemm_dot", "agx_dgemm_dot"][..]),
+                      "agx_sgemm_generic", "agx_dgemm_generic", "agx_sgemm_dot", "agx_dgemm_dot", "agx_sgemm_dotrows",
+                      "agx_dgemm_dotrows"][..]),
             (HGEMM, &["agx_hgemm_tile64_cf16", "agx_hgemm_tile64_cf32", "agx_hgemm_tile64_cf16_tatb",
                       "agx_hgemm_tile64_cf32_tb", "agx_hgemm_generic_cf16", "agx_hgemm_generic_cf32",
-                      "agx_hgemm_dot_cf16", "agx_hgemm_dot_cf32"][..]),
+                      "agx_hgemm_dot_cf16", "agx_hgemm_dot_cf32", "agx_hgemm_dotrows_cf16", "agx_hgemm_dotrows_cf32"][..]),
         ] {
             assert_eq!(&fat[..8], b"ZAGXFAT1");
             let s = String::from_utf8_lossy(fat);

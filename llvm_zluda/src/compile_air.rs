@@ -19,7 +19,7 @@ use crate::utils::{Context, Message, Module, PassBuilderOptions, TargetMachine};
 use crate::{
     LLVMZludaAgxKeepGlobals, LLVMZludaAgxLowerAddressSpaces, LLVMZludaAgxLowerClusters, LLVMZludaAgxSpillClusterShared,
     LLVMZludaAirFunctionPointers, LLVMZludaSetAirPrimitives, LLVMZludaAirGlobalsToBuffer, LLVMZludaAirInlineGlobalUsers,
-    LLVMZludaAirRemapAddressSpaces, LLVMZludaAirSharedLayout, LLVMZludaAirStaticRounding, LLVMZludaAirDropCompareFlushes, LLVMZludaAirDropMinMaxFixups, LLVMZludaAirExpandDivisions, LLVMZludaAirCanonicalNaNs, LLVMZludaAirTextureSampleHint, LLVMZludaAirCompareFloatBits, LLVMZludaAirRangeReport, LLVMZludaAirKernelModule, LLVMZludaAirSaltKernels, LLVMZludaAgxCanonicalizeFoldedNaNs, LLVMZludaLinkUsedDefinitions,
+    LLVMZludaAirRemapAddressSpaces, LLVMZludaAirSharedLayout, LLVMZludaAirStaticRounding, LLVMZludaAirDropCompareFlushes, LLVMZludaAirDropMinMaxFixups, LLVMZludaAirExpandDivisions, LLVMZludaAirCanonicalNaNs, LLVMZludaAirTextureSampleHint, LLVMZludaAirCompareFloatBits, LLVMZludaAirRangeReport, LLVMZludaAirKernelModule, LLVMZludaPromoteDynamicPrivateLoads, LLVMZludaAirSaltKernels, LLVMZludaAgxCanonicalizeFoldedNaNs, LLVMZludaLinkUsedDefinitions,
     LLVMZludaUpgradeFunctionAttributes,
 };
 use llvm_sys::target_machine::{
@@ -43,7 +43,7 @@ const LIGHT_PLUS: &CStr = c"function(simplifycfg,sroa,early-cse),always-inline,i
 pub struct AirCompilation {
     /// The portable AIR, for any AIR consumer.
     pub portable: Vec<u8>,
-    /// The AIR for Metal (packaged by the AIR target's Metal pipeline).
+    /// The AIR for Metal (packaged by the AIR target's Metal pipeline); empty with `agx_only`.
     pub metal: Vec<u8>,
     /// NAME.air.globals: the .global variables' buffer of the Metal AIR (JSON), if the module has any.
     pub metal_globals: Option<String>,
@@ -91,7 +91,8 @@ fn bitcode(module: &Module) -> Vec<u8> {
 }
 
 /// Compiles the front end's module (and `others`, linked) for the Air target. `agx_cpu`: also compile the
-/// portable AIR for this AGX processor.
+/// portable AIR for this AGX processor. `agx_only` (with `agx_cpu`): the AGX object alone, no AIR for Metal and no
+/// portable AIR output (the copy for Metal and its passes are not made).
 pub fn compile_air(
     ctx: &Context,
     main: Module,
@@ -100,8 +101,10 @@ pub fn compile_air(
     agx_cpu: Option<&str>,
     compiler_hook: Option<&dyn Fn(&Vec<u8>, String)>,
     object_only: bool,
+    agx_only: bool,
     strict_fp: bool,
 ) -> Result<AirCompilation, String> {
+    let agx_only = agx_only && agx_cpu.is_some();
     // object_only: the compiled outputs (the AIR, the globals buffer, the AGX object) only, not the IR text or
     // the AGX assembly, which take as long again to make
     let text_hook = compiler_hook.filter(|_| !object_only);
@@ -186,8 +189,20 @@ pub fn compile_air(
         _ => LIGHT_PLUS_FIRST,
     };
     unsafe { LLVMZludaSetAirPrimitives(1) };
+    // ZLUDA_AIR_DUMP_FIRST=FILE: the module before the first pipeline as bitcode (to time its passes with opt)
+    if let Some(path) = std::env::var_os("ZLUDA_AIR_DUMP_FIRST") {
+        std::fs::write(path, bitcode(&linked)).map_err(|e| e.to_string())?;
+    }
     let lowered = (|| -> Result<(), String> {
         run(&linked, first_pipeline, &air, &options)?;
+        stage("first pipeline");
+        // small private arrays read at run-time offsets kept in registers (LLVMZludaPromoteDynamicPrivateLoads):
+        // SROA again for them. ZLUDA_AIR_PROMOTE_PRIVATE=0 keeps them in memory.
+        if std::env::var("ZLUDA_AIR_PROMOTE_PRIVATE").map_or(true, |v| v != "0")
+            && unsafe { LLVMZludaPromoteDynamicPrivateLoads(linked.get()) } > 0
+        {
+            run(&linked, c"function(sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg)", &air, &options)?;
+        }
         let mut err = std::ptr::null_mut();
         let clusters = unsafe { LLVMZludaAgxLowerClusters(linked.get(), &mut err) };
         if clusters < 0 {
@@ -199,6 +214,7 @@ pub fn compile_air(
                 break;
             }
             run(&linked, rerun_pipeline, &air, &options)?;
+            stage("address spaces lowered, the pipeline again");
         }
         let spilled = unsafe { LLVMZludaAgxSpillClusterShared(linked.get(), &mut err) };
         if spilled < 0 {
@@ -272,7 +288,20 @@ pub fn compile_air(
     // With AGX code and another Metal pipeline, the Metal copy is taken before the portable module's O3; without
     // AGX code, the Metal pipeline optimizes the portable module itself, which the Metal copy is taken from (one
     // optimization for both, and portable AIR optimized as the Metal AIR is)
-    let metal_source = metal_pipeline.filter(|_| agx_cpu.is_some()).map(|_| linked.clone());
+    let metal_source = metal_pipeline.filter(|_| agx_cpu.is_some() && !agx_only).map(|_| linked.clone());
+    // A module compiled a kernel at a time (ZLUDA_AGX_PER_KERNEL=1, as zluda_agx compiles large modules) whose kernels
+    // share few functions: the cleanup of light+ here and O3 in each kernel's module, in parallel, instead of O3 on
+    // the whole module (llama.cpp's 10 MB module, 317 kernels and 15 other functions: 26.5 -> 22.1 s, its Q5_K
+    // matrix-vector kernel 4% faster, the Q5_1 one the same). Not for kernels sharing much (Blender Cycles: each
+    // kernel's O3 repeats the shared functions, 43-50 -> 50-57 s). ZLUDA_AIR_AS_PIPELINE: o3 or light+ to choose.
+    let kernels_own_o3 = agx_cpu.is_some()
+        && match std::env::var("ZLUDA_AIR_AS_PIPELINE").as_deref() {
+            Ok("light+") => true,
+            Ok("o3") => false,
+            _ => THREAD_INDEPENDENT.with(|i| i.get()).unwrap_or_else(|| {
+                std::env::var("ZLUDA_AGX_PER_KERNEL").is_ok_and(|v| v == "1") && independent_kernels(&linked)
+            }),
+        };
     // O3 again in AIR's address spaces: a lighter cleanup (inlining, SROA, EarlyCSE, InstCombine, SimplifyCFG,
     // GVN) gives the tensor-core PTX tests 18-23% more AGX code (their loops are unrolled differently)
     match metal_pipeline {
@@ -283,81 +312,24 @@ pub fn compile_air(
             stage("the Metal pipeline in AIR's address spaces");
         }
         _ => {
-            run(&linked, c"default<O3>", &air, &options)?;
-            stage("O3 in AIR's address spaces");
+            run(&linked, if kernels_own_o3 { LIGHT_PLUS } else { c"default<O3>" }, &air, &options)?;
+            stage(if kernels_own_o3 { "light+ in AIR's address spaces (O3 a kernel at a time)" } else { "O3 in AIR's address spaces" });
         }
     }
     // (AGX code from it: AGX's f32 compares flush as .ftz ones do; Metal-only: all on the bits)
     finish_air(ctx, &linked, strict_fp, if agx_cpu.is_some() { 1 } else { 3 })?;
-    // Metal: what only Metal needs from ZLUDA, on a copy, before the AIR kernel signatures are made (the
-    // globals buffer is a kernel parameter like the others)
-    let metal = match (metal_source, metal_pipeline) {
-        (Some(source), Some(pipeline)) => {
-            unsafe { LLVMZludaAirExpandDivisions(source.get()) };
-            run(&source, pipeline, &air, &options)?;
-            stage("Metal copy: its pipeline");
-            finish_air(ctx, &source, strict_fp, 3)?;
-            source
-        }
-        _ => {
-            let metal = linked.clone();
-            // (the .ftz functions' comparisons on the bits too, which the AGX code's module left to the hardware)
-            if strict_fp && agx_cpu.is_some() {
-                unsafe { LLVMZludaAirCompareFloatBits(metal.get(), 2) };
-            }
-            // (with AGX code and the portable module's O3 for both: the Metal copy's divisions expanded here, and
-            // what of them depends on the divisor only hoisted out of loops)
-            if agx_cpu.is_some() && unsafe { LLVMZludaAirExpandDivisions(metal.get()) } > 0 {
-                run(&metal, c"function(loop-mssa(licm),instcombine<no-verify-fixpoint>,simplifycfg)", &air, &options)?;
-            }
-            metal
-        }
+    // (agx_only: no copy for Metal at all, its passes and its bitcode take time and memory for nothing)
+    let (metal_air, metal_globals) = if agx_only {
+        (Vec::new(), None)
+    } else {
+        metal_air(ctx, &linked, metal_source, metal_pipeline, agx_cpu.is_some(), strict_fp, &air, &options, &diagnostics, compiler_hook, &mut stage)?
     };
-    unsafe { LLVMZludaAirSharedLayout(metal.get()) };
-    // ZLUDA_AIR_SALT: an unused stack array, its length from the string, at the start of each kernel of the Metal
-    // copy, which makes Metal compile the pipelines anew instead of taking them from its cache, which ignores
-    // metadata (comparisons of the pipelines' compile times)
-    if let Ok(salt) = std::env::var("ZLUDA_AIR_SALT") {
-        let len = 1 + salt.bytes().fold(7u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64)) % 63;
-        unsafe { LLVMZludaAirSaltKernels(metal.get(), len) };
-    }
-    // The functions that use a variable take the buffer's address as a parameter (LLVMZludaAirGlobalsToBuffer).
-    // ZLUDA_AIR_INLINE_GLOBAL_USERS, non-empty: inline them into the kernels instead, as before (comparisons).
-    if std::env::var("ZLUDA_AIR_INLINE_GLOBAL_USERS").is_ok_and(|v| !v.is_empty()) {
-        for _ in 0..16 {
-            if unsafe { LLVMZludaAirInlineGlobalUsers(metal.get()) } == 0 {
-                break;
-            }
-            run(&metal, c"always-inline", &air, &options)?;
-        }
-    }
-    let mut json = std::ptr::null_mut();
-    let mut err = std::ptr::null_mut();
-    let metal_globals = match unsafe { LLVMZludaAirGlobalsToBuffer(metal.get(), &mut json, &mut err) } {
-        -1 => return Err(Message::new(unsafe { CStr::from_ptr(err) }).to_str().to_string()),
-        1 => Some(Message::new(unsafe { CStr::from_ptr(json) }).to_str().to_string()),
-        _ => None,
-    };
-    stage("Metal copy: globals buffer, shared layout");
-    run(&metal, c"air-portable", &air, &options)?;
-    stage("Metal copy: air-portable");
-    diagnostics.check()?;
-    metal.verify().map_err(|e| format!("the AIR for Metal is broken: {e}"))?;
-    let metal_air = bitcode(&metal);
-    // (the copy is done with: freed before the AGX code generation, the largest stage of a large module)
-    drop(metal);
-    if let Some(hook) = compiler_hook {
-        hook(&metal_air, String::from("air"));
-        if let Some(json) = &metal_globals {
-            hook(&json.as_bytes().to_vec(), String::from("air.globals"));
-        }
-    }
 
     run(&linked, c"air-portable", &air, &options)?;
     stage("portable: air-portable");
     diagnostics.check()?;
-    let portable = bitcode(&linked);
-    if let Some(hook) = compiler_hook {
+    let mut portable = bitcode(&linked);
+    if let Some(hook) = compiler_hook.filter(|_| !agx_only) {
         hook(&portable, String::from("portable.air"));
         if !object_only {
             hook(&linked.print_module_to_string().to_bytes().to_vec(), String::from("opt.ll"));
@@ -377,7 +349,8 @@ pub fn compile_air(
     };
     let per_kernel_pipeline = match agx_pipeline_env.as_deref() {
         Ok("o3") => agx_pipeline,
-        _ => None,
+        Ok("none") => None,
+        _ => agx_pipeline.filter(|_| kernels_own_o3),
     };
     let agx_object = match agx_cpu {
         None => None,
@@ -411,9 +384,9 @@ pub fn compile_air(
                 // and target machine; the objects in the kernels' order.
                 drop(linked);
                 drop(agx);
-                let jobs = std::env::var("ZLUDA_AGX_JOBS")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
+                let jobs = THREAD_JOBS
+                    .with(|j| j.get())
+                    .or_else(|| std::env::var("ZLUDA_AGX_JOBS").ok().and_then(|v| v.parse::<usize>().ok()))
                     .unwrap_or_else(default_jobs)
                     .clamp(1, kernels.len());
                 // ZLUDA_AGX_INLINE_KERNELS (comma separated, or "all"): these kernels' functions inlined, no real
@@ -498,6 +471,10 @@ pub fn compile_air(
                 }
                 return Ok(AirCompilation { portable, metal: metal_air, metal_globals, agx_object: Some(object) });
             }
+            // (the whole module's code: its portable AIR, only an output, freed first with agx_only)
+            if agx_only {
+                drop(std::mem::take(&mut portable));
+            }
             if let Some(pipeline) = agx_pipeline {
                 run(&linked, pipeline, &agx, &options)?;
                 stage("the AGX pipeline");
@@ -525,6 +502,114 @@ pub fn compile_air(
         }
     };
     Ok(AirCompilation { portable, metal: metal_air, metal_globals, agx_object })
+}
+
+/// The AIR for Metal from `linked` (optimized in AIR's address spaces): `source`, the copy taken before that
+/// optimization for `pipeline`, or a copy of `linked`; what only Metal needs from ZLUDA, then air-portable.
+#[allow(clippy::too_many_arguments)]
+fn metal_air(
+    ctx: &Context,
+    linked: &Module,
+    metal_source: Option<Module>,
+    metal_pipeline: Option<&CStr>,
+    with_agx: bool,
+    strict_fp: bool,
+    air: &TargetMachine,
+    options: &PassBuilderOptions,
+    diagnostics: &Diagnostics,
+    compiler_hook: Option<&dyn Fn(&Vec<u8>, String)>,
+    stage: &mut dyn FnMut(&str),
+) -> Result<(Vec<u8>, Option<String>), String> {
+    // Metal: what only Metal needs from ZLUDA, on a copy, before the AIR kernel signatures are made (the
+    // globals buffer is a kernel parameter like the others)
+    let metal = match (metal_source, metal_pipeline) {
+        (Some(source), Some(pipeline)) => {
+            unsafe { LLVMZludaAirExpandDivisions(source.get()) };
+            run(&source, pipeline, air, options)?;
+            stage("Metal copy: its pipeline");
+            finish_air(ctx, &source, strict_fp, 3)?;
+            source
+        }
+        _ => {
+            let metal = linked.clone();
+            // (the .ftz functions' comparisons on the bits too, which the AGX code's module left to the hardware)
+            if strict_fp && with_agx {
+                unsafe { LLVMZludaAirCompareFloatBits(metal.get(), 2) };
+            }
+            // (with AGX code and the portable module's O3 for both: the Metal copy's divisions expanded here, and
+            // what of them depends on the divisor only hoisted out of loops)
+            if with_agx && unsafe { LLVMZludaAirExpandDivisions(metal.get()) } > 0 {
+                run(&metal, c"function(loop-mssa(licm),instcombine<no-verify-fixpoint>,simplifycfg)", air, options)?;
+            }
+            metal
+        }
+    };
+    unsafe { LLVMZludaAirSharedLayout(metal.get()) };
+    // ZLUDA_AIR_SALT: an unused stack array, its length from the string, at the start of each kernel of the Metal
+    // copy, which makes Metal compile the pipelines anew instead of taking them from its cache, which ignores
+    // metadata (comparisons of the pipelines' compile times)
+    if let Ok(salt) = std::env::var("ZLUDA_AIR_SALT") {
+        let len = 1 + salt.bytes().fold(7u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64)) % 63;
+        unsafe { LLVMZludaAirSaltKernels(metal.get(), len) };
+    }
+    // The functions that use a variable take the buffer's address as a parameter (LLVMZludaAirGlobalsToBuffer).
+    // ZLUDA_AIR_INLINE_GLOBAL_USERS, non-empty: inline them into the kernels instead, as before (comparisons).
+    if std::env::var("ZLUDA_AIR_INLINE_GLOBAL_USERS").is_ok_and(|v| !v.is_empty()) {
+        for _ in 0..16 {
+            if unsafe { LLVMZludaAirInlineGlobalUsers(metal.get()) } == 0 {
+                break;
+            }
+            run(&metal, c"always-inline", air, options)?;
+        }
+    }
+    let mut json = std::ptr::null_mut();
+    let mut err = std::ptr::null_mut();
+    let metal_globals = match unsafe { LLVMZludaAirGlobalsToBuffer(metal.get(), &mut json, &mut err) } {
+        -1 => return Err(Message::new(unsafe { CStr::from_ptr(err) }).to_str().to_string()),
+        1 => Some(Message::new(unsafe { CStr::from_ptr(json) }).to_str().to_string()),
+        _ => None,
+    };
+    stage("Metal copy: globals buffer, shared layout");
+    run(&metal, c"air-portable", air, options)?;
+    stage("Metal copy: air-portable");
+    diagnostics.check()?;
+    metal.verify().map_err(|e| format!("the AIR for Metal is broken: {e}"))?;
+    let metal_air = bitcode(&metal);
+    // (the copy is done with: freed before the AGX code generation, the largest stage of a large module)
+    drop(metal);
+    if let Some(hook) = compiler_hook {
+        hook(&metal_air, String::from("air"));
+        if let Some(json) = &metal_globals {
+            hook(&json.as_bytes().to_vec(), String::from("air.globals"));
+        }
+    }
+    Ok((metal_air, metal_globals))
+}
+
+thread_local! {
+    /// The threads of the per-kernel AGX code of compilations on this thread (`set_thread_jobs`).
+    static THREAD_JOBS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Whether the kernels of compilations on this thread share few functions (`set_thread_independent`).
+    static THREAD_INDEPENDENT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the kernels of compilations on this thread are independent (light+ in AIR's address spaces, O3 a kernel
+/// at a time), in place of `independent_kernels` on the module: a part of a module of independent kernels holds few
+/// kernels next to the helper functions the module links, which the ratio would count against it.
+pub fn set_thread_independent(independent: Option<bool>) {
+    THREAD_INDEPENDENT.with(|i| i.set(independent));
+}
+
+/// The threads compile_air's per-kernel AGX code takes on the calling thread, in place of ZLUDA_AGX_JOBS and the
+/// default (a module compiled in parts on threads of their own: 1 each).
+pub fn set_thread_jobs(jobs: Option<usize>) {
+    THREAD_JOBS.with(|j| j.set(jobs));
+}
+
+/// The object of a module from the objects of its parts (each compiled with every global variable, as the parts of a
+/// kernel-at-a-time compilation): see agx_merge. An error when they cannot be merged (e.g. their global data differ).
+pub fn merge_objects(objects: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+    crate::agx_merge::merge(objects)
 }
 
 /// Marks every function of `module` that is not a kernel always-inline (and not no-inline), so that the AGX backend
@@ -560,6 +645,23 @@ fn default_jobs() -> usize {
         Some(kb) => cores.min((kb * 1024 / JOB_BYTES) as usize).max(1),
         None => cores.min(4),
     }
+}
+
+/// Whether `module`'s kernels share few other functions: at most one defined non-kernel function per 8 kernels.
+fn independent_kernels(module: &Module) -> bool {
+    let kernels = kernel_names(module).len();
+    let mut others = 0;
+    unsafe {
+        let mut f = llvm_sys::core::LLVMGetFirstFunction(module.get());
+        while !f.is_null() {
+            let kernel = !llvm_sys::core::LLVMGetStringAttributeAtIndex(f, llvm_sys::LLVMAttributeFunctionIndex, c"air-kernel".as_ptr(), 10).is_null();
+            if llvm_sys::core::LLVMIsDeclaration(f) == 0 && !kernel {
+                others += 1;
+            }
+            f = llvm_sys::core::LLVMGetNextFunction(f);
+        }
+    }
+    kernels > 1 && others * 8 <= kernels
 }
 
 /// The names of the kernels (functions with the air-kernel attribute) of `module`.

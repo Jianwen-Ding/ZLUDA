@@ -41,6 +41,113 @@ section. GPU times are from the M2 Max behind the AIR service; "suite" is PTX-fo
   is now the slow part. Not over-inlining: shade_surface_mnee packaged alone keeps 162 functions, and
   `-air-keep-function-cost` 20000 / 5000 / 2000 left it byte-identical (its large functions are kept already).
 
+## Compile time, memory and host costs on Asahi (2026-11-01)
+
+No AIR service this session: GPU numbers are of the AGX code on the M2 Max through zluda_agx (Asahi DRM). Corpus:
+Geekbench's 15 modules and llama.cpp's 17 (`/scratch/perf-goal/ctime.py`: one zoc per module as the driver runs it,
+wall time, peak RSS, object md5).
+
+- **The Metal copy is not needed on Asahi** (`zoc --agx-only`, the driver and every served request): the clone of the
+  module for Metal, its passes and bitcode, and the portable AIR output. Objects byte-identical (30/30), corpus
+  51.5 -> 49.3 s.
+- **llama.cpp's 10 MB module (317 kernels): 28.6 s, 2.1 GB.** Serial: the first pipeline 9.8 s (InstCombine 55%, the
+  first of its three runs 3.7 s; SROA 19%: 311k allocas), O3 in AIR's address spaces 9.5 s; the per-kernel AGX code
+  6.7 s on 12 threads. The time is spread over 332 functions (median 3k lines), no outlier: what would shorten it is
+  optimizing the module in parallel parts (the IPO passes, globalopt and ipsccp, would then see a part's globals only:
+  unsound without care). Dead end: an early-cse / instsimplify / simplifycfg before the first InstCombine changes
+  nothing (7.98-8.19 s for the prefix). `ZLUDA_AIR_DUMP_FIRST=FILE` writes the module before the first pipeline for
+  `opt -time-passes`.
+- **"Cannot select: store (s64) into %stack.0"** (that module as a whole, and per kernel with O3): two zero
+  <2 x float> stores into one alloca, the DAG rebuilding a memory operand from the frame index with the stack's
+  pseudo source value in address space 0. Fixed in the AGX backend (getAddressSpaceForPseudoSourceKind, llvm-project
+  claude/perf-air-agx); llvm-reduce from the kernel to 6 lines. The default objects are unchanged by the fix.
+- **Host costs that libcudart programs hit** (llama.cpp b11706 links the CUDA runtime statically, so its start-up is
+  the runtime's): `ZLUDA_AGX_API_STATS` showed 1.75 of 2.5 s of start-up in cuMemsetD8Async, two 384 MiB memsets at
+  0.45 GB/s (a pattern copy per element, length known at run time; a micro-benchmark with a constant pattern length
+  had looked fast: measure the real call). Fill as typed slices: 866 -> 8 ms, start-up 0.72 s. Generation: per token
+  ~4.7 ms waiting for the logits (GPU time) and ~3 ms in cuGraphLaunch overlapping it; GPU-bound.
+- **AGX O3 per kernel for large modules** (`ZLUDA_AIR_AGX_PIPELINE=o3`, possible once the stack fix above was in):
+  llama.cpp's 10 MB module +0.9 s (26.5 -> 27.4 s, the stage runs in parallel), same peak memory; llama.cpp
+  tg64 133.1 -> 134.5 t/s (two runs each, run-to-run spread +-1.3), pp128 equal. Within noise: left off (Cycles' compile
+  paid 31 -> 44 s for it before).
+- **Small private arrays read at a run-time offset in registers** (LLVMZludaPromoteDynamicPrivateLoads, after the
+  first pipeline): ggml's mul_mat_vec_f<half> keeps a float[8] written at constant offsets and read once at
+  `[depot + 4 * lane]`, so the array went to the stack (80 bytes): stack setup ~7.5 us a launch plus scattered stack
+  traffic (playground stack-launch, stack-memory). As a select over the 8 constant-offset loads SROA keeps it in
+  registers: 46.1 -> 14.6 us and 53.8 -> 25.3 us per launch, llama.cpp pp128 445.6 -> 566.0 t/s, tg64 131.9 -> 133.9;
+  completions exact, formalization suite unchanged. Found from the simulator's worst capture (-72%), whose gap
+  turned out to be the stack.
+  Then also stores at run-time offsets (arrays of at most 8 elements), the `or disjoint` InstCombine makes of an
+  aligned array's address plus an offset, and phis of pointers of one offset (GVN's PRE): Geekbench's blend kernel
+  loses its 64-byte stack; of the corpus' 589 kernels 3 keep one (trace_bvh / trace_bvh_shadow: BVH traversal stacks;
+  calculate_descriptors: a 256-byte array). (The commit message of 59957a9 says 1,774 kernels: wrong, 589.)
+  Geekbench with it: blend 725.5 -> 702.4 us per launch (-3%), summed GPU time 26.94 -> 26.87 s, the same 10 expected
+  errors.
+  Geekbench (2 of its modules change): every workload completes, the same 10 expected errors, summed GPU time 27.13
+  -> 26.94 s; its changed modules' kernels within their run-to-run spread (keypoint kernels are data-dependent).
+- Dead end, software-pipelined tile GEMM: loading the next k-step's 8 fragments before this step's 16 products
+  (gen_tile_gemm.py, the variants that load all fragments first, and the f16 `_tb` one) passes the kernel tests
+  but is 9-14% slower on the M2 Max (gemmbench, f16 A/B: 4096^3 6.99 -> 6.35 TFLOPS, f16 C 7.18 -> 6.20, 4096 x
+  512 x 4096 6.26 -> 5.66): 8 more fragments live per SIMD-group, while AGX already overlaps the loads with the
+  products. Large GEMMs run at ~7 TFLOPS (about half the FMA peak); more needs a different tile, not pipelining.
+- Dead end, wider SIMD-group tiles: 32 x 64 per SIMD-group (4 x 8 matrices, 32 accumulators), two SIMD-groups per
+  64 x 64 workgroup tile (GEN_TILE_J=8 in a trial generator, 64-thread launches): correct (1024^3 max relative error
+  3.6e-6) but 7-25% slower (4096^3 6.99 -> 6.49 TFLOPS, 1024^3 5.38 -> 4.05, f16 C 7.18 -> 5.45): half the SIMD-groups
+  per workgroup hide less latency than the better load-to-product ratio gains. A larger tile would have to keep
+  four SIMD-groups per workgroup (a 128 x 64 or 128 x 128 workgroup tile and a new plan).
+  Tried too: 128 x 64 workgroup tiles, four SIMD-groups of 32 x 64 (the plan cutting M' in 128s): as slow (4096^3
+  6.48, 1024^3 4.02, f16 C 5.39 TFLOPS). So the 32 accumulators per SIMD-group (register pressure, fewer resident
+  SIMD-groups) cost more than the reuse gains, whatever the workgroup shape: 16 accumulators (32 x 32) is the
+  better point for these kernels.
+- Dead end (as built), threadgroup-staged tile GEMM: agx_hgemm_tile64_cf{16,32}_tb with K in chunks of 32 staged
+  in 8 KiB of threadgroup memory by the 128 threads (16 scalar f16 loads of A and of B each, zero past K), a barrier,
+  the 4 x 4 fragments per SIMD-group from threadgroup memory (air.simdgroup_matrix_load from workgroup memory
+  compiles and is correct: hgemm kernel tests 21/21, 1024^3 max relative error 3.6e-6), a barrier: 2.5x slower
+  (4096^3 6.99 -> 2.75 TFLOPS, 512 x 512 x 4096 4.97 -> 1.30). The staging is the cost (scalar loads behind a bound
+  branch, B's transposed stores into threadgroup memory, two barriers per 32 of K); fragments loaded straight from
+  device memory are already efficient here. A competitive version needs vector loads, a conflict-free layout and
+  double buffering (generator: /scratch/perf-goal/tggemm/gen_tg.py, not kept).
+- Dead end, dp4a: a signed dp4a is 18 AGX instructions (4 imadd; the bytes extracted by bfi + asr pairs, asr 24 for
+  byte 3). The free 16-bit sign extension (MOD_SX) exists only on add / multiply-add sources (IADD_I32_FROM16,
+  IMADD_*_FROM32), not on shifts, so byte 1 (sext of the low half, then asr 8) is two instructions as now: no
+  saving there. A real gain needs packed 8-bit arithmetic, which AGX does not have (see 2026-10-31 above).
+- Geekbench 7 GPU with all of the above: every workload completes (the block-size search's out-of-resources answers
+  as before), summed GPU time 27.13 s against 25.93-26.85 s of earlier AIR-route runs; its largest difference,
+  particle 2.39 s, is inside those runs' 2.04-2.42 s.
+- Blender default cube (1024x1024, 128 spp) with all of the above: first render (compiling Cycles) 52.1 -> 45.2 s,
+  second 1.67 -> 1.63 s, the image the same (max difference 1/255, none over 2).
+- **A module of independent kernels compiled in parts** (zoc, `parts`): llama.cpp's 10 MB module has 317 kernels and
+  no other function, so its PTX splits into 12 parts (every part with the module's variables, the kernels balanced by
+  size), each compiled on its own thread with its own context, the objects merged (the parts' global data are equal;
+  the merger checks it, and any failure compiles the module whole). 22.1 -> 6.1 s, peak 2.4 -> 1.2 GB; the 7 MB one
+  6.3 -> 1.4 s; the corpus 40.6 -> 19.3 s. A part takes the module's light+ / per-kernel O3 decision (by its own
+  ratio, few kernels next to the linked helpers, it would have taken O3: the Q5_K kernel back at 122 us); with it the
+  Q5_K kernel 116.7-117.2 us, the Q5_1 one 25.9-26.3 us (controlled replays), completions 4/4 exact. Cycles (383
+  .func) and the other 28 modules are byte-identical. ZLUDA_AGX_PARTS=0 / N.
+- **Light cleanup in AIR's address spaces, O3 per kernel** (`ZLUDA_AIR_AS_PIPELINE=light+` with
+  `ZLUDA_AIR_AGX_PIPELINE=o3`, experiment): llama.cpp's modules 44.1 -> 36.7 s (the 10 MB one 26.5 -> 22.1 s; peak
+  2.08 -> 2.44 GB, every compiling thread running O3), completions 4/4 exact; but GPU time not shown to be equal
+  (tg64 134.6 / 123.7 against 132.8, pp128 -2%; per kernel +1-4% everywhere, even in modules it does not change,
+  i.e. within the clock's variation). Controlled (captures of both builds replayed alternately, 1000 back to back,
+  three times): mul_mat_vec_q<Q5_K> 121.7-122.6 -> 117.1-117.5 us (-4%), mul_mat_vec_q<Q5_1> 26.0 -> 26.2 us. But
+  Blender Cycles (75 kernels sharing many functions, each kernel's O3 repeating them) gains nothing: 43.4-49.7 ->
+  49.5-57.3 s, peak up to 6.9 GB. Left opt-in: it suits modules of independent kernels (llama.cpp's), not Cycles'.
+- Dead end: compiling a lazily loaded library in the background when the runtime registers it (cuLibraryLoadData),
+  to overlap llama.cpp's 17 module compilations on an empty cache (41.6 s): the same 41.6 s. The CUDA runtime that
+  llama-app links asks for each library's module (cuLibraryGetModule) right after registering it, before it registers
+  the next, so the compilations stay one after the other. Overlapping them would need module and kernel handles
+  before compiling (compilation at the first launch), a change of the driver's module model. Reverted.
+- Dead end: reading each kernel's module lazily from the portable AIR (getLazyBitcodeModule, materializing only the
+  functions the kernel reaches, instead of parsing all 13 MB of Cycles per kernel): the same object, peak 6.1-6.3 GB
+  against 6.3-6.7, the AGX stage 30.6-32.6 s against 26.6-32.1 (two runs each): within noise. Cycles' peak is the
+  12 kernels being compiled at once (the largest ~1-2 GB each), not the parses. Reverted.
+- cuDNN (agx): temporaries from a per-handle pool instead of an allocation, a synchronization and a free per call:
+  3x3 convolutions 1.4-4x faster (8x64x56x56 4.52 -> 1.11 ms), the CPU no longer blocked on each call
+  (`zluda_dnn_agx/tools/convbench.c`, checked against a CPU convolution).
+- cuBLAS (agx) split K now also for f16 A/B with f32 C from K = 512: 896 x 64 x 896 98 -> 86 us, 128 x 512 x 896
+  99 -> 82 us (`zluda_blas_agx/tools/gemmbench.c`). Skinny n <= 8 products stay slow (0.2-0.3 TFLOPS: the dot kernel
+  reads A once per column), but ggml uses its own kernels there.
+
 ## Real calls in the AGX backend (`-agx-experimental-leaf-calls`), 2026-10-30
 
 The way out of Cycles' AGX memory: shade_shadow with its large helpers kept as called functions compiles in 14 s at

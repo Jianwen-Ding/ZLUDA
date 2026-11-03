@@ -38,7 +38,7 @@ def kernel_records(obj, a, tmp):
     """name -> (threadgroups_per_grid uniform, [(kind, bytes, first half) per argument], global data half, stack
     bytes, [(half, value) of the 32-bit constants to preload (extension 6, llc -agx-uniform-constants)],
     [(half, source half, kind) of the values the launch computes from argument words (extension 7,
-    llc -agx-launch-divisors)]) from .agx.kernels."""
+    llc -agx-launch-divisors)], threadgroup memory bytes) from .agx.kernels."""
     p = os.path.join(tmp, "o.o")
     open(p, "wb").write(obj)
     sec = os.path.join(tmp, "k.bin")
@@ -53,7 +53,7 @@ def kernel_records(obj, a, tmp):
         (nlen,) = struct.unpack_from("<I", d, pos + 8)
         name = d[pos + 12:pos + 12 + nlen].decode()
         q = pos + 12 + (nlen + 3) // 4 * 4
-        _halves, tg_half, glob, _gprs, _tg, stack, nargs = struct.unpack_from("<7I", d, q)
+        _halves, tg_half, glob, _gprs, tg_bytes, stack, nargs = struct.unpack_from("<7I", d, q)
         q += 28
         args = [struct.unpack_from("<3I", d, q + 12 * i) for i in range(nargs)]
         e, consts, derived = q + 12 * nargs, [], []
@@ -73,7 +73,7 @@ def kernel_records(obj, a, tmp):
                 e += 8 + 12 * n
             else:
                 break
-        out[name] = (tg_half // 2, args, glob, stack, consts, derived)
+        out[name] = (tg_half // 2, args, glob, stack, consts, derived, tg_bytes)
         pos += size
     return out
 
@@ -116,7 +116,7 @@ def run(a, obj, name, args, grid, wg, tmp, heap=0):
     its contents (a heap returned by an earlier run); its address goes into the module's __zluda_agx_heap, as
     zluda_agx does, and its contents after the run follow the dumped buffers. Returns the dumped buffers."""
     name += a.kernel_suffix
-    tg_uniform, slots, glob, stack, consts, derived = kernel_records(obj, a, tmp)[name]
+    tg_uniform, slots, glob, stack, consts, derived, tg_bytes = kernel_records(obj, a, tmp)[name]
     code = os.path.join(tmp, name + ".bin")
     open(code, "wb").write(kernel_code(obj, name, a, tmp))
     grid3 = tuple(grid) + (1,) * (3 - len(grid))  # a third dimension for batched launches
@@ -124,6 +124,8 @@ def run(a, obj, name, args, grid, wg, tmp, heap=0):
     # on the GPU, a kernel that uses the stack needs its scratch (the simulator gives every thread one)
     if stack and os.path.basename(a.agx_run).startswith("agx_run_hw"):
         cmd += ["--stack", str(stack)]
+    if tg_bytes:
+        cmd += ["--shared", str(tg_bytes)]
     uniforms, dumps, bases = {}, [], [0x1000000 * (k + 1) for k in range(16)][::-1]
     for (kind, value, *rest), (_k, nbytes, half) in zip(args, slots):
         u = half // 2
@@ -583,10 +585,31 @@ def case_fft(a, obj, tmp, n, batch, stride, dist, inverse, radix2, rnd, t="f"):
                          (n // r, batch), (min(n // r, 64), 1), tmp)
             ns *= r
     else:
-        (buf,) = run(a, obj, "agx_dft" + sfx,
-                     [("buf", buf), ("buf", pack([0.0] * (2 * total), t), True), ("buf", tw), ("i32", n), ("i32", batch),
-                      ("i32", stride), ("i32", dist), ("i32", inverse)],
-                     (-(-n // 16) * 16, batch), (16, 1), tmp)
+        # zluda_fft_agx's mixed radices: the power of two as above, then each odd prime factor on agx_fft_radixr
+        # (a prime n: one pass, the direct transform)
+        stages = (n & -n).bit_length() - 1
+        radices = [2] * (stages % 2) + [4] * (stages // 2)
+        rest, p = n >> stages, 3
+        while rest > 1:
+            p = rest if p * p > rest else p
+            while rest % p == 0:
+                radices.append(p)
+                rest //= p
+            p += 2
+        ns = 1
+        for r in radices:
+            out = ("buf", pack([0.0] * (2 * total), t), True)
+            if r in (2, 4):
+                (buf,) = run(a, obj, "agx_fft_radix%d" % r + sfx,
+                             [("buf", buf), out, ("buf", tw), ("i32", n), ("i32", ns), ("i32", batch), ("i32", stride),
+                              ("i32", dist), ("i32", inverse)], (n // r, batch), (min(n // r, 64), 1), tmp)
+            else:
+                (buf,) = run(a, obj, "agx_fft_radixr" + sfx,
+                             [("buf", buf), out, ("buf", tw), ("i32", n), ("i32", ns), ("i32", r), ("i32", n // r),
+                              ("i32", n // (r * ns)), ("i32", batch),
+                              ("i32", stride), ("i32", dist), ("i32", inverse)],
+                             (-(-n // 64) * 64, batch), (64, 1), tmp)
+            ns *= r
     got = unpack(buf, t)
     bad = []
     for b in range(batch):
@@ -595,6 +618,27 @@ def case_fft(a, obj, tmp, n, batch, stride, dist, inverse, radix2, rnd, t="f"):
         for i, w in zip(idx, want):
             g = complex(got[2 * i], got[2 * i + 1])
             if abs(g - w) > tol * (1 + abs(w)) * max(1, math.log2(n)):
+                bad.append(i)
+    return bad
+
+
+def case_fft_shared(a, obj, tmp, n, batch, stride, dist, inverse, rnd):
+    """agx_fft_shared: whole transforms in threadgroup memory, as zluda_fft_agx launches it."""
+    total = max((b * dist + (n - 1) * stride for b in range(batch)), default=0) + 1
+    data = [complex(rnd.uniform(-1, 1), rnd.uniform(-1, 1)) for _ in range(total)]
+    per = min(max(1, min(256 // (n // 4), 2048 // n)), batch)
+    # the 8 KiB kernel when it is enough, as zluda_fft_agx picks it
+    (buf,) = run(a, obj, "agx_fft_shared" if per * n <= 1024 else "agx_fft_shared_2048",
+                 [("buf", pack(interleave(data), "f")), ("buf", pack([0.0] * (2 * total), "f"), True),
+                  ("buf", pack(twiddles(n), "f")), ("i32", n), ("i32", batch), ("i32", stride), ("i32", dist),
+                  ("i32", inverse)], (n // 4 * -(-batch // per), per), (n // 4, per), tmp)
+    got = unpack(buf, "f")
+    bad = []
+    for b in range(batch):
+        idx = [b * dist + i * stride for i in range(n)]
+        want = dft([data[i] for i in idx], n, inverse)
+        for i, w in zip(idx, want):
+            if abs(complex(got[2 * i], got[2 * i + 1]) - w) > 1e-4 * (1 + abs(w)) * math.log2(n):
                 bad.append(i)
     return bad
 
@@ -696,10 +740,13 @@ def case_sparse(a, obj, tmp, what, I, base, rnd):
     cs = (1, ldc) if col_major else (ldc, 1)
     B = rounded([rnd.uniform(-1, 1) for _ in range(ldb * (n if col_major else cols))], BT)
     C = rounded([rnd.uniform(-1, 1) for _ in range(ldc * (n if col_major else rows))], BT)
+    # row-major B: C's columns along x (jfast), as zluda_sparse_agx launches it
+    jfast = 0 if col_major else n
+    grid, block = ((-(-rows * jfast // 128) * 128, 1), (128, 1)) if jfast else ((-(-rows // 16) * 16, -(-n // 4) * 4), (16, 4))
     (got,) = run(a, obj, K("agx_csr_spmm_" + I),
                  [("buf", rp), ("buf", ci), ("buf", pack(val, BT)), ("buf", pack(B, BT)), ("buf", pack(C, BT), True),
                   ("i64", rows), ("i64", n), ("i64", base), ("i64", bs[0]), ("i64", bs[1]), ("i64", cs[0]), ("i64", cs[1]),
-                  (S(), alpha), (S(), beta)], (-(-rows // 16) * 16, -(-n // 4) * 4), (16, 4), tmp)
+                  ("i64", jfast), (S(), alpha), (S(), beta)], grid, block, tmp)
     want = list(C)
     idx = []
     for i in range(rows):
@@ -2565,6 +2612,12 @@ def main():
                             ("fft%s n=32 columns of 32x3 inverse=%d" % (p, inv), lambda inv=inv, t=t: case_fft(a, obj, tmp, 32, 3, 3, 1, inv, True, rnd, t)),
                             ("dft%s n=12 x2 inverse=%d" % (p, inv), lambda inv=inv, t=t: case_fft(a, obj, tmp, 12, 2, 1, 12, inv, False, rnd, t)),
                             ("dft%s n=7 columns of 7x3 inverse=%d" % (p, inv), lambda inv=inv, t=t: case_fft(a, obj, tmp, 7, 3, 3, 1, inv, False, rnd, t)),
+                            *([("fft shared n=%d x%d stride %d inverse=%d" % (n, bt, st, inv),
+                                lambda inv=inv, n=n, bt=bt, st=st, ds=ds: case_fft_shared(a, obj, tmp, n, bt, st, ds, inv, rnd))
+                               for n, bt, st, ds in ((4, 3, 1, 4), (8, 70, 1, 8), (64, 5, 1, 64), (512, 9, 1, 512),
+                                                     (32, 3, 3, 1), (2048, 3, 1, 2048))] if t == "f" else []),
+                            ("mixed radix fft%s n=360 x2 inverse=%d" % (p, inv), lambda inv=inv, t=t: case_fft(a, obj, tmp, 360, 2, 1, 360, inv, False, rnd, t)),
+                            ("mixed radix fft%s n=75 columns of 75x2 inverse=%d" % (p, inv), lambda inv=inv, t=t: case_fft(a, obj, tmp, 75, 2, 2, 1, inv, False, rnd, t)),
                         ]
                     cases += [("fft%s packing n=10 x2" % p, lambda t=t: case_fft_packing(a, obj, tmp, 10, 2, rnd, t)),
                               ("fft%s packing n=9 x1" % p, lambda t=t: case_fft_packing(a, obj, tmp, 9, 1, rnd, t))]

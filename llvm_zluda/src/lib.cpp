@@ -3810,3 +3810,191 @@ int LLVMZludaAirRangeReport(LLVMModuleRef M)
 }
 
 LLVM_C_EXTERN_C_END
+
+LLVM_C_EXTERN_C_BEGIN
+
+// Loads from a small private array at a run-time offset, `inttoptr(ptrtoint(array) + offset)` as ZLUDA's front end
+// writes PTX's `ld.local [%depot + %r]`, as a select over the loads at each element's constant offset, and stores at
+// a run-time offset (arrays of at most 8 elements) as a store of each element, the value where the offset is its
+// own and the element's value elsewhere: then every
+// access of the array has a constant offset and SROA keeps it in registers, where the AGX backend put it on the stack
+// (stack_load / stack_store, and ~7.5 us of stack setup at each launch: playground 2026-11-01-stack-launch). Only for
+// arrays of at most 64 bytes whose other uses are loads and stores at constant offsets, and loads of a type that
+// divides the array's size into at most 16 elements. An offset that is not a multiple of the element's size, or past
+// the array, reads an undefined value in PTX; here it reads the last element. Returns the loads rewritten.
+int LLVMZludaPromoteDynamicPrivateLoads(LLVMModuleRef M)
+{
+    Module *Mod = unwrap(M);
+    const DataLayout &DL = Mod->getDataLayout();
+    int rewritten = 0;
+    for (Function &F : *Mod)
+    {
+        SmallVector<AllocaInst *, 4> Allocas;
+        for (Instruction &I : instructions(F))
+            if (auto *AI = dyn_cast<AllocaInst>(&I))
+                if (AI->isStaticAlloca() && AI->getAllocatedType()->isArrayTy())
+                    Allocas.push_back(AI);
+        for (AllocaInst *AI : Allocas)
+        {
+            std::optional<TypeSize> Size = AI->getAllocationSize(DL);
+            if (!Size || Size->isScalable() || Size->getFixedValue() > 64 || Size->getFixedValue() == 0)
+                continue;
+            uint64_t Bytes = Size->getFixedValue();
+            // the dynamic loads (load, offset) and whether every other use is a constant-offset load or store
+            SmallVector<std::pair<LoadInst *, Value *>, 4> Dynamic;
+            SmallVector<std::pair<StoreInst *, Value *>, 4> DynamicStores;
+            bool ok = true;
+            std::function<void(Value *)> constantUses = [&](Value *P) {
+                for (User *U : P->users())
+                {
+                    if (!ok)
+                        return;
+                    if (auto *L = dyn_cast<LoadInst>(U))
+                        ok = L->isSimple();
+                    else if (auto *S = dyn_cast<StoreInst>(U))
+                        ok = S->isSimple() && S->getValueOperand() != P;
+                    else if (auto *G = dyn_cast<GetElementPtrInst>(U))
+                    {
+                        APInt Off(DL.getIndexTypeSizeInBits(G->getType()), 0);
+                        if (G->accumulateConstantOffset(DL, Off))
+                            constantUses(G);
+                        else
+                            ok = false;
+                    }
+                    else if (auto *PI = dyn_cast<PtrToIntInst>(U); PI && P == AI)
+                    {
+                        // ptrtoint(array) + offset -> inttoptr -> loads
+                        for (User *A : PI->users())
+                        {
+                            // (an add, or the `or disjoint` InstCombine makes of it with an aligned array)
+                            auto *Add = dyn_cast<BinaryOperator>(A);
+                            bool disjoint = Add && Add->getOpcode() == Instruction::Or && cast<PossiblyDisjointInst>(Add)->isDisjoint();
+                            if (!Add || (Add->getOpcode() != Instruction::Add && !disjoint))
+                            {
+                                ok = false;
+                                return;
+                            }
+                            Value *Offset = Add->getOperand(0) == PI ? Add->getOperand(1) : Add->getOperand(0);
+                            for (User *T : Add->users())
+                            {
+                                // (a private pointer, or the generic one the front end makes of the array's address and
+                                // an offset, which ZLUDA's address-space lowering takes as the array's)
+                                auto *IP = dyn_cast<IntToPtrInst>(T);
+                                if (!IP || (IP->getType() != AI->getType() && IP->getType()->getPointerAddressSpace() != 0))
+                                {
+                                    ok = false;
+                                    return;
+                                }
+                                // the accesses through IP, and through phis of pointers that are all inttoptr of this
+                                // same offset (GVN's partial redundancy elimination makes them)
+                                SmallVector<Value *, 4> Pointers{IP};
+                                for (User *LU : IP->users())
+                                    if (auto *Phi = dyn_cast<PHINode>(LU))
+                                    {
+                                        bool same = llvm::all_of(Phi->incoming_values(), [&](Value *In) {
+                                            auto *I = dyn_cast<IntToPtrInst>(In);
+                                            return I && I->getOperand(0) == Add;
+                                        });
+                                        if (!same)
+                                        {
+                                            ok = false;
+                                            return;
+                                        }
+                                        // (each phi once: it is reached from each of its incoming pointers)
+                                        if (IP == dyn_cast<IntToPtrInst>(Phi->getIncomingValue(0)))
+                                            Pointers.push_back(Phi);
+                                    }
+                                for (Value *Ptr : Pointers)
+                                for (User *LU : Ptr->users())
+                                {
+                                    if (isa<PHINode>(LU) && Ptr == IP)
+                                        continue;
+                                    if (auto *S = dyn_cast<StoreInst>(LU);
+                                        S && S->isSimple() && S->getPointerOperand() == Ptr && S->getValueOperand() != Ptr)
+                                    {
+                                        DynamicStores.push_back({S, Offset});
+                                        continue;
+                                    }
+                                    auto *L = dyn_cast<LoadInst>(LU);
+                                    if (!L || !L->isSimple() || L->getPointerOperand() != Ptr)
+                                    {
+                                        ok = false;
+                                        return;
+                                    }
+                                    Dynamic.push_back({L, Offset});
+                                }
+                            }
+                        }
+                    }
+                    else
+                        ok = false;
+                }
+            };
+            constantUses(AI);
+            if (!ok || (Dynamic.empty() && DynamicStores.empty()))
+                continue;
+            // a store at a run-time offset rewrites every element (at most 8)
+            for (auto &[S, Offset] : DynamicStores)
+            {
+                Type *T = S->getValueOperand()->getType();
+                uint64_t Elem = DL.getTypeStoreSize(T).getFixedValue();
+                if (Elem == 0 || Bytes % Elem != 0 || Bytes / Elem > 8 || !T->isSingleValueType())
+                    ok = false;
+            }
+            if (!ok)
+                continue;
+            // every dynamic load's type divides the array into at most 16 elements
+            for (auto &[L, Offset] : Dynamic)
+            {
+                uint64_t Elem = DL.getTypeStoreSize(L->getType()).getFixedValue();
+                if (Elem == 0 || Bytes % Elem != 0 || Bytes / Elem > 16 || !L->getType()->isSingleValueType())
+                    ok = false;
+            }
+            if (!ok)
+                continue;
+            for (auto &[L, Offset] : Dynamic)
+            {
+                IRBuilder<> B(L);
+                Type *T = L->getType();
+                uint64_t Elem = DL.getTypeStoreSize(T).getFixedValue();
+                uint64_t N = Bytes / Elem;
+                Type *I8 = B.getInt8Ty();
+                auto at = [&](uint64_t k) {
+                    Value *P = B.CreateInBoundsGEP(I8, AI, B.getInt32(k * Elem));
+                    return B.CreateAlignedLoad(T, P, commonAlignment(AI->getAlign(), k * Elem));
+                };
+                Value *R = at(N - 1);
+                for (uint64_t k = N - 1; k-- > 0;)
+                {
+                    Value *Is = B.CreateICmpEQ(Offset, ConstantInt::get(Offset->getType(), k * Elem));
+                    R = B.CreateSelect(Is, at(k), R);
+                }
+                R->takeName(L);
+                L->replaceAllUsesWith(R);
+                L->eraseFromParent();
+                rewritten++;
+            }
+            // a[k] = offset == k * size ? value : a[k], for each element
+            for (auto &[S, Offset] : DynamicStores)
+            {
+                IRBuilder<> B(S);
+                Value *V = S->getValueOperand();
+                Type *T = V->getType();
+                uint64_t Elem = DL.getTypeStoreSize(T).getFixedValue();
+                for (uint64_t k = 0; k < Bytes / Elem; k++)
+                {
+                    Value *P = B.CreateInBoundsGEP(B.getInt8Ty(), AI, B.getInt32(k * Elem));
+                    Align A = commonAlignment(AI->getAlign(), k * Elem);
+                    Value *Old = B.CreateAlignedLoad(T, P, A);
+                    Value *Is = B.CreateICmpEQ(Offset, ConstantInt::get(Offset->getType(), k * Elem));
+                    B.CreateAlignedStore(B.CreateSelect(Is, V, Old), P, A);
+                }
+                S->eraseFromParent();
+                rewritten++;
+            }
+        }
+    }
+    return rewritten;
+}
+
+LLVM_C_EXTERN_C_END

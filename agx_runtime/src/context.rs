@@ -119,10 +119,53 @@ impl Memory {
     }
 }
 
+/// A copy between CPU-mapped memory and host memory (non-overlapping), on several threads from 4 MiB: one thread
+/// moves ~30-35 GB/s, under the memory system's rate. ZLUDA_AGX_COPY_THREADS sets the most threads (1: one).
+fn par_copy(dst: &mut [u8], src: &[u8]) {
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let most = *THREADS.get_or_init(|| {
+        std::env::var("ZLUDA_AGX_COPY_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4).max(1)
+    });
+    let n = dst.len().min(src.len());
+    let threads = most.min(n >> 22).max(1);
+    if threads == 1 {
+        dst[..n].copy_from_slice(&src[..n]);
+        return;
+    }
+    // chunks on 64-byte boundaries
+    let part = (n / threads).div_ceil(64) * 64;
+    std::thread::scope(|sc| {
+        let mut rest = (&mut dst[..n], &src[..n]);
+        while !rest.0.is_empty() {
+            let take = part.min(rest.0.len());
+            let (d, dr) = std::mem::take(&mut rest.0).split_at_mut(take);
+            let (s, sr) = rest.1.split_at(take);
+            rest = (dr, sr);
+            if rest.0.is_empty() {
+                d.copy_from_slice(s);
+            } else {
+                sc.spawn(move || d.copy_from_slice(s));
+            }
+        }
+    });
+}
+
+/// The reuse cache's limit in bytes: ZLUDA_AGX_ALLOC_CACHE (MiB; 0 turns it off), 512 MiB by default.
+fn cache_limit() -> u64 {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| std::env::var("ZLUDA_AGX_ALLOC_CACHE").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(512) << 20)
+}
+
 /// Fields drop in declaration order: the allocations and the queue are unbound before the VM is destroyed (a VM
 /// destroyed with objects still bound strands their memory in the kernel, also past process exit; B42).
 pub struct Context {
     allocs: BTreeMap<u64, (Memory, u64)>,
+    /// Freed allocations kept for reuse by `mem_alloc_cached` (oldest first): creating, binding and mapping an object
+    /// cost 17 us at 4 KiB, 160 us at 1 MiB and 6.6 ms at 64 MiB (allocation and free). At most `cache_limit()`
+    /// bytes; emptied when an allocation fails; counted as free by `mem_info`.
+    free_cache: Vec<Bo>,
+    /// The addresses of live allocations from `mem_alloc_cached`, which return to the cache when freed.
+    cacheable: std::collections::HashSet<u64>,
     pub stream: Queue,
     pub vm: Vm,
     pub props: DeviceProps,
@@ -139,7 +182,7 @@ impl Context {
         let props = DeviceProps::from_params(&device.params, system_memory());
         let mut vm = Vm::new(&device)?;
         let stream = Queue::new(&mut vm)?;
-        Ok(Context { device, props, vm, stream, allocs: BTreeMap::new() })
+        Ok(Context { device, props, vm, stream, allocs: BTreeMap::new(), free_cache: Vec::new(), cacheable: Default::default() })
     }
 
     /// cuMemAlloc: `size` bytes, zeroed, 16 KiB aligned.
@@ -216,14 +259,57 @@ impl Context {
         }
     }
 
-    /// cuMemFree: waits for the default stream first, as CUDA does.
+    /// cuMemFree: waits for the default stream first, as CUDA does. A data object that `mem_alloc_cached` made goes
+    /// to the reuse cache (idle: nothing queued uses it after the wait).
     pub fn mem_free(&mut self, va: u64) -> io::Result<()> {
         if !self.allocs.get(&va).is_some_and(|a| matches!(a.0, Memory::Bo(_))) {
             return Err(invalid(format!("{va:#x} is not an allocation")));
         }
         self.stream.synchronize()?;
-        self.allocs.remove(&va);
+        if let Some((Memory::Bo(bo), _)) = self.allocs.remove(&va) {
+            let limit = cache_limit();
+            if self.cacheable.remove(&va) && bo.size <= limit / 2 {
+                self.free_cache.push(bo);
+                // the oldest go first
+                while self.free_cache.iter().map(|b| b.size).sum::<u64>() > limit {
+                    self.free_cache.remove(0);
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// cuMemAlloc through the reuse cache: a freed data object of between `size` and 1.25 `size` bytes (the
+    /// smallest), else a new one (after emptying the cache if the first attempt fails). A reused object keeps its old
+    /// contents, as CUDA's allocations may (AGX_ZERO_ALLOC=1 zeroes it). ZLUDA_AGX_ALLOC_CACHE=0: no cache.
+    pub fn mem_alloc_cached(&mut self, size: u64) -> io::Result<u64> {
+        let need = size.max(1).div_ceil(PAGE) * PAGE;
+        let best = (0..self.free_cache.len())
+            .filter(|&i| (need..=need + need / 4).contains(&self.free_cache[i].size))
+            .min_by_key(|&i| self.free_cache[i].size);
+        if let Some(i) = best {
+            let mut bo = self.free_cache.remove(i);
+            if crate::zero_alloc() {
+                bo.as_mut_slice().fill(0);
+            }
+            let va = bo.va;
+            self.allocs.insert(va, (Memory::Bo(bo), size.max(1)));
+            self.cacheable.insert(va);
+            return Ok(va);
+        }
+        let bo = match self.vm.alloc_data(size) {
+            Err(_) if !self.free_cache.is_empty() => {
+                self.free_cache.clear();
+                self.vm.alloc_data(size)?
+            }
+            r => r?,
+        };
+        let va = bo.va;
+        self.allocs.insert(va, (Memory::Bo(bo), size.max(1)));
+        if cache_limit() > 0 {
+            self.cacheable.insert(va);
+        }
+        Ok(va)
     }
 
     /// cuMemAllocManaged: an allocation whose GPU address is also its CPU address. Fails if that CPU range is taken.
@@ -287,22 +373,28 @@ impl Context {
     /// cuMemcpyHtoD (synchronous with respect to the default stream).
     pub fn memcpy_htod(&mut self, dst: u64, src: &[u8]) -> io::Result<()> {
         self.stream.synchronize()?;
-        self.bytes_mut(dst, src.len() as u64)?.copy_from_slice(src);
+        par_copy(self.bytes_mut(dst, src.len() as u64)?, src);
         Ok(())
     }
 
     /// cuMemcpyDtoH.
     pub fn memcpy_dtoh(&mut self, dst: &mut [u8], src: u64) -> io::Result<()> {
         self.stream.synchronize()?;
-        dst.copy_from_slice(self.bytes(src, dst.len() as u64)?);
+        par_copy(dst, self.bytes(src, dst.len() as u64)?);
         Ok(())
     }
 
     /// cuMemcpyDtoD (the regions may be in the same or different allocations, and may overlap).
     pub fn memcpy_dtod(&mut self, dst: u64, src: u64, len: u64) -> io::Result<()> {
         self.stream.synchronize()?;
-        let tmp = self.bytes(src, len)?.to_vec();
-        self.bytes_mut(dst, len)?.copy_from_slice(&tmp);
+        // one memmove, overlapping or not (a temporary copy held a second buffer the size of the copy)
+        let from = self.bytes(src, len)?.as_ptr();
+        let to = self.bytes_mut(dst, len)?.as_mut_ptr();
+        if from as usize + len as usize <= to as usize || to as usize + len as usize <= from as usize {
+            par_copy(unsafe { std::slice::from_raw_parts_mut(to, len as usize) }, unsafe { std::slice::from_raw_parts(from, len as usize) });
+        } else {
+            unsafe { std::ptr::copy(from, to, len as usize) };
+        }
         Ok(())
     }
 
@@ -310,9 +402,7 @@ impl Context {
     pub fn memset(&mut self, dst: u64, pattern: &[u8], count: u64) -> io::Result<()> {
         self.stream.synchronize()?;
         let n = pattern.len() as u64;
-        for chunk in self.bytes_mut(dst, count * n)?.chunks_exact_mut(n as usize) {
-            chunk.copy_from_slice(pattern);
-        }
+        fill_pattern(self.bytes_mut(dst, count * n)?, pattern);
         Ok(())
     }
 
@@ -328,6 +418,7 @@ impl Context {
     /// (ptx-re-blockers B39): free is the system's available memory (MemAvailable, which counts reclaimable
     /// caches), both within the process's cgroup limit if it has one.
     pub fn mem_info(&self) -> (u64, u64) {
+        let cached: u64 = self.free_cache.iter().map(|b| b.size).sum();
         let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
         let field = |name: &str| {
             meminfo
@@ -345,7 +436,8 @@ impl Context {
             total = total.min(limit);
             free = free.min(limit.saturating_sub(used));
         }
-        (free, total)
+        // the reuse cache's objects are free to the application
+        ((free + cached).min(total), total)
     }
 }
 
@@ -378,5 +470,62 @@ mod tests {
         assert_eq!(d.name, "Apple M2 Max (G14C, 38 cores)");
         assert_eq!(d.llvm_cpu, "agx-g14c");
         assert_eq!((d.cores, d.clock_khz, d.warp_size), (38, 1_398_000, 32));
+    }
+}
+
+/// Fills `bytes` with copies of `pattern` (1, 2 or 4 bytes; `bytes` a multiple of it) as `fill` on bytes, halves or
+/// words: a copy of the pattern per element, its length known only at run time, ran at ~0.45 GB/s (a 384 MiB
+/// cudaMemsetAsync of llama.cpp's KV cache took 870 ms).
+pub fn fill_pattern(bytes: &mut [u8], pattern: &[u8]) {
+    fn typed<T: Copy>(bytes: &mut [u8], v: T, pattern: &[u8]) {
+        // SAFETY: any bit pattern is a valid u16 / u32; head and tail are the unaligned bytes
+        let (head, mid, tail) = unsafe { bytes.align_to_mut::<T>() };
+        let n = pattern.len();
+        // the elements are at multiples of n from the start: the head's bytes continue the pattern from its start
+        for (i, b) in head.iter_mut().enumerate() {
+            *b = pattern[i % n];
+        }
+        if head.len() % n != 0 {
+            // the aligned part starts inside an element: rotate the value by the head's phase
+            let phase = head.len() % n;
+            let rotated: Vec<u8> = (0..n).map(|i| pattern[(i + phase) % n]).collect();
+            let mut w = v;
+            unsafe { std::ptr::copy_nonoverlapping(rotated.as_ptr(), &mut w as *mut T as *mut u8, n) };
+            mid.fill(w);
+        } else {
+            mid.fill(v);
+        }
+        let start = head.len() + mid.len() * n;
+        for (i, b) in tail.iter_mut().enumerate() {
+            *b = pattern[(start + i) % n];
+        }
+    }
+    match *pattern {
+        [b] => bytes.fill(b),
+        [a, b] => typed(bytes, u16::from_ne_bytes([a, b]), pattern),
+        [a, b, c, d] => typed(bytes, u32::from_ne_bytes([a, b, c, d]), pattern),
+        _ => {
+            for chunk in bytes.chunks_exact_mut(pattern.len()) {
+                chunk.copy_from_slice(pattern);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod fill_tests {
+    #[test]
+    fn fill_pattern_matches_elementwise() {
+        for pattern in [&[7u8][..], &[1, 2], &[1, 2, 3, 4], &[9, 9, 9, 9]] {
+            for offset in 0..4 {
+                for count in [0usize, 1, 2, 3, 7, 64, 1000, 4097] {
+                    let mut buf = vec![0u8; offset + count * pattern.len() + 3];
+                    let fast = &mut buf[offset..offset + count * pattern.len()];
+                    super::fill_pattern(fast, pattern);
+                    let slow: Vec<u8> = pattern.iter().copied().cycle().take(count * pattern.len()).collect();
+                    assert_eq!(fast, &slow[..], "pattern {pattern:?} offset {offset} count {count}");
+                }
+            }
+        }
     }
 }

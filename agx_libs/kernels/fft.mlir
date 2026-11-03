@@ -271,16 +271,28 @@ gpu.module @agx_fft {
     gpu.return
   }
 
-  // The direct transform for any n: dst[k] = sum over j of src[j] tw[(j k) mod
-  // n] (conjugated when inverse). Launch an n x batch grid; src and dst must
-  // not overlap.
-  gpu.func @agx_dft(%src0: memref<1xf32, 1>, %dst0: memref<1xf32, 1>,
-                    %tw0: memref<1xf32, 1>, %n_: i32, %batch_: i32,
-                    %stride_: i32, %dist_: i32, %inverse_: i32) kernel {
+  // A whole power-of-two transform in threadgroup memory (4 <= n, n x
+  // (threads y) <= 1024: 8 KiB, so that 8 workgroups fit a core, not 2 with
+  // 32 KiB; agx_fft_shared_2048 below: 16 KiB, n x (threads y) <= 2048; single
+  // precision only, see agx_libs/build.rs):
+  // one SIMD-group row of n / 4 threads (x) per sequence, (threads y)
+  // sequences per workgroup, so each element is read and written in device
+  // memory once. Thread j loads src[j + k n / 4], k < 4, and when log2(n) is
+  // odd does the twiddle-free first radix-2 pass on them (the butterflies j and
+  // j + n / 4 of agx_fft_radix2 with ns = 1); then radix-4 passes as
+  // agx_fft_radix4, through threadgroup memory (real parts, then imaginary
+  // parts), the last one storing to dst. In place is allowed. Launch a
+  // ((n / 4) x (batch / threads y, rounded up)) grid of (n / 4, threads y)
+  // groups.
+  gpu.func @agx_fft_shared(%src0: memref<1xf32, 1>, %dst0: memref<1xf32, 1>,
+                           %tw0: memref<1xf32, 1>, %n_: i32, %batch_: i32,
+                           %stride_: i32, %dist_: i32, %inverse_: i32)
+      workgroup(%sm: memref<2048xf32, #gpu.address_space<workgroup>>) kernel {
     %i0 = arith.constant 0 : index
     %i1 = arith.constant 1 : index
     %i2 = arith.constant 2 : index
-    %f0 = arith.constant 0.0 : f32
+    %i3 = arith.constant 3 : index
+    %i4 = arith.constant 4 : index
     %big = arith.constant 4611686018427387904 : index
     %n = arith.index_cast %n_ : i32 to index
     %batch = arith.index_cast %batch_ : i32 to index
@@ -293,16 +305,739 @@ gpu.module @agx_fft {
         : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
     %Tw = memref.reinterpret_cast %tw0 to offset: [0], sizes: [%big], strides: [1]
         : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
-    %k = gpu.global_id x
+    %is_inv = arith.cmpi ne, %inverse, %i0 : index
+    %j = gpu.thread_id x
+    %s = gpu.thread_id y
+    %per = gpu.block_dim y
+    %grp = gpu.block_id x
+    %b0 = arith.muli %grp, %per : index
+    %b = arith.addi %b0, %s : index
+    %live = arith.cmpi ult, %b, %batch : index
+    %base = arith.muli %b, %dist : index
+    %slot = arith.muli %s, %n : index
+    %im0 = arith.muli %per, %n : index
+    %quarter = arith.shrui %n, %i2 : index
+    %half = arith.shrui %n, %i1 : index
+    %jk0 = arith.addi %j, %i0 : index
+    %jk1 = arith.addi %j, %quarter : index
+    %jk2 = arith.addi %j, %half : index
+    %jk3 = arith.addi %jk1, %half : index
+    // log2(n) odd: 0xAAAAAAAA has the odd bits
+    %oddbits = arith.constant 2863311530 : index
+    %ob = arith.andi %n, %oddbits : index
+    %odd = arith.cmpi ne, %ob, %i0 : index
+    scf.if %live {
+      %v0 = arith.muli %jk0, %stride : index
+      %v1 = arith.addi %base, %v0 : index
+      %v2 = arith.muli %v1, %i2 : index
+      %v3 = arith.addi %v2, %i1 : index
+      %xr4 = memref.load %Src[%v2] : memref<?xf32, strided<[1]>, 1>
+      %xi5 = memref.load %Src[%v3] : memref<?xf32, strided<[1]>, 1>
+      %v6 = arith.muli %jk1, %stride : index
+      %v7 = arith.addi %base, %v6 : index
+      %v8 = arith.muli %v7, %i2 : index
+      %v9 = arith.addi %v8, %i1 : index
+      %xr10 = memref.load %Src[%v8] : memref<?xf32, strided<[1]>, 1>
+      %xi11 = memref.load %Src[%v9] : memref<?xf32, strided<[1]>, 1>
+      %v12 = arith.muli %jk2, %stride : index
+      %v13 = arith.addi %base, %v12 : index
+      %v14 = arith.muli %v13, %i2 : index
+      %v15 = arith.addi %v14, %i1 : index
+      %xr16 = memref.load %Src[%v14] : memref<?xf32, strided<[1]>, 1>
+      %xi17 = memref.load %Src[%v15] : memref<?xf32, strided<[1]>, 1>
+      %v18 = arith.muli %jk3, %stride : index
+      %v19 = arith.addi %base, %v18 : index
+      %v20 = arith.muli %v19, %i2 : index
+      %v21 = arith.addi %v20, %i1 : index
+      %xr22 = memref.load %Src[%v20] : memref<?xf32, strided<[1]>, 1>
+      %xi23 = memref.load %Src[%v21] : memref<?xf32, strided<[1]>, 1>
+      scf.if %odd {
+        %v24 = arith.addf %xr4, %xr16 : f32
+        %v25 = arith.addf %xi5, %xi17 : f32
+        %v26 = arith.subf %xr4, %xr16 : f32
+        %v27 = arith.subf %xi5, %xi17 : f32
+        %v28 = arith.addf %xr10, %xr22 : f32
+        %v29 = arith.addf %xi11, %xi23 : f32
+        %v30 = arith.subf %xr10, %xr22 : f32
+        %v31 = arith.subf %xi11, %xi23 : f32
+        %v32 = arith.muli %j, %i2 : index
+        %v33 = arith.addi %v32, %i1 : index
+        %v34 = arith.muli %jk1, %i2 : index
+        %v35 = arith.addi %v34, %i1 : index
+        %v36 = arith.addi %slot, %v32 : index
+        %v37 = arith.addi %im0, %v36 : index
+        memref.store %v24, %sm[%v36] : memref<2048xf32, #gpu.address_space<workgroup>>
+        memref.store %v25, %sm[%v37] : memref<2048xf32, #gpu.address_space<workgroup>>
+        %v38 = arith.addi %slot, %v33 : index
+        %v39 = arith.addi %im0, %v38 : index
+        memref.store %v26, %sm[%v38] : memref<2048xf32, #gpu.address_space<workgroup>>
+        memref.store %v27, %sm[%v39] : memref<2048xf32, #gpu.address_space<workgroup>>
+        %v40 = arith.addi %slot, %v34 : index
+        %v41 = arith.addi %im0, %v40 : index
+        memref.store %v28, %sm[%v40] : memref<2048xf32, #gpu.address_space<workgroup>>
+        memref.store %v29, %sm[%v41] : memref<2048xf32, #gpu.address_space<workgroup>>
+        %v42 = arith.addi %slot, %v35 : index
+        %v43 = arith.addi %im0, %v42 : index
+        memref.store %v30, %sm[%v42] : memref<2048xf32, #gpu.address_space<workgroup>>
+        memref.store %v31, %sm[%v43] : memref<2048xf32, #gpu.address_space<workgroup>>
+      } else {
+        %v44 = arith.addi %slot, %jk0 : index
+        %v45 = arith.addi %im0, %v44 : index
+        memref.store %xr4, %sm[%v44] : memref<2048xf32, #gpu.address_space<workgroup>>
+        memref.store %xi5, %sm[%v45] : memref<2048xf32, #gpu.address_space<workgroup>>
+        %v46 = arith.addi %slot, %jk1 : index
+        %v47 = arith.addi %im0, %v46 : index
+        memref.store %xr10, %sm[%v46] : memref<2048xf32, #gpu.address_space<workgroup>>
+        memref.store %xi11, %sm[%v47] : memref<2048xf32, #gpu.address_space<workgroup>>
+        %v48 = arith.addi %slot, %jk2 : index
+        %v49 = arith.addi %im0, %v48 : index
+        memref.store %xr16, %sm[%v48] : memref<2048xf32, #gpu.address_space<workgroup>>
+        memref.store %xi17, %sm[%v49] : memref<2048xf32, #gpu.address_space<workgroup>>
+        %v50 = arith.addi %slot, %jk3 : index
+        %v51 = arith.addi %im0, %v50 : index
+        memref.store %xr22, %sm[%v50] : memref<2048xf32, #gpu.address_space<workgroup>>
+        memref.store %xi23, %sm[%v51] : memref<2048xf32, #gpu.address_space<workgroup>>
+      }
+    }
+    gpu.barrier
+    %ns0 = arith.select %odd, %i2, %i1 : index
+    %lns0 = arith.select %odd, %i1, %i0 : index
+    %eighth = arith.shrui %quarter, %i1 : index
+    %step0 = arith.select %odd, %eighth, %quarter : index
+    %nsl:3 = scf.while (%ns = %ns0, %lns = %lns0, %step = %step0) : (index, index, index) -> (index, index, index) {
+      %more = arith.cmpi ugt, %step, %i1 : index
+      scf.condition(%more) %ns, %lns, %step : index, index, index
+    } do {
+      ^bb0(%ns: index, %lns: index, %step: index):
+      %v52 = arith.subi %ns, %i1 : index
+      %v53 = arith.andi %j, %v52 : index
+      %v54 = arith.muli %ns, %i4 : index
+      %v55 = arith.muli %v53, %step : index
+      %v56 = arith.addi %slot, %jk0 : index
+      %v57 = arith.addi %im0, %v56 : index
+      %xr58 = memref.load %sm[%v56] : memref<2048xf32, #gpu.address_space<workgroup>>
+      %xi59 = memref.load %sm[%v57] : memref<2048xf32, #gpu.address_space<workgroup>>
+      %v60 = arith.addi %slot, %jk1 : index
+      %v61 = arith.addi %im0, %v60 : index
+      %xr62 = memref.load %sm[%v60] : memref<2048xf32, #gpu.address_space<workgroup>>
+      %xi63 = memref.load %sm[%v61] : memref<2048xf32, #gpu.address_space<workgroup>>
+      %v64 = arith.addi %slot, %jk2 : index
+      %v65 = arith.addi %im0, %v64 : index
+      %xr66 = memref.load %sm[%v64] : memref<2048xf32, #gpu.address_space<workgroup>>
+      %xi67 = memref.load %sm[%v65] : memref<2048xf32, #gpu.address_space<workgroup>>
+      %v68 = arith.addi %slot, %jk3 : index
+      %v69 = arith.addi %im0, %v68 : index
+      %xr70 = memref.load %sm[%v68] : memref<2048xf32, #gpu.address_space<workgroup>>
+      %xi71 = memref.load %sm[%v69] : memref<2048xf32, #gpu.address_space<workgroup>>
+      %v72 = arith.muli %v55, %i1 : index
+      %v73 = arith.muli %v72, %i2 : index
+      %v74 = arith.addi %v73, %i1 : index
+      %v75 = memref.load %Tw[%v73] : memref<?xf32, strided<[1]>, 1>
+      %v76 = memref.load %Tw[%v74] : memref<?xf32, strided<[1]>, 1>
+      %v77 = arith.negf %v76 : f32
+      %v78 = arith.select %is_inv, %v77, %v76 : f32
+      %v79 = arith.mulf %xr62, %v75 : f32
+      %v80 = arith.mulf %xi63, %v78 : f32
+      %v81 = arith.subf %v79, %v80 : f32
+      %v82 = arith.mulf %xr62, %v78 : f32
+      %v83 = math.fma %xi63, %v75, %v82 : f32
+      %v84 = arith.muli %v55, %i2 : index
+      %v85 = arith.muli %v84, %i2 : index
+      %v86 = arith.addi %v85, %i1 : index
+      %v87 = memref.load %Tw[%v85] : memref<?xf32, strided<[1]>, 1>
+      %v88 = memref.load %Tw[%v86] : memref<?xf32, strided<[1]>, 1>
+      %v89 = arith.negf %v88 : f32
+      %v90 = arith.select %is_inv, %v89, %v88 : f32
+      %v91 = arith.mulf %xr66, %v87 : f32
+      %v92 = arith.mulf %xi67, %v90 : f32
+      %v93 = arith.subf %v91, %v92 : f32
+      %v94 = arith.mulf %xr66, %v90 : f32
+      %v95 = math.fma %xi67, %v87, %v94 : f32
+      %v96 = arith.muli %v55, %i3 : index
+      %v97 = arith.muli %v96, %i2 : index
+      %v98 = arith.addi %v97, %i1 : index
+      %v99 = memref.load %Tw[%v97] : memref<?xf32, strided<[1]>, 1>
+      %v100 = memref.load %Tw[%v98] : memref<?xf32, strided<[1]>, 1>
+      %v101 = arith.negf %v100 : f32
+      %v102 = arith.select %is_inv, %v101, %v100 : f32
+      %v103 = arith.mulf %xr70, %v99 : f32
+      %v104 = arith.mulf %xi71, %v102 : f32
+      %v105 = arith.subf %v103, %v104 : f32
+      %v106 = arith.mulf %xr70, %v102 : f32
+      %v107 = math.fma %xi71, %v99, %v106 : f32
+      %v108 = arith.addf %xr58, %v93 : f32
+      %v109 = arith.addf %xi59, %v95 : f32
+      %v110 = arith.subf %xr58, %v93 : f32
+      %v111 = arith.subf %xi59, %v95 : f32
+      %v112 = arith.addf %v81, %v105 : f32
+      %v113 = arith.addf %v83, %v107 : f32
+      %v114 = arith.subf %v81, %v105 : f32
+      %v115 = arith.subf %v83, %v107 : f32
+      %v116 = arith.addf %v108, %v112 : f32
+      %v117 = arith.addf %v109, %v113 : f32
+      %v118 = arith.subf %v108, %v112 : f32
+      %v119 = arith.subf %v109, %v113 : f32
+      %v120 = arith.addf %v110, %v115 : f32
+      %v121 = arith.subf %v111, %v114 : f32
+      %v122 = arith.subf %v110, %v115 : f32
+      %v123 = arith.addf %v111, %v114 : f32
+      %v124 = arith.select %is_inv, %v122, %v120 : f32
+      %v125 = arith.select %is_inv, %v123, %v121 : f32
+      %v126 = arith.select %is_inv, %v120, %v122 : f32
+      %v127 = arith.select %is_inv, %v121, %v123 : f32
+      %v128 = arith.shrui %j, %lns : index
+      %v129 = arith.muli %v128, %v54 : index
+      %v130 = arith.addi %v129, %v53 : index
+      %v131 = arith.muli %ns, %i0 : index
+      %v132 = arith.addi %v130, %v131 : index
+      %v133 = arith.muli %ns, %i1 : index
+      %v134 = arith.addi %v130, %v133 : index
+      %v135 = arith.muli %ns, %i2 : index
+      %v136 = arith.addi %v130, %v135 : index
+      %v137 = arith.muli %ns, %i3 : index
+      %v138 = arith.addi %v130, %v137 : index
+      gpu.barrier
+      %v139 = arith.addi %slot, %v132 : index
+      %v140 = arith.addi %im0, %v139 : index
+      memref.store %v116, %sm[%v139] : memref<2048xf32, #gpu.address_space<workgroup>>
+      memref.store %v117, %sm[%v140] : memref<2048xf32, #gpu.address_space<workgroup>>
+      %v141 = arith.addi %slot, %v134 : index
+      %v142 = arith.addi %im0, %v141 : index
+      memref.store %v124, %sm[%v141] : memref<2048xf32, #gpu.address_space<workgroup>>
+      memref.store %v125, %sm[%v142] : memref<2048xf32, #gpu.address_space<workgroup>>
+      %v143 = arith.addi %slot, %v136 : index
+      %v144 = arith.addi %im0, %v143 : index
+      memref.store %v118, %sm[%v143] : memref<2048xf32, #gpu.address_space<workgroup>>
+      memref.store %v119, %sm[%v144] : memref<2048xf32, #gpu.address_space<workgroup>>
+      %v145 = arith.addi %slot, %v138 : index
+      %v146 = arith.addi %im0, %v145 : index
+      memref.store %v126, %sm[%v145] : memref<2048xf32, #gpu.address_space<workgroup>>
+      memref.store %v127, %sm[%v146] : memref<2048xf32, #gpu.address_space<workgroup>>
+      gpu.barrier
+      %nsn = arith.muli %ns, %i4 : index
+      %lnsn = arith.addi %lns, %i2 : index
+      %stepn = arith.shrui %step, %i2 : index
+      scf.yield %nsn, %lnsn, %stepn : index, index, index
+    }
+    scf.if %live {
+      %v147 = arith.subi %nsl#0, %i1 : index
+      %v148 = arith.andi %j, %v147 : index
+      %v149 = arith.muli %nsl#0, %i4 : index
+      %v150 = arith.muli %v148, %nsl#2 : index
+      %v151 = arith.addi %slot, %jk0 : index
+      %v152 = arith.addi %im0, %v151 : index
+      %xr153 = memref.load %sm[%v151] : memref<2048xf32, #gpu.address_space<workgroup>>
+      %xi154 = memref.load %sm[%v152] : memref<2048xf32, #gpu.address_space<workgroup>>
+      %v155 = arith.addi %slot, %jk1 : index
+      %v156 = arith.addi %im0, %v155 : index
+      %xr157 = memref.load %sm[%v155] : memref<2048xf32, #gpu.address_space<workgroup>>
+      %xi158 = memref.load %sm[%v156] : memref<2048xf32, #gpu.address_space<workgroup>>
+      %v159 = arith.addi %slot, %jk2 : index
+      %v160 = arith.addi %im0, %v159 : index
+      %xr161 = memref.load %sm[%v159] : memref<2048xf32, #gpu.address_space<workgroup>>
+      %xi162 = memref.load %sm[%v160] : memref<2048xf32, #gpu.address_space<workgroup>>
+      %v163 = arith.addi %slot, %jk3 : index
+      %v164 = arith.addi %im0, %v163 : index
+      %xr165 = memref.load %sm[%v163] : memref<2048xf32, #gpu.address_space<workgroup>>
+      %xi166 = memref.load %sm[%v164] : memref<2048xf32, #gpu.address_space<workgroup>>
+      %v167 = arith.muli %v150, %i1 : index
+      %v168 = arith.muli %v167, %i2 : index
+      %v169 = arith.addi %v168, %i1 : index
+      %v170 = memref.load %Tw[%v168] : memref<?xf32, strided<[1]>, 1>
+      %v171 = memref.load %Tw[%v169] : memref<?xf32, strided<[1]>, 1>
+      %v172 = arith.negf %v171 : f32
+      %v173 = arith.select %is_inv, %v172, %v171 : f32
+      %v174 = arith.mulf %xr157, %v170 : f32
+      %v175 = arith.mulf %xi158, %v173 : f32
+      %v176 = arith.subf %v174, %v175 : f32
+      %v177 = arith.mulf %xr157, %v173 : f32
+      %v178 = math.fma %xi158, %v170, %v177 : f32
+      %v179 = arith.muli %v150, %i2 : index
+      %v180 = arith.muli %v179, %i2 : index
+      %v181 = arith.addi %v180, %i1 : index
+      %v182 = memref.load %Tw[%v180] : memref<?xf32, strided<[1]>, 1>
+      %v183 = memref.load %Tw[%v181] : memref<?xf32, strided<[1]>, 1>
+      %v184 = arith.negf %v183 : f32
+      %v185 = arith.select %is_inv, %v184, %v183 : f32
+      %v186 = arith.mulf %xr161, %v182 : f32
+      %v187 = arith.mulf %xi162, %v185 : f32
+      %v188 = arith.subf %v186, %v187 : f32
+      %v189 = arith.mulf %xr161, %v185 : f32
+      %v190 = math.fma %xi162, %v182, %v189 : f32
+      %v191 = arith.muli %v150, %i3 : index
+      %v192 = arith.muli %v191, %i2 : index
+      %v193 = arith.addi %v192, %i1 : index
+      %v194 = memref.load %Tw[%v192] : memref<?xf32, strided<[1]>, 1>
+      %v195 = memref.load %Tw[%v193] : memref<?xf32, strided<[1]>, 1>
+      %v196 = arith.negf %v195 : f32
+      %v197 = arith.select %is_inv, %v196, %v195 : f32
+      %v198 = arith.mulf %xr165, %v194 : f32
+      %v199 = arith.mulf %xi166, %v197 : f32
+      %v200 = arith.subf %v198, %v199 : f32
+      %v201 = arith.mulf %xr165, %v197 : f32
+      %v202 = math.fma %xi166, %v194, %v201 : f32
+      %v203 = arith.addf %xr153, %v188 : f32
+      %v204 = arith.addf %xi154, %v190 : f32
+      %v205 = arith.subf %xr153, %v188 : f32
+      %v206 = arith.subf %xi154, %v190 : f32
+      %v207 = arith.addf %v176, %v200 : f32
+      %v208 = arith.addf %v178, %v202 : f32
+      %v209 = arith.subf %v176, %v200 : f32
+      %v210 = arith.subf %v178, %v202 : f32
+      %v211 = arith.addf %v203, %v207 : f32
+      %v212 = arith.addf %v204, %v208 : f32
+      %v213 = arith.subf %v203, %v207 : f32
+      %v214 = arith.subf %v204, %v208 : f32
+      %v215 = arith.addf %v205, %v210 : f32
+      %v216 = arith.subf %v206, %v209 : f32
+      %v217 = arith.subf %v205, %v210 : f32
+      %v218 = arith.addf %v206, %v209 : f32
+      %v219 = arith.select %is_inv, %v217, %v215 : f32
+      %v220 = arith.select %is_inv, %v218, %v216 : f32
+      %v221 = arith.select %is_inv, %v215, %v217 : f32
+      %v222 = arith.select %is_inv, %v216, %v218 : f32
+      %v223 = arith.shrui %j, %nsl#1 : index
+      %v224 = arith.muli %v223, %v149 : index
+      %v225 = arith.addi %v224, %v148 : index
+      %v226 = arith.muli %nsl#0, %i0 : index
+      %v227 = arith.addi %v225, %v226 : index
+      %v228 = arith.muli %nsl#0, %i1 : index
+      %v229 = arith.addi %v225, %v228 : index
+      %v230 = arith.muli %nsl#0, %i2 : index
+      %v231 = arith.addi %v225, %v230 : index
+      %v232 = arith.muli %nsl#0, %i3 : index
+      %v233 = arith.addi %v225, %v232 : index
+      %v234 = arith.muli %v227, %stride : index
+      %v235 = arith.addi %base, %v234 : index
+      %v236 = arith.muli %v235, %i2 : index
+      %v237 = arith.addi %v236, %i1 : index
+      memref.store %v211, %Dst[%v236] : memref<?xf32, strided<[1]>, 1>
+      memref.store %v212, %Dst[%v237] : memref<?xf32, strided<[1]>, 1>
+      %v238 = arith.muli %v229, %stride : index
+      %v239 = arith.addi %base, %v238 : index
+      %v240 = arith.muli %v239, %i2 : index
+      %v241 = arith.addi %v240, %i1 : index
+      memref.store %v219, %Dst[%v240] : memref<?xf32, strided<[1]>, 1>
+      memref.store %v220, %Dst[%v241] : memref<?xf32, strided<[1]>, 1>
+      %v242 = arith.muli %v231, %stride : index
+      %v243 = arith.addi %base, %v242 : index
+      %v244 = arith.muli %v243, %i2 : index
+      %v245 = arith.addi %v244, %i1 : index
+      memref.store %v213, %Dst[%v244] : memref<?xf32, strided<[1]>, 1>
+      memref.store %v214, %Dst[%v245] : memref<?xf32, strided<[1]>, 1>
+      %v246 = arith.muli %v233, %stride : index
+      %v247 = arith.addi %base, %v246 : index
+      %v248 = arith.muli %v247, %i2 : index
+      %v249 = arith.addi %v248, %i1 : index
+      memref.store %v221, %Dst[%v248] : memref<?xf32, strided<[1]>, 1>
+      memref.store %v222, %Dst[%v249] : memref<?xf32, strided<[1]>, 1>
+    }
+    gpu.return
+  }
+
+  // agx_fft_shared with 16 KiB of threadgroup memory (n x (threads y) <= 2048).
+  gpu.func @agx_fft_shared_2048(%src0: memref<1xf32, 1>, %dst0: memref<1xf32, 1>,
+                           %tw0: memref<1xf32, 1>, %n_: i32, %batch_: i32,
+                           %stride_: i32, %dist_: i32, %inverse_: i32)
+      workgroup(%sm: memref<4096xf32, #gpu.address_space<workgroup>>) kernel {
+    %i0 = arith.constant 0 : index
+    %i1 = arith.constant 1 : index
+    %i2 = arith.constant 2 : index
+    %i3 = arith.constant 3 : index
+    %i4 = arith.constant 4 : index
+    %big = arith.constant 4611686018427387904 : index
+    %n = arith.index_cast %n_ : i32 to index
+    %batch = arith.index_cast %batch_ : i32 to index
+    %stride = arith.index_cast %stride_ : i32 to index
+    %dist = arith.index_cast %dist_ : i32 to index
+    %inverse = arith.index_cast %inverse_ : i32 to index
+    %Src = memref.reinterpret_cast %src0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %Dst = memref.reinterpret_cast %dst0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %Tw = memref.reinterpret_cast %tw0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %is_inv = arith.cmpi ne, %inverse, %i0 : index
+    %j = gpu.thread_id x
+    %s = gpu.thread_id y
+    %per = gpu.block_dim y
+    %grp = gpu.block_id x
+    %b0 = arith.muli %grp, %per : index
+    %b = arith.addi %b0, %s : index
+    %live = arith.cmpi ult, %b, %batch : index
+    %base = arith.muli %b, %dist : index
+    %slot = arith.muli %s, %n : index
+    %im0 = arith.muli %per, %n : index
+    %quarter = arith.shrui %n, %i2 : index
+    %half = arith.shrui %n, %i1 : index
+    %jk0 = arith.addi %j, %i0 : index
+    %jk1 = arith.addi %j, %quarter : index
+    %jk2 = arith.addi %j, %half : index
+    %jk3 = arith.addi %jk1, %half : index
+    // log2(n) odd: 0xAAAAAAAA has the odd bits
+    %oddbits = arith.constant 2863311530 : index
+    %ob = arith.andi %n, %oddbits : index
+    %odd = arith.cmpi ne, %ob, %i0 : index
+    scf.if %live {
+      %v0 = arith.muli %jk0, %stride : index
+      %v1 = arith.addi %base, %v0 : index
+      %v2 = arith.muli %v1, %i2 : index
+      %v3 = arith.addi %v2, %i1 : index
+      %xr4 = memref.load %Src[%v2] : memref<?xf32, strided<[1]>, 1>
+      %xi5 = memref.load %Src[%v3] : memref<?xf32, strided<[1]>, 1>
+      %v6 = arith.muli %jk1, %stride : index
+      %v7 = arith.addi %base, %v6 : index
+      %v8 = arith.muli %v7, %i2 : index
+      %v9 = arith.addi %v8, %i1 : index
+      %xr10 = memref.load %Src[%v8] : memref<?xf32, strided<[1]>, 1>
+      %xi11 = memref.load %Src[%v9] : memref<?xf32, strided<[1]>, 1>
+      %v12 = arith.muli %jk2, %stride : index
+      %v13 = arith.addi %base, %v12 : index
+      %v14 = arith.muli %v13, %i2 : index
+      %v15 = arith.addi %v14, %i1 : index
+      %xr16 = memref.load %Src[%v14] : memref<?xf32, strided<[1]>, 1>
+      %xi17 = memref.load %Src[%v15] : memref<?xf32, strided<[1]>, 1>
+      %v18 = arith.muli %jk3, %stride : index
+      %v19 = arith.addi %base, %v18 : index
+      %v20 = arith.muli %v19, %i2 : index
+      %v21 = arith.addi %v20, %i1 : index
+      %xr22 = memref.load %Src[%v20] : memref<?xf32, strided<[1]>, 1>
+      %xi23 = memref.load %Src[%v21] : memref<?xf32, strided<[1]>, 1>
+      scf.if %odd {
+        %v24 = arith.addf %xr4, %xr16 : f32
+        %v25 = arith.addf %xi5, %xi17 : f32
+        %v26 = arith.subf %xr4, %xr16 : f32
+        %v27 = arith.subf %xi5, %xi17 : f32
+        %v28 = arith.addf %xr10, %xr22 : f32
+        %v29 = arith.addf %xi11, %xi23 : f32
+        %v30 = arith.subf %xr10, %xr22 : f32
+        %v31 = arith.subf %xi11, %xi23 : f32
+        %v32 = arith.muli %j, %i2 : index
+        %v33 = arith.addi %v32, %i1 : index
+        %v34 = arith.muli %jk1, %i2 : index
+        %v35 = arith.addi %v34, %i1 : index
+        %v36 = arith.addi %slot, %v32 : index
+        %v37 = arith.addi %im0, %v36 : index
+        memref.store %v24, %sm[%v36] : memref<4096xf32, #gpu.address_space<workgroup>>
+        memref.store %v25, %sm[%v37] : memref<4096xf32, #gpu.address_space<workgroup>>
+        %v38 = arith.addi %slot, %v33 : index
+        %v39 = arith.addi %im0, %v38 : index
+        memref.store %v26, %sm[%v38] : memref<4096xf32, #gpu.address_space<workgroup>>
+        memref.store %v27, %sm[%v39] : memref<4096xf32, #gpu.address_space<workgroup>>
+        %v40 = arith.addi %slot, %v34 : index
+        %v41 = arith.addi %im0, %v40 : index
+        memref.store %v28, %sm[%v40] : memref<4096xf32, #gpu.address_space<workgroup>>
+        memref.store %v29, %sm[%v41] : memref<4096xf32, #gpu.address_space<workgroup>>
+        %v42 = arith.addi %slot, %v35 : index
+        %v43 = arith.addi %im0, %v42 : index
+        memref.store %v30, %sm[%v42] : memref<4096xf32, #gpu.address_space<workgroup>>
+        memref.store %v31, %sm[%v43] : memref<4096xf32, #gpu.address_space<workgroup>>
+      } else {
+        %v44 = arith.addi %slot, %jk0 : index
+        %v45 = arith.addi %im0, %v44 : index
+        memref.store %xr4, %sm[%v44] : memref<4096xf32, #gpu.address_space<workgroup>>
+        memref.store %xi5, %sm[%v45] : memref<4096xf32, #gpu.address_space<workgroup>>
+        %v46 = arith.addi %slot, %jk1 : index
+        %v47 = arith.addi %im0, %v46 : index
+        memref.store %xr10, %sm[%v46] : memref<4096xf32, #gpu.address_space<workgroup>>
+        memref.store %xi11, %sm[%v47] : memref<4096xf32, #gpu.address_space<workgroup>>
+        %v48 = arith.addi %slot, %jk2 : index
+        %v49 = arith.addi %im0, %v48 : index
+        memref.store %xr16, %sm[%v48] : memref<4096xf32, #gpu.address_space<workgroup>>
+        memref.store %xi17, %sm[%v49] : memref<4096xf32, #gpu.address_space<workgroup>>
+        %v50 = arith.addi %slot, %jk3 : index
+        %v51 = arith.addi %im0, %v50 : index
+        memref.store %xr22, %sm[%v50] : memref<4096xf32, #gpu.address_space<workgroup>>
+        memref.store %xi23, %sm[%v51] : memref<4096xf32, #gpu.address_space<workgroup>>
+      }
+    }
+    gpu.barrier
+    %ns0 = arith.select %odd, %i2, %i1 : index
+    %lns0 = arith.select %odd, %i1, %i0 : index
+    %eighth = arith.shrui %quarter, %i1 : index
+    %step0 = arith.select %odd, %eighth, %quarter : index
+    %nsl:3 = scf.while (%ns = %ns0, %lns = %lns0, %step = %step0) : (index, index, index) -> (index, index, index) {
+      %more = arith.cmpi ugt, %step, %i1 : index
+      scf.condition(%more) %ns, %lns, %step : index, index, index
+    } do {
+      ^bb0(%ns: index, %lns: index, %step: index):
+      %v52 = arith.subi %ns, %i1 : index
+      %v53 = arith.andi %j, %v52 : index
+      %v54 = arith.muli %ns, %i4 : index
+      %v55 = arith.muli %v53, %step : index
+      %v56 = arith.addi %slot, %jk0 : index
+      %v57 = arith.addi %im0, %v56 : index
+      %xr58 = memref.load %sm[%v56] : memref<4096xf32, #gpu.address_space<workgroup>>
+      %xi59 = memref.load %sm[%v57] : memref<4096xf32, #gpu.address_space<workgroup>>
+      %v60 = arith.addi %slot, %jk1 : index
+      %v61 = arith.addi %im0, %v60 : index
+      %xr62 = memref.load %sm[%v60] : memref<4096xf32, #gpu.address_space<workgroup>>
+      %xi63 = memref.load %sm[%v61] : memref<4096xf32, #gpu.address_space<workgroup>>
+      %v64 = arith.addi %slot, %jk2 : index
+      %v65 = arith.addi %im0, %v64 : index
+      %xr66 = memref.load %sm[%v64] : memref<4096xf32, #gpu.address_space<workgroup>>
+      %xi67 = memref.load %sm[%v65] : memref<4096xf32, #gpu.address_space<workgroup>>
+      %v68 = arith.addi %slot, %jk3 : index
+      %v69 = arith.addi %im0, %v68 : index
+      %xr70 = memref.load %sm[%v68] : memref<4096xf32, #gpu.address_space<workgroup>>
+      %xi71 = memref.load %sm[%v69] : memref<4096xf32, #gpu.address_space<workgroup>>
+      %v72 = arith.muli %v55, %i1 : index
+      %v73 = arith.muli %v72, %i2 : index
+      %v74 = arith.addi %v73, %i1 : index
+      %v75 = memref.load %Tw[%v73] : memref<?xf32, strided<[1]>, 1>
+      %v76 = memref.load %Tw[%v74] : memref<?xf32, strided<[1]>, 1>
+      %v77 = arith.negf %v76 : f32
+      %v78 = arith.select %is_inv, %v77, %v76 : f32
+      %v79 = arith.mulf %xr62, %v75 : f32
+      %v80 = arith.mulf %xi63, %v78 : f32
+      %v81 = arith.subf %v79, %v80 : f32
+      %v82 = arith.mulf %xr62, %v78 : f32
+      %v83 = math.fma %xi63, %v75, %v82 : f32
+      %v84 = arith.muli %v55, %i2 : index
+      %v85 = arith.muli %v84, %i2 : index
+      %v86 = arith.addi %v85, %i1 : index
+      %v87 = memref.load %Tw[%v85] : memref<?xf32, strided<[1]>, 1>
+      %v88 = memref.load %Tw[%v86] : memref<?xf32, strided<[1]>, 1>
+      %v89 = arith.negf %v88 : f32
+      %v90 = arith.select %is_inv, %v89, %v88 : f32
+      %v91 = arith.mulf %xr66, %v87 : f32
+      %v92 = arith.mulf %xi67, %v90 : f32
+      %v93 = arith.subf %v91, %v92 : f32
+      %v94 = arith.mulf %xr66, %v90 : f32
+      %v95 = math.fma %xi67, %v87, %v94 : f32
+      %v96 = arith.muli %v55, %i3 : index
+      %v97 = arith.muli %v96, %i2 : index
+      %v98 = arith.addi %v97, %i1 : index
+      %v99 = memref.load %Tw[%v97] : memref<?xf32, strided<[1]>, 1>
+      %v100 = memref.load %Tw[%v98] : memref<?xf32, strided<[1]>, 1>
+      %v101 = arith.negf %v100 : f32
+      %v102 = arith.select %is_inv, %v101, %v100 : f32
+      %v103 = arith.mulf %xr70, %v99 : f32
+      %v104 = arith.mulf %xi71, %v102 : f32
+      %v105 = arith.subf %v103, %v104 : f32
+      %v106 = arith.mulf %xr70, %v102 : f32
+      %v107 = math.fma %xi71, %v99, %v106 : f32
+      %v108 = arith.addf %xr58, %v93 : f32
+      %v109 = arith.addf %xi59, %v95 : f32
+      %v110 = arith.subf %xr58, %v93 : f32
+      %v111 = arith.subf %xi59, %v95 : f32
+      %v112 = arith.addf %v81, %v105 : f32
+      %v113 = arith.addf %v83, %v107 : f32
+      %v114 = arith.subf %v81, %v105 : f32
+      %v115 = arith.subf %v83, %v107 : f32
+      %v116 = arith.addf %v108, %v112 : f32
+      %v117 = arith.addf %v109, %v113 : f32
+      %v118 = arith.subf %v108, %v112 : f32
+      %v119 = arith.subf %v109, %v113 : f32
+      %v120 = arith.addf %v110, %v115 : f32
+      %v121 = arith.subf %v111, %v114 : f32
+      %v122 = arith.subf %v110, %v115 : f32
+      %v123 = arith.addf %v111, %v114 : f32
+      %v124 = arith.select %is_inv, %v122, %v120 : f32
+      %v125 = arith.select %is_inv, %v123, %v121 : f32
+      %v126 = arith.select %is_inv, %v120, %v122 : f32
+      %v127 = arith.select %is_inv, %v121, %v123 : f32
+      %v128 = arith.shrui %j, %lns : index
+      %v129 = arith.muli %v128, %v54 : index
+      %v130 = arith.addi %v129, %v53 : index
+      %v131 = arith.muli %ns, %i0 : index
+      %v132 = arith.addi %v130, %v131 : index
+      %v133 = arith.muli %ns, %i1 : index
+      %v134 = arith.addi %v130, %v133 : index
+      %v135 = arith.muli %ns, %i2 : index
+      %v136 = arith.addi %v130, %v135 : index
+      %v137 = arith.muli %ns, %i3 : index
+      %v138 = arith.addi %v130, %v137 : index
+      gpu.barrier
+      %v139 = arith.addi %slot, %v132 : index
+      %v140 = arith.addi %im0, %v139 : index
+      memref.store %v116, %sm[%v139] : memref<4096xf32, #gpu.address_space<workgroup>>
+      memref.store %v117, %sm[%v140] : memref<4096xf32, #gpu.address_space<workgroup>>
+      %v141 = arith.addi %slot, %v134 : index
+      %v142 = arith.addi %im0, %v141 : index
+      memref.store %v124, %sm[%v141] : memref<4096xf32, #gpu.address_space<workgroup>>
+      memref.store %v125, %sm[%v142] : memref<4096xf32, #gpu.address_space<workgroup>>
+      %v143 = arith.addi %slot, %v136 : index
+      %v144 = arith.addi %im0, %v143 : index
+      memref.store %v118, %sm[%v143] : memref<4096xf32, #gpu.address_space<workgroup>>
+      memref.store %v119, %sm[%v144] : memref<4096xf32, #gpu.address_space<workgroup>>
+      %v145 = arith.addi %slot, %v138 : index
+      %v146 = arith.addi %im0, %v145 : index
+      memref.store %v126, %sm[%v145] : memref<4096xf32, #gpu.address_space<workgroup>>
+      memref.store %v127, %sm[%v146] : memref<4096xf32, #gpu.address_space<workgroup>>
+      gpu.barrier
+      %nsn = arith.muli %ns, %i4 : index
+      %lnsn = arith.addi %lns, %i2 : index
+      %stepn = arith.shrui %step, %i2 : index
+      scf.yield %nsn, %lnsn, %stepn : index, index, index
+    }
+    scf.if %live {
+      %v147 = arith.subi %nsl#0, %i1 : index
+      %v148 = arith.andi %j, %v147 : index
+      %v149 = arith.muli %nsl#0, %i4 : index
+      %v150 = arith.muli %v148, %nsl#2 : index
+      %v151 = arith.addi %slot, %jk0 : index
+      %v152 = arith.addi %im0, %v151 : index
+      %xr153 = memref.load %sm[%v151] : memref<4096xf32, #gpu.address_space<workgroup>>
+      %xi154 = memref.load %sm[%v152] : memref<4096xf32, #gpu.address_space<workgroup>>
+      %v155 = arith.addi %slot, %jk1 : index
+      %v156 = arith.addi %im0, %v155 : index
+      %xr157 = memref.load %sm[%v155] : memref<4096xf32, #gpu.address_space<workgroup>>
+      %xi158 = memref.load %sm[%v156] : memref<4096xf32, #gpu.address_space<workgroup>>
+      %v159 = arith.addi %slot, %jk2 : index
+      %v160 = arith.addi %im0, %v159 : index
+      %xr161 = memref.load %sm[%v159] : memref<4096xf32, #gpu.address_space<workgroup>>
+      %xi162 = memref.load %sm[%v160] : memref<4096xf32, #gpu.address_space<workgroup>>
+      %v163 = arith.addi %slot, %jk3 : index
+      %v164 = arith.addi %im0, %v163 : index
+      %xr165 = memref.load %sm[%v163] : memref<4096xf32, #gpu.address_space<workgroup>>
+      %xi166 = memref.load %sm[%v164] : memref<4096xf32, #gpu.address_space<workgroup>>
+      %v167 = arith.muli %v150, %i1 : index
+      %v168 = arith.muli %v167, %i2 : index
+      %v169 = arith.addi %v168, %i1 : index
+      %v170 = memref.load %Tw[%v168] : memref<?xf32, strided<[1]>, 1>
+      %v171 = memref.load %Tw[%v169] : memref<?xf32, strided<[1]>, 1>
+      %v172 = arith.negf %v171 : f32
+      %v173 = arith.select %is_inv, %v172, %v171 : f32
+      %v174 = arith.mulf %xr157, %v170 : f32
+      %v175 = arith.mulf %xi158, %v173 : f32
+      %v176 = arith.subf %v174, %v175 : f32
+      %v177 = arith.mulf %xr157, %v173 : f32
+      %v178 = math.fma %xi158, %v170, %v177 : f32
+      %v179 = arith.muli %v150, %i2 : index
+      %v180 = arith.muli %v179, %i2 : index
+      %v181 = arith.addi %v180, %i1 : index
+      %v182 = memref.load %Tw[%v180] : memref<?xf32, strided<[1]>, 1>
+      %v183 = memref.load %Tw[%v181] : memref<?xf32, strided<[1]>, 1>
+      %v184 = arith.negf %v183 : f32
+      %v185 = arith.select %is_inv, %v184, %v183 : f32
+      %v186 = arith.mulf %xr161, %v182 : f32
+      %v187 = arith.mulf %xi162, %v185 : f32
+      %v188 = arith.subf %v186, %v187 : f32
+      %v189 = arith.mulf %xr161, %v185 : f32
+      %v190 = math.fma %xi162, %v182, %v189 : f32
+      %v191 = arith.muli %v150, %i3 : index
+      %v192 = arith.muli %v191, %i2 : index
+      %v193 = arith.addi %v192, %i1 : index
+      %v194 = memref.load %Tw[%v192] : memref<?xf32, strided<[1]>, 1>
+      %v195 = memref.load %Tw[%v193] : memref<?xf32, strided<[1]>, 1>
+      %v196 = arith.negf %v195 : f32
+      %v197 = arith.select %is_inv, %v196, %v195 : f32
+      %v198 = arith.mulf %xr165, %v194 : f32
+      %v199 = arith.mulf %xi166, %v197 : f32
+      %v200 = arith.subf %v198, %v199 : f32
+      %v201 = arith.mulf %xr165, %v197 : f32
+      %v202 = math.fma %xi166, %v194, %v201 : f32
+      %v203 = arith.addf %xr153, %v188 : f32
+      %v204 = arith.addf %xi154, %v190 : f32
+      %v205 = arith.subf %xr153, %v188 : f32
+      %v206 = arith.subf %xi154, %v190 : f32
+      %v207 = arith.addf %v176, %v200 : f32
+      %v208 = arith.addf %v178, %v202 : f32
+      %v209 = arith.subf %v176, %v200 : f32
+      %v210 = arith.subf %v178, %v202 : f32
+      %v211 = arith.addf %v203, %v207 : f32
+      %v212 = arith.addf %v204, %v208 : f32
+      %v213 = arith.subf %v203, %v207 : f32
+      %v214 = arith.subf %v204, %v208 : f32
+      %v215 = arith.addf %v205, %v210 : f32
+      %v216 = arith.subf %v206, %v209 : f32
+      %v217 = arith.subf %v205, %v210 : f32
+      %v218 = arith.addf %v206, %v209 : f32
+      %v219 = arith.select %is_inv, %v217, %v215 : f32
+      %v220 = arith.select %is_inv, %v218, %v216 : f32
+      %v221 = arith.select %is_inv, %v215, %v217 : f32
+      %v222 = arith.select %is_inv, %v216, %v218 : f32
+      %v223 = arith.shrui %j, %nsl#1 : index
+      %v224 = arith.muli %v223, %v149 : index
+      %v225 = arith.addi %v224, %v148 : index
+      %v226 = arith.muli %nsl#0, %i0 : index
+      %v227 = arith.addi %v225, %v226 : index
+      %v228 = arith.muli %nsl#0, %i1 : index
+      %v229 = arith.addi %v225, %v228 : index
+      %v230 = arith.muli %nsl#0, %i2 : index
+      %v231 = arith.addi %v225, %v230 : index
+      %v232 = arith.muli %nsl#0, %i3 : index
+      %v233 = arith.addi %v225, %v232 : index
+      %v234 = arith.muli %v227, %stride : index
+      %v235 = arith.addi %base, %v234 : index
+      %v236 = arith.muli %v235, %i2 : index
+      %v237 = arith.addi %v236, %i1 : index
+      memref.store %v211, %Dst[%v236] : memref<?xf32, strided<[1]>, 1>
+      memref.store %v212, %Dst[%v237] : memref<?xf32, strided<[1]>, 1>
+      %v238 = arith.muli %v229, %stride : index
+      %v239 = arith.addi %base, %v238 : index
+      %v240 = arith.muli %v239, %i2 : index
+      %v241 = arith.addi %v240, %i1 : index
+      memref.store %v219, %Dst[%v240] : memref<?xf32, strided<[1]>, 1>
+      memref.store %v220, %Dst[%v241] : memref<?xf32, strided<[1]>, 1>
+      %v242 = arith.muli %v231, %stride : index
+      %v243 = arith.addi %base, %v242 : index
+      %v244 = arith.muli %v243, %i2 : index
+      %v245 = arith.addi %v244, %i1 : index
+      memref.store %v213, %Dst[%v244] : memref<?xf32, strided<[1]>, 1>
+      memref.store %v214, %Dst[%v245] : memref<?xf32, strided<[1]>, 1>
+      %v246 = arith.muli %v233, %stride : index
+      %v247 = arith.addi %base, %v246 : index
+      %v248 = arith.muli %v247, %i2 : index
+      %v249 = arith.addi %v248, %i1 : index
+      memref.store %v221, %Dst[%v248] : memref<?xf32, strided<[1]>, 1>
+      memref.store %v222, %Dst[%v249] : memref<?xf32, strided<[1]>, 1>
+    }
+    gpu.return
+  }
+
+  // One Stockham pass of any radix r (n / ns a multiple of r), one thread per
+  // output: thread g of n, with m = g / (n / r) and j = g mod (n / r), q = j mod
+  // ns, writes dst[(j / ns) r ns + q + m ns] = sum over k < r of
+  // src[j + k n / r] tw[(k (q n / (r ns) + m n / r)) mod n] (conjugated when
+  // inverse): the twiddle of the pass times that of the r-point transform. With
+  // r = n and ns = 1 it is the direct transform. nr = n / r and step =
+  // n / (r ns) are arguments so that every division is by an argument (a
+  // multiply and shifts at launch, not a software divide). Launch an n x batch
+  // grid; src and dst must not overlap.
+  gpu.func @agx_fft_radixr(%src0: memref<1xf32, 1>, %dst0: memref<1xf32, 1>,
+                           %tw0: memref<1xf32, 1>, %n_: i32, %ns_: i32, %r_: i32,
+                           %nr_: i32, %step_: i32, %batch_: i32, %stride_: i32,
+                           %dist_: i32, %inverse_: i32) kernel {
+    %i0 = arith.constant 0 : index
+    %i1 = arith.constant 1 : index
+    %i2 = arith.constant 2 : index
+    %f0 = arith.constant 0.0 : f32
+    %big = arith.constant 4611686018427387904 : index
+    %n = arith.index_cast %n_ : i32 to index
+    %ns = arith.index_cast %ns_ : i32 to index
+    %r = arith.index_cast %r_ : i32 to index
+    %batch = arith.index_cast %batch_ : i32 to index
+    %stride = arith.index_cast %stride_ : i32 to index
+    %dist = arith.index_cast %dist_ : i32 to index
+    %inverse = arith.index_cast %inverse_ : i32 to index
+    %Src = memref.reinterpret_cast %src0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %Dst = memref.reinterpret_cast %dst0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %Tw = memref.reinterpret_cast %tw0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %g = gpu.global_id x
     %b = gpu.global_id y
-    %in_k = arith.cmpi ult, %k, %n : index
+    %in_g = arith.cmpi ult, %g, %n : index
     %in_b = arith.cmpi ult, %b, %batch : index
-    %live = arith.andi %in_k, %in_b : i1
+    %live = arith.andi %in_g, %in_b : i1
     scf.if %live {
       %base = arith.muli %b, %dist : index
       %is_inv = arith.cmpi ne, %inverse, %i0 : index
-      %sum:3 = scf.for %j = %i0 to %n step %i1 iter_args(%sr = %f0, %si = %f0, %t = %i0) -> (f32, f32, index) {
-        %ij0 = arith.muli %j, %stride : index
+      %nr = arith.index_cast %nr_ : i32 to index
+      %step = arith.index_cast %step_ : i32 to index
+      %m = arith.divui %g, %nr : index
+      %j = arith.remui %g, %nr : index
+      %q = arith.remui %j, %ns : index
+      %rns = arith.muli %r, %ns : index
+      %qs = arith.muli %q, %step : index
+      %mn = arith.muli %m, %nr : index
+      // below n: q step < n / r and m n / r <= n - n / r
+      %inc = arith.addi %qs, %mn : index
+      %sum:4 = scf.for %k = %i0 to %r step %i1 iter_args(%sr = %f0, %si = %f0, %t = %i0, %jk = %j) -> (f32, f32, index, index) {
+        %ij0 = arith.muli %jk, %stride : index
         %ij1 = arith.addi %base, %ij0 : index
         %ij = arith.muli %ij1, %i2 : index
         %ij_im = arith.addi %ij, %i1 : index
@@ -320,19 +1055,203 @@ gpu.module @agx_fft {
         %sr1 = math.fma %ni, %wi, %p0 : f32
         %q0 = math.fma %xr, %wi, %si : f32
         %si1 = math.fma %xi, %wr, %q0 : f32
-        // next twiddle index (j + 1) k mod n
-        %t_n0 = arith.addi %t, %k : index
+        // next twiddle index (k + 1) inc mod n, next element j + (k + 1) n / r
+        %t_n0 = arith.addi %t, %inc : index
         %wrap = arith.cmpi uge, %t_n0, %n : index
         %t_n1 = arith.subi %t_n0, %n : index
         %t_n = arith.select %wrap, %t_n1, %t_n0 : index
-        scf.yield %sr1, %si1, %t_n : f32, f32, index
+        %jk_n = arith.addi %jk, %nr : index
+        scf.yield %sr1, %si1, %t_n, %jk_n : f32, f32, index, index
       }
-      %ok0 = arith.muli %k, %stride : index
+      %jd0 = arith.divui %j, %ns : index
+      %jd1 = arith.muli %jd0, %rns : index
+      %jd2 = arith.addi %jd1, %q : index
+      %mns = arith.muli %m, %ns : index
+      %jd = arith.addi %jd2, %mns : index
+      %ok0 = arith.muli %jd, %stride : index
       %ok1 = arith.addi %base, %ok0 : index
       %ok = arith.muli %ok1, %i2 : index
       %ok_im = arith.addi %ok, %i1 : index
       memref.store %sum#0, %Dst[%ok] : memref<?xf32, strided<[1]>, 1>
       memref.store %sum#1, %Dst[%ok_im] : memref<?xf32, strided<[1]>, 1>
+    }
+    gpu.return
+  }
+
+  // Bluestein's algorithm for lengths with a large prime factor (zluda_fft_agx
+  // Step::ChirpIn, Pointwise, ChirpOut): the transform of length n as a
+  // convolution of length m (a power of two >= 2 n - 1) on power-of-two
+  // transforms. chirp holds c_j = exp(-pi i j^2 / n), j < n, kern the m-point
+  // transform of b (b_j = b_(m - j) = conj(c_j), j < n, 0 elsewhere), both from
+  // the host in double precision; inverse transforms use their conjugates.
+  // Sequence s of the work buffer is at s m. Launch m x batch grids
+  // (chirp_out: n x batch).
+  //
+  // work[s m + j] = src[s dist + j stride] c_j for j < n, 0 up to m.
+  gpu.func @agx_fft_chirp_in(%src0: memref<1xf32, 1>, %dst0: memref<1xf32, 1>,
+                            %chirp0: memref<1xf32, 1>, %n_: i32, %m_: i32,
+                            %batch_: i32, %stride_: i32, %dist_: i32,
+                            %inverse_: i32) kernel {
+    %i0 = arith.constant 0 : index
+    %i1 = arith.constant 1 : index
+    %i2 = arith.constant 2 : index
+    %big = arith.constant 4611686018427387904 : index
+    %n = arith.index_cast %n_ : i32 to index
+    %m = arith.index_cast %m_ : i32 to index
+    %batch = arith.index_cast %batch_ : i32 to index
+    %stride = arith.index_cast %stride_ : i32 to index
+    %dist = arith.index_cast %dist_ : i32 to index
+    %inverse = arith.index_cast %inverse_ : i32 to index
+    %Src = memref.reinterpret_cast %src0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %Dst = memref.reinterpret_cast %dst0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %Ch = memref.reinterpret_cast %chirp0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %j = gpu.global_id x
+    %b = gpu.global_id y
+    %in_j = arith.cmpi ult, %j, %m : index
+    %in_b = arith.cmpi ult, %b, %batch : index
+    %live = arith.andi %in_j, %in_b : i1
+    scf.if %live {
+      %is_inv = arith.cmpi ne, %inverse, %i0 : index
+      %bm = arith.muli %b, %m : index
+      %w = arith.addi %bm, %j : index
+      %wo = arith.muli %w, %i2 : index
+      %woi = arith.addi %wo, %i1 : index
+      %data = arith.cmpi ult, %j, %n : index
+      %v:2 = scf.if %data -> (f32, f32) {
+        %base = arith.muli %b, %dist : index
+        %e0 = arith.muli %j, %stride : index
+        %e = arith.addi %base, %e0 : index
+      %xo = arith.muli %e, %i2 : index
+      %xoi = arith.addi %xo, %i1 : index
+      %xr = memref.load %Src[%xo] : memref<?xf32, strided<[1]>, 1>
+      %xi = memref.load %Src[%xoi] : memref<?xf32, strided<[1]>, 1>
+      %c0o = arith.muli %j, %i2 : index
+      %c0oi = arith.addi %c0o, %i1 : index
+      %c0r = memref.load %Ch[%c0o] : memref<?xf32, strided<[1]>, 1>
+      %c0i = memref.load %Ch[%c0oi] : memref<?xf32, strided<[1]>, 1>
+      %cin = arith.negf %c0i : f32
+      %ci = arith.select %is_inv, %cin, %c0i : f32
+      %pa = arith.mulf %xr, %c0r : f32
+      %pb = arith.mulf %xi, %ci : f32
+      %pr = arith.subf %pa, %pb : f32
+      %pc = arith.mulf %xr, %ci : f32
+      %pi = math.fma %xi, %c0r, %pc : f32
+        scf.yield %pr, %pi : f32, f32
+      } else {
+        %z = arith.constant 0.0 : f32
+        scf.yield %z, %z : f32, f32
+      }
+      memref.store %v#0, %Dst[%wo] : memref<?xf32, strided<[1]>, 1>
+      memref.store %v#1, %Dst[%woi] : memref<?xf32, strided<[1]>, 1>
+    }
+    gpu.return
+  }
+
+  // work[s m + j] *= kern[j].
+  gpu.func @agx_fft_pointwise(%buf0: memref<1xf32, 1>, %kern0: memref<1xf32, 1>,
+                              %m_: i32, %batch_: i32, %inverse_: i32) kernel {
+    %i0 = arith.constant 0 : index
+    %i1 = arith.constant 1 : index
+    %i2 = arith.constant 2 : index
+    %big = arith.constant 4611686018427387904 : index
+    %m = arith.index_cast %m_ : i32 to index
+    %batch = arith.index_cast %batch_ : i32 to index
+    %inverse = arith.index_cast %inverse_ : i32 to index
+    %Buf = memref.reinterpret_cast %buf0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %Kn = memref.reinterpret_cast %kern0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %j = gpu.global_id x
+    %b = gpu.global_id y
+    %in_j = arith.cmpi ult, %j, %m : index
+    %in_b = arith.cmpi ult, %b, %batch : index
+    %live = arith.andi %in_j, %in_b : i1
+    scf.if %live {
+      %is_inv = arith.cmpi ne, %inverse, %i0 : index
+      %bm = arith.muli %b, %m : index
+      %w = arith.addi %bm, %j : index
+      %xo = arith.muli %w, %i2 : index
+      %xoi = arith.addi %xo, %i1 : index
+      %xr = memref.load %Buf[%xo] : memref<?xf32, strided<[1]>, 1>
+      %xi = memref.load %Buf[%xoi] : memref<?xf32, strided<[1]>, 1>
+      %c0o = arith.muli %j, %i2 : index
+      %c0oi = arith.addi %c0o, %i1 : index
+      %c0r = memref.load %Kn[%c0o] : memref<?xf32, strided<[1]>, 1>
+      %c0i = memref.load %Kn[%c0oi] : memref<?xf32, strided<[1]>, 1>
+      %cin = arith.negf %c0i : f32
+      %ci = arith.select %is_inv, %cin, %c0i : f32
+      %pa = arith.mulf %xr, %c0r : f32
+      %pb = arith.mulf %xi, %ci : f32
+      %pr = arith.subf %pa, %pb : f32
+      %pc = arith.mulf %xr, %ci : f32
+      %pi = math.fma %xi, %c0r, %pc : f32
+      memref.store %pr, %Buf[%xo] : memref<?xf32, strided<[1]>, 1>
+      memref.store %pi, %Buf[%xoi] : memref<?xf32, strided<[1]>, 1>
+    }
+    gpu.return
+  }
+
+  // dst[s dist + k stride] = work[s m + k] c_k / m, k < n.
+  gpu.func @agx_fft_chirp_out(%src0: memref<1xf32, 1>, %dst0: memref<1xf32, 1>,
+                             %chirp0: memref<1xf32, 1>, %n_: i32, %m_: i32,
+                             %batch_: i32, %stride_: i32, %dist_: i32,
+                             %inverse_: i32) kernel {
+    %i0 = arith.constant 0 : index
+    %i1 = arith.constant 1 : index
+    %i2 = arith.constant 2 : index
+    %big = arith.constant 4611686018427387904 : index
+    %n = arith.index_cast %n_ : i32 to index
+    %m = arith.index_cast %m_ : i32 to index
+    %batch = arith.index_cast %batch_ : i32 to index
+    %stride = arith.index_cast %stride_ : i32 to index
+    %dist = arith.index_cast %dist_ : i32 to index
+    %inverse = arith.index_cast %inverse_ : i32 to index
+    %Src = memref.reinterpret_cast %src0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %Dst = memref.reinterpret_cast %dst0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %Ch = memref.reinterpret_cast %chirp0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %j = gpu.global_id x
+    %b = gpu.global_id y
+    %in_j = arith.cmpi ult, %j, %n : index
+    %in_b = arith.cmpi ult, %b, %batch : index
+    %live = arith.andi %in_j, %in_b : i1
+    scf.if %live {
+      %is_inv = arith.cmpi ne, %inverse, %i0 : index
+      %bm = arith.muli %b, %m : index
+      %w = arith.addi %bm, %j : index
+      %xo = arith.muli %w, %i2 : index
+      %xoi = arith.addi %xo, %i1 : index
+      %xr = memref.load %Src[%xo] : memref<?xf32, strided<[1]>, 1>
+      %xi = memref.load %Src[%xoi] : memref<?xf32, strided<[1]>, 1>
+      %c0o = arith.muli %j, %i2 : index
+      %c0oi = arith.addi %c0o, %i1 : index
+      %c0r = memref.load %Ch[%c0o] : memref<?xf32, strided<[1]>, 1>
+      %c0i = memref.load %Ch[%c0oi] : memref<?xf32, strided<[1]>, 1>
+      %cin = arith.negf %c0i : f32
+      %ci = arith.select %is_inv, %cin, %c0i : f32
+      %pa = arith.mulf %xr, %c0r : f32
+      %pb = arith.mulf %xi, %ci : f32
+      %pr = arith.subf %pa, %pb : f32
+      %pc = arith.mulf %xr, %ci : f32
+      %pi = math.fma %xi, %c0r, %pc : f32
+      %mi = arith.index_cast %m : index to i32
+      %mf = arith.uitofp %mi : i32 to f32
+      %one = arith.constant 1.0 : f32
+      %scale = arith.divf %one, %mf : f32
+      %sr = arith.mulf %pr, %scale : f32
+      %si = arith.mulf %pi, %scale : f32
+      %base = arith.muli %b, %dist : index
+      %e0 = arith.muli %j, %stride : index
+      %e = arith.addi %base, %e0 : index
+      %eo = arith.muli %e, %i2 : index
+      %eoi = arith.addi %eo, %i1 : index
+      memref.store %sr, %Dst[%eo] : memref<?xf32, strided<[1]>, 1>
+      memref.store %si, %Dst[%eoi] : memref<?xf32, strided<[1]>, 1>
     }
     gpu.return
   }

@@ -55,7 +55,7 @@ pub(crate) struct Driver {
     batching: bool,
     batch: Option<Batch>,
     /// The copy kernels of `copy_in_batch` once loaded (None inside: they failed to)
-    copy_kernels: Option<Option<[usize; 3]>>,
+    copy_kernels: Option<Option<[usize; 7]>>,
     events: HashMap<usize, Event>,
     /// cuCtxSetLimit values of this context.
     limits: HashMap<u32, usize>,
@@ -275,15 +275,59 @@ fn graph_batching_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("ZLUDA_AGX_GRAPH_BATCH").map_or(true, |v| v != "0"))
 }
 
-/// `ZLUDA_AGX_LAUNCH_BATCH=1`: ordinary kernel launches (outside graphs) are gathered into one command while the GPU
-/// is busy with the stream's earlier work, as graph launches are (`Batch`). A launch to an idle GPU is submitted at
-/// once; every API call other than a launch submits the gathered launches first, so they keep their order with
-/// copies, events, synchronizations and other streams. Off by default until measured on hardware: launches held while
-/// the program only computes on the CPU wait for its next API call (a program polling host memory a kernel writes,
-/// with no API call, would wait for ever).
+/// Ordinary kernel launches (outside graphs) are gathered into one command while the GPU is busy with the stream's
+/// earlier work, as graph launches are (`Batch`). A launch to an idle GPU is submitted at once; every API call other
+/// than a launch submits the gathered launches first, so they keep their order with copies, events, synchronizations
+/// and other streams; and the flusher thread (`ensure_flusher`) submits them when their queue goes idle, so that a
+/// program that only computes on the CPU meanwhile (or polls host memory a kernel writes) does not keep them waiting.
+/// `ZLUDA_AGX_LAUNCH_BATCH=0` submits every launch at once.
 fn launch_batching_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ZLUDA_AGX_LAUNCH_BATCH").is_ok_and(|v| !v.is_empty() && v != "0"))
+    *ON.get_or_init(|| std::env::var("ZLUDA_AGX_LAUNCH_BATCH").map_or(true, |v| v != "0"))
+}
+
+/// Whether the flusher thread runs; changed only with the driver's lock held, so that a launch that gathers (with the
+/// lock) either sees it running or starts it.
+static FLUSHER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Starts the flusher thread if it is not running: every ~30 us it submits the gathered launches of each context
+/// whose queue has finished its earlier work (the GPU would otherwise idle until the program's next API call), and it
+/// ends when no launches are gathered. Called with the driver's lock held.
+fn ensure_flusher() {
+    use std::sync::atomic::Ordering::SeqCst;
+    if FLUSHER.swap(true, SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| loop {
+        std::thread::sleep(std::time::Duration::from_micros(30));
+        // (a busy lock is an API call in progress: it submits the batch itself, or is a launch joining it; waiting for
+        // the lock would only delay the program's launches, by ~5 us each in Geekbench)
+        let mut g = match DRIVER.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => continue,
+        };
+        let mut pending = false;
+        if let Some(contexts) = g.as_mut() {
+            for d in contexts.states_mut() {
+                let Some(stream) = d.batch.as_ref().map(|b| b.stream) else { continue };
+                let idle = match queue_of(&mut d.ctx, &mut d.streams, stream) {
+                    Ok(q) => q.is_done(q.last()).unwrap_or(true),
+                    Err(_) => true,
+                };
+                if idle {
+                    // (an error here is the stream's: it reaches the program at its next call on it)
+                    let _ = d.flush_batch();
+                } else {
+                    pending = true;
+                }
+            }
+        }
+        if !pending {
+            FLUSHER.store(false, SeqCst);
+            return;
+        }
+    });
 }
 
 /// Whether a launch goes into the batch: always while a graph runs (`graph`); for ordinary launches with
@@ -291,6 +335,24 @@ fn launch_batching_enabled() -> bool {
 /// queue is still busy (so the GPU is not left idle waiting for the batch).
 fn gathers(graph: bool, ordinary: bool, batch_of_stream: bool, queue_busy: bool) -> bool {
     graph || (ordinary && (batch_of_stream || queue_busy))
+}
+
+/// ZLUDA_AGX_HAZARD_STATS=1 (read once: the launch path asked the environment at every launch).
+fn hazard_stats() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ZLUDA_AGX_HAZARD_STATS").is_ok_and(|v| v == "1"))
+}
+
+/// ZLUDA_AGX_CAPTURE (read once, as `hazard_stats`).
+fn capture_dir() -> Option<&'static std::ffi::OsStr> {
+    static DIR: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| std::env::var_os("ZLUDA_AGX_CAPTURE")).as_deref()
+}
+
+/// ZLUDA_AGX_GPU_COPIES=0: asynchronous device-to-device copies always wait for the GPU and copy on the CPU.
+fn gpu_async_copies() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ZLUDA_AGX_GPU_COPIES").map_or(true, |v| v != "0"))
 }
 
 /// ZLUDA_AGX_SPECIALIZE=0 turns launch-time specialization off.
@@ -490,7 +552,7 @@ impl Driver {
         // ZLUDA_AGX_HAZARD_STATS=1: an estimate of how many batched barriers byte ranges could leave out, by the
         // pointer values (tensors in one allocation start at different addresses) the dispatches share since the
         // last estimated barrier; printed every 4096 dispatches
-        if batchable && std::env::var("ZLUDA_AGX_HAZARD_STATS").is_ok_and(|v| v == "1") {
+        if batchable && hazard_stats() {
             use std::sync::Mutex;
             static S: Mutex<(Vec<u64>, u64, u64)> = Mutex::new((Vec::new(), 0, 0));
             let ptrs: Vec<u64> = args
@@ -513,6 +575,10 @@ impl Driver {
             }
         }
         let fence = if batchable {
+            // (ordinary launches gathered: submitted when the queue goes idle if no API call comes first)
+            if ordinary {
+                ensure_flusher();
+            }
             // a batch of another stream, or one that this launch's waits would delay, goes first
             if batch.as_ref().is_some_and(|b| b.stream != sh || has_waits) {
                 let b = batch.take().unwrap();
@@ -757,7 +823,7 @@ impl Driver {
         shared: u32,
         args: &[&[u8]],
     ) -> Result<Option<std::path::PathBuf>, CUerror> {
-        let Some(dir) = std::env::var_os("ZLUDA_AGX_CAPTURE") else { return Ok(None) };
+        let Some(dir) = capture_dir() else { return Ok(None) };
         let wanted = std::env::var("ZLUDA_AGX_CAPTURE_KERNELS").unwrap_or_else(|_| "all".into());
         if wanted != "all" && !wanted.split(',').any(|k| k == name) {
             return Ok(None);
@@ -807,9 +873,11 @@ impl Driver {
         let params: Vec<&[u8]> = r.params.iter().map(|p| &p[..]).collect();
         let pointers = module::checked_pointers(k, &params).unwrap_or_default();
         let bounds: Vec<(u64, u64)> = pointers.iter().map(|&p| self.allocation_bounds(p)).collect();
-        // the parameter block goes where no allocation is
-        const PARAM_BLOCK: u64 = 0x7f_0000_0000;
-        const TABLE: u64 = 0x7e_0000_0000;
+        // the parameter block goes where no allocation is, in the data heap: below the kernel's part of the VM, which
+        // is its last 32 GiB (0x78_0000_0000 on the M2 Max; the 0x7f / 0x7e addresses used before were in it, so a
+        // replay could not map them: "fixed address 0x7f00000000 not usable")
+        const PARAM_BLOCK: u64 = 0x70_0000_0000;
+        const TABLE: u64 = 0x6f_0000_0000;
         let allocations = self.live_allocations();
         let mut replay = m.replay(&r.kernel, &params, r.grid, r.block, r.shared, &bounds, &allocations, TABLE, PARAM_BLOCK)?;
         replay.add_textures(&self.ctx.vm);
@@ -827,6 +895,16 @@ impl Driver {
             if let Some((start, bytes)) = self.ctx.allocation(u64::from_le_bytes(w.try_into().unwrap())) {
                 if !regions.iter().any(|(va, _)| *va == start) {
                     regions.push((start, bytes.to_vec()));
+                }
+            }
+        }
+        // and the allocation right after each (up to 64 MiB of it): kernels read past the end of a buffer into the next
+        // one (llama.cpp's mul_mat_vec_q<Q5_K> reads beyond its 16 KiB quantized vector), which a replay must map too
+        let ends: Vec<u64> = regions.iter().map(|(va, b)| (va + b.len() as u64).next_multiple_of(16384)).collect();
+        for end in ends {
+            if let Some((start, bytes)) = self.ctx.allocation(end) {
+                if start == end && !regions.iter().any(|(va, _)| *va == start) {
+                    regions.push((start, bytes[..bytes.len().min(64 << 20)].to_vec()));
                 }
             }
         }
@@ -927,7 +1005,82 @@ impl Driver {
     /// their barriers), instead of waiting for the GPU and copying on the CPU; false when it cannot be (no batch,
     /// a module's global data, which the CPU writes, or the copy kernels not compiling).
     fn copy_in_batch(&mut self, dst: u64, src: u64, n: u64, sh: usize) -> Result<bool, CUerror> {
-        if !self.batching || n == 0 || self.module_global(dst, n).is_some() || self.module_global(src, n).is_some() {
+        if !self.batching {
+            return Ok(false);
+        }
+        self.copy_kernel(dst, src, n, sh)
+    }
+
+    /// An asynchronous device-to-device copy as a copy kernel on stream `sh` while the stream's queue still has work
+    /// (or it waits for events): in order with its other work, without waiting for the GPU, instead of waiting for
+    /// every stream and copying on the CPU (cudaMemcpyAsync of the runtime, the libraries' copies). An idle stream
+    /// copies on the CPU at once, as before (sooner than a launch). False when not done this way.
+    fn copy_async(&mut self, dst: u64, src: u64, n: u64, sh: usize) -> Result<bool, CUerror> {
+        if !gpu_async_copies() || n == 0 || !self.is_device(dst) || !self.is_device(src) {
+            return Ok(false);
+        }
+        let busy = {
+            let (q, waits) = self.queue(sh)?;
+            !waits.is_empty() || !q.is_done(q.last()).unwrap_or(true)
+        };
+        if !busy && self.batch.as_ref().is_none_or(|b| b.stream != sh) {
+            return Ok(false);
+        }
+        self.copy_kernel(dst, src, n, sh)
+    }
+
+    /// An asynchronous memset (`pattern` 1, 2 or 4 bytes, `count` of them) as a fill kernel on stream `sh` while
+    /// the stream is busy, as `copy_async`; false when not done this way.
+    fn memset_async(&mut self, dst: u64, pattern: &[u8], count: u64, sh: usize) -> Result<bool, CUerror> {
+        let n = count * pattern.len() as u64;
+        if !gpu_async_copies() || n == 0 || self.ctx.address_range(dst).is_none() || self.module_global(dst, n).is_some() {
+            return Ok(false);
+        }
+        let busy = {
+            let (q, waits) = self.queue(sh)?;
+            !waits.is_empty() || !q.is_done(q.last()).unwrap_or(true)
+        };
+        if !busy && self.batch.as_ref().is_none_or(|b| b.stream != sh) {
+            return Ok(false);
+        }
+        if self.copy_kernels.is_none() {
+            self.copy_kernels = Some(unsafe { load_copy_kernels(self) }.ok());
+        }
+        let Some(Some(kernels)) = self.copy_kernels else { return Ok(false) };
+        // the pattern repeated in a 32-bit word, filled in the widest unit the address and the size allow
+        let word = match *pattern {
+            [b] => u32::from_le_bytes([b; 4]),
+            [a, b] => u32::from_le_bytes([a, b, a, b]),
+            [a, b, c, e] => u32::from_le_bytes([a, b, c, e]),
+            _ => return Ok(false),
+        };
+        let all = dst | n;
+        let (f, unit) = if all % 16 == 0 {
+            (kernels[3], 16)
+        } else if all % 4 == 0 {
+            (kernels[4], 4)
+        } else if all % 2 == 0 && pattern.len() <= 2 {
+            (kernels[5], 2)
+        } else if pattern.len() == 1 {
+            (kernels[6], 1)
+        } else {
+            return Ok(false);
+        };
+        let units = n / unit;
+        let grid = units.div_ceil(256);
+        if grid > u32::MAX as u64 {
+            return Ok(false);
+        }
+        let args = [dst.to_le_bytes().to_vec(), word.to_le_bytes().to_vec(), units.to_le_bytes().to_vec()];
+        let args: Vec<&[u8]> = args.iter().map(|a| &a[..]).collect();
+        self.launch(f, [grid as u32, 1, 1], [256, 1, 1], 0, sh, &args)?;
+        Ok(true)
+    }
+
+    /// The copy as a launch of the copy kernels on stream `sh`; false for module globals (which the CPU writes) or
+    /// when the copy kernels do not load.
+    fn copy_kernel(&mut self, dst: u64, src: u64, n: u64, sh: usize) -> Result<bool, CUerror> {
+        if n == 0 || self.module_global(dst, n).is_some() || self.module_global(src, n).is_some() {
             return Ok(false);
         }
         if self.copy_kernels.is_none() {
@@ -1049,15 +1202,92 @@ DONE:
 DONE:
     ret;
 }
+.visible .entry __zluda_agx_fill16(.param .u64 dst, .param .u32 word, .param .u64 count)
+{
+    .reg .u64 %d, %n, %i, %o;
+    .reg .u32 %t, %b, %c, %w;
+    .reg .u16 %h;
+    .reg .pred %p;
+    ld.param.u64 %d, [dst]; ld.param.u32 %w, [word]; ld.param.u64 %n, [count];
+    cvt.u16.u32 %h, %w;
+    mov.u32 %t, %tid.x; mov.u32 %b, %ctaid.x; mov.u32 %c, %ntid.x;
+    mul.wide.u32 %i, %b, %c; cvt.u64.u32 %o, %t; add.u64 %i, %i, %o;
+    setp.ge.u64 %p, %i, %n;
+    @%p bra DONE;
+    shl.b64 %o, %i, 4;
+    add.u64 %d, %d, %o;
+    st.global.v4.u32 [%d], {%w, %w, %w, %w};
+DONE:
+    ret;
+}
+.visible .entry __zluda_agx_fill4(.param .u64 dst, .param .u32 word, .param .u64 count)
+{
+    .reg .u64 %d, %n, %i, %o;
+    .reg .u32 %t, %b, %c, %w;
+    .reg .u16 %h;
+    .reg .pred %p;
+    ld.param.u64 %d, [dst]; ld.param.u32 %w, [word]; ld.param.u64 %n, [count];
+    cvt.u16.u32 %h, %w;
+    mov.u32 %t, %tid.x; mov.u32 %b, %ctaid.x; mov.u32 %c, %ntid.x;
+    mul.wide.u32 %i, %b, %c; cvt.u64.u32 %o, %t; add.u64 %i, %i, %o;
+    setp.ge.u64 %p, %i, %n;
+    @%p bra DONE;
+    shl.b64 %o, %i, 2;
+    add.u64 %d, %d, %o;
+    st.global.u32 [%d], %w;
+DONE:
+    ret;
+}
+.visible .entry __zluda_agx_fill2(.param .u64 dst, .param .u32 word, .param .u64 count)
+{
+    .reg .u64 %d, %n, %i, %o;
+    .reg .u32 %t, %b, %c, %w;
+    .reg .u16 %h;
+    .reg .pred %p;
+    ld.param.u64 %d, [dst]; ld.param.u32 %w, [word]; ld.param.u64 %n, [count];
+    cvt.u16.u32 %h, %w;
+    mov.u32 %t, %tid.x; mov.u32 %b, %ctaid.x; mov.u32 %c, %ntid.x;
+    mul.wide.u32 %i, %b, %c; cvt.u64.u32 %o, %t; add.u64 %i, %i, %o;
+    setp.ge.u64 %p, %i, %n;
+    @%p bra DONE;
+    shl.b64 %o, %i, 1;
+    add.u64 %d, %d, %o;
+    st.global.u16 [%d], %h;
+DONE:
+    ret;
+}
+.visible .entry __zluda_agx_fill1(.param .u64 dst, .param .u32 word, .param .u64 count)
+{
+    .reg .u64 %d, %n, %i, %o;
+    .reg .u32 %t, %b, %c, %w;
+    .reg .u16 %h;
+    .reg .pred %p;
+    ld.param.u64 %d, [dst]; ld.param.u32 %w, [word]; ld.param.u64 %n, [count];
+    cvt.u16.u32 %h, %w;
+    mov.u32 %t, %tid.x; mov.u32 %b, %ctaid.x; mov.u32 %c, %ntid.x;
+    mul.wide.u32 %i, %b, %c; cvt.u64.u32 %o, %t; add.u64 %i, %i, %o;
+    setp.ge.u64 %p, %i, %n;
+    @%p bra DONE;
+    mov.u64 %o, %i;
+    add.u64 %d, %d, %o;
+    st.global.u8 [%d], %h;
+DONE:
+    ret;
+}
 \0";
 
-/// The handles of the copy kernels (16, 4 and 1 byte units).
-unsafe fn load_copy_kernels(d: &mut Driver) -> Result<[usize; 3], CUerror> {
+/// The handles of the copy kernels (16, 4 and 1 byte units), then the fill kernels (a 32-bit word in 16-, 4-, 2- and
+/// 1-byte units).
+unsafe fn load_copy_kernels(d: &mut Driver) -> Result<[usize; 7], CUerror> {
     let m = load_module_data(d, COPY_PTX.as_ptr())?;
     Ok([
         module_function(d, m, "__zluda_agx_copy16")?,
         module_function(d, m, "__zluda_agx_copy4")?,
         module_function(d, m, "__zluda_agx_copy1")?,
+        module_function(d, m, "__zluda_agx_fill16")?,
+        module_function(d, m, "__zluda_agx_fill4")?,
+        module_function(d, m, "__zluda_agx_fill2")?,
+        module_function(d, m, "__zluda_agx_fill1")?,
     ])
 }
 
@@ -1480,6 +1710,8 @@ fn compile_or_cached(sources: &[&[u8]], cpu: &str, cached_only: bool) -> Result<
         }
         let target = if direct { "agx" } else { "air" };
         let mut args: Vec<String> = ["--target", target, "--arch", cpu, "--object-only"].iter().map(|a| a.to_string()).collect();
+        // (the AGX object alone: no AIR for Metal, which nothing on Asahi reads)
+        args.extend((!direct).then(|| "--agx-only".to_string()));
         args.extend(mesa.then(|| "--agx-strict".to_string()));
         args.extend(checked.then(|| "--agx-checked".to_string()));
         args.extend(strict_fp.then(|| "--strict-fp".to_string()));
@@ -1964,7 +2196,8 @@ pub(crate) unsafe fn cuCtxSynchronize() -> CUresult {
 }
 
 pub(crate) unsafe fn cuMemAlloc_v2(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult {
-    let va = with(|d| d.ctx.mem_alloc(bytesize as u64).map_err(from_io))?;
+    // through the reuse cache of freed allocations (agx_runtime Context::mem_alloc_cached)
+    let va = with(|d| d.ctx.mem_alloc_cached(bytesize as u64).map_err(from_io))?;
     out(dptr, CUdeviceptr_v2(va as *mut c_void))
 }
 
@@ -2016,8 +2249,14 @@ pub(crate) unsafe fn cuMemcpyDtoD_v2(dst: CUdeviceptr, src: CUdeviceptr, n: usiz
 
 pub(crate) unsafe fn cuMemsetD8_v2(dst: CUdeviceptr, uc: u8, n: usize) -> CUresult {
     with(|d| {
+        let started = Instant::now();
         d.sync_all()?;
-        d.ctx.memset(dst.0 as u64, &[uc], n as u64).map_err(from_io)
+        let synced = started.elapsed();
+        d.ctx.memset(dst.0 as u64, &[uc], n as u64).map_err(from_io)?;
+        if crate::log_enabled() {
+            eprintln!("[zluda_agx] memset {n} bytes of {:#x}: wait {:.3} ms, fill {:.3} ms", dst.0 as u64, synced.as_secs_f64() * 1e3, (started.elapsed() - synced).as_secs_f64() * 1e3);
+        }
+        Ok(())
     })
 }
 
@@ -3132,6 +3371,9 @@ pub(crate) unsafe fn cuMemcpyAsync(dst: CUdeviceptr, src: CUdeviceptr, n: usize,
     if with(|d| Ok(d.captured(s, || Op::Copy { dst: dst.0 as u64, src: src.0 as u64, n })))? {
         return Ok(());
     }
+    if with(|d| d.copy_async(dst.0 as u64, src.0 as u64, n as u64, s.0 as usize))? {
+        return Ok(());
+    }
     cuMemcpy(dst, src, n)
 }
 
@@ -3153,11 +3395,17 @@ pub(crate) unsafe fn cuMemcpyDtoDAsync_v2(dst: CUdeviceptr, src: CUdeviceptr, n:
     if with(|d| Ok(d.captured(s, || Op::Copy { dst: dst.0 as u64, src: src.0 as u64, n })))? {
         return Ok(());
     }
+    if with(|d| d.copy_async(dst.0 as u64, src.0 as u64, n as u64, s.0 as usize))? {
+        return Ok(());
+    }
     cuMemcpyDtoD_v2(dst, src, n)
 }
 
 pub(crate) unsafe fn cuMemsetD8Async(dst: CUdeviceptr, uc: u8, n: usize, s: CUstream) -> CUresult {
     if with(|d| Ok(d.captured(s, || Op::Memset { dst: dst.0 as u64, pattern: vec![uc], count: n as u64 })))? {
+        return Ok(());
+    }
+    if with(|d| d.memset_async(dst.0 as u64, &[uc], n as u64, s.0 as usize))? {
         return Ok(());
     }
     cuMemsetD8_v2(dst, uc, n)
@@ -3174,11 +3422,17 @@ pub(crate) unsafe fn cuMemsetD16Async(dst: CUdeviceptr, us: u16, n: usize, s: CU
     if with(|d| Ok(d.captured(s, || Op::Memset { dst: dst.0 as u64, pattern: us.to_le_bytes().to_vec(), count: n as u64 })))? {
         return Ok(());
     }
+    if with(|d| d.memset_async(dst.0 as u64, &us.to_le_bytes(), n as u64, s.0 as usize))? {
+        return Ok(());
+    }
     cuMemsetD16_v2(dst, us, n)
 }
 
 pub(crate) unsafe fn cuMemsetD32Async(dst: CUdeviceptr, ui: c_uint, n: usize, s: CUstream) -> CUresult {
     if with(|d| Ok(d.captured(s, || Op::Memset { dst: dst.0 as u64, pattern: ui.to_le_bytes().to_vec(), count: n as u64 })))? {
+        return Ok(());
+    }
+    if with(|d| d.memset_async(dst.0 as u64, &ui.to_le_bytes(), n as u64, s.0 as usize))? {
         return Ok(());
     }
     cuMemsetD32_v2(dst, ui, n)

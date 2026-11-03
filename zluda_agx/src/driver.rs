@@ -1398,6 +1398,8 @@ const LARGE_MODULE_BYTES: usize = 4 << 20;
 /// The AGX backend's calls (experimental): called functions as calls, frames measured per call depth, and calls
 /// left to relocations, which the merger of the kernels' objects resolves to one copy of each function.
 const LARGE_MODULE_LLVM_ARGS: &str = "-agx-experimental-leaf-calls -agx-measured-call-frames -agx-call-relocations";
+/// The stack per thread a large module is first compiled with.
+const LARGE_MODULE_STACK_TRY: u32 = 12288;
 
 /// Compiles PTX for `cpu` with zoc, through the compilation cache.
 pub(crate) fn compile_ptx(ptx: &[u8], cpu: &str) -> Result<(Vec<u8>, String), String> {
@@ -1519,20 +1521,38 @@ fn compile_or_cached(sources: &[&[u8]], cpu: &str, cached_only: bool) -> Result<
             paths.push(src);
         }
         // the object alone: its .agx.kernels records describe the kernels, so no IR text or assembly
-        let mut command = std::process::Command::new(&zoc);
-        if large {
-            let llvm_args = std::env::var("ZLUDA_AGX_LLVM_ARGS").unwrap_or_default();
+        let run = |stack_bytes: Option<u32>| -> Result<std::process::Output, String> {
+            let mut command = std::process::Command::new(&zoc);
+            if large {
+                let llvm_args = std::env::var("ZLUDA_AGX_LLVM_ARGS").unwrap_or_default();
+                let stack = stack_bytes.map_or(String::new(), |b| format!(" -agx-measured-stack-bytes={b}"));
+                command
+                    .env("ZLUDA_AGX_LLVM_ARGS", format!("{LARGE_MODULE_LLVM_ARGS}{stack} {llvm_args}"))
+                    .env("ZLUDA_AGX_PER_KERNEL", "1");
+            }
             command
-                .env("ZLUDA_AGX_LLVM_ARGS", format!("{LARGE_MODULE_LLVM_ARGS} {llvm_args}"))
-                .env("ZLUDA_AGX_PER_KERNEL", "1");
+                .args(&args)
+                .arg("--output-dir")
+                .arg(dir.path())
+                .args(&paths)
+                .output()
+                .map_err(|e| format!("{}: {e}", zoc.display()))
+        };
+        // The stack the kernels reserve per thread sizes the scratch buffer, about 7 GB between 12 and 32 KB on the M2
+        // Max whether or not it is touched, and the frames of called functions are only known once compiled. So a
+        // large module is first compiled with a small reservation, which the backend refuses if the frames do not fit,
+        // and then with all that is addressable. ZLUDA_AGX_STACK_TRY overrides the first (0: not tried).
+        let stack_try = std::env::var("ZLUDA_AGX_STACK_TRY")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(LARGE_MODULE_STACK_TRY);
+        let mut out = run((large && stack_try != 0).then_some(stack_try))?;
+        if large && stack_try != 0 && !out.status.success() {
+            if crate::log_enabled() {
+                eprintln!("[zluda_agx] zoc failed with {stack_try} bytes of stack per thread: compiling with all of it");
+            }
+            out = run(None)?;
         }
-        let out = command
-            .args(&args)
-            .arg("--output-dir")
-            .arg(dir.path())
-            .args(&paths)
-            .output()
-            .map_err(|e| format!("{}: {e}", zoc.display()))?;
         if crate::log_enabled() {
             eprintln!("[zluda_agx] zoc finished: {}, elapsed={:.3}s", out.status, started.elapsed().as_secs_f64());
         }

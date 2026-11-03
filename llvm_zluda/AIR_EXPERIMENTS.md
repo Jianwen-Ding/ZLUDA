@@ -71,8 +71,8 @@ Mistakes in how the work was done:
   whole-module compilation with a module-wide frame layout (AGXFrameLowering, reverted) took 188 s at 1.48 GB, no
   better than ZLUDA_AGX_JOBS=1 (188 s, 1.26 GB), and the object was still 37 MB. The old "1338 copies, 5.3 MB unique"
   figure no longer describes this build. Look at symbol sizes first.
-- **Unexplained, not chased**: at 16 samples Cycles' seed 0 and seed 7 on the CPU differ by at most 2/255. Do not use
-  a second seed as a noise floor until that is understood. Convergence against sample count needs no seed.
+- **Unexplained, not chased**: Cycles' seed has almost no effect in this host, on the CPU and the GPU alike (0 against 7 or
+  123456: at most 1-2/255 at 16 samples), so not ZLUDA. Do not use a second seed as a noise floor.
 
 ## Instanced geometry missing: a miscompiled host, not ZLUDA (2026-11-03)
 
@@ -97,8 +97,10 @@ monster 245 (was 466), junkshop 193 (160), classroom 146 (133).
 
 Classroom GPU against CPU by samples, at the same seed: 16 mean 0.34 / max 139, 128 0.28 / 54, 1024 0.17 / 13, 4096
 0.098 / 4, signed error about 0 throughout: no measured bias. ZLUDA_ROUNDING_STRICT=1 does not reduce the difference
-(0.3455), and the CPU on BVH2 against Embree is 0.0004, so it is neither rounding nor BVH layout. A faint trace along
-chair edges remains in the 4096 map, cause unknown. Junkshop and monster were compared at 16 samples only (mean
+(0.3455; 0.1712 against 0.1665 at 1024), and the CPU on BVH2 against Embree is 0.0004, so it is neither rounding nor BVH
+layout. The faint trace along chair edges in the 4096 map is noise: the signed error averaged over blocks of 1, 4, 8, 16
+and 32 pixels has rms 0.28, 0.071, 0.036, 0.017, 0.009, halving as uncorrelated noise does (blockdiff.py), a tenth of
+the image's own sampling noise (1024 against 4096 samples: rms 3.0014 on the GPU, 3.0006 on the CPU). Junkshop and monster were compared at 16 samples only (mean
 differences small, signed error about 0).
 
 ## Compile memory, the result (2026-11-03, Blender Cycles' stock kernel)
@@ -131,6 +133,11 @@ Baseline with instances fixed: junkshop 193, classroom 146, monster 245. Same im
   images as before. llama.cpp pp128 435, tg64 131 t/s, 4/4 completions as on the CPU. Geekbench, alternating the compiler
   from before these changes with this one on the same day: 26.98, 26.12 s -> 25.60, 25.75 s of GPU time. Older sessions'
   24.8-25.3 s are not comparable: compare on the same day.
+- **Stack per thread, a memory result**: kernels with calls reserved all 32 KB addressable, as called functions' frames are
+  unknown when a kernel is compiled. Cycles' fit in 12 KB. The scratch buffer scales with it and is real memory whether
+  touched or not: system memory at peak of a junkshop render 21.9 -> 15.2 GB, process RSS unchanged at 7.9 (so RSS does not
+  show it). Throughput the same, so stack spacing was not a cost. The driver tries 12 KB and falls back to all of it when
+  the backend refuses (ZLUDA_AGX_STACK_TRY; forced at 2048 bytes: the fallback ran, 51 s, same image).
 - **Refuted, register cap (-agx-default-max-gprs)**: occupancy is not the limit. 128: 194, 96: 161, 72: 131, 56: 96.
 - **Refuted, more inlining**: -inline-threshold 500 and 2000 are within noise and cost compile time. -air-keep-function-cost
   does not change AGX code at all (17.9129 MB at 5000, 80000, 320000): what O3 leaves uninlined stays a real call.

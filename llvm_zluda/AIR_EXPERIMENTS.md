@@ -127,7 +127,17 @@ Baseline with instances fixed: junkshop 193, classroom 146, monster 245. Same im
   difference from the CPU, 0.1665). The unit's own filtering gives 238, 184, 272 but moves that to 0.2277: opt-in only.
 - **A 64-bit remainder per axis per texel** in the sampler's mod_pos: no speed change, as wrapping is rare at run time, but
   compile 4.96 -> 3.65 GB. Static size and dynamic cost are separate questions: check both.
+- **Result**: junkshop 193 -> 229, classroom 146 -> 176, monster 245 -> 268-271 samples per minute (+19%, +21%, +10%), the
+  images as before. llama.cpp pp128 435, tg64 131 t/s, 4/4 completions as on the CPU. Geekbench, alternating the compiler
+  from before these changes with this one on the same day: 26.98, 26.12 s -> 25.60, 25.75 s of GPU time. Older sessions'
+  24.8-25.3 s are not comparable: compare on the same day.
 - **Refuted, register cap (-agx-default-max-gprs)**: occupancy is not the limit. 128: 194, 96: 161, 72: 131, 56: 96.
+- **Refuted, more inlining**: -inline-threshold 500 and 2000 are within noise and cost compile time. -air-keep-function-cost
+  does not change AGX code at all (17.9129 MB at 5000, 80000, 320000): what O3 leaves uninlined stays a real call.
+- **Refuted, backend options**: on classroom and junkshop -agx-uniform-constants, -agx-max-unskipped-instrs=2 and 8,
+  -agx-atomic-optimizer, -agx-element-aligned-vectors, -agx-mem-cluster=32 and -agx-launch-divisors are all within about 1%.
+- **What is left is spread out**: replaying shade_surface (junkshop, 30.8M instructions, agx_run --trace-pcs), the largest
+  part is mov_imm 9%, fmul 9%, stack_load 7%, jmp_exec_none 7%, wait 7%, and no function but the interpreter over 15%.
 - **Refuted, launch overhead**: launch batching changes nothing (197.9 vs 197.4). 18.8 s GPU in about 19.7 s of launches:
   this is GPU-bound. An earlier "19% not GPU" was wrong, its span included 3.5 s of scene setup.
 

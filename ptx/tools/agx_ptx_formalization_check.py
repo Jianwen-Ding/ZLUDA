@@ -650,6 +650,35 @@ def simulate(args, tmp, name, k, ps, ops, grid, block, dyn, syms, mem, globals_m
         cmd += ['--uniform', '%d=%d' % (u, v)]
     if getattr(args, 'agx_strict', False):
         cmd += ['--agx-strict', args.arch]
+    if getattr(args, 'cost_file', None):
+        # the AGX Performance Simulator's prediction of the launch over the same memory (before agx_run writes it)
+        dcmd = [args.agx_dispatch, f_code,
+                '--grid', ','.join(str(hw_grid[j] * hw_block[j]) for j in range(3)),
+                '--wg', ','.join(map(str, hw_block)), '--tg-bytes', str(k['shared'] + dyn),
+                '--map', '%#x=%s' % (BASE, f_mem), '--map', '%#x=%s' % (PARAM_BASE, f_par),
+                '--map', '%#x=%s' % (GLOBALS_BASE, f_glob)] + list(extra)
+        for u, v in uniforms:
+            dcmd += ['--uniform', '%d=%d' % (u, v)]
+        try:
+            d = subprocess.run(dcmd, capture_output=True, text=True, timeout=args.timeout)
+            j = json.loads(d.stdout.strip().splitlines()[-1])
+            with open(args.cost_file, 'a') as f:
+                t = j.get('time_ns', j.get('predicted_ns', -1))
+                if t == -1 and 'time_us' in j:
+                    t = j['time_us'] * 1000.0
+                f.write('%s %.1f %.1f %s\n' % (name, j.get('core_cycles', -1), t,
+                                                json.dumps({x: j[x] for x in sorted(j) if not isinstance(j[x], (list, dict))})))
+                if os.environ.get('AGX_ISSUE_PROFILE'):
+                    f.write(d.stderr)
+            # AGX_COST_ANNOTATE=path/to/agx_cost: also its per-instruction table of one SIMD group's path
+            if os.environ.get('AGX_COST_ANNOTATE'):
+                a = subprocess.run([os.environ['AGX_COST_ANNOTATE'], '--annotate'] + dcmd[1:], capture_output=True,
+                                   text=True, timeout=args.timeout)
+                with open(args.cost_file, 'a') as f:
+                    f.write(a.stdout + a.stderr[-2000:])
+        except Exception as e:
+            with open(args.cost_file, 'a') as f:
+                f.write('%s error %s\n' % (name, str(e)[:100]))
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout)
     except subprocess.TimeoutExpired:
@@ -660,6 +689,14 @@ def simulate(args, tmp, name, k, ps, ops, grid, block, dyn, syms, mem, globals_m
         except Exception:
             err = (r.stdout + r.stderr).strip()[-300:]
         return '%s: %s' % (name, err[:300])
+    if getattr(args, 'count_file', None):
+        # executed instructions of the launch (agx_run's JSON line), for comparing the code of two compilers
+        try:
+            n = json.loads(r.stdout.strip().splitlines()[-1])['instructions']
+            with open(args.count_file, 'a') as f:
+                f.write('%s %d\n' % (name, n))
+        except Exception:
+            pass
     with open(f_mem, 'rb') as f:
         mem.buf = bytearray(f.read())
     with open(f_glob, 'rb') as f:
@@ -1021,6 +1058,9 @@ def main():
     ap.add_argument('--max-failures', type=int, default=4, help='failing elements listed per test')
     ap.add_argument('-j', type=int, default=os.cpu_count())
     ap.add_argument('--json', help='write the results to this file')
+    ap.add_argument('--cost-file', help="append each launch's kernel name, predicted core cycles and time in ns (agx_dispatch over the launch's memory) to this file")
+    ap.add_argument('--agx-dispatch', dest='agx_dispatch', default='agx_dispatch')
+    ap.add_argument('--count-file', help="append each launch's kernel name and executed instruction count (agx_run) to this file")
     args = ap.parse_args()
     args.counts = {'pass': 0, 'fail': 0, 'skip': 0, 'near': 0}
 

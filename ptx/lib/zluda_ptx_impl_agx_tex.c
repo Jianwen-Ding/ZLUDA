@@ -208,7 +208,26 @@ static inline rgba texel(desc_t t, struct q *q, int64_t i, int64_t j, int64_t k,
 
 static inline int64_t floor_i(double x) { return (int64_t)__builtin_floor(x); }
 
-static inline int64_t mod_pos(int64_t a, int64_t n) { return ((a % n) + n) % n; }
+// a mod n in [0, n), for n > 0. A 64-bit remainder is hundreds of AGX instructions, and this is inlined for every axis of
+// every texel of a filtered sample: in range nothing, a 32-bit remainder when both fit, and only coordinates beyond them
+// (rare, and never in the fast paths) a small exact loop.
+static inline int64_t mod_pos(int64_t a, int64_t n) {
+    if ((uint64_t)a < (uint64_t)n)
+        return a;
+    if (a == (int32_t)a && n == (int32_t)n) {
+        int32_t r = (int32_t)a % (int32_t)n;
+        return r < 0 ? (int64_t)r + n : r;
+    }
+    uint64_t u = a < 0 ? -(uint64_t)a : (uint64_t)a, r = 0;
+#pragma clang loop unroll(disable) vectorize(disable)
+    for (int i = 63; i >= 0; i--) {
+        // r < n <= 2^62: no overflow
+        r = (r << 1) | ((u >> i) & 1);
+        if (r >= (uint64_t)n)
+            r -= (uint64_t)n;
+    }
+    return a < 0 && r ? n - (int64_t)r : (int64_t)r;
+}
 
 // index with the address mode applied (-1: border)
 static inline int64_t ad_idx(int mode, int64_t i, int64_t n) {

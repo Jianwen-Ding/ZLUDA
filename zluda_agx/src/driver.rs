@@ -908,6 +908,19 @@ impl Driver {
                 }
             }
         }
+        // the texture descriptors that tables among them point to (Cycles' image info)
+        let mut descriptors: Vec<(u64, Vec<u8>)> = Vec::new();
+        for (_, b) in regions.iter().filter(|(_, b)| b.len() <= 16 << 20) {
+            for w in b.chunks_exact(8) {
+                if let Some((start, bytes)) = self.ctx.allocation(u64::from_le_bytes(w.try_into().unwrap())) {
+                    let texture = bytes.len() >= 16 && u64::from_le_bytes(bytes[..8].try_into().unwrap()) == TEXTURE_MAGIC;
+                    if texture && !regions.iter().chain(&descriptors).any(|(va, _)| *va == start) {
+                        descriptors.push((start, bytes.to_vec()));
+                    }
+                }
+            }
+        }
+        regions.extend(descriptors);
         // the texels of the texture objects among them (word 1 of a texture descriptor)
         let mut i = 0;
         while i < regions.len() {
@@ -1615,6 +1628,8 @@ const LARGE_MODULE_BYTES: usize = 4 << 20;
 /// The AGX backend's calls (experimental): called functions as calls, frames measured per call depth, and calls
 /// left to relocations, which the merger of the kernels' objects resolves to one copy of each function.
 const LARGE_MODULE_LLVM_ARGS: &str = "-agx-experimental-leaf-calls -agx-measured-call-frames -agx-call-relocations";
+/// The stack per thread a large module is first compiled with.
+const LARGE_MODULE_STACK_TRY: u32 = 12288;
 
 /// Compiles PTX for `cpu` with zoc, through the compilation cache.
 pub(crate) fn compile_ptx(ptx: &[u8], cpu: &str) -> Result<(Vec<u8>, String), String> {
@@ -1738,20 +1753,38 @@ fn compile_or_cached(sources: &[&[u8]], cpu: &str, cached_only: bool) -> Result<
             paths.push(src);
         }
         // the object alone: its .agx.kernels records describe the kernels, so no IR text or assembly
-        let mut command = std::process::Command::new(&zoc);
-        if large {
-            let llvm_args = std::env::var("ZLUDA_AGX_LLVM_ARGS").unwrap_or_default();
+        let run = |stack_bytes: Option<u32>| -> Result<std::process::Output, String> {
+            let mut command = std::process::Command::new(&zoc);
+            if large {
+                let llvm_args = std::env::var("ZLUDA_AGX_LLVM_ARGS").unwrap_or_default();
+                let stack = stack_bytes.map_or(String::new(), |b| format!(" -agx-measured-stack-bytes={b}"));
+                command
+                    .env("ZLUDA_AGX_LLVM_ARGS", format!("{LARGE_MODULE_LLVM_ARGS}{stack} {llvm_args}"))
+                    .env("ZLUDA_AGX_PER_KERNEL", "1");
+            }
             command
-                .env("ZLUDA_AGX_LLVM_ARGS", format!("{LARGE_MODULE_LLVM_ARGS} {llvm_args}"))
-                .env("ZLUDA_AGX_PER_KERNEL", "1");
+                .args(&args)
+                .arg("--output-dir")
+                .arg(dir.path())
+                .args(&paths)
+                .output()
+                .map_err(|e| format!("{}: {e}", zoc.display()))
+        };
+        // The stack the kernels reserve per thread sizes the scratch buffer, about 7 GB between 12 and 32 KB on the M2
+        // Max whether or not it is touched, and the frames of called functions are only known once compiled. So a
+        // large module is first compiled with a small reservation, which the backend refuses if the frames do not fit,
+        // and then with all that is addressable. ZLUDA_AGX_STACK_TRY overrides the first (0: not tried).
+        let stack_try = std::env::var("ZLUDA_AGX_STACK_TRY")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(LARGE_MODULE_STACK_TRY);
+        let mut out = run((large && stack_try != 0).then_some(stack_try))?;
+        if large && stack_try != 0 && !out.status.success() {
+            if crate::log_enabled() {
+                eprintln!("[zluda_agx] zoc failed with {stack_try} bytes of stack per thread: compiling with all of it");
+            }
+            out = run(None)?;
         }
-        let out = command
-            .args(&args)
-            .arg("--output-dir")
-            .arg(dir.path())
-            .args(&paths)
-            .output()
-            .map_err(|e| format!("{}: {e}", zoc.display()))?;
         if crate::log_enabled() {
             eprintln!("[zluda_agx] zoc finished: {}, elapsed={:.3}s", out.status, started.elapsed().as_secs_f64());
         }
@@ -2044,8 +2077,12 @@ pub(crate) unsafe fn cuDeviceTotalMem_v2(bytes: *mut usize, dev: CUdevice) -> CU
     out(bytes, t)
 }
 
-/// CUDA compute capability reported for AGX: what ZLUDA's PTX front end accepts.
-const CC: (c_int, c_int) = (8, 6);
+/// CUDA compute capability reported for AGX: within what ZLUDA's PTX front end accepts, and a real architecture, as
+/// libraries check it (cuBLAS's creation fails on a version no GPU has, 8.7). The driver loads PTX and not machine code,
+/// and an application that ships a binary per architecture picks it from this number and fails to load it: 8.0 is a
+/// data-center architecture that those for graphics cards leave out (Blender's with 8.6, 8.9 and 12.0), which then
+/// take their PTX.
+const CC: (c_int, c_int) = (8, 0);
 
 pub(crate) unsafe fn cuDeviceComputeCapability(major: *mut c_int, minor: *mut c_int, dev: CUdevice) -> CUresult {
     check_device(dev)?;
@@ -3306,6 +3343,8 @@ pub(crate) unsafe fn cuOccupancyMaxPotentialBlockSizeWithFlags(
         let (m, name) = d.functions.get(&(f.0 as usize)).ok_or(CUerror::INVALID_HANDLE)?;
         let k = &d.modules[m].module.kernels[name];
         let max = k.max_threads_per_threadgroup().min(if block_size_limit == 0 { u32::MAX } else { block_size_limit as u32 });
+        // Experiment (AIR_EXPERIMENTS.md, "Options at cap 80"): the largest block size to recommend.
+        let max = std::env::var("ZLUDA_AGX_MAX_BLOCK").ok().and_then(|v| v.parse::<u32>().ok()).map_or(max, |m| max.min(m));
         let mut best = (0u32, 0u32, 0u32); // occupied threads, resident blocks, block size
         let mut candidates: Vec<u32> = (32..=max).step_by(32).collect();
         if max % 32 != 0 {

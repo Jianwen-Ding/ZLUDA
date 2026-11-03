@@ -279,15 +279,11 @@ unsafe fn write_texture(d: &mut Driver, img: &Image, t: &CUDA_TEXTURE_DESC) -> R
     // The texture unit's point sampling gives the software sampler's results bit for bit in every form checked on the
     // GPU (agx_texture_check, M2 Max, 2026-10-31: u8 / u16 / s8 / s16 / f16 / f32, 1, 2 and 4 channels, wrap, clamp,
     // mirror and border, normalized or not, 1D, 2D and pitch-linear; 2^22 values each), so point-sampled textures use
-    // it by default. Its linear filtering differs from CUDA's 1/256 weights (up to 0.3% of the texel range with
-    // normalized coordinates; f16 results rounded to half), so linearly filtered ones only with
-    // ZLUDA_AGX_HARDWARE_TEXTURES=1. ZLUDA_AGX_SOFTWARE_TEXTURES keeps every texture in software.
-    let hardware = if std::env::var_os("ZLUDA_AGX_SOFTWARE_TEXTURES").is_some() {
-        false
-    } else {
-        std::env::var_os("ZLUDA_AGX_HARDWARE_TEXTURES").is_some() || !filters_linearly(img, t)
-    };
-    if hardware {
+    // it. Its linear filtering differs from CUDA's 1/256 weights (from strict mode at most 1.2e-4 for 8-bit texels and
+    // 3.8e-6 for f32; f16 results rounded to half) and is what default mode uses, for speed (Blender Open Data 4-16%):
+    // the exact filtering of the model is strict mode's (--strict-fp), whose kernels do not use the unit.
+    // ZLUDA_AGX_SOFTWARE_TEXTURES keeps every texture in software outside strict mode too.
+    if std::env::var_os("ZLUDA_AGX_SOFTWARE_TEXTURES").is_none() {
         let why = match native_descriptors(img, t) {
             None => Some("not a form the texture unit samples as the software sampler does"),
             Some((texture, sampler, integer, rank)) => match d.ctx.vm.add_texture(&texture).map_err(from_io)? {

@@ -50,6 +50,22 @@ impl Module {
         Self(unsafe { LLVMModuleCreateWithNameInContext(name.as_ptr(), ctx.get()) })
     }
 
+    /// As `try_from_bitcode`, with function bodies read only when materialized.
+    pub fn try_from_bitcode_lazy(ctx: &Context, bitcode: &[u8]) -> Option<Self> {
+        let memory_buffer: LLVMMemoryBufferRef = unsafe {
+            LLVMCreateMemoryBufferWithMemoryRangeCopy(bitcode.as_ptr().cast(), bitcode.len(), c"".as_ptr())
+        };
+        let mut module: LLVMModuleRef = unsafe { mem::zeroed() };
+        // the module owns the buffer from here on, on success
+        let status = unsafe { llvm_sys::bit_reader::LLVMGetBitcodeModuleInContext2(ctx.get(), memory_buffer, &mut module) };
+        if status != 0 {
+            unsafe { llvm_sys::core::LLVMDisposeMemoryBuffer(memory_buffer) };
+            None
+        } else {
+            Some(Self(module))
+        }
+    }
+
     pub fn try_from_bitcode(ctx: &Context, bitcode: &[u8], name: Option<&CStr>) -> Option<Self> {
         let bitcode: Vec<std::ffi::c_char> = bitcode.iter().map(|&v| v as std::ffi::c_char).collect();
         let memory_buffer: LLVMMemoryBufferRef = unsafe {

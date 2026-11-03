@@ -3077,6 +3077,8 @@ pub(crate) unsafe fn cuOccupancyMaxPotentialBlockSizeWithFlags(
         let (m, name) = d.functions.get(&(f.0 as usize)).ok_or(CUerror::INVALID_HANDLE)?;
         let k = &d.modules[m].module.kernels[name];
         let max = k.max_threads_per_threadgroup().min(if block_size_limit == 0 { u32::MAX } else { block_size_limit as u32 });
+        // Experiment (AIR_EXPERIMENTS.md, "Options at cap 80"): the largest block size to recommend.
+        let max = std::env::var("ZLUDA_AGX_MAX_BLOCK").ok().and_then(|v| v.parse::<u32>().ok()).map_or(max, |m| max.min(m));
         let mut best = (0u32, 0u32, 0u32); // occupied threads, resident blocks, block size
         let mut candidates: Vec<u32> = (32..=max).step_by(32).collect();
         if max % 32 != 0 {

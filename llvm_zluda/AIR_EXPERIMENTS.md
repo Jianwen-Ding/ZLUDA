@@ -602,3 +602,40 @@ Samples/min at -agx-default-max-gprs (callee-saved 32, 30 s of Blender Open Data
 - Frames grow as registers shrink: the 12 KB stack first try fails at cap 80 (sample_f32_outlined), and the driver
   then compiles twice (warm-up 26 s to 52 s). 16 KB fits.
 - Block size (cuOccupancyMaxPotentialBlockSize capped at 32-192 threads): no gain at 128 registers; 32 was slightly worse.
+
+### Options at cap 80 (2026-11-03, sweep8)
+
+Samples/min, classroom / junkshop / monster, cap 80 and 16 KB stack unless stated, 0 GPU faults. **Power caveat:** an 18 W USB-C
+charger against about 60 W of load, battery draining from 46% to 21%: compare within this table, do not compare it with other
+tables or take it as the final number. Base ran first, and its monster (332) may be low: a monster gain under about 4% may be noise.
+
+| Option | classroom | junkshop | monster | Verdict |
+| --- | --- | --- | --- | --- |
+| base: -agx-callee-saved=32 | 230 | 269 | 332 | |
+| -agx-callee-saved=48 (the default) | 221 | 254 | 323 | worse: 48 leaves almost nothing free under a cap of 80 |
+| -agx-callee-saved=16 | 236 | 278 | 335 | best on classroom, junkshop; values under 16 not tried |
+| ZLUDA_AGX_STACK_TRY=0 (full stack) | 230 | 270 | 331 | no gain over 16 KB |
+| ZLUDA_AGX_MAX_BLOCK=64 | 229 | 273 | 337 | |
+| ZLUDA_AGX_MAX_BLOCK=128 | 232 | 274 | 344 | |
+| ZLUDA_AGX_MAX_BLOCK=192 | 233 | 275 | 345 | best block size |
+| ZLUDA_AGX_MAX_BLOCK=320 | 233 | 276 | 339 | |
+| -agx-sched-target-gprs=48 | 237 | 271 | 352 | a real gain; much less than hoped |
+| -agx-sink-remat | 231 | 272 | 333 | **refuted**, no gain |
+| -agx-callee-saved-stride=8 | 230 | 274 | 346 | unclear: may be noise |
+| -agx-uniform-constants | 230 | 270 | 328 | **refuted** at cap 80, no gain |
+
+The combination has not been run. -agx-declare-tree-gprs has had no render test: every kernel's tree still reaches the cap, so it
+cannot change anything until the worst functions come down. check_tree_gprs.py (/scratch/air-pipeline) checks it offline first.
+
+### What went wrong in these sweeps (for the next agent)
+
+- **sweep6 forgot -agx-callee-saved**, so ran at the default of 48, and made every option look wrong against the earlier sweep.
+  Pin every option you are not testing.
+- **The laptop lost AC at about 17:50 UTC with nobody noticing**, then a weak charger replaced it. sweep6 and sweep7 are invalid
+  (the last 9 runs of sweep7 fell to 75-170 samples/min), and two conclusions drawn from them were withdrawn. run.sh now refuses on
+  battery, but **"AC online" does not mean enough power**: macsmc-ac/online was 1 and status "Charging" while the battery supplied
+  41 W. Read power2_input (AC input) during a run; it was about 56 W with the good charger, 18 W with the weak one.
+  Total system power and AC input: /sys/class/hwmon/hwmon1/power{1,2}_input.
+- **A wrong "refuted" outlived its test**: see the register cap note above. A flag recorded as refuted at 128 registers has not been
+  refuted at 80. Occupancy changes what matters.
+

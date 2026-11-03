@@ -8,6 +8,11 @@
 //      * For each global variable, a 32 bit pseudo-pointer
 // A later pass will transform all loads from 32 bit pseudo-pointers into loads
 // from the 64 bit pointer with an offset
+//
+// With `keep_globals` (AGX, whose runtime places a module's variables in its
+// globals buffer) the .const and .global variables stay module variables: a
+// 32-bit address of one is its offset from the 64-bit base (see emit's
+// ConversionKind::AddressOf), which the runtime keeps within 4 GiB of them.
 
 use crate::{
     pass::{
@@ -23,6 +28,7 @@ use rustc_hash::FxHashMap;
 pub(super) fn run<'input>(
     resolver: &mut GlobalStringIdentResolver2<'input>,
     directives: Vec<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>,
+    keep_globals: bool,
 ) -> Result<
     (
         Vec<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>,
@@ -30,7 +36,11 @@ pub(super) fn run<'input>(
     ),
     TranslateError,
 > {
-    let (global_ids, globals) = collect_globals(resolver, &directives)?;
+    let (global_ids, globals) = if keep_globals {
+        (Vec::new(), Vec::new())
+    } else {
+        collect_globals(resolver, &directives)?
+    };
     let mut explicit_args_size_align = Vec::new();
     let directives = directives
         .into_iter()
@@ -40,6 +50,7 @@ pub(super) fn run<'input>(
                 directive,
                 &global_ids,
                 &mut explicit_args_size_align,
+                keep_globals,
             )
             .transpose()
         })
@@ -60,36 +71,22 @@ pub(super) fn collect_globals<'a, 'input>(
     let (ids, globals): (Vec<SpirvWord>, Vec<Global32Bit>) = directives
         .iter()
         .filter_map(|directive| match directive {
+            Directive2::Variable(_, var) if pass_through_variable(var) => None,
+            // .const and .global variables of any scalar, vector or array type whose initializer is immediates
+            // (or none: zeros), as bytes
             Directive2::Variable(
                 _,
                 ast::Variable {
                     info:
                         ast::VariableInfo {
                             align,
-                            v_type:
-                                ast::Type::Array(
-                                    None,
-                                    ast::ScalarType::U8 | ast::ScalarType::B8,
-                                    array_dims,
-                                ),
+                            v_type,
                             state_space: ast::StateSpace::Const | ast::StateSpace::Global,
                             array_init,
                         },
                     name,
                 },
-            ) if array_dims.len() == 1
-                && array_init.iter().all(|x| {
-                    matches!(
-                        x,
-                        RegOrImmediate::Imm(
-                            ptx_parser::ImmediateValue::U64(_) | ptx_parser::ImmediateValue::S64(_)
-                        )
-                    )
-                }) =>
-            {
-                Some(get_global_details(resolver, align, array_init, *name))
-            }
-            Directive2::Variable(_, var) if pass_through_variable(var) => None,
+            ) => Some(get_global_details(resolver, align, v_type, array_init, *name)),
             Directive2::Method(..) => None,
             _ => Some(Err(error_todo())),
         })
@@ -107,6 +104,7 @@ fn pass_through_variable(variable: &Variable<SpirvWord>) -> bool {
 fn get_global_details<'input>(
     resolver: &mut GlobalStringIdentResolver2<'input>,
     align: &Option<u32>,
+    v_type: &ast::Type,
     array_init: &Vec<RegOrImmediate<SpirvWord>>,
     name: SpirvWord,
 ) -> Result<(SpirvWord, Global32Bit), TranslateError> {
@@ -119,15 +117,37 @@ fn get_global_details<'input>(
         .as_ref()
         .ok_or_else(error_unreachable)?
         .to_string();
-    let align = align.unwrap_or(1);
-    let initializer = array_init
-        .iter()
-        .map(|x| match x {
-            RegOrImmediate::Imm(ptx_parser::ImmediateValue::U64(x)) => Ok(*x as u8),
-            RegOrImmediate::Imm(ptx_parser::ImmediateValue::S64(x)) => Ok(*x as u8),
-            _ => Err(error_unreachable()),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let element = match v_type {
+        ast::Type::Scalar(t) | ast::Type::Vector(_, t) | ast::Type::Array(_, t, _) => *t,
+        ast::Type::Texref => return Err(error_todo()),
+    };
+    let size = v_type.layout().ok_or_else(error_todo)?.size();
+    let align = align.unwrap_or(element.layout().align() as u32);
+    // each element little-endian at its type's size; zeros past the initializer (PTX ISA 5.4.4)
+    let width = element.size_of() as usize;
+    let mut initializer = Vec::with_capacity(size);
+    for x in array_init {
+        let bits = match (x, element.kind()) {
+            (RegOrImmediate::Imm(v), ast::ScalarKind::Float) if width == 4 => match v {
+                ptx_parser::ImmediateValue::F32(f) => f.to_bits() as u64,
+                ptx_parser::ImmediateValue::F64(f) => (*f as f32).to_bits() as u64,
+                _ => v.as_u64().ok_or_else(error_todo)?,
+            },
+            (RegOrImmediate::Imm(v), ast::ScalarKind::Float) if width == 8 => match v {
+                ptx_parser::ImmediateValue::F32(f) => (*f as f64).to_bits(),
+                ptx_parser::ImmediateValue::F64(f) => f.to_bits(),
+                _ => v.as_u64().ok_or_else(error_todo)?,
+            },
+            (RegOrImmediate::Imm(v), _) => v.as_u64().ok_or_else(error_todo)?,
+            // (addresses of other variables)
+            _ => return Err(error_todo()),
+        };
+        initializer.extend_from_slice(&bits.to_le_bytes()[..width]);
+    }
+    if initializer.len() > size {
+        return Err(error_todo());
+    }
+    initializer.resize(size, 0);
     Ok((
         name,
         Global32Bit {
@@ -143,9 +163,10 @@ fn run_directive<'input>(
     directive: Directive2<ast::Instruction<SpirvWord>, SpirvWord>,
     globals_ids: &[SpirvWord],
     explicit_args_size_align: &mut Vec<(String, Vec<(u32, u32)>)>,
+    keep_globals: bool,
 ) -> Result<Option<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>, TranslateError> {
     Ok(match directive {
-        Directive2::Variable(linking, varinfo) if pass_through_variable(&varinfo) => {
+        Directive2::Variable(linking, varinfo) if keep_globals || pass_through_variable(&varinfo) => {
             Some(Directive2::Variable(linking, varinfo))
         }
         Directive2::Method(method) => Some(Directive2::Method(run_method(

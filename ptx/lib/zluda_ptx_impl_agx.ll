@@ -218,7 +218,8 @@ define i32 @__zluda_ptx_impl_activemask() #2 {
   ret i32 %m
 }
 
-; Bit field extract and insert, with PTX's clamping of position and length.
+; Bit field extract and insert, with PTX's clamping of position and length: "pos = b & 0xff; len = c & 0xff" for
+; every type, 64-bit ones included (PTX ISA 9.7.1.20 bfe, 9.7.1.21 bfi).
 define i32 @__zluda_ptx_impl_bfe_u32(i32 %base, i32 %pos32, i32 %len32) #0 {
   %pos = and i32 %pos32, 255
   %len = and i32 %len32, 255
@@ -233,7 +234,9 @@ define i32 @__zluda_ptx_impl_bfe_u32(i32 %base, i32 %pos32, i32 %len32) #0 {
   ret i32 %r
 }
 
-define i64 @__zluda_ptx_impl_bfe_u64(i64 %base, i32 %pos, i32 %len) #0 {
+define i64 @__zluda_ptx_impl_bfe_u64(i64 %base, i32 %pos32, i32 %len32) #0 {
+  %pos = and i32 %pos32, 255
+  %len = and i32 %len32, 255
   %pos64 = zext i32 %pos to i64
   %len64 = zext i32 %len to i64
   %pos.big = icmp uge i32 %pos, 64
@@ -268,7 +271,9 @@ define i32 @__zluda_ptx_impl_bfe_s32(i32 %base, i32 %pos32, i32 %len32) #0 {
   ret i32 %r
 }
 
-define i64 @__zluda_ptx_impl_bfe_s64(i64 %base, i32 %pos, i32 %len) #0 {
+define i64 @__zluda_ptx_impl_bfe_s64(i64 %base, i32 %pos32, i32 %len32) #0 {
+  %pos = and i32 %pos32, 255
+  %len = and i32 %len32, 255
   %len.zero = icmp eq i32 %len, 0
   %pos.big = icmp uge i32 %pos, 64
   %sign = ashr i64 %base, 63
@@ -309,7 +314,9 @@ define i32 @__zluda_ptx_impl_bfi_b32(i32 %insert, i32 %base, i32 %pos32, i32 %le
   ret i32 %r
 }
 
-define i64 @__zluda_ptx_impl_bfi_b64(i64 %insert, i64 %base, i32 %pos, i32 %len) #0 {
+define i64 @__zluda_ptx_impl_bfi_b64(i64 %insert, i64 %base, i32 %pos32, i32 %len32) #0 {
+  %pos = and i32 %pos32, 255
+  %len = and i32 %len32, 255
   %pos.big = icmp uge i32 %pos, 64
   %len.big = icmp uge i32 %len, 64
   %pos64 = zext i32 %pos to i64
@@ -441,6 +448,40 @@ define i32 @__zluda_ptx_impl_sreg_aggr_smem_size() #3 {
   %t = call i32 @__zluda_ptx_impl_sreg_total_smem_size()
   %v = add i32 %t, 1024
   ret i32 %v
+}
+
+; Per-CTA global memory (PTX ISA 10.34, 10.35, 11.4.10). A kernel with .minperctamemory takes the base of the
+; launch's per-CTA region in its hidden argument "agx-hidden"="perctamemory:<size>" (the record's extension 8) and
+; stores it and the slice size (the directive's bytes rounded up to 1024) here; CTA c (x fastest) has the slice at
+; base + c * size.
+@__zluda_agx_percta_base = addrspace(3) global i64 undef, align 8
+@__zluda_agx_percta_size = addrspace(3) global i32 undef, align 4
+
+define i32 @__zluda_ptx_impl_sreg_perctamemorysize() #3 {
+  %v = load i32, ptr addrspace(3) @__zluda_agx_percta_size, align 4
+  ret i32 %v
+}
+define i64 @__zluda_ptx_impl_sreg_perctamemoryoffset() #3 {
+  %base = load i64, ptr addrspace(3) @__zluda_agx_percta_base, align 8
+  %size = load i32, ptr addrspace(3) @__zluda_agx_percta_size, align 4
+  %x = call i32 @__zluda_ptx_impl_sreg_ctaid(i8 0)
+  %y = call i32 @__zluda_ptx_impl_sreg_ctaid(i8 1)
+  %z = call i32 @__zluda_ptx_impl_sreg_ctaid(i8 2)
+  %nx = call i32 @__zluda_ptx_impl_sreg_nctaid(i8 0)
+  %ny = call i32 @__zluda_ptx_impl_sreg_nctaid(i8 1)
+  %x64 = zext i32 %x to i64
+  %y64 = zext i32 %y to i64
+  %z64 = zext i32 %z to i64
+  %nx64 = zext i32 %nx to i64
+  %ny64 = zext i32 %ny to i64
+  %zy = mul i64 %z64, %ny64
+  %row = add i64 %zy, %y64
+  %rows = mul i64 %row, %nx64
+  %c = add i64 %rows, %x64
+  %size64 = zext i32 %size to i64
+  %off = mul i64 %c, %size64
+  %v = add i64 %base, %off
+  ret i64 %v
 }
 
 define i32 @__zluda_ptx_impl_mapa_shared_u32(i32 %addr, i32 %rank) #0 {

@@ -1,0 +1,48 @@
+// Per-CTA global memory (PTX ISA 9.4 10.34, 10.35, 11.4.10) over a 2-D grid: .minperctamemory 1024 gives slices of
+// 1024 bytes (the size, a multiple of 1024), CTA (x, y) at slice x + 3 * y. Every thread of a CTA fills its word of
+// the slice, the CTA synchronizes, and thread 0 sums the slice: the CTA's own words only, so the slices are disjoint.
+.version 9.4
+.target sm_90
+.address_size 64
+.visible .entry k(.param .u64 po) .minperctamemory 1024
+{
+    .reg .b64 %o, %off, %a, %first; .reg .b32 %sz, %t, %cx, %cy, %c, %v, %s, %i; .reg .pred %p;
+    ld.param.u64 %o, [po];
+    mov.u32 %sz, %perctamemorysize;
+    mov.u64 %off, %perctamemoryoffset;
+    mov.u32 %t, %tid.x;
+    mov.u32 %cx, %ctaid.x;
+    mov.u32 %cy, %ctaid.y;
+    mad.lo.u32 %c, %cy, 3, %cx;              // the CTA's linear index
+    mad.lo.u32 %v, %c, 1000, %t;             // its threads' values
+    mul.wide.u32 %a, %t, 4;
+    add.u64 %a, %off, %a;
+    st.global.u32 [%a], %v;
+    bar.sync 0;
+    setp.ne.u32 %p, %t, 0;
+    @%p bra $done;
+    mov.u32 %s, 0;
+    mov.u32 %i, 0;
+$sum:
+    mul.wide.u32 %a, %i, 4;
+    add.u64 %a, %off, %a;
+    ld.global.u32 %v, [%a];
+    add.u32 %s, %s, %v;
+    add.u32 %i, %i, 1;
+    setp.lt.u32 %p, %i, 8;
+    @%p bra $sum;
+    // the slice's distance from CTA 0's: c * size
+    mul.wide.u32 %first, %c, %sz;
+    sub.u64 %first, %off, %first;
+    mul.wide.u32 %a, %c, 16;
+    add.u64 %o, %o, %a;
+    cvt.u32.u64 %v, %first;
+    and.b32 %v, %v, 1023;
+    st.global.v4.u32 [%o], {%sz, %s, %c, %v};
+$done:
+    ret;
+}
+.buffer OUT .u32 [24];
+.launch k <<< (3, 2, 1), 8 >>> (OUT);
+// sum of c * 1000 + t over t < 8: 8000 c + 28
+.expect OUT .u32 = { 1024, 28, 0, 0, 1024, 8028, 1, 0, 1024, 16028, 2, 0, 1024, 24028, 3, 0, 1024, 32028, 4, 0, 1024, 40028, 5, 0 };

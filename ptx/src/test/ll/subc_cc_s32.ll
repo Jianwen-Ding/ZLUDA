@@ -35,23 +35,22 @@ define amdgpu_kernel void @subc_cc_s32(ptr addrspace(4) byref(i64) %"49", ptr ad
   %13 = call { i32, i1 } @llvm.usub.with.overflow.i32(i32 %11, i32 %12)
   %14 = extractvalue { i32, i1 } %13, 0
   %15 = extractvalue { i32, i1 } %13, 1
-  %16 = xor i1 %15, true
-  store i1 %16, ptr addrspace(5) %__ZLUDA_REG_CC_CF, align 1
+  store i1 %15, ptr addrspace(5) %__ZLUDA_REG_CC_CF, align 1
   store i32 %14, ptr addrspace(5) %"53", align 4
-  %17 = load i1, ptr addrspace(5) %__ZLUDA_REG_CC_CF, align 1
-  %18 = zext i1 %17 to i32
-  %19 = add i32 0, %18
-  store i32 %19, ptr addrspace(5) %"54", align 4
-  %20 = load i32, ptr addrspace(5) %"53", align 4
-  %21 = load i32, ptr addrspace(5) %"54", align 4
-  %22 = insertelement <2 x i32> undef, i32 %20, i8 0
-  %"47" = insertelement <2 x i32> %22, i32 %21, i8 1
+  %16 = load i1, ptr addrspace(5) %__ZLUDA_REG_CC_CF, align 1
+  %17 = zext i1 %16 to i32
+  %18 = add i32 0, %17
+  store i32 %18, ptr addrspace(5) %"54", align 4
+  %19 = load i32, ptr addrspace(5) %"53", align 4
+  %20 = load i32, ptr addrspace(5) %"54", align 4
+  %21 = insertelement <2 x i32> undef, i32 %19, i8 0
+  %"47" = insertelement <2 x i32> %21, i32 %20, i8 1
   %"80" = bitcast <2 x i32> %"47" to i64
   store i64 %"80", ptr addrspace(5) %"55", align 8
-  %23 = load i64, ptr addrspace(5) %"52", align 8
-  %24 = load i64, ptr addrspace(5) %"55", align 8
-  %"81" = inttoptr i64 %23 to ptr
-  store i64 %24, ptr %"81", align 8
+  %22 = load i64, ptr addrspace(5) %"52", align 8
+  %23 = load i64, ptr addrspace(5) %"55", align 8
+  %"81" = inttoptr i64 %22 to ptr
+  store i64 %23, ptr %"81", align 8
   ret void
 }
 

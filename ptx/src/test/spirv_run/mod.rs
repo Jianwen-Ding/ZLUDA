@@ -185,7 +185,8 @@ test_ptx!(
     [0x62D0B1FDu32, 0xB632D4DFu32],
     [0x1190386DDu64]
 );
-test_ptx!(subc_cc_s32, [0x627ADF75u32, 0x864CCEF5u32], [3694006400u64]);
+// sub.cc writes the borrow-out into CC.CF (PTX ISA 9.7.2.3): a < b, so addc reads 1.
+test_ptx!(subc_cc_s32, [0x627ADF75u32, 0x864CCEF5u32], [7988973696u64]);
 test_ptx!(
     mul24_lo_u32,
     [0b01110101_01010101_01010101u32],

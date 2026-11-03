@@ -68,66 +68,60 @@ define amdgpu_kernel void @sub_extended(ptr addrspace(4) byref(i64) %"70", ptr a
   %22 = call { i32, i1 } @llvm.usub.with.overflow.i32(i32 %20, i32 %21)
   %23 = extractvalue { i32, i1 } %22, 0
   %24 = extractvalue { i32, i1 } %22, 1
-  %25 = xor i1 %24, true
-  store i1 %25, ptr addrspace(5) %__ZLUDA_REG_CC_CF, align 1
+  store i1 %24, ptr addrspace(5) %__ZLUDA_REG_CC_CF, align 1
   store i32 %23, ptr addrspace(5) %"82", align 4
-  %26 = load i32, ptr addrspace(5) %"75", align 4
-  %27 = load i32, ptr addrspace(5) %"79", align 4
-  %28 = load i1, ptr addrspace(5) %__ZLUDA_REG_CC_CF, align 1
-  %29 = xor i1 %28, true
-  %30 = zext i1 %29 to i32
-  %31 = call { i32, i1 } @llvm.usub.with.overflow.i32(i32 %26, i32 %27)
-  %32 = extractvalue { i32, i1 } %31, 0
-  %33 = extractvalue { i32, i1 } %31, 1
-  %34 = call { i32, i1 } @llvm.usub.with.overflow.i32(i32 %32, i32 %30)
-  %35 = extractvalue { i32, i1 } %34, 0
-  %36 = extractvalue { i32, i1 } %34, 1
-  %37 = or i1 %33, %36
-  %38 = xor i1 %37, true
-  store i1 %38, ptr addrspace(5) %__ZLUDA_REG_CC_CF, align 1
-  store i32 %35, ptr addrspace(5) %"83", align 4
-  %39 = load i32, ptr addrspace(5) %"76", align 4
-  %40 = load i32, ptr addrspace(5) %"80", align 4
-  %41 = load i1, ptr addrspace(5) %__ZLUDA_REG_CC_CF, align 1
-  %42 = xor i1 %41, true
-  %43 = zext i1 %42 to i32
-  %44 = call { i32, i1 } @llvm.usub.with.overflow.i32(i32 %39, i32 %40)
-  %45 = extractvalue { i32, i1 } %44, 0
-  %46 = extractvalue { i32, i1 } %44, 1
-  %47 = call { i32, i1 } @llvm.usub.with.overflow.i32(i32 %45, i32 %43)
-  %48 = extractvalue { i32, i1 } %47, 0
-  %49 = extractvalue { i32, i1 } %47, 1
-  %50 = or i1 %46, %49
-  %51 = xor i1 %50, true
-  store i1 %51, ptr addrspace(5) %__ZLUDA_REG_CC_CF, align 1
-  store i32 %48, ptr addrspace(5) %"84", align 4
-  %52 = load i32, ptr addrspace(5) %"77", align 4
-  %53 = load i32, ptr addrspace(5) %"81", align 4
-  %54 = sub i32 %52, %53
-  %55 = load i1, ptr addrspace(5) %__ZLUDA_REG_CC_CF, align 1
-  %56 = xor i1 %55, true
-  %57 = zext i1 %56 to i32
-  %58 = sub i32 %54, %57
-  store i32 %58, ptr addrspace(5) %"85", align 4
-  %59 = load i64, ptr addrspace(5) %"73", align 8
-  %60 = load i32, ptr addrspace(5) %"82", align 4
-  %"132" = inttoptr i64 %59 to ptr
-  store i32 %60, ptr %"132", align 4
-  %61 = load i64, ptr addrspace(5) %"73", align 8
-  %"133" = inttoptr i64 %61 to ptr
+  %25 = load i32, ptr addrspace(5) %"75", align 4
+  %26 = load i32, ptr addrspace(5) %"79", align 4
+  %27 = load i1, ptr addrspace(5) %__ZLUDA_REG_CC_CF, align 1
+  %28 = zext i1 %27 to i32
+  %29 = call { i32, i1 } @llvm.usub.with.overflow.i32(i32 %25, i32 %26)
+  %30 = extractvalue { i32, i1 } %29, 0
+  %31 = extractvalue { i32, i1 } %29, 1
+  %32 = call { i32, i1 } @llvm.usub.with.overflow.i32(i32 %30, i32 %28)
+  %33 = extractvalue { i32, i1 } %32, 0
+  %34 = extractvalue { i32, i1 } %32, 1
+  %35 = or i1 %31, %34
+  store i1 %35, ptr addrspace(5) %__ZLUDA_REG_CC_CF, align 1
+  store i32 %33, ptr addrspace(5) %"83", align 4
+  %36 = load i32, ptr addrspace(5) %"76", align 4
+  %37 = load i32, ptr addrspace(5) %"80", align 4
+  %38 = load i1, ptr addrspace(5) %__ZLUDA_REG_CC_CF, align 1
+  %39 = zext i1 %38 to i32
+  %40 = call { i32, i1 } @llvm.usub.with.overflow.i32(i32 %36, i32 %37)
+  %41 = extractvalue { i32, i1 } %40, 0
+  %42 = extractvalue { i32, i1 } %40, 1
+  %43 = call { i32, i1 } @llvm.usub.with.overflow.i32(i32 %41, i32 %39)
+  %44 = extractvalue { i32, i1 } %43, 0
+  %45 = extractvalue { i32, i1 } %43, 1
+  %46 = or i1 %42, %45
+  store i1 %46, ptr addrspace(5) %__ZLUDA_REG_CC_CF, align 1
+  store i32 %44, ptr addrspace(5) %"84", align 4
+  %47 = load i32, ptr addrspace(5) %"77", align 4
+  %48 = load i32, ptr addrspace(5) %"81", align 4
+  %49 = sub i32 %47, %48
+  %50 = load i1, ptr addrspace(5) %__ZLUDA_REG_CC_CF, align 1
+  %51 = zext i1 %50 to i32
+  %52 = sub i32 %49, %51
+  store i32 %52, ptr addrspace(5) %"85", align 4
+  %53 = load i64, ptr addrspace(5) %"73", align 8
+  %54 = load i32, ptr addrspace(5) %"82", align 4
+  %"132" = inttoptr i64 %53 to ptr
+  store i32 %54, ptr %"132", align 4
+  %55 = load i64, ptr addrspace(5) %"73", align 8
+  %"133" = inttoptr i64 %55 to ptr
   %"64" = getelementptr inbounds i8, ptr %"133", i64 4
-  %62 = load i32, ptr addrspace(5) %"83", align 4
-  store i32 %62, ptr %"64", align 4
-  %63 = load i64, ptr addrspace(5) %"73", align 8
-  %"134" = inttoptr i64 %63 to ptr
+  %56 = load i32, ptr addrspace(5) %"83", align 4
+  store i32 %56, ptr %"64", align 4
+  %57 = load i64, ptr addrspace(5) %"73", align 8
+  %"134" = inttoptr i64 %57 to ptr
   %"66" = getelementptr inbounds i8, ptr %"134", i64 8
-  %64 = load i32, ptr addrspace(5) %"84", align 4
-  store i32 %64, ptr %"66", align 4
-  %65 = load i64, ptr addrspace(5) %"73", align 8
-  %"135" = inttoptr i64 %65 to ptr
+  %58 = load i32, ptr addrspace(5) %"84", align 4
+  store i32 %58, ptr %"66", align 4
+  %59 = load i64, ptr addrspace(5) %"73", align 8
+  %"135" = inttoptr i64 %59 to ptr
   %"68" = getelementptr inbounds i8, ptr %"135", i64 12
-  %66 = load i32, ptr addrspace(5) %"85", align 4
-  store i32 %66, ptr %"68", align 4
+  %60 = load i32, ptr addrspace(5) %"85", align 4
+  store i32 %60, ptr %"68", align 4
   ret void
 }
 

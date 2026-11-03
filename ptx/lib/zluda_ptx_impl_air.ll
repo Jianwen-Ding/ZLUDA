@@ -247,6 +247,7 @@ umax:
 ; fast reciprocal that AGX reads back, so rcp is __zluda_air.fast.rcp.f32, which
 ; LLVMZludaAirStaticRounding makes an afn 1 / x once the inlining is done.
 declare float @llvm.sqrt.f32(float)
+declare float @llvm.fabs.f32(float)
 declare float @air.fast_exp2.f32(float)
 declare float @air.fast_log2.f32(float)
 declare float @air.fast_sin.f32(float)
@@ -264,13 +265,21 @@ define float @__zluda_air.rsqrt.f32(float %x) #0 {
   %r = call afn float @air.fast_rsqrt.f32(float %x)
   ret float %r
 }
-; (--strict-fp: a square root and a division, whose NaNs the strict mode
-; makes canonical; rsqrt.approx.f32 without .ftz calls it through
-; __zluda_ptx_impl_rsqrt_approx_ieee_f32)
+; (--strict-fp: rsqrt.approx.f32 without .ftz, through
+; __zluda_ptx_impl_rsqrt_approx_ieee_f32, takes subnormal inputs: those scaled
+; by 2^24 into the normal range, whose rsqrt is 2^-12 times theirs, so the
+; scaling back by 2^12 is exact and the hardware's error is kept, within PTX's
+; 2^-22.9 (ISA 9.7.3.19). An approximate square root and division compounded
+; past it: 2^-22.8 relative. Zeros give their infinities alike)
 define float @__zluda_air.rsqrt.ieee.f32(float %x) #0 {
-  %s = call afn float @llvm.sqrt.f32(float %x)
-  %r = fdiv afn float 1.0, %s
-  ret float %r
+  %a = call float @llvm.fabs.f32(float %x)
+  %small = fcmp olt float %a, 0x3810000000000000
+  %scaled = fmul float %x, 0x4170000000000000
+  %in = select i1 %small, float %scaled, float %x
+  %r = call afn float @air.fast_rsqrt.f32(float %in)
+  %back = fmul float %r, 0x40B0000000000000
+  %out = select i1 %small, float %back, float %r
+  ret float %out
 }
 define float @__zluda_ptx_impl_rsqrt_approx_ieee_f32(float %x) #0 {
   %r = call float @__zluda_air.rsqrt.ieee.f32(float %x)

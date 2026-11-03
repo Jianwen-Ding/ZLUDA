@@ -1363,7 +1363,28 @@ static bool zludaIsBufferGlobal(GlobalVariable &GV)
         return false;
     if (GV.getAddressSpace() == 1)
         return true;
-    return GV.getAddressSpace() == 2 && zludaAddressEscapes(&GV);
+    if (GV.getAddressSpace() != 2)
+        return false;
+    if (zludaAddressEscapes(&GV))
+        return true;
+    // an initializer holding another variable's address (.const .u64 p[2] = { x, y }, PTX ISA 5.4.4): the address
+    // is the buffer's, known when it is, so the variable is in the buffer with its relocations
+    if (!GV.hasInitializer())
+        return false;
+    SmallVector<const Constant *, 16> work{GV.getInitializer()};
+    SmallPtrSet<const Constant *, 16> seen;
+    while (!work.empty())
+    {
+        const Constant *C = work.pop_back_val();
+        if (!seen.insert(C).second)
+            continue;
+        if (isa<GlobalVariable>(C))
+            return true;
+        for (const Use &U : C->operands())
+            if (auto *O = dyn_cast<Constant>(U.get()))
+                work.push_back(O);
+    }
+    return false;
 }
 
 // Replaces the uses in F of Old, a variable in address space 1 or 2, with
@@ -1855,7 +1876,13 @@ int LLVMZludaAirGlobalsToBuffer(LLVMModuleRef M, char **json, char **error)
     {
         GV->removeDeadConstantUsers();
         if (!GV->use_empty())
-            return fail(GV->getName().str() + " is used outside the kernels (in another variable's initializer?)");
+        {
+            std::string what;
+            raw_string_ostream os(what);
+            GV->user_back()->print(os);
+            return fail(GV->getName().str() + " is used outside the kernels (in another variable's initializer?): " +
+                        os.str());
+        }
         GV->eraseFromParent();
     }
     *json = LLVMCreateMessage(out.c_str());
@@ -2871,6 +2898,92 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
         if (Rcp->use_empty())
             Rcp->eraseFromParent();
     }
+    // A function whose operations take the mode it is called in (add.rp.f32 in a .func, whose caller sets the
+    // rounding before the call) inlined where it is called directly, as the kernels' others were: the mode then
+    // reaches its operations.
+    {
+        auto readsMode = [&](Function &F) {
+            for (Instruction &I : instructions(F))
+                if (auto *CI = dyn_cast<CallInst>(&I))
+                {
+                    if (Get && CI->getCalledFunction() == Get)
+                        return true;
+                    if (auto *C = dyn_cast<ConstrainedFPIntrinsic>(CI); C && C->getRoundingMode() == RoundingMode::Dynamic)
+                        return true;
+                }
+            return false;
+        };
+        for (unsigned round = 0; round < 8; round++)
+        {
+            SmallVector<CallInst *, 16> calls;
+            for (Function &F : *Mod)
+                if (!F.isDeclaration() && !F.hasFnAttribute("air-kernel") &&
+                    readsMode(F))
+                    for (User *U : F.users())
+                        if (auto *CI = dyn_cast<CallInst>(U); CI && CI->getCalledFunction() == &F && CI->getFunction() != &F)
+                            calls.push_back(CI);
+            if (calls.empty())
+                break;
+            for (CallInst *CI : calls)
+            {
+                InlineFunctionInfo IFI;
+                InlineFunction(*CI, IFI);
+            }
+        }
+        // The ones still called (recursive functions, and those calling them) take the caller's mode as a last
+        // argument instead, which starts their mode: each call passes the mode at the call (a get of it, which
+        // makes the caller one of them too, up to the kernels)
+        for (bool again = true; again;)
+        {
+            again = false;
+            SmallVector<Function *, 4> work;
+            for (Function &F : *Mod)
+                if (!F.isDeclaration() && !F.hasFnAttribute("air-kernel") && !F.hasFnAttribute("zluda-fpmode-arg") &&
+                    readsMode(F) && !F.use_empty() &&
+                    all_of(F.users(), [&](User *U) {
+                        auto *CI = dyn_cast<CallInst>(U);
+                        return CI && CI->getCalledFunction() == &F;
+                    }))
+                    work.push_back(&F);
+            if (work.empty())
+                break;
+            if (!Get)
+                Get = Function::Create(FunctionType::get(Type::getInt32Ty(Ctx), false), GlobalValue::ExternalLinkage,
+                                       "__zluda_air.get.fpmode", Mod);
+            for (Function *F : work)
+            {
+                SmallVector<Type *, 8> params(F->getFunctionType()->params());
+                params.push_back(Type::getInt32Ty(Ctx));
+                Function *NF = Function::Create(FunctionType::get(F->getReturnType(), params, false), F->getLinkage(),
+                                                F->getAddressSpace(), "", Mod);
+                NF->copyAttributesFrom(F);
+                NF->addFnAttr("zluda-fpmode-arg");
+                NF->splice(NF->begin(), F);
+                for (unsigned i = 0; i < F->arg_size(); i++)
+                {
+                    F->getArg(i)->replaceAllUsesWith(NF->getArg(i));
+                    NF->getArg(i)->takeName(F->getArg(i));
+                }
+                NF->getArg(F->arg_size())->setName("fpmode.in");
+                NF->takeName(F);
+                for (User *U : make_early_inc_range(F->users()))
+                {
+                    auto *CI = cast<CallInst>(U);
+                    IRBuilder<> B(CI);
+                    SmallVector<Value *, 8> args(CI->args());
+                    args.push_back(B.CreateCall(Get));
+                    CallInst *New = B.CreateCall(NF, args);
+                    New->setCallingConv(CI->getCallingConv());
+                    New->setAttributes(CI->getAttributes());
+                    New->takeName(CI);
+                    CI->replaceAllUsesWith(New);
+                    CI->eraseFromParent();
+                }
+                F->eraseFromParent();
+                again = true;
+            }
+        }
+    }
     for (Function &F : *Mod)
     {
         if (F.isDeclaration())
@@ -2898,11 +3011,17 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
             auto denorm = F.getDenormalMode(sem);
             return denorm.Output != DenormalMode::IEEE && denorm.Output != DenormalMode::Dynamic;
         };
-        // Function attributes supply only the entry mode. A later PTX mode change may preserve
-        // subnormals even when the function's most common mode flushes them.
+        // Function attributes supply only the entry mode (round to nearest, and the function's denormal modes: the
+        // front end writes a kernel's first mode, .ftz or not, as its denormal mode, and a later mode as a set of
+        // all the bits). A function taking its caller's mode (see above) starts in that mode instead.
         uint32_t initialMode = 1 | (1 << 2) | (flushes(APFloat::IEEEsingle()) ? 0x10 : 0) |
                                (flushes(APFloat::IEEEhalf()) ? 0x20 : 0);
-        Entry.CreateStore(ConstantInt::get(I32, initialMode), mode);
+        bool ftz32 = initialMode & 0x10, ftz16 = initialMode & 0x20;
+        Entry.CreateStore(F.hasFnAttribute("zluda-fpmode-arg")
+                              ? static_cast<Value *>(F.getArg(F.arg_size() - 1))
+                              : ConstantInt::get(I32, initialMode),
+                          mode);
+        F.removeFnAttr("zluda-fpmode-arg");
         for (CallInst *CI : sets)
         {
             new StoreInst(CI->getArgOperand(0), mode, CI->getIterator());
@@ -2935,20 +3054,38 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
                     }
         }
         ZludaModeFields solved;
-        // Strict f32 emulation must not leave a function-wide FTZ attribute overriding an
-        // instruction that restores IEEE mode. Keep all-FTZ functions on their existing fast path.
-        if (strict && (initialMode & 0x10)) {
-            bool needsIEEE = llvm::any_of(ops, [&](ConstrainedFPIntrinsic *C) {
-                if (!C->getType()->getScalarType()->isFloatTy())
-                    return false;
-                auto bit = zludaModeField(at[C]->getOperand(0), 0x10, solved);
-                return !bit || !*bit;
-            });
-            if (needsIEEE) {
-                auto env = F.getDenormalFPEnv();
+        // A function flushing denormals where an operation keeps them (div.rn.f32 after mul.ftz.f32): AGX has no
+        // denormal mode to switch, so the function keeps them, and its .ftz operations flush explicitly. For f32
+        // only in strict mode (IEEE f32 emulation): elsewhere the hardware flushes f32 anyway, and all-FTZ functions
+        // stay on their fast path.
+        auto flushTypeOf = [](ConstrainedFPIntrinsic *C) {
+            Type *T = C->getType();
+            if (C->getType()->isFPOrFPVectorTy() && C->arg_size() > 0 &&
+                C->getArgOperand(0)->getType()->isFPOrFPVectorTy())
+                T = C->getArgOperand(0)->getType();
+            return T->getScalarType();
+        };
+        bool keep32 = false, keep16 = false;
+        for (ConstrainedFPIntrinsic *C : ops)
+        {
+            Type *scalar = flushTypeOf(C);
+            if (!scalar->isHalfTy() && !scalar->isFloatTy())
+                continue;
+            bool half = scalar->isHalfTy();
+            auto f = zludaModeField(at[C]->getOperand(0), half ? 0x20 : 0x10, solved);
+            if (!f || !*f)
+                (half ? keep16 : keep32) = true;
+        }
+        keep32 = keep32 && strict;
+        if ((keep32 && ftz32) || (keep16 && ftz16))
+        {
+            DenormalFPEnv env = F.getDenormalFPEnv();
+            if (keep32 && ftz32)
                 env.F32Mode = DenormalMode::getIEEE();
-                F.addFnAttrs(AttrBuilder(Ctx).addDenormalFPEnvAttr(env));
-            }
+            if (keep16 && ftz16)
+                env.DefaultMode = DenormalMode::getIEEE();
+            F.removeFnAttr(Attribute::DenormalFPEnv);
+            F.addFnAttr(Attribute::get(Ctx, Attribute::DenormalFPEnv, env.toIntValue()));
         }
         for (ConstrainedFPIntrinsic *C : ops)
         {
@@ -2979,11 +3116,8 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
                 uint64_t bit = half ? 0x20 : 0x10;
                 unsigned width = half ? 16 : 32;
                 uint64_t expMask = half ? 0x7c00 : 0x7f800000, signMask = half ? 0x8000 : 0x80000000;
+                // (the function's own denormal mode is the mode's initial bits)
                 auto flushBit = zludaModeField(m, bit, solved);
-                // (the front end writes .ftz as the function's denormal mode, preserve-sign)
-                if (F.getDenormalMode(half ? APFloat::IEEEhalf() : APFloat::IEEEsingle()).Output !=
-                    DenormalMode::IEEE)
-                    flushBit = bit;
                 // An f32 operation rounding to nearest is the hardware's, which flushes f32 denormals itself unless
                 // strict mode keeps them (IEEE f32 emulation): flushed here only in strict mode or for the directed
                 // roundings, whose software emulation keeps denormals. (Flushed always, Blender Cycles' .ftz

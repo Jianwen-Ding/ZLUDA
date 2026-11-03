@@ -29,7 +29,7 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
-HARNESS = ('.buffer', '.launch', '.cooplaunch', '.print', '.expect', '.patch', '.append',
+HARNESS = ('.buffer', '.launch', '.cooplaunch', '.print', '.expect', '.expectbound', '.patch', '.append',
            '.tensormap', '.texture', '.sampler', '.surface', '.multimem', '.fabric',
            '.memmodel', '.ub', '.occupancy', '.convergence', '.isacheck')
 IGNORED = ('.print', '.memmodel', '.ub', '.occupancy', '.convergence', '.isacheck')
@@ -50,6 +50,7 @@ MM_WINDOW = 1 << 36
 FAB_TABLE = 0x6ff000000000
 TEX_HEAP = 0x6fe000000000      # hardware texture descriptors (zluda_agx's texture heap)
 SAMPLER_HEAP = 0x6fe100000000  # hardware samplers
+PERCTA_BASE = 0x6fd000000000   # per-CTA global memory (.minperctamemory)
 
 
 class Unsupported(Exception):
@@ -255,6 +256,17 @@ def within_margin(want, got, t, args):
     return args.ulp > 0 and w == w and g == g and abs(ordered(want, t) - ordered(got, t)) <= args.ulp
 
 
+def is_any_nan(want, got, size):
+    """--nan-any: an expected canonical NaN of a 2-, 4- or 8-byte element (0x7fff, 0x7fffffff, 0x7fffffffffffffff, by
+    their bits whatever the element's declared type) and a NaN got of that width, for the results whose NaN PTX
+    leaves unspecified (single and half precision, ISA 8.x; f16 and f32 as such or packed)."""
+    exp = {2: (0x7fff, 0x7c00, 0x3ff), 4: (0x7fffffff, 0x7f800000, 0x7fffff),
+           8: (0x7fffffffffffffff, 0x7ff0000000000000, 0xfffffffffffff)}.get(size)
+    if not exp or want != exp[0]:
+        return False
+    return got & exp[1] == exp[1] and got & exp[2] != 0
+
+
 def dec_float(bits, t):
     if t == 'f32':
         return struct.unpack('<f', struct.pack('<I', bits))[0]
@@ -262,6 +274,8 @@ def dec_float(bits, t):
         return struct.unpack('<d', struct.pack('<Q', bits))[0]
     if t == 'f16':
         return struct.unpack('<e', struct.pack('<H', bits))[0]
+    if t == 'bf16':
+        return struct.unpack('<f', struct.pack('<I', bits << 16))[0]
     raise Unsupported(t)
 
 
@@ -415,8 +429,11 @@ def kernel_info(asm, obj, readelf, objcopy, tmp):
             args = [struct.unpack_from('<3I', d, q + 28 + 12 * i) for i in range(nargs)]
             # tagged extensions up to the record's end: 1 = cluster dimensions, 4 = the hidden threadgroup memory
             # size argument, 5 = the texture heap, 6 = 32-bit constants to preload, 7 = values computed from argument
-            # words (2 and 3 are checked mode's, which the harness does not run)
+            # words, 8 = the hidden per-CTA global memory argument and its slice size (2 and 3 are checked mode's,
+            # which the harness does not run)
             cluster, tgb_half, tex_half, consts, derived, e = (1, 1, 1), None, None, [], [], q + 28 + 12 * nargs
+            percta = None
+            base32_half = None
             while e + 4 <= pos + size:
                 tag, = struct.unpack_from('<I', d, e)
                 if tag == 1 and e + 16 <= pos + size:
@@ -436,15 +453,23 @@ def kernel_info(asm, obj, readelf, objcopy, tmp):
                     n, = struct.unpack_from('<I', d, e + 4)
                     derived = [struct.unpack_from('<3I', d, e + 8 + 12 * i) for i in range(n)]
                     e += 8 + 12 * n
+                elif tag == 8 and e + 12 <= pos + size:
+                    percta = struct.unpack_from('<2I', d, e + 4)
+                    e += 12
+                elif tag == 9 and e + 8 <= pos + size:
+                    base32_half, = struct.unpack_from('<I', d, e + 4)
+                    e += 8
                 else:
                     break
-            records[name] = (halves, tg_half, glob, tg_bytes, args, cluster, tgb_half, tex_half, consts, derived)
+            records[name] = (halves, tg_half, glob, tg_bytes, args, cluster, tgb_half, tex_half, consts, derived, percta,
+                            base32_half)
             pos += size
     kernels = {}
     # a module with called functions (llc -agx-experimental-leaf-calls) has them after every kernel: a kernel's code
     # is then from its symbol to the end of .text, which holds what it calls (as agx_runtime loads it)
     calls = any(v[2] == 'FUNC' and n not in records for n, v in syms.items())
-    for name, (halves, tg_half, glob, tg_bytes, args, cluster, tgb_half, tex_half, consts, derived) in records.items():
+    for name, (halves, tg_half, glob, tg_bytes, args, cluster, tgb_half, tex_half, consts, derived, percta,
+               base32_half) in records.items():
         if name not in syms or syms[name][2] != 'FUNC':
             continue
         off, size = syms[name][0], syms[name][1]
@@ -462,6 +487,10 @@ def kernel_info(asm, obj, readelf, objcopy, tmp):
             'cluster': cluster,
             # the hidden argument set to the threadgroup memory of the launch, static and dynamic bytes
             'tgb_half': None if tgb_half in (None, 0xffffffff) else tgb_half,
+            # (half, slice bytes): the hidden argument set to a region of slice bytes per CTA (extension 8)
+            'percta': percta,
+            # the hidden base of a 32-bit module's addresses (extension 9)
+            'base32_half': base32_half,
             # the texture heap address (extension 5, a module that samples with the texture unit)
             'tex_half': tex_half,
             # (half, value): 32-bit constants the launch preloads (extension 6, llc -agx-uniform-constants)
@@ -541,9 +570,9 @@ def simulate(args, tmp, name, k, ps, ops, grid, block, dyn, syms, mem, globals_m
             halves[half + j] = (value >> (16 * j)) & 0xffff
 
     ps_all = list(zip(ps, ops))
-    if address32:
-        # 32-bit modules take the 64-bit base of their 32-bit addresses as a last parameter; the harness
-        # buffers are below 4 GiB, so it is 0.
+    if address32 and k.get('base32_half') is None:
+        # 32-bit modules take the 64-bit base of their 32-bit addresses as a last parameter (a hidden argument,
+        # extension 9, in newer objects); the harness buffers are below 4 GiB, so it is 0.
         ps_all.append((('u64', 1, 8), '0'))
     if len(k['args']) != len(ps_all):
         raise Unsupported('kernel record argument count')
@@ -578,6 +607,17 @@ def simulate(args, tmp, name, k, ps, ops, grid, block, dyn, syms, mem, globals_m
         put(k['tgb_half'], k['shared'] + dyn, 4)
     if k['tex_half'] is not None:
         put(k['tex_half'], TEX_HEAP, 8)
+    if k.get('base32_half') not in (None, 0xffffffff):
+        put(k['base32_half'], 0, 8)
+    if k['percta'] is not None:
+        # a zeroed region of the slice size per CTA of the grid (CTAs, not the threadgroups of clusters)
+        h, slice_bytes = k['percta']
+        if h != 0xffffffff:
+            put(h, PERCTA_BASE, 8)
+        f_pc = os.path.join(tmp, tag + '.percta.bin')
+        with open(f_pc, 'wb') as f:
+            f.write(b'\0' * max(16, grid[0] * grid[1] * grid[2] * slice_bytes))
+        extra = list(extra) + ['--map', '%#x=%s' % (PERCTA_BASE, f_pc)]
     for h, v in k['consts']:
         put(h, v, 4)
     for h, src, kind in k['derived']:
@@ -646,6 +686,9 @@ def compile_ptx(args, module, tmp, extra=(), env=None, product='m.o', target='ag
             flags.append('--agx-strict')
         # (--arch none: the AIR only, as compiled for Metal alone)
         arch = [] if args.arch == 'none' else ['--arch', args.arch]
+        # (the object alone, as the runtime compiles: the assembly took as long again, 60 s of tex-mip's 170)
+        if arch and product == 'm.o' and not getattr(args, 'keep_asm', False):
+            flags.append('--object-only')
         return subprocess.run([args.zoc, *flags, '--target', target, *arch, '--output-dir', tmp, src],
                               capture_output=True, text=True, timeout=args.timeout, env=env)
     try:
@@ -688,8 +731,8 @@ def run_test(path, args):
         if status:
             return status, detail
         out, rejected, tainted = detail
-        with open(os.path.join(tmp, 'm.asm')) as f:
-            asm = f.read()
+        asm_path = os.path.join(tmp, 'm.asm')
+        asm = open(asm_path).read() if os.path.exists(asm_path) else ''
         kernels, gdata, gsyms, gsizes, relocs = kernel_info(asm, os.path.join(tmp, 'm.o'), args.readelf, args.objcopy, tmp)
         params = kernel_params(module)
 
@@ -859,6 +902,50 @@ def run_test(path, args):
                 if err:
                     return 'SIM-ERROR', err
                 launches += 1
+            elif kw == '.expectbound':
+                # .expectbound NAME .f32 [@ OFF] KIND BOUND = { exact values }: the error bounds the ISA states
+                # for the approximations instead of one admissible result (ZLUDA's tests only: K's harness has
+                # no such directive). KIND is ulp (from the correctly rounded value), rel or abs; BOUND a number
+                # or 2^E; an exact value nan wants any NaN, and an infinite or zero one the same bits
+                m = re.fullmatch(r'\.expectbound ([\w$.]+) \.(f32|f16|bf16)\s*(@\s*(\d+))?\s*(ulp|rel|abs)\s+(\S+)\s*=\s*\{(.*)\}',
+                                 d)
+                if not m:
+                    raise Unsupported('malformed .expectbound')
+                name, t, kind = m.group(1), m.group(2), m.group(5)
+                bound = m.group(6)
+                bound = 2.0 ** float(bound[2:]) if bound.startswith('2^') else float(bound)
+                off = int(m.group(4)) if m.group(4) else 0
+                if name not in syms:
+                    raise Unsupported('.expectbound of unknown symbol ' + name)
+                if skipped_launches and (name in tainted_bufs or name not in bufs):
+                    skipped += 1
+                    continue
+                bad = []
+                for i, v in enumerate(split_vals(m.group(7))):
+                    exact = float(v)
+                    gbits = gread(syms[name] + (off + i) * SIZES[t], SIZES[t])
+                    got = dec_float(gbits, t)
+                    if exact != exact:
+                        ok = got != got
+                    elif math.isinf(exact) or exact == 0 and kind != 'abs':
+                        ok = gbits == enc_float(exact, t)
+                    elif kind == 'ulp':
+                        # (from the rounded value, infinite where the exact one is beyond the format)
+                        ok = got == got and abs(ordered(gbits, t) - ordered(enc_float(exact, t), t)) <= bound
+                    elif got != got or math.isinf(got):
+                        ok = False
+                    elif kind == 'rel':
+                        ok = abs(got - exact) <= bound * abs(exact)
+                    else:
+                        ok = abs(got - exact) <= bound
+                    if not ok:
+                        bad.append('%s[%d] %s, got %#x (%r): %s error over %s' % (
+                            name, off + i, v, gbits, got, kind, m.group(6)))
+                if bad:
+                    failures += bad
+                    args.counts['fail'] += 1
+                else:
+                    passed += 1
             elif kw == '.expect':
                 m = re.fullmatch(r'\.expect ([\w$.]+) \.(\w+)\s*(@\s*(\d+))?\s*=\s*\{(.*)\}', d)
                 t = ty_of(m.group(2))
@@ -876,7 +963,9 @@ def run_test(path, args):
                 for i, v in enumerate(vals):
                     want = lit_bits(v, t, syms)
                     got = gread(syms[name] + (off + i) * SIZES[t], SIZES[t])
-                    if want != got:
+                    if want != got and getattr(args, 'nan_any', False) and is_any_nan(want, got, SIZES[t]):
+                        near = True
+                    elif want != got:
                         if within_margin(want, got, t, args):
                             near = True
                         else:
@@ -922,9 +1011,13 @@ def main():
     ap.add_argument('--ulp', type=int, default=0,
                     help='also accept float results within this many units in the last place (any NaN for a NaN), '
                          'counted apart (PASS~)')
+    ap.add_argument('--nan-any', dest='nan_any', action='store_true',
+                    help='also accept any NaN for an expected canonical NaN (counted as within the margin): the '
+                         'default mode, whose NaNs PTX leaves unspecified')
     ap.add_argument('--flush-ok', dest='flush_ok', action='store_true',
                     help='also accept the same-signed zero for an expected subnormal (the default mode flushes)')
-    ap.add_argument('--timeout', type=int, default=120)
+    ap.add_argument('--timeout', type=int, default=300,
+                    help='seconds per zoc or agx_run run (the software texture sampling of --strict-fp takes ~100 s to compile)')
     ap.add_argument('--max-failures', type=int, default=4, help='failing elements listed per test')
     ap.add_argument('-j', type=int, default=os.cpu_count())
     ap.add_argument('--json', help='write the results to this file')

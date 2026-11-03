@@ -1,0 +1,60 @@
+// .address_size 32 (PTX ISA 6.4.1.1): .global, .const, .shared and .local variables reached through 32-bit generic
+// addresses from cvta, by every thread, with isspacep on each, and the generic address of .shared back to a
+// .shared one (cvta.to.shared).
+.version 7.0
+.target sm_70
+.address_size 32
+.global .u32 g[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+.const .u32 c[2] = { 100, 200 };
+.visible .entry k(.param .u32 po)
+{
+    .reg .b32 %o, %t, %a, %ga, %ca, %sa, %la, %v, %w, %s, %r<8>; .reg .pred %p;
+    .shared .align 4 .b32 sh[8];
+    .local .align 4 .b32 lo[2];
+    ld.param.u32 %o, [po];
+    mov.u32 %t, %tid.x;
+    shl.b32 %a, %t, 2;
+    // .global through a generic address: g[t] += 10
+    mov.u32 %ga, g;
+    cvta.global.u32 %ga, %ga;
+    add.u32 %ga, %ga, %a;
+    ld.u32 %v, [%ga];
+    add.u32 %v, %v, 10;
+    st.u32 [%ga], %v;
+    // .const through a generic address
+    cvta.const.u32 %ca, c;
+    ld.u32 %w, [%ca + 4];
+    // .shared through a generic address, read back by another thread
+    cvta.shared.u32 %sa, sh;
+    add.u32 %r1, %sa, %a;
+    mul.lo.u32 %r2, %t, 3;
+    st.u32 [%r1], %r2;
+    bar.sync 0;
+    xor.b32 %r3, %t, 1;
+    shl.b32 %r3, %r3, 2;
+    add.u32 %r3, %sa, %r3;
+    ld.u32 %s, [%r3];
+    // .local through a generic address
+    cvta.local.u32 %la, lo;
+    st.u32 [%la + 4], %t;
+    ld.u32 %r4, [%la + 4];
+    add.u32 %s, %s, %r4;
+    // the generic shared address as a .shared one
+    cvta.to.shared.u32 %r5, %r3;
+    ld.shared.u32 %r6, [%r5];
+    add.u32 %s, %s, %r6;
+    // isspacep: shared, local, global, const as bits 0-3, and the shared address is not global (bit 4)
+    isspacep.shared %p, %sa;  selp.u32 %r1, 1, 0, %p;
+    isspacep.local %p, %la;   selp.u32 %r2, 2, 0, %p; or.b32 %r1, %r1, %r2;
+    isspacep.global %p, %ga;  selp.u32 %r2, 4, 0, %p; or.b32 %r1, %r1, %r2;
+    isspacep.const %p, %ca;   selp.u32 %r2, 8, 0, %p; or.b32 %r1, %r1, %r2;
+    isspacep.global %p, %sa;  selp.u32 %r2, 16, 0, %p; or.b32 %r1, %r1, %r2;
+    shl.b32 %r7, %t, 4;
+    add.u32 %o, %o, %r7;
+    st.global.v4.u32 [%o], {%v, %w, %s, %r1};
+    ret;
+}
+.buffer OUT .u32 [32];
+.launch k <<< 1, 8 >>> (OUT);
+// thread t: g[t] + 10, c[1], 2 * 3 * (t ^ 1) + t, isspacep bits 0b01111
+.expect OUT .u32 = { 11, 200, 6, 15, 12, 200, 1, 15, 13, 200, 20, 15, 14, 200, 15, 15, 15, 200, 34, 15, 16, 200, 29, 15, 17, 200, 48, 15, 18, 200, 43, 15 };

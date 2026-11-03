@@ -296,6 +296,18 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
         let name = CString::new(name).map_err(|_| error_unreachable())?;
         let mut fn_ = unsafe { LLVMGetNamedFunction(self.module, name.as_ptr()) };
         let threadgroup_bytes = method.is_kernel() && self.threadgroup_bytes_argument;
+        let base32_hidden = (self.target.is_air() && method.is_kernel() && method.kernel_meta32.is_some())
+            .then(|| (method.input_arguments.len() as u32).checked_sub(1))
+            .flatten();
+        // .minperctamemory: the slice size, a multiple of 1024 bytes at least the directive's (PTX ISA 10.35)
+        let percta = (method.is_kernel() && self.target.is_air())
+            .then(|| {
+                method.tuning.iter().find_map(|t| match *t {
+                    ptx_parser::TuningDirective::MinPerCtaMemory(n) => Some((n as u64).div_ceil(1024) * 1024),
+                    _ => None,
+                })
+            })
+            .flatten();
         if fn_ == ptr::null_mut() {
             let i32_type = unsafe { LLVMInt32TypeInContext(self.context) };
             let fn_type = get_function_type(
@@ -305,7 +317,8 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                     .input_arguments
                     .iter()
                     .map(|v| get_input_argument_type(self.context, &v.info.v_type, v.info.state_space))
-                    .chain(threadgroup_bytes.then_some(Ok(i32_type))),
+                    .chain(threadgroup_bytes.then_some(Ok(i32_type)))
+                    .chain(percta.map(|_| Ok(unsafe { LLVMInt64TypeInContext(self.context) }))),
             )?;
             fn_ = unsafe { LLVMAddFunction(self.module, name.as_ptr(), fn_type) };
             self.emit_fn_attribute_string(fn_, "amdgpu-unsafe-fp-atomics", "true");
@@ -396,6 +409,27 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
             if threadgroup_bytes && unsafe { LLVMCountParams(fn_) } as usize > method.input_arguments.len() {
                 self.emit_threadgroup_bytes_argument(fn_, method.input_arguments.len() as u32);
             }
+            // .address_size 32: the base of the 32-bit addresses, the last argument convert_32bit_to_64bit adds, is
+            // a hidden one the runtime sets on AGX (.agx.kernels extension 9)
+            if let Some(index) = base32_hidden {
+                let (key, role) = ("agx-hidden", "address32-base");
+                unsafe {
+                    let attr = LLVMCreateStringAttribute(
+                        self.context,
+                        key.as_ptr().cast(),
+                        key.len() as u32,
+                        role.as_ptr().cast(),
+                        role.len() as u32,
+                    );
+                    LLVMAddAttributeAtIndex(fn_, index + 1, attr);
+                }
+            }
+            if let Some(size) = percta {
+                let index = method.input_arguments.len() as u32 + threadgroup_bytes as u32;
+                if unsafe { LLVMCountParams(fn_) } > index {
+                    self.emit_percta_argument(fn_, index, size);
+                }
+            }
             let base_32bit_memory = method.kernel_meta32.as_ref().map(|m| m.implicit_memory_ptr);
             // instructions before the first .loc are at line 0
             let subprogram = self.debug.as_ref().map(|d| {
@@ -456,6 +490,41 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                 LLVMSetAlignment(global, 4);
             }
             LLVMBuildStore(self.builder.get(), value, global);
+        }
+    }
+
+    // The hidden argument of the per-CTA global memory region's base ("agx-hidden"="perctamemory:<size>", which the
+    // launch sets to grid size * size bytes), stored with the slice size for %perctamemoryoffset and
+    // %perctamemorysize (zluda_ptx_impl_agx.ll)
+    fn emit_percta_argument(&mut self, fn_: LLVMValueRef, index: u32, size: u64) {
+        unsafe {
+            let value = LLVMGetParam(fn_, index);
+            let (key, role) = ("agx-hidden", format!("perctamemory:{size}"));
+            let attr = LLVMCreateStringAttribute(
+                self.context,
+                key.as_ptr().cast(),
+                key.len() as u32,
+                role.as_ptr().cast(),
+                role.len() as u32,
+            );
+            LLVMAddAttributeAtIndex(fn_, index + 1, attr);
+            let space = get_state_space(ast::StateSpace::Shared).unwrap_or(3);
+            for (name, type_, v, align) in [
+                (c"__zluda_agx_percta_base", LLVMInt64TypeInContext(self.context), value, 8),
+                (
+                    c"__zluda_agx_percta_size",
+                    LLVMInt32TypeInContext(self.context),
+                    LLVMConstInt(LLVMInt32TypeInContext(self.context), size, 0),
+                    4,
+                ),
+            ] {
+                let mut global = LLVMGetNamedGlobal(self.module, name.as_ptr());
+                if global.is_null() {
+                    global = LLVMAddGlobalInAddressSpace(self.module, type_, name.as_ptr(), space);
+                    LLVMSetAlignment(global, align);
+                }
+                LLVMBuildStore(self.builder.get(), v, global);
+            }
         }
     }
 
@@ -703,7 +772,8 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                     }
                     ptx_parser::TuningDirective::NoReturn
                     | ptx_parser::TuningDirective::ExplicitCluster
-                    | ptx_parser::TuningDirective::MaxClusterRank(_) => {}
+                    | ptx_parser::TuningDirective::MaxClusterRank(_)
+                    | ptx_parser::TuningDirective::MinPerCtaMemory(_) => {}
                 }
             }
             if let Some(t) = threads {
@@ -737,7 +807,8 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                 // clusters of several CTAs are only implemented for AGX: their instructions are rejected here
                 ptx_parser::TuningDirective::ReqNctaPerCluster(..)
                 | ptx_parser::TuningDirective::ExplicitCluster
-                | ptx_parser::TuningDirective::MaxClusterRank(_) => {}
+                | ptx_parser::TuningDirective::MaxClusterRank(_)
+                | ptx_parser::TuningDirective::MinPerCtaMemory(_) => {}
             }
         }
     }
@@ -1447,7 +1518,13 @@ impl<'a> MethodEmitContext<'a> {
             ConversionKind::BitToPtr => {
                 let src = self.resolver.value(conversion.src)?;
                 let ptr_type = get_pointer_type(self.context, conversion.to_space)?;
-                if let (
+                if let (Some(base32), ast::StateSpace::Generic, true) =
+                    (self.base_32bit_memory, conversion.to_space, self.target.is_air())
+                {
+                    let base = self.resolver.value(base32)?;
+                    let p = self.widen_generic32(src, base)?;
+                    self.resolver.register(conversion.dst, p);
+                } else if let (
                     Some(base32),
                     ast::StateSpace::Global | ast::StateSpace::Generic | ast::StateSpace::Const,
                 ) = (self.base_32bit_memory, conversion.to_space)
@@ -1496,12 +1573,24 @@ impl<'a> MethodEmitContext<'a> {
                 let src = self.resolver.value(conversion.src)?;
                 let dst_type = get_type(self.context, &conversion.to_type)?;
                 if let (
-                    Some(_),
+                    Some(base32),
                     ast::StateSpace::Global | ast::StateSpace::Generic | ast::StateSpace::Const,
                 ) = (self.base_32bit_memory, conversion.to_space)
                 {
-                    // Should never happen because globals are removed
-                    return Err(error_unreachable());
+                    // A module variable of a 32-bit module (kept on AGX, convert_32bit_to_64bit): its offset from
+                    // the base of the module's 32-bit addresses (elsewhere the variables are removed)
+                    if !self.target.is_air() {
+                        return Err(error_unreachable());
+                    }
+                    let i64_type = get_scalar_type(self.context, ast::ScalarType::B64);
+                    let base = self.resolver.value(base32)?;
+                    unsafe {
+                        let p = LLVMBuildPtrToInt(builder, src, i64_type, LLVM_UNNAMED.as_ptr());
+                        let offset = LLVMBuildSub(builder, p, base, LLVM_UNNAMED.as_ptr());
+                        self.resolver.with_result(conversion.dst, |dst| {
+                            LLVMBuildTruncOrBitCast(builder, offset, dst_type, dst)
+                        });
+                    }
                 } else {
                     self.resolver.with_result(conversion.dst, |dst| unsafe {
                         LLVMBuildPtrToInt(builder, src, dst_type, dst)
@@ -1716,17 +1805,13 @@ impl<'a> MethodEmitContext<'a> {
 
     fn emit_load_carry_flag(
         &mut self,
-        reverse_carry: bool,
         type_: ast::ScalarType,
     ) -> Result<LLVMValueRef, TranslateError> {
         let carry_flag = self.get_or_emit_carry_flag()?;
         let builder = self.builder;
         let pred_type = unsafe { LLVMIntTypeInContext(self.context, 1) };
-        let mut load =
+        let load =
             unsafe { LLVMBuildLoad2(builder, pred_type, carry_flag, LLVM_UNNAMED.as_ptr()) };
-        if reverse_carry {
-            load = self.emit_not_impl(pred_type, load);
-        }
         let zext = unsafe {
             LLVMBuildZExt(
                 builder,
@@ -1738,24 +1823,18 @@ impl<'a> MethodEmitContext<'a> {
         Ok(zext)
     }
 
-    fn emit_store_carry_flag(
-        &mut self,
-        reverse_carry: bool,
-        mut value: LLVMValueRef,
-    ) -> Result<(), TranslateError> {
+    fn emit_store_carry_flag(&mut self, value: LLVMValueRef) -> Result<(), TranslateError> {
         let carry_flag = self.get_or_emit_carry_flag()?;
-        if reverse_carry {
-            value = self.emit_not_impl(unsafe { LLVMIntTypeInContext(self.context, 1) }, value);
-        }
         unsafe {
             LLVMBuildStore(self.builder, value, carry_flag);
         };
         Ok(())
     }
 
+    /// `add.cc` / `addc` / `sub.cc` / `subc` / `mad.cc` / `madc`: CC.CF holds the carry of an addition and the borrow
+    /// of a subtraction ("borrow-out written to CC.CF", "d = a - (b + CC.CF)", PTX ISA 9.7.2.3-9.7.2.4).
     fn emit_extended_arithmetic(
         &mut self,
-        reverse_carry: bool,
         op: LLVMOpcode,
         op_name: &str,
         data: ast::CarryDetails,
@@ -1773,7 +1852,7 @@ impl<'a> MethodEmitContext<'a> {
                         self.builder,
                         op,
                         sum,
-                        self.emit_load_carry_flag(reverse_carry, data.type_)?,
+                        self.emit_load_carry_flag(data.type_)?,
                         LLVM_UNNAMED.as_ptr(),
                     )
                 }
@@ -1782,12 +1861,12 @@ impl<'a> MethodEmitContext<'a> {
                 // { sum, overflow } = lhs + rhs
                 let (sum, overflow) =
                     self.emit_binop_with_overflow(&op_name, data.type_, lhs, rhs)?;
-                self.emit_store_carry_flag(reverse_carry, overflow)?;
+                self.emit_store_carry_flag(overflow)?;
                 sum
             }
             ast::CarryKind::CarryInCarryOut => {
                 // { final_sum, final_overflow } = lhs + rhs + carry
-                let carry_in = self.emit_load_carry_flag(reverse_carry, data.type_)?;
+                let carry_in = self.emit_load_carry_flag(data.type_)?;
 
                 let (sum, overflow1) =
                     self.emit_binop_with_overflow(&op_name, data.type_, lhs, rhs)?;
@@ -1796,7 +1875,7 @@ impl<'a> MethodEmitContext<'a> {
                 let final_overflow = unsafe {
                     LLVMBuildOr(self.builder, overflow1, overflow2, LLVM_UNNAMED.as_ptr())
                 };
-                self.emit_store_carry_flag(reverse_carry, final_overflow)?;
+                self.emit_store_carry_flag(final_overflow)?;
                 final_sum
             }
         };
@@ -1811,7 +1890,6 @@ impl<'a> MethodEmitContext<'a> {
         arguments: ast::AddExtendedArgs<SpirvWord>,
     ) -> Result<(), TranslateError> {
         self.emit_extended_arithmetic(
-            false,
             LLVMOpcode::LLVMAdd,
             "uadd",
             data,
@@ -1827,7 +1905,6 @@ impl<'a> MethodEmitContext<'a> {
         arguments: ast::SubExtendedArgs<SpirvWord>,
     ) -> Result<(), TranslateError> {
         self.emit_extended_arithmetic(
-            true,
             LLVMOpcode::LLVMSub,
             "usub",
             data,
@@ -1851,7 +1928,6 @@ impl<'a> MethodEmitContext<'a> {
         let src3 = self.resolver.value(arguments.src3)?;
 
         self.emit_extended_arithmetic(
-            false,
             LLVMOpcode::LLVMAdd,
             "uadd",
             ast::CarryDetails {
@@ -2774,6 +2850,36 @@ impl<'a> MethodEmitContext<'a> {
         Ok(())
     }
 
+    // A 32-bit generic address of .address_size 32 on AGX as a generic pointer: bit 31 tags the shared window and
+    // bit 30 the local one (their offsets in the low 30 bits, see emit_cvta); other addresses are offsets from the
+    // module's 64-bit base.
+    fn widen_generic32(&mut self, a32: LLVMValueRef, base: LLVMValueRef) -> Result<LLVMValueRef, TranslateError> {
+        let b = self.builder;
+        let i8_type = get_scalar_type(self.context, ast::ScalarType::B8);
+        let i32_type = get_scalar_type(self.context, ast::ScalarType::B32);
+        let i64_type = get_scalar_type(self.context, ast::ScalarType::B64);
+        let generic = get_pointer_type(self.context, ast::StateSpace::Generic)?;
+        let shared = get_pointer_type(self.context, ast::StateSpace::Shared)?;
+        let local = get_pointer_type(self.context, ast::StateSpace::Local)?;
+        unsafe {
+            let offset = LLVMBuildAnd(b, a32, LLVMConstInt(i32_type, 0x3fff_ffff, 0), LLVM_UNNAMED.as_ptr());
+            let sh = LLVMBuildIntToPtr(b, offset, shared, LLVM_UNNAMED.as_ptr());
+            let sh = LLVMBuildAddrSpaceCast(b, sh, generic, LLVM_UNNAMED.as_ptr());
+            let lo = LLVMBuildIntToPtr(b, offset, local, LLVM_UNNAMED.as_ptr());
+            let lo = LLVMBuildAddrSpaceCast(b, lo, generic, LLVM_UNNAMED.as_ptr());
+            let base_ptr = LLVMBuildIntToPtr(b, base, generic, LLVM_UNNAMED.as_ptr());
+            let mut index = [LLVMBuildZExt(b, a32, i64_type, LLVM_UNNAMED.as_ptr())];
+            let dev = LLVMBuildInBoundsGEP2(b, i8_type, base_ptr, index.as_mut_ptr(), 1, LLVM_UNNAMED.as_ptr());
+            let bit = |mask: u64| {
+                let m = LLVMBuildAnd(b, a32, LLVMConstInt(i32_type, mask, 0), LLVM_UNNAMED.as_ptr());
+                LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntNE, m, LLVMConstInt(i32_type, 0, 0), LLVM_UNNAMED.as_ptr())
+            };
+            let (is_sh, is_lo) = (bit(0x8000_0000), bit(0x4000_0000));
+            let p = LLVMBuildSelect(b, is_lo, lo, dev, LLVM_UNNAMED.as_ptr());
+            Ok(LLVMBuildSelect(b, is_sh, sh, p, LLVM_UNNAMED.as_ptr()))
+        }
+    }
+
     fn emit_cvta(
         &mut self,
         data: ptx_parser::CvtaDetails,
@@ -2797,6 +2903,29 @@ impl<'a> MethodEmitContext<'a> {
                 dst: arguments.dst,
                 src: arguments.src,
             });
+        }
+        // .address_size 32 on AGX: the shared and local windows inside the 32-bit generic space (PTX ISA 6.4.1.1),
+        // tagged with bit 31 and bit 30 (see widen_generic32)
+        if self.base_32bit_memory.is_some()
+            && self.target.is_air()
+            && data.size == 32
+            && matches!(data.state_space, ast::StateSpace::Shared | ast::StateSpace::Local)
+        {
+            let src = self.resolver.value(arguments.src)?;
+            let i32_type = get_scalar_type(self.context, ast::ScalarType::B32);
+            let tag = if data.state_space == ast::StateSpace::Shared { 0x8000_0000 } else { 0x4000_0000 };
+            let builder = self.builder;
+            self.resolver.with_result(arguments.dst, |dst| unsafe {
+                match data.direction {
+                    ptx_parser::CvtaDirection::ExplicitToGeneric => {
+                        LLVMBuildOr(builder, src, LLVMConstInt(i32_type, tag, 0), dst)
+                    }
+                    ptx_parser::CvtaDirection::GenericToExplicit => {
+                        LLVMBuildAnd(builder, src, LLVMConstInt(i32_type, 0x3fff_ffff, 0), dst)
+                    }
+                }
+            });
+            return Ok(());
         }
         let from_type = get_pointer_type(self.context, from_space)?;
         let dest_type = get_pointer_type(self.context, to_space)?;
@@ -4834,6 +4963,18 @@ impl<'a> MethodEmitContext<'a> {
         let src = self.resolver.value(arguments.src)?;
         let i1_type = get_scalar_type(self.context, ast::ScalarType::Pred);
         let i64_type = get_scalar_type(self.context, ast::ScalarType::B64);
+        // (a 32-bit address of .address_size 32: on AGX the generic pointer it stands for, see widen_generic32)
+        let src = unsafe {
+            if LLVMGetIntTypeWidth(LLVMTypeOf(src)) != 32 {
+                src
+            } else if let (Some(base32), true) = (self.base_32bit_memory, self.target.is_air()) {
+                let base = self.resolver.value(base32)?;
+                let p = self.widen_generic32(src, base)?;
+                LLVMBuildPtrToInt(self.builder, p, i64_type, LLVM_UNNAMED.as_ptr())
+            } else {
+                LLVMBuildZExt(self.builder, src, i64_type, LLVM_UNNAMED.as_ptr())
+            }
+        };
         let name = match space {
             ast::StateSpace::Global => "global",
             ast::StateSpace::Shared | ast::StateSpace::SharedCta | ast::StateSpace::SharedCluster => "shared",
@@ -5778,12 +5919,14 @@ impl<'a> MethodEmitContext<'a> {
             vec![(a, llvm_type), (b, llvm_type)],
         )?;
         // A NaN result of f64 is the first NaN operand, quieted ("NaN payloads are supported for double-precision
-        // instructions", PTX ISA 9.7.3): explicit, as the intrinsics are commutative and their operands may swap
+        // instructions", PTX ISA 9.7.3): explicit, as the intrinsics are commutative and their operands may swap.
+        // The operands before .abs: "if the result of max is NaN then the .xorsign and .abs modifiers will be
+        // ignored" (PTX ISA 9.7.3.11)
         let result = match data {
             ptx_parser::MinMaxDetails::Float(ptx_parser::MinMaxFloat { nan, .. })
-                if type_ == ast::ScalarType::F64 && !xorsign_abs && self.target.is_air() =>
+                if type_ == ast::ScalarType::F64 && self.target.is_air() =>
             unsafe {
-                let src_b = b;
+                let (a, src_b) = (original_a, original_b);
                 let b = self.builder;
                 let i64_type = get_scalar_type(self.context, ast::ScalarType::B64);
                 let quiet = |x| {

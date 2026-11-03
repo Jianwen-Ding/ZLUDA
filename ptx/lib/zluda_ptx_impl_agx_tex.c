@@ -714,6 +714,12 @@ static inline rgbaf unit_linear(desc_t t, uint64_t native, int addr, int norm, f
     return acc;
 }
 
+// A texture the unit cannot sample (only those reach this from tex.1d / tex.2d): once, not at every tex. The format is
+// decoded per channel, which is a lot of code to repeat where it is rarely run.
+__attribute__((noinline)) rgbaf sample_f32_outlined(desc_t t, int filter, int addr, int norm, float x, float y, int rank) {
+    return sample_f32(t, filter, addr, norm, x, y, rank);
+}
+
 // tex[.base|.level|.grad].geom.v4.dtype.ctype d, [t {, s}, {c0..c3}] {, lod | , dPdx, dPdy} {, offsets} {, ref}
 // lod_mode: 0 none (.base too), 1 .level, 2 .grad. `unit`: the form may use the texture unit (tex.1d / tex.2d with
 // float coordinates, automatic lod, no sampler, offsets or depth compare, outside --strict-fp), which it does on a
@@ -740,7 +746,7 @@ API v4u32 __zluda_ptx_impl_agx_tex(desc_t t, desc_t s, int geom, int lod_mode, i
                 uint32_t u;
                 float f;
             } x = {c0}, y = {c1};
-            rgbaf r = sample_f32(t, sm.filter, sm.addr, sm.norm, x.f, y.f, geom == G_2D ? 2 : 1);
+            rgbaf r = sample_f32_outlined(t, sm.filter, sm.addr, sm.norm, x.f, y.f, geom == G_2D ? 2 : 1);
             v4u32 out = {float_bits(r[0]), float_bits(r[1]), float_bits(r[2]), float_bits(r[3])};
             return out;
         }

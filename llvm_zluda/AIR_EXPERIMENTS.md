@@ -101,6 +101,14 @@ Classroom GPU against CPU by samples, at the same seed: 16 mean 0.34 / max 139, 
 chair edges remains in the 4096 map, cause unknown. Junkshop and monster were compared at 16 samples only (mean
 differences small, signed error about 0).
 
+## Compile memory, the result (2026-11-03, Blender Cycles' stock kernel)
+
+6.53 GB 44 s, object 44 MB -> 1.86 GB 31 s, object 19 MB, 106 s of CPU, with GPU time improving, not traded. In order of
+effect: the software texture fallback out of line (`sample_f32_outlined`, 3.65 -> 1.86 GB: it was inlined at every tex,
+and only textures the unit cannot sample reach it now), no 64-bit remainders in the sampler (4.96 -> 3.65), jobs on the
+fast cores only (5.92 -> 4.96), lazy bitcode (6.53 -> 5.92). The cost was the code expanded per tex, not LLVM. An
+out-pointer cannot be passed across a real call ("Cannot select: FrameIndex"): the fallback returns its four floats.
+
 ## GPU time of Blender Cycles, what moved it (2026-11-03, stock PTX, samples per minute)
 
 Baseline with instances fixed: junkshop 193, classroom 146, monster 245. Same images and PTX suite at each step.

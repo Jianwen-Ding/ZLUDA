@@ -3486,6 +3486,10 @@ LLVM_C_EXTERN_C_BEGIN
 LLVMModuleRef LLVMZludaAirKernelModule(LLVMModuleRef M, const char *name)
 {
     Module *Mod = unwrap(M);
+    // A lazily read module (Module::try_from_bitcode_lazy) has function bodies only once materialized: below, only
+    // the reached ones are, so that a kernel's compilation does not hold the whole program
+    if (Error E = Mod->materializeMetadata())
+        report_fatal_error(std::move(E));
     // The functions the kernel reaches (through calls, function pointers, constants and global initializers): only
     // those are defined in the copy, which AGX code generation inlines into each other (every function of Cycles'
     // module in each kernel's copy made it as large as the whole compilation).
@@ -3508,6 +3512,9 @@ LLVMModuleRef LLVMZludaAirKernelModule(LLVMModuleRef M, const char *name)
                 if (F->hasFnAttribute("air-kernel") && F->getName() != name)
                     continue;
                 Reached.insert(F);
+                if (F->isMaterializable())
+                    if (Error E = const_cast<Function *>(F)->materialize())
+                        report_fatal_error(std::move(E));
                 for (const Instruction &I : instructions(*F))
                     for (const Value *Op : I.operands())
                         if (isa<Constant>(Op))
@@ -3518,6 +3525,12 @@ LLVMModuleRef LLVMZludaAirKernelModule(LLVMModuleRef M, const char *name)
                     Work.push_back(Op);
         }
     }
+    // CloneModule wants a materialized module: the bodies not reached become declarations, unread
+    for (Function &F : *Mod)
+        if (F.isMaterializable() && !Reached.contains(&F))
+            F.setIsMaterializable(false);
+    if (Error E = Mod->materializeAll())
+        report_fatal_error(std::move(E));
     ValueToValueMapTy VMap;
     std::unique_ptr<Module> New = CloneModule(*Mod, VMap, [&](const GlobalValue *GV) {
         auto *F = dyn_cast<Function>(GV);

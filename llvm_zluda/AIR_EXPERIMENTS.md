@@ -62,7 +62,59 @@ Mistakes in how the work was done:
   the bug for weeks: a stock install failed. Fixed in the driver instead, by reporting compute capability 8.7 (no GPU
   has it, so no application ships machine code for it, and PTX is chosen). Test on an unmodified install.
 - **Theorized about the instanced-mesh BVH leaves from reading the source**, with no new evidence. Reading bvh2.cpp,
-  build.cpp and geometry_bvh.cpp finds no path to (2, 4, 0, 0). Get data from the running host instead.
+  build.cpp and geometry_bvh.cpp finds no path to (2, 4, 0, 0): the source is right. The answer was in the compiled
+  host (below).
+- **Three wrong guesses at compile memory, each stated before it was measured**: (1) every job parsing the whole
+  module: lazy bitcode loading gave only 6.53 -> 5.92 GB; (2) allocator arenas keeping freed memory:
+  MALLOC_ARENA_MAX=1 gave 5.89 GB at twice the CPU; (3) the same called functions compiled in every kernel:
+  whole-module compilation with a module-wide frame layout (AGXFrameLowering, reverted) took 188 s at 1.48 GB, no
+  better than ZLUDA_AGX_JOBS=1 (188 s, 1.26 GB), and the object was still 37 MB. The old "1338 copies, 5.3 MB unique"
+  figure no longer describes this build. Look at symbol sizes first.
+- **Unexplained, not chased**: at 16 samples Cycles' seed 0 and seed 7 on the CPU differ by at most 2/255. Do not use
+  a second seed as a noise floor until that is understood. Convergence against sample count needs no seed.
+
+## Instanced geometry missing: a miscompiled host, not ZLUDA (2026-11-03)
+
+The aarch64 Blender 5.1.0 build (ae6d847d66fa, .comment names GCC 14.2.1) miscompiles `BVH2::pack_instances`:
+
+    41e2168: ldr q30, [x0], #16             // int4 data = leaf_nodes_offset[i]
+    41e216c: add v30.2s, v31.2s, v30.2s     // data.x += prim_offset; data.y += prim_offset
+    41e2170: str q30, [x1], #16
+
+A .2s operation clears the upper half of the register, so every instanced mesh's leaf loses its visibility and primitive
+type: the (2, 4, 0, 0) above, skipped by the traversal. Cycles' source is correct. Top-level leaves do not pass through
+this loop, which is why only instances disappeared. GCC 15.2 compiles a small replica correctly (ldp d30, d29), and it
+was not reproduced with a compiler here, so it is not established as a GCC bug. A scan of the whole .text finds this
+one instance of the pattern.
+
+Nothing belongs in ZLUDA or LLVM for this. Workaround: /scratch/.../blender-instfix, the same binary with bit 30 set in
+the word at 0x41e216c (file offset 0x3de216c, 0x0ebe87fe -> 0x4ebe87fe, add .4s; v31's upper half is already 0). The
+original binary is kept and the bench scripts use the copy. A rebuild with a fixed compiler is the real fix.
+**Every Blender score from before this is for scenes with geometry missing.** Against the CPU (16 samples, 25%):
+linked and collection instances now max 0; classroom mean 19.3 -> 0.34. Open Data, samples per minute (stock PTX):
+monster 245 (was 466), junkshop 193 (160), classroom 146 (133).
+
+Classroom GPU against CPU by samples, at the same seed: 16 mean 0.34 / max 139, 128 0.28 / 54, 1024 0.17 / 13, 4096
+0.098 / 4, signed error about 0 throughout: no measured bias. ZLUDA_ROUNDING_STRICT=1 does not reduce the difference
+(0.3455), and the CPU on BVH2 against Embree is 0.0004, so it is neither rounding nor BVH layout. A faint trace along
+chair edges remains in the 4096 map, cause unknown. Junkshop and monster were compared at 16 samples only (mean
+differences small, signed error about 0).
+
+## Compile memory: what it is (2026-11-03, stock PTX, per kernel with real calls)
+
+Of 36.4 MB of AGX code, 34 MB is 14 functions of about 2.4 MB each: Cycles' shader interpreter with its cases inlined, one
+per template variant, already inlined in the PTX. Compiling one holds about 0.5 GB, so the peak is simply how many run
+at once. Time (llc, whole module, 131 s): instruction selection 22%, StructurizeCFG 19%, register allocation 16%, of
+which global splitting 11 s. No pass dominates.
+
+Jobs against peak and wall: 1: 1.26 GB 188 s; 2: 1.71 GB 101 s; 4: 2.84 GB 63 s; 6: 3.94 GB 54 s; 8: 4.97 GB 45 s;
+12: 5.89 GB 48 s. Past the 8 performance cores, jobs only hold memory for longer on efficiency cores, so the default is
+now the fastest cores' count: 6.53 GB 44 s -> 4.96 GB 44.8 s, the object byte-identical. For less memory still,
+ZLUDA_AGX_JOBS trades it for time as above. Merging identical functions at IR level is untested: `opt -passes=mergefunc`
+on stock.opt.ll did not finish in 280 s.
+
+Also a dead end: llc cannot read stock.portable.air ("Invalid call record"), and -time-passes through
+ZLUDA_AGX_LLVM_ARGS prints nothing. Profile with llc on zoc's stock.opt.ll (run zoc without --object-only).
 
 Dead ends and traps:
 
@@ -71,6 +123,8 @@ Dead ends and traps:
   projects.blender.org, pypi.org and Fedora mirrors fails, ssh.github.com:443 is refused, sudo needs a password.
   `dnf repoquery` still answers, from its cache, and `dnf download` then fails, so a repoquery result does not mean
   packages can be had. Sources arrive only when the user puts them in /scratch.
+- **`pgrep -f NAME` and `pkill -f NAME` match their own shell's command line**: a wait loop never ended (a finished test
+  suite sat waited on for several minutes), and pkill killed the command running it. Use -x, or wait on the output.
 - **Pushing was refused all session** (all four keys). /scratch/save-repos.sh after each commit, and retry.
 - **A commit needs an identity**: none is configured. Use GIT_AUTHOR_* / GIT_COMMITTER_* for one command, not git config.
 - **Copying ext/HiGHS from /scratch/ZLUDA brings its .git file**, which breaks `git status` ("not a git repository:

@@ -143,6 +143,10 @@ Baseline with instances fixed: junkshop 193, classroom 146, monster 245. Same im
   does not change AGX code at all (17.9129 MB at 5000, 80000, 320000): what O3 leaves uninlined stays a real call.
 - **Refuted, backend options**: on classroom and junkshop -agx-uniform-constants, -agx-max-unskipped-instrs=2 and 8,
   -agx-atomic-optimizer, -agx-element-aligned-vectors, -agx-mem-cluster=32 and -agx-launch-divisors are all within about 1%.
+- **Refuted, register allocator options**: -exhaustive-register-search, -enable-local-reassign, -greedy-reverse-local-assignment and
+  -agx-postra-cluster-wait=0 are within 1%; -split-spill-mode=size is 1-2% worse; -enable-misched=false costs 7%, so the
+  machine scheduler earns its time. -consider-local-interval-cost and -disable-spill-hoist gave no result (not looked into).
+- **Refuted, stack spacing**: 12 KB against 32 KB per thread is the same speed (a memory gain, above).
 - **What is left is spread out**: replaying shade_surface (junkshop, 30.8M instructions, agx_run --trace-pcs), the largest
   part is mov_imm 9%, fmul 9%, stack_load 7%, jmp_exec_none 7%, wait 7%, and no function but the interpreter over 15%.
 - **Refuted, launch overhead**: launch batching changes nothing (197.9 vs 197.4). 18.8 s GPU in about 19.7 s of launches:

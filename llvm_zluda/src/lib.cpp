@@ -3503,7 +3503,10 @@ int LLVMZludaAirCanonicalNaNs(LLVMModuleRef M)
                 return r;
             });
         };
+        // (or never a NaN: nnan, as the front end marks an addition of finite operands)
         auto unobserved = [&](Instruction *I) {
+            if (isa<FPMathOperator>(I) && I->hasNoNaNs())
+                return true;
             return !I->getType()->getScalarType()->isDoubleTy() && usersIgnoreNaNBits(I, 0);
         };
         SmallVector<Instruction *, 64> observed;

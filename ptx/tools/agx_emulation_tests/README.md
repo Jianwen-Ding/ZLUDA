@@ -24,7 +24,12 @@ PTX-formalization test format (`.buffer` / `.launch` / `.expect`), with expected
 - `lop3.ptx`: `lop3.b32` with each of the 256 constant tables on 128 operand triples;
 - `shf.ptx`: `shf.l` / `shf.r` `.wrap` / `.clamp` of 256 pairs with every shift amount 0..63;
 - `f16_directed.ptx`: `cvt.{rz,rm,rp,rn}.f16.f32` of 4,096 floats (half boundaries and midpoints ±1 float ulp,
-  half and float denormals, overflow edges, infinities, random).
+  half and float denormals, overflow edges, infinities, random);
+- `mini_encode.ptx`: `cvt.rn.satfinite` of f32 pairs to e4m3x2, e5m2x2, e2m3x2, e3m2x2, e2m1x2 and relu.e4m3x2 at
+  every code's value, the midpoints between codes (ties) and a quarter either side, each ±1 float ulp, with
+  saturation, infinities, NaNs and float subnormals (`gen/mini_encode.py`, expected from exact rationals; its `f16`
+  and `decode` sets, written by `gen_all.sh`: e4m3x2 and e5m2x2 from f16x2 of every f16, and to f16x2 of every
+  pair of codes).
 
 `strict/` holds tests of exactness that only `--strict-fp` promises (the default mode rounds bfloat fma twice, through
 float): `strict/bf16_fma.ptx`, `fma.rn.bf16x2` of 4,096 bfloat triples (realistic, subnormal, edge exponents,
@@ -34,7 +39,7 @@ cancellation; `gen/bf16_fma.py`).
 edge, denormal, overflow and cancellation operands; with `ZEROS=1` 40% zeros), float fma rounded toward zero / up
 / down, float add / sub / mul in those directions (operands around the fast paths' bounds 2^-102, 2^-70, 2^126,
 cancellations, exact zero sums), the f64 conversions to and from f32 and 32- / 64-bit integers, rounding to integral values (cvt.rmi / rpi / rzi / rni),
-and 2048 64-bit div / rem pairs.
+and 2048 64-bit div / rem pairs, every f16 to e4m3 / e5m2 and every e4m3 / e5m2 pair to f16x2.
 
     ptx/tools/agx_emulation_tests/gen_all.sh /tmp/emu
     python3 ptx/tools/agx_ptx_formalization_check.py --zoc target/debug/zoc --agx-run .../agx_run --target air \

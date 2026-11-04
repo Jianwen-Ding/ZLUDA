@@ -3383,12 +3383,6 @@ fn tcgen05_mma(ir: &mut Ir, d: &ast::Tcgen05MmaDetails, p: &[String]) -> Result<
     let more = ir.icmp("ult", "i32", "%tc_r", &m);
     ir.stmt(&format!("br i1 {more}, label %tc_col_start, label %tc_exit"));
     ir.label("tc_col_start");
-    ir.stmt("br label %tc_col");
-    ir.label("tc_col");
-    ir.stmt("%tc_c = phi i32 [ 0, %tc_col_start ], [ %tc_c_next, %tc_latch ]");
-    let more = ir.icmp("ult", "i32", "%tc_c", &n);
-    ir.stmt(&format!("br i1 {more}, label %tc_body, label %tc_row_end"));
-    ir.label("tc_body");
     let r = "%tc_r".to_string();
     let c = "%tc_c".to_string();
     // .ashift: row r of A is row r - 1 (row 0 stays)
@@ -3399,6 +3393,31 @@ fn tcgen05_mma(ir: &mut Ir, d: &ast::Tcgen05MmaDetails, p: &[String]) -> Result<
     } else {
         r.clone()
     };
+    // Row r's elements of A from shared memory (a descriptor) as f32, once per row rather than for every column,
+    // where K is at most 16 (the f16 and tf32 kinds; more of them live across the column loop spill, measured);
+    // the loop writes only tensor memory
+    let float_kind = !matches!(d.kind, ast::Tcgen05Kind::Ti16 | ast::Tcgen05Kind::I8);
+    let mut a_pre: Vec<String> = Vec::new();
+    let mut a32_pre: Vec<String> = Vec::new();
+    if let (Some(desc), true) = (&a_desc, k <= 16 && !f8 && !fp4x2) {
+        for kk in 0..k {
+            let kk_s = kk.to_string();
+            let x = tile_element(ir, desc, true, bits, &a_row, &kk_s);
+            let y = tile_element(ir, desc, false, bits, &a_row, &kk_s);
+            let a_raw = ir.select(&a_k_major, "i32", &x, &y);
+            if float_kind {
+                let v = ir.def(&format!("call i32 @__zluda_ptx_impl_agx_mma_elem_f32(i32 {a_code}, i32 {a_raw})"));
+                a32_pre.push(ir.op("xor", "i32", &v, &neg_a));
+            }
+            a_pre.push(a_raw);
+        }
+    }
+    ir.stmt("br label %tc_col");
+    ir.label("tc_col");
+    ir.stmt("%tc_c = phi i32 [ 0, %tc_col_start ], [ %tc_c_next, %tc_latch ]");
+    let more = ir.icmp("ult", "i32", "%tc_c", &n);
+    ir.stmt(&format!("br i1 {more}, label %tc_body, label %tc_row_end"));
+    ir.label("tc_body");
     let element_mask = ((1u64 << bits) - 1).to_string();
     // .ws: the columns of B start at the descriptor's shift, and the zero-column mask clears whole columns
     // (ptx-exec-tc.k tcZero, tcRun)
@@ -3465,6 +3484,7 @@ fn tcgen05_mma(ir: &mut Ir, d: &ast::Tcgen05MmaDetails, p: &[String]) -> Result<
     for kk in 0..k {
         let kk_s = kk.to_string();
         let a_raw = match &a_desc {
+            Some(_) if !a_pre.is_empty() => a_pre[kk as usize].clone(),
             Some(desc) => {
                 let x = tile_element(ir, desc, true, bits, &a_row, &kk_s);
                 let y = tile_element(ir, desc, false, bits, &a_row, &kk_s);
@@ -3669,13 +3689,17 @@ fn tcgen05_mma(ir: &mut Ir, d: &ast::Tcgen05MmaDetails, p: &[String]) -> Result<
         let sum = ir.select(&satfinite, "i64", &clamped, &sum);
         ir.cast("trunc", "i64", &sum, "i32")
     } else {
-        let a32: Vec<String> = a_elements
-            .iter()
-            .map(|x| {
-                let v = ir.def(&format!("call i32 @__zluda_ptx_impl_agx_mma_elem_f32(i32 {a_code}, i32 {x})"));
-                ir.op("xor", "i32", &v, &neg_a)
-            })
-            .collect();
+        let a32: Vec<String> = if a32_pre.len() == a_elements.len() {
+            a32_pre.clone()
+        } else {
+            a_elements
+                .iter()
+                .map(|x| {
+                    let v = ir.def(&format!("call i32 @__zluda_ptx_impl_agx_mma_elem_f32(i32 {a_code}, i32 {x})"));
+                    ir.op("xor", "i32", &v, &neg_a)
+                })
+                .collect()
+        };
         let b32: Vec<String> = b_elements
             .iter()
             .map(|x| {

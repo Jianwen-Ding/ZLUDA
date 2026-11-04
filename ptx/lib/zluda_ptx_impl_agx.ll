@@ -2801,6 +2801,40 @@ exit:
 ; filled), -2 store (shared -> global, out-of-bounds elements dropped), >= 0
 ; reduce with that operation. The shared image is dense, swizzled by the
 ; CTA-relative address. Returns the bytes of the box.
+; A row of %bytes (a multiple of 16) between global memory at %g and shared
+; memory at the CTA-relative %rel (both 16-byte aligned) swizzled in %mode
+; (one that keeps 16-byte chunks whole) within %window: %dir -1 loads it into
+; shared memory, -2 stores it, 16 bytes at a time
+define void @__zluda_ptx_impl_agx_tma_row(i64 %g, i32 %rel, i32 %window, i32 %mode, i32 %bytes, i32 %dir) #3 {
+entry:
+  %load = icmp eq i32 %dir, -1
+  br label %loop
+loop:
+  %o = phi i32 [ 0, %entry ], [ %o.n, %step ]
+  %sr = add i32 %rel, %o
+  %sw = call i32 @__zluda_ptx_impl_agx_tma_swizzle(i32 %mode, i32 %sr)
+  %sa = add i32 %window, %sw
+  %sp = inttoptr i32 %sa to ptr addrspace(3)
+  %o64 = zext i32 %o to i64
+  %ga = add i64 %g, %o64
+  %gp = inttoptr i64 %ga to ptr addrspace(1)
+  br i1 %load, label %ld, label %st
+ld:
+  %v = load <4 x i32>, ptr addrspace(1) %gp, align 16
+  store <4 x i32> %v, ptr addrspace(3) %sp, align 16
+  br label %step
+st:
+  %w = load <4 x i32>, ptr addrspace(3) %sp, align 16
+  store <4 x i32> %w, ptr addrspace(1) %gp, align 16
+  br label %step
+step:
+  %o.n = add i32 %o, 16
+  %more = icmp ult i32 %o.n, %bytes
+  br i1 %more, label %loop, label %exit
+exit:
+  ret void
+}
+
 define i32 @__zluda_ptx_impl_agx_tma_tile(ptr %tm, i32 %c0, i32 %c1, i32 %c2, i32 %c3, i32 %c4, i32 %smem, i32 %dir) #3 {
 entry:
   %w1 = call i64 @__zluda_ptx_impl_agx_tma_word(ptr %tm, i32 1)
@@ -2911,6 +2945,26 @@ elements:
   %v0123 = mul i32 %v012, %cnt3
   %count = mul i32 %v0123, %cnt4
   %bytes = mul i32 %count, %eb
+  ; whole rows in 16-byte chunks (__zluda_ptx_impl_agx_tma_row) where the box's
+  ; dimension 0 is a multiple of 16 bytes of consecutive elements copied or
+  ; stored (not reduced or inspected) and the swizzle keeps 16-byte chunks
+  ; whole (not mode 5's 8-byte flip); each row also needs to be in bounds and
+  ; 16-byte aligned (checked in the loop)
+  %rowbytes = mul i32 %cnt0, %eb
+  %rb16 = and i32 %rowbytes, 15
+  %rbok = icmp eq i32 %rb16, 0
+  %unit0 = icmp eq i32 %e0, 1
+  %copydir = icmp ult i32 %dir, -2
+  %copying = xor i1 %copydir, true
+  %dirok = icmp slt i32 %dir, 0
+  %mode5 = icmp eq i32 %mode, 5
+  %swzok = xor i1 %mode5, true
+  %ra = and i1 %rbok, %unit0
+  %rb = and i1 %ra, %copying
+  %rc = and i1 %rb, %dirok
+  %rowable = and i1 %rc, %swzok
+  %cnt0w = zext i32 %cnt0 to i64
+  %cnt0m1 = sub i32 %cnt0, 1
   %empty = icmp eq i32 %count, 0
   br i1 %empty, label %exit, label %loop
 loop:
@@ -2964,6 +3018,30 @@ loop:
   %rel = add i32 %smem_rel, %eoff
   %swizzled = call i32 @__zluda_ptx_impl_agx_tma_swizzle(i32 %mode, i32 %rel)
   %saddr = add i32 %window, %swizzled
+  ; the start of a row in bounds and aligned: the row at once
+  %q0z = icmp eq i32 %q0, 0
+  %hi1 = or i1 %o1, %o2
+  %hi2 = or i1 %hi1, %o3
+  %hi = or i1 %hi2, %o4
+  %inhi = xor i1 %hi, true
+  %g0end = add i64 %g0w, %cnt0w
+  %g0lo = icmp sge i64 %g0w, 0
+  %g0hi = icmp ule i64 %g0end, %d0
+  %ga15 = and i64 %gaddr, 15
+  %gal = icmp eq i64 %ga15, 0
+  %sa15 = and i32 %rel, 15
+  %sal = icmp eq i32 %sa15, 0
+  %rw1 = and i1 %rowable, %q0z
+  %rw2 = and i1 %rw1, %inhi
+  %rw3 = and i1 %rw2, %g0lo
+  %rw4 = and i1 %rw3, %g0hi
+  %rw5 = and i1 %rw4, %gal
+  %rowok = and i1 %rw5, %sal
+  br i1 %rowok, label %rowcopy, label %perelem
+rowcopy:
+  call void @__zluda_ptx_impl_agx_tma_row(i64 %gaddr, i32 %rel, i32 %window, i32 %mode, i32 %rowbytes, i32 %dir)
+  br label %next
+perelem:
   br i1 %inspecting, label %inspect, label %copy
 inspect:
   br i1 %oob, label %next, label %inspect_elem
@@ -2998,9 +3076,12 @@ reduce:
   call void @__zluda_ptx_impl_agx_tma_red(i64 %gaddr, i32 %et, i32 %dir, i64 %sv)
   br label %next
 next:
-  %hits.n = phi i32 [ %hits, %load_fill ], [ %hits, %out ], [ %hits, %store ], [ %hits, %reduce ], [ %hits, %inspect ], [ %hits.e, %inspect_elem ]
+  %hits.n = phi i32 [ %hits, %load_fill ], [ %hits, %out ], [ %hits, %store ], [ %hits, %reduce ], [ %hits, %inspect ], [ %hits.e, %inspect_elem ], [ %hits, %rowcopy ]
+  ; the elements of a row copied at once beyond the first
+  %skip = phi i32 [ 0, %load_fill ], [ 0, %out ], [ 0, %store ], [ 0, %reduce ], [ 0, %inspect ], [ 0, %inspect_elem ], [ %cnt0m1, %rowcopy ]
   ; advance (q0, ..., q4) through the box, dim 0 fastest
-  %q0.i = add i32 %q0, 1
+  %q0.p = add i32 %q0, 1
+  %q0.i = add i32 %q0.p, %skip
   %w0 = icmp eq i32 %q0.i, %cnt0
   %q0.n = select i1 %w0, i32 0, i32 %q0.i
   %k0 = zext i1 %w0 to i32
@@ -3017,7 +3098,8 @@ next:
   %q3.n = select i1 %w3c, i32 0, i32 %q3.i
   %k3 = zext i1 %w3c to i32
   %q4.n = add i32 %q4, %k3
-  %e.next = add i32 %e, 1
+  %e.p = add i32 %e, 1
+  %e.next = add i32 %e.p, %skip
   %more = icmp ult i32 %e.next, %count
   br i1 %more, label %loop, label %exit
 exit:

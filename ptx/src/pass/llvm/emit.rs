@@ -7325,7 +7325,8 @@ impl<'a> MethodEmitContext<'a> {
                 args.extend(offsets);
                 args.extend([has_ref, reference]);
                 // the texture unit may sample it (on a texture with hardware descriptors): not bit exact for
-                // linear filtering, so not with --strict-fp
+                // linear filtering, so not with --strict-fp (1); the default mode's other samples take the float
+                // sampler (2: zluda_ptx_impl_agx_tex.c's TEX_F32 build), the strict mode's the exact one (0)
                 let unit = !self.strict_fp
                     && matches!(data.geometry, ast::TexGeometry::D1 | ast::TexGeometry::D2)
                     && data.lod_mode == 0
@@ -7333,7 +7334,8 @@ impl<'a> MethodEmitContext<'a> {
                     && arguments.src_sampler.is_none()
                     && arguments.src_ref.is_none()
                     && [arguments.src_o0, arguments.src_o1, arguments.src_o2].iter().all(|o| o.is_none());
-                args.push(self.const_u32(unit as u64));
+                let mode = if unit { 1 } else if !self.strict_fp { 2 } else { 0 };
+                args.push(self.const_u32(mode));
                 self.emit_vector_helper(c"__zluda_ptx_impl_agx_tex", ast::ScalarType::B32, &args)?
             }
             ast::TexOp::Tld4(comp) => {

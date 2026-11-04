@@ -674,6 +674,19 @@ llama-app (cuBLAS linked statically, so -b 8 -ub 8; a cudart replacement is out 
   about one instruction per signed operand of a dp4a (7 -> 6), not the 38% upper bound. Not pursued further; the
   unexplored part (imadd's unused encoding bits) is speculative and earlier undefined encodings hung the GPU.
 
+## Default mode: the float sampler for every software texture sample (2026-11-04)
+
+The default mode filtered only plain tex.1d / tex.2d in float (or on the texture unit); every other tex form
+(mipmaps, tex.level / .grad, 3D, cubemaps, arrays, offsets, depth compare) ran the exact sampler in software
+double precision: ~7600 AGX instructions a mipmapped sample (PTX-formalization tex-mip, one thread, 32 samples:
+243,945 instructions, 556,017 cycles in the AGX Performance Simulator). zluda_ptx_impl_agx_tex.c is now also
+compiled with float for double (gen_agx_tex.py: -DTEX_F32 -cl-single-precision-constant, its types and internal
+functions prefixed apart), and the default mode's tex instructions call that build (mode 2 of the last argument;
+strict mode keeps the exact sampler): tex-mip 39,561 instructions, 206,839 cycles, compiled in 7.3 s (193 MB).
+The texture tests still match the model exactly in default mode; strict mode, the default-mode results of the
+other tests and the strict compile of the 413 test modules (320 s, 541 MB) are unchanged. The generated section
+is now clang 18's output throughout.
+
 ## Strict FP: exact texture filtering in integers (2026-10-31)
 
 The exact double precision sampler, the remaining strict-mode cost in Cycles, now has an integer path for unsigned

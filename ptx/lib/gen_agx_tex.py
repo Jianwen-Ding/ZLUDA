@@ -17,7 +17,9 @@ from pathlib import Path
 
 LIB = Path(__file__).resolve().parent
 # source, prefix of its internal functions, first metadata number
-SOURCES = [('zluda_ptx_impl_agx_tex.c', '__zluda_agx_tex_', 10000), ('zluda_ptx_impl_agx_cvt.c', '__zluda_agx_cvt_', 20000),
+# (the float build of the texture sampler first: the double build calls its entry, defined by then)
+SOURCES = [('zluda_ptx_impl_agx_tex.c', '__zluda_agx_texf_', 70000, ['-DTEX_F32', '-cl-single-precision-constant']),
+           ('zluda_ptx_impl_agx_tex.c', '__zluda_agx_tex_', 10000), ('zluda_ptx_impl_agx_cvt.c', '__zluda_agx_cvt_', 20000),
            ('zluda_ptx_impl_agx_heap.c', '__zluda_agx_heap_', 30000),
            ('zluda_ptx_impl_agx_math.c', '__zluda_agx_math_', 40000)]
 TARGET = LIB / 'zluda_ptx_impl_agx.ll'
@@ -25,12 +27,14 @@ BEGIN = '; ---------------------------------------------------------------- BEGI
 END = '; ---------------------------------------------------------------- END GENERATED (gen_agx_tex.py)\n'
 
 
-def convert(clang, source, prefix, metadata_base, declared, defined):
-    ir = subprocess.run([clang, '-O2', '-S', '-emit-llvm', '-target', 'nvptx64-nvidia-cuda', '-std=c11', '-ffreestanding',
+def convert(clang, source, prefix, metadata_base, declared, defined, flags=()):
+    ir = subprocess.run([clang, *flags, '-O2', '-S', '-emit-llvm', '-target', 'nvptx64-nvidia-cuda', '-std=c11', '-ffreestanding',
                          # (-fno-jump-tables: no switch lookup tables either, globals AIR and AGX do not have)
                          '-fno-builtin', '-ffp-contract=off', '-fno-jump-tables', '-Wall', '-Werror', '-o', '-', str(LIB / source)],
                         check=True, capture_output=True, text=True).stdout
     internal = set(re.findall(r'^define internal [^@]*@([\w.$]+)\(', ir, re.M))
+    # named types, each source's own (a source compiled twice has them twice)
+    types = set(re.findall(r'^%([\w.]+) = type ', ir, re.M))
     out = []
     for line in ir.splitlines():
         if line.startswith(('source_filename', 'target datalayout', 'target triple', 'attributes #', '; ModuleID')):
@@ -67,8 +71,12 @@ def convert(clang, source, prefix, metadata_base, declared, defined):
         line = re.sub(r'!llvm\.loop !(\d+)', lambda m: '!llvm.loop !' + str(int(m.group(1)) + metadata_base), line)
         for name in internal:
             line = re.sub(r'@' + re.escape(name) + r'\b', '@' + prefix + name, line)
+        for name in types:
+            line = re.sub(r'%' + re.escape(name) + r'(?![\w.])', '%' + prefix + name, line)
         out.append(line)
-    return '; from ' + source + '\n\n' + '\n'.join(out).strip() + '\n'
+    # what later sources may call without declaring it again
+    defined |= set(re.findall(r'^define [^@]*@([\w.$]+)\(', '\n'.join(out), re.M))
+    return '; from ' + source + (' ' + ' '.join(flags) if flags else '') + '\n\n' + '\n'.join(out).strip() + '\n'
 
 
 def main():
@@ -81,7 +89,7 @@ def main():
         head, tail = text, ''
     declared = set(re.findall(r'^declare [^@]*@([\w.$]+)\(', head, re.M))
     defined = set(re.findall(r'^define [^@]*@([\w.$]+)\(', head, re.M)) | set(re.findall(r'^@([\w.$]+) = ', head, re.M))
-    bodies = [convert(clang, *source, declared, defined) for source in SOURCES]
+    bodies = [convert(clang, *source[:3], declared, defined, *source[3:]) for source in SOURCES]
     TARGET.write_text(head + BEGIN + '; regenerate with ptx/lib/gen_agx_tex.py\n\n' + '\n'.join(bodies) + END + tail)
 
 

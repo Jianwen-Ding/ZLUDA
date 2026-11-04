@@ -17,6 +17,18 @@
 
 #include <stdint.h>
 
+// TEX_F32: this file compiled again with float for double and float constants (gen_agx_tex.py: -DTEX_F32
+// -cl-single-precision-constant), of which only __zluda_ptx_impl_agx_tex_f32 is kept: the sampler of the default
+// mode's tex instructions other than the plain tex.1d / tex.2d ones (which have sample_f32 or the texture unit):
+// mipmaps, 3D, cubemaps, arrays, offsets, depth compare. Its results are within a few ulps of the exact double
+// precision sampler's, which strict mode keeps; in software double precision that one was ~7600 AGX instructions a
+// mipmapped sample.
+#ifdef TEX_F32
+#define double float
+#define __builtin_floor __builtin_floorf
+#define __builtin_fabs __builtin_fabsf
+#endif
+
 #define GLOBAL __attribute__((address_space(1)))
 #define API __attribute__((always_inline))
 
@@ -364,7 +376,7 @@ static inline float pos_f32(float x, int64_t n, int norm, float d) {
     return norm == 1 ? __builtin_fmaf(x, (float)n, d) : x + d;
 }
 
-static inline rgbaf sample_f32(desc_t t, int filter, int addr, int norm, float x, float y, int rank) {
+__attribute__((unused)) static inline rgbaf sample_f32(desc_t t, int filter, int addr, int norm, float x, float y, int rank) {
     int64_t n0 = lv_dim(t, 0, 0), n1 = lv_dim(t, 0, 1);
     if (filter != 1) {
         int64_t i = ad_idx(addr, (int64_t)__builtin_floorf(pos_f32(x, n0, norm, 0.0f)), n0);
@@ -390,6 +402,10 @@ static inline rgbaf sample_f32(desc_t t, int filter, int addr, int norm, float x
 
 // ---------------------------------------------------------------- mipmaps
 
+#ifdef TEX_F32
+// log2 for x > 0 in float (the default mode's sampler)
+static inline float log2_d(float x) { return __builtin_log2f(x); }
+#else
 // log2 for x > 0 at double precision (the model's log(x) / log(2) at 53 bits)
 static inline double log2_d(double x) {
     union {
@@ -417,6 +433,7 @@ static inline double log2_d(double x) {
     }
     return (double)exp + 2.0 * sum / 0.6931471805599453;
 }
+#endif
 
 static inline rgba mip_sample(desc_t t, struct sampling *sm, int use_lod, double lam, struct q *q, int filter,
                                      int addr, int norm, double x, double y, double z, int64_t layer, int rank) {
@@ -675,8 +692,14 @@ static inline v4u32 exact_unorm_sample(desc_t t, struct sampling *sm, int rank, 
     return out;
 }
 
+#ifndef TEX_F32
 // The texture unit's sample of (x, y) (zluda_ptx_impl_agx.ll): word 16 of a texture descriptor that zluda_agx gave
 // hardware descriptors.
+// the float sampler (the TEX_F32 build of this file)
+v4u32 __zluda_ptx_impl_agx_tex_f32(desc_t t, desc_t s, int geom, int lod_mode, int ctype_float, int dtype, uint32_t c0,
+                                   uint32_t c1, uint32_t c2, uint32_t c3, float lod, float dx0, float dx1, float dx2,
+                                   float dy0, float dy1, float dy2, int32_t o0, int32_t o1, int32_t o2, int has_ref,
+                                   uint32_t ref, int unit);
 v4u32 __zluda_ptx_impl_agx_tex_unit(uint64_t native, float x, float y);
 
 // A texture the unit cannot sample (only those reach this from tex.1d / tex.2d): once, not at every tex. The format is
@@ -689,11 +712,20 @@ __attribute__((noinline)) rgbaf sample_f32_outlined(desc_t t, int filter, int ad
 // lod_mode: 0 none (.base too), 1 .level, 2 .grad. `unit`: the form may use the texture unit (tex.1d / tex.2d with
 // float coordinates, automatic lod, no sampler, offsets or depth compare, outside --strict-fp), which it does on a
 // texture with hardware descriptors of its rank whose results are integers exactly when dtype is.
+#else
+#define __zluda_ptx_impl_agx_tex __zluda_ptx_impl_agx_tex_f32
+#endif
+
 API v4u32 __zluda_ptx_impl_agx_tex(desc_t t, desc_t s, int geom, int lod_mode, int ctype_float, int dtype,
                                    uint32_t c0, uint32_t c1, uint32_t c2, uint32_t c3, float lod, float dx0,
                                    float dx1, float dx2, float dy0, float dy1, float dy2, int32_t o0, int32_t o1,
                                    int32_t o2, int has_ref, uint32_t ref, int unit) {
-    if (unit) {
+#ifndef TEX_F32
+    // the default mode's other samples: the float sampler
+    if (unit == 2)
+        return __zluda_ptx_impl_agx_tex_f32(t, s, geom, lod_mode, ctype_float, dtype, c0, c1, c2, c3, lod, dx0, dx1,
+                                            dx2, dy0, dy1, dy2, o0, o1, o2, has_ref, ref, 0);
+    if (unit == 1) {
         uint64_t native = tw(t, 16);
         if ((native >> 63) && (int)((native >> 62) & 1) == (dtype != 0) &&
             (int)((native >> 61) & 1) == (geom == G_2D))
@@ -709,6 +741,7 @@ API v4u32 __zluda_ptx_impl_agx_tex(desc_t t, desc_t s, int geom, int lod_mode, i
             return out;
         }
     }
+#endif
     struct sampling sm = sampling_of(t, s);
     struct q q = {0, {o0, o1, o2}, has_ref, ref};
     double dx[3] = {dx0, dx1, dx2}, dy[3] = {dy0, dy1, dy2};
@@ -758,6 +791,7 @@ API v4u32 __zluda_ptx_impl_agx_tex(desc_t t, desc_t s, int geom, int lod_mode, i
     return out;
 }
 
+#ifndef TEX_F32
 // tld4.comp.geom.v4.dtype.f32 d, [t {, s}, {c..}] {, offsets} {, ref}: the 2x2 footprint, counter-clockwise from
 // the lower-left texel
 API v4u32 __zluda_ptx_impl_agx_tld4(desc_t t, desc_t s, int geom, int comp, int dtype, uint32_t c0, uint32_t c1,
@@ -1183,3 +1217,4 @@ typedef int32_t s32_t;
     TEXOBJ(3d, G_3D, DTYPE, DCODE, s32, 0, 4, coord[1], coord[2])
 ALL_TEXOBJ(f32, 0)
 ALL_TEXOBJ(s32, 1)
+#endif // TEX_F32

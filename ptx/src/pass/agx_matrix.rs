@@ -61,16 +61,29 @@ pub(super) fn set_fast_mma(fast: bool) {
 /// multiply-accumulate.
 fn is_fast(d: &ast::MmaDetails) -> bool {
     use ast::MmaType::*;
-    d.sparse.is_none()
-        && d.block_scale.is_none()
-        && !d.satfinite
-        && matches!(d.atype, F16 | Bf16 | Tf32)
-        && d.btype == d.atype
-        && matches!(d.ctype, F16 | F32)
-        && matches!(d.dtype, F16 | F32)
-        && d.n == 8
-        && matches!(d.m, 8 | 16)
-        && (d.m, d.k) != (8, 4)
+    let shape = d.sparse.is_none() && d.block_scale.is_none() && d.n == 8 && matches!(d.m, 8 | 16) && (d.m, d.k) != (8, 4);
+    shape
+        && ((!d.satfinite
+            && matches!(d.atype, F16 | Bf16 | Tf32)
+            && d.btype == d.atype
+            && matches!(d.ctype, F16 | F32)
+            && matches!(d.dtype, F16 | F32))
+            || is_fast_int(d))
+}
+
+/// Integer mma (8- and 4-bit A and B, s32 C and D) on the matrix unit: the
+/// elements are exact in f32, and so are their products and every partial sum
+/// (at most k 255^2 < 2^24), whatever the order; C is added in integers.
+/// (Measured: k = 16 without .satfinite is cheaper exactly.)
+fn is_fast_int(d: &ast::MmaDetails) -> bool {
+    use ast::MmaType::*;
+    (d.k >= 32 || d.satfinite)
+        && matches!(d.atype, S8 | U8 | S4 | U4)
+        && matches!(d.btype, S8 | U8 | S4 | U4)
+        && d.atype.bits() == d.btype.bits()
+        && d.ctype == S32
+        && d.dtype == S32
+        && d.k * 255 * 255 < 1 << 24
 }
 
 #[derive(Copy, Clone)]
@@ -1278,9 +1291,23 @@ fn fast_tile(
             }
             ast::MmaType::Bf16 => ir.op("shl", "i32", &x, "16"),
             ast::MmaType::Tf32 => ir.op("and", "i32", &x, "-8192"),
+            // integers as their (exact) floats
+            ast::MmaType::S8 | ast::MmaType::S4 => {
+                let sh = (32 - bits).to_string();
+                let x = ir.op("shl", "i32", &x, &sh);
+                let x = ir.op("ashr", "i32", &x, &sh);
+                let f = ir.cast("sitofp", "i32", &x, "float");
+                ir.cast("bitcast", "float", &f, "i32")
+            }
+            ast::MmaType::U8 | ast::MmaType::U4 => {
+                let x = ir.op("and", "i32", &x, &((1u32 << bits) - 1).to_string());
+                let f = ir.cast("uitofp", "i32", &x, "float");
+                ir.cast("bitcast", "float", &f, "i32")
+            }
             _ => x,
         }
     };
+    let int = is_fast_int(d);
     // f32 bits of the operand slot s of this thread for the 8x8 tile of
     // `matrix` at (row0, col0), zero past `cols`
     let mut gather = |ir: &mut Ir,
@@ -1343,8 +1370,15 @@ fn fast_tile(
     }
     let mut tiles = Vec::new();
     for h in 0..m / 8 {
-        let x = gather(ir, 2, c, d.ctype, &c_owners, (8 * h, 0, 8), 0)?;
-        let y = gather(ir, 2, c, d.ctype, &c_owners, (8 * h, 0, 8), 1)?;
+        // (integers: the products' sum from zero, C added in integers below)
+        let (x, y) = if int {
+            ("0".to_string(), "0".to_string())
+        } else {
+            (
+                gather(ir, 2, c, d.ctype, &c_owners, (8 * h, 0, 8), 0)?,
+                gather(ir, 2, c, d.ctype, &c_owners, (8 * h, 0, 8), 1)?,
+            )
+        };
         let mut acc = vector(ir, &x, &y);
         for (kt, bt) in b_tiles.iter().enumerate() {
             let kt = kt as u32;
@@ -1393,6 +1427,21 @@ fn fast_tile(
             let h = ir.cast("fptrunc", "float", &f, "half");
             let h = ir.cast("bitcast", "half", &h, "i16");
             ir.cast("zext", "i16", &h, "i32")
+        } else if int {
+            // C + the sum (exact in f32), wrapping, or clamped to s32 with .satfinite
+            let f = ir.cast("bitcast", "i32", &value, "float");
+            let v = ir.cast("fptosi", "float", &f, "i32");
+            let cj = c.get(j as usize).ok_or_else(|| todo("mma fragment size"))?;
+            if d.satfinite {
+                let v64 = ir.cast("sext", "i32", &v, "i64");
+                let c64 = ir.cast("sext", "i32", cj, "i64");
+                let sum = ir.op("add", "i64", &c64, &v64);
+                let low = ir.intrinsic("smax", "i64", &[&sum, "-2147483648"]);
+                let sum = ir.intrinsic("smin", "i64", &[&low, "2147483647"]);
+                ir.cast("trunc", "i64", &sum, "i32")
+            } else {
+                ir.op("add", "i32", cj, &v)
+            }
         } else {
             value
         });

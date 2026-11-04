@@ -25,6 +25,9 @@ PTX-formalization test format (`.buffer` / `.launch` / `.expect`), with expected
 - `shf.ptx`: `shf.l` / `shf.r` `.wrap` / `.clamp` of 256 pairs with every shift amount 0..63;
 - `f16_directed.ptx`: `cvt.{rz,rm,rp,rn}.f16.f32` of 4,096 floats (half boundaries and midpoints ±1 float ulp,
   half and float denormals, overflow edges, infinities, random);
+- `f64_to_i32.ptx`: `cvt.{rni,rmi,rpi,rzi}.{s32,u32}.f64` of 2,048 doubles (halves and quarters of integers and one
+  ulp either way, the ends of the 32-bit ranges, denormals, zeros, infinities, NaNs for s32, random;
+  `gen/f64_to_i32.py`, expected from Python);
 - `prmt_const.ptx`: `prmt.b32` with 320 constant selectors (every repeated nibble, the sign-free low-half pairs,
   random ones with and without sign bits) on 32 operand pairs, each selector on its own operands
   (`gen/prmt_const.py`, expected from the ISA's definition);

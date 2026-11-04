@@ -4981,6 +4981,29 @@ impl<'a> MethodEmitContext<'a> {
                         or(and(r, not(m)), and(bound, m))
                     }
                 }
+                // signed bytes: in the order of their unsigned values with the sign bits flipped (min, max and the
+                // absolute difference of those, which is the same; flipped back for min and max; not .sat, which
+                // clamps an absolute difference above 127)
+                ast::VideoOp::Min | ast::VideoOp::Max | ast::VideoOp::Absdiff
+                    if signed && w == 8 && !(data.saturate && op == ast::VideoOp::Absdiff) =>
+                {
+                    let (fa, fb) = (xor(a, k(h)), xor(b, k(h)));
+                    let below = mask(borrow(fa, fb, sub_wrap(fa, fb)));
+                    let s = and(xor(fa, fb), below);
+                    match op {
+                        ast::VideoOp::Min => xor(xor(fb, s), k(h)),
+                        ast::VideoOp::Max => xor(xor(fa, s), k(h)),
+                        _ => {
+                            let d = sub(xor(fa, s), xor(fb, s));
+                            if !data.add {
+                                d
+                            } else {
+                                let pairs = add(and(d, k(0x00ff_00ff)), and(lshr(d, 8), k(0x00ff_00ff)));
+                                add(add(and(pairs, k(0xffff)), lshr(pairs, 16)), c)
+                            }
+                        }
+                    }
+                }
                 _ if signed => return None,
                 // (a + b + 1) >> 1 in each lane
                 ast::VideoOp::Avrg => sub(or(a, b), and(lshr(xor(a, b), 1), k(l))),

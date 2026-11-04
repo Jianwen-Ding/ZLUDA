@@ -1,0 +1,31 @@
+// 16-bit atomics on the two halves of one word from one SIMD group of 32 threads (thread i on half i & 1):
+// atom.add.noftz.f16 of small integers (exact sums) and atom.cas.b16 counters; the returned values in lane
+// order, as the backend serializes a SIMD group on one word. Expected values from Python.
+.version 8.7
+.target sm_90
+.address_size 64
+.visible .entry k(.param .u64 pw, .param .u64 pv, .param .u64 pr, .param .u64 pc, .param .u64 pcr)
+{
+  .reg .u64 %w, %v, %r, %c, %cr, %o, %h; .reg .u32 %t, %s; .reg .b16 %x, %y, %e, %n; .reg .pred %p1;
+  ld.param.u64 %w, [pw]; ld.param.u64 %v, [pv]; ld.param.u64 %r, [pr]; ld.param.u64 %c, [pc]; ld.param.u64 %cr, [pcr];
+  mov.u32 %t, %tid.x; and.b32 %s, %t, 1; mul.wide.u32 %h, %s, 2;
+  mul.wide.u32 %o, %t, 2; add.u64 %v, %v, %o; add.u64 %r, %r, %o; add.u64 %cr, %cr, %o;
+  ld.global.b16 %x, [%v]; add.u64 %w, %w, %h; atom.global.add.noftz.f16 %y, [%w], %x; st.global.b16 [%r], %y;
+  add.u64 %c, %c, %h;
+  // a counter per half: retry the compare-and-swap until it takes
+LOOP:
+  ld.volatile.global.b16 %e, [%c]; add.u16 %n, %e, 1; atom.global.cas.b16 %y, [%c], %e, %n;
+  setp.ne.b16 %p1, %y, %e;
+  @%p1 bra LOOP;
+  st.global.b16 [%cr], %e;
+  ret;
+}
+.buffer W .u32 = { 0 };
+.buffer V .u16 = { 15360, 16384, 16896, 17408, 17664, 17920, 18176, 15360, 16384, 16896, 17408, 17664, 17920, 18176, 15360, 16384, 16896, 17408, 17664, 17920, 18176, 15360, 16384, 16896, 17408, 17664, 17920, 18176, 15360, 16384, 16896, 17408 };
+.buffer R .u16 [32];
+.buffer C .u32 = { 0 };
+.buffer CR .u16 [32];
+.launch k <<< 1, 32 >>> (W, V, R, C, CR);
+.expect W .u32 = { 1405113216 };
+.expect R .u16 = { 0, 0, 15360, 16384, 17408, 17920, 18560, 18944, 19456, 19072, 19584, 19456, 19840, 19776, 20224, 20224, 20288, 20352, 20480, 20544, 20640, 20736, 20864, 20768, 20928, 20864, 21056, 21024, 21248, 21248, 21280, 21312 };
+.expect C .u32 = { 1048592 };

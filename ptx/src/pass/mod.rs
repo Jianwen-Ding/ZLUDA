@@ -217,6 +217,7 @@ pub fn to_llvm_module_with_options<'input>(
     // mma / wmma with f16, bf16 or tf32 A and B through the SIMD-group matrix multiply-accumulate (a few ulps from
     // the exact sums) except under strict floating point, where `fast_mma` asks for it too
     agx_matrix::set_fast_mma((fast_mma || !strict_fp) && target.is_air());
+    agx_matrix::set_fast_wgmma(fast_mma && target.is_air());
     let directives = instruction_mode_to_global_mode::run(&mut flat_resolver, directives)?;
     on_pass_end("instruction_mode_to_global_mode");
     let mut directives = insert_explicit_load_store::run(&mut flat_resolver, directives, target.is_air())?;

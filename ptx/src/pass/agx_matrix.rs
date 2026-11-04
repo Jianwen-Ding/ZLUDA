@@ -57,16 +57,6 @@ pub(super) fn set_fast_mma(fast: bool) {
     FAST_MMA.with(|f| f.set(fast));
 }
 
-thread_local! {
-    static FAST_WGMMA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// The fast tiles for wgmma too: only when `--fast-mma` asks for them (their
-/// default-mode results would change from the exact sums by rounding).
-pub(super) fn set_fast_wgmma(fast: bool) {
-    FAST_WGMMA.with(|f| f.set(fast));
-}
-
 /// The `mma` tiles that `fast_mma` computes with the SIMD-group matrix
 /// multiply-accumulate.
 fn is_fast(d: &ast::MmaDetails) -> bool {
@@ -3063,11 +3053,8 @@ fn wgmma(
 ) -> Result<Vec<String>, TranslateError> {
     let w = &d.mma;
     let tile = ast::MmaDetails { m: 16, n: 8, ..*w };
-    // (the fast tiles with --fast-mma, the integer ones by default too:
-    // define picks them by the name)
-    // (integer tiles, exact, also by default as for mma.sync)
-    let fast = is_fast(&tile)
-        && (FAST_WGMMA.with(|f| f.get()) || (is_fast_int(&tile) && FAST_MMA.with(|f| f.get())));
+    // (the fast tiles as for mma.sync: define picks them by the name)
+    let fast = is_fast(&tile) && FAST_MMA.with(|f| f.get());
     let tile_name =
         format!("{ZLUDA_PTX_PREFIX}{}_wgmma{}", Helper::Mma(tile).name(), if fast { "_fast" } else { "" });
     let tile_types = [ast::MmaMatrix::A, ast::MmaMatrix::B, ast::MmaMatrix::C].map(|m| match tile.mma_type(m) {

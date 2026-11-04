@@ -214,10 +214,9 @@ pub fn to_llvm_module_with_options<'input>(
     let directives = remove_unreachable_basic_blocks::run(directives, target.is_air())?;
     on_pass_end("remove_unreachable_basic_blocks");
     instruction_mode_to_global_mode::set_f32_always_ftz(sm_version < 20);
-    // mma / wmma with f16, bf16 or tf32 A and B through the SIMD-group matrix multiply-accumulate (a few ulps from
-    // the exact sums) except under strict floating point, where `fast_mma` asks for it too
+    // mma / wmma / wgmma with f16, bf16 or tf32 A and B through the SIMD-group matrix multiply-accumulate (a few ulps
+    // from the exact sums) except under strict floating point, where `fast_mma` asks for it too
     agx_matrix::set_fast_mma((fast_mma || !strict_fp) && target.is_air());
-    agx_matrix::set_fast_wgmma(fast_mma && target.is_air());
     let directives = instruction_mode_to_global_mode::run(&mut flat_resolver, directives)?;
     on_pass_end("instruction_mode_to_global_mode");
     let mut directives = insert_explicit_load_store::run(&mut flat_resolver, directives, target.is_air())?;

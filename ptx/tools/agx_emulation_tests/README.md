@@ -25,6 +25,9 @@ PTX-formalization test format (`.buffer` / `.launch` / `.expect`), with expected
 - `shf.ptx`: `shf.l` / `shf.r` `.wrap` / `.clamp` of 256 pairs with every shift amount 0..63;
 - `f16_directed.ptx`: `cvt.{rz,rm,rp,rn}.f16.f32` of 4,096 floats (half boundaries and midpoints ±1 float ulp,
   half and float denormals, overflow edges, infinities, random);
+- `prmt_const.ptx`: `prmt.b32` with 320 constant selectors (every repeated nibble, the sign-free low-half pairs,
+  random ones with and without sign bits) on 32 operand pairs, each selector on its own operands
+  (`gen/prmt_const.py`, expected from the ISA's definition);
 - `tma-edge-*.ptx`: `cp.async.bulk.tensor` 2D tile loads and stores whose rows run past the end of the tensor in both
   dimensions or start before it, with the swizzle modes none, 32B, 128B and 128B with 32B atoms and the 8-byte flip,
   and NaN fill (`gen/tma_edges.py`, expected from the PTX ISA's swizzle tables);

@@ -26,6 +26,10 @@ PTX-formalization test format (`.buffer` / `.launch` / `.expect`), with expected
 - `f16_directed.ptx`: `cvt.{rz,rm,rp,rn}.f16.f32` of 4,096 floats (half boundaries and midpoints ±1 float ulp,
   half and float denormals, overflow edges, infinities, random).
 
+`strict/` holds tests of exactness that only `--strict-fp` promises (the default mode rounds bfloat fma twice, through
+float): `strict/bf16_fma.ptx`, `fma.rn.bf16x2` of 4,096 bfloat triples (realistic, subnormal, edge exponents,
+cancellation; `gen/bf16_fma.py`).
+
 `gen_all.sh DIR` writes the larger generated sets (several MB): f64 add / sub / mul, fma and div / sqrt (random,
 edge, denormal, overflow and cancellation operands; with `ZEROS=1` 40% zeros), float fma rounded toward zero / up
 / down, float add / sub / mul in those directions (operands around the fast paths' bounds 2^-102, 2^-70, 2^126,

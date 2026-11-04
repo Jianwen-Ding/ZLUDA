@@ -2843,26 +2843,32 @@ loop5:
   %o5 = phi i32 [ 0, %entry ], [ %o5.n, %step5 ]
   %sr5 = add i32 %rel, %o5
   %sw5 = call i32 @__zluda_ptx_impl_agx_tma_swizzle(i32 5, i32 %sr5)
+  ; (the halves at the block's start + the flip bit and + it ^ 8: the 8-byte
+  ; halves moved apart, no select of the data)
   %sw16 = and i32 %sw5, -16
   %fb = and i32 %sw5, 8
-  %flip = icmp ne i32 %fb, 0
+  %fb2 = xor i32 %fb, 8
   %sa5 = add i32 %window, %sw16
-  %sp5 = inttoptr i32 %sa5 to ptr addrspace(3)
+  %sl = add i32 %sa5, %fb
+  %sh = add i32 %sa5, %fb2
+  %spl = inttoptr i32 %sl to ptr addrspace(3)
+  %sph = inttoptr i32 %sh to ptr addrspace(3)
   %o564 = zext i32 %o5 to i64
   %ga5 = add i64 %g, %o564
   %gp5 = inttoptr i64 %ga5 to ptr addrspace(1)
   br i1 %load, label %ld5, label %st5
 ld5:
   %v5 = load <4 x i32>, ptr addrspace(1) %gp5, align 16
-  %vs = shufflevector <4 x i32> %v5, <4 x i32> poison, <4 x i32> <i32 2, i32 3, i32 0, i32 1>
-  %vf = select i1 %flip, <4 x i32> %vs, <4 x i32> %v5
-  store <4 x i32> %vf, ptr addrspace(3) %sp5, align 16
+  %vl = shufflevector <4 x i32> %v5, <4 x i32> poison, <2 x i32> <i32 0, i32 1>
+  %vh = shufflevector <4 x i32> %v5, <4 x i32> poison, <2 x i32> <i32 2, i32 3>
+  store <2 x i32> %vl, ptr addrspace(3) %spl, align 8
+  store <2 x i32> %vh, ptr addrspace(3) %sph, align 8
   br label %step5
 st5:
-  %w5 = load <4 x i32>, ptr addrspace(3) %sp5, align 16
-  %ws = shufflevector <4 x i32> %w5, <4 x i32> poison, <4 x i32> <i32 2, i32 3, i32 0, i32 1>
-  %wf = select i1 %flip, <4 x i32> %ws, <4 x i32> %w5
-  store <4 x i32> %wf, ptr addrspace(1) %gp5, align 16
+  %wl = load <2 x i32>, ptr addrspace(3) %spl, align 8
+  %wh = load <2 x i32>, ptr addrspace(3) %sph, align 8
+  %w5 = shufflevector <2 x i32> %wl, <2 x i32> %wh, <4 x i32> <i32 0, i32 1, i32 2, i32 3>
+  store <4 x i32> %w5, ptr addrspace(1) %gp5, align 16
   br label %step5
 step5:
   %o5.n = add i32 %o5, 16

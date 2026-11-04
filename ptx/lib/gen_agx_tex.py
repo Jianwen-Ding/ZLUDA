@@ -37,6 +37,9 @@ def convert(clang, source, prefix, metadata_base, declared, defined, flags=()):
     types = set(re.findall(r'^%([\w.]+) = type ', ir, re.M))
     out = []
     for line in ir.splitlines():
+        # the hardware estimates (zluda_ptx_impl_agx_math.c) as AGX's intrinsics
+        line = line.replace('@__zluda_agx_hw_rcp(', '@llvm.agx.rcp.f32(')
+        line = line.replace('@__zluda_agx_hw_rsqrt(', '@llvm.agx.rsqrt.f32(')
         if line.startswith(('source_filename', 'target datalayout', 'target triple', 'attributes #', '; ModuleID')):
             continue
         if 'llvm.experimental.noalias.scope.decl' in line:

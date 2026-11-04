@@ -43157,57 +43157,79 @@ define dso_local void @__zluda_ptx_impl_free(i64 noundef %0) local_unnamed_addr 
 
 ; from zluda_ptx_impl_agx_math.c
 
-; Function Attrs: alwaysinline mustprogress nofree norecurse nosync nounwind willreturn memory(none)
+; Function Attrs: alwaysinline mustprogress nofree nosync nounwind willreturn memory(none)
 define dso_local double @__zluda_ptx_impl_rcp_approx_ftz_f64(double noundef %0) local_unnamed_addr #3 {
   %2 = bitcast double %0 to i64
   %3 = and i64 %2, 9218868437227405312
   %4 = icmp eq i64 %3, 0
   %5 = select i1 %4, i64 -9223372036854775808, i64 -4294967296
   %6 = and i64 %5, %2
-  %7 = and i64 %6, 9223372032559808512
-  %8 = icmp ugt i64 %7, 9218868437227405312
-  br i1 %8, label %32, label %9
+  %7 = and i64 %2, -9223372036854775808
+  %8 = and i64 %6, 9223372032559808512
+  %9 = lshr i64 %8, 52
+  %10 = trunc i64 %9 to i32
+  %11 = lshr exact i64 %6, 32
+  %12 = trunc i64 %11 to i32
+  %13 = and i32 %12, 1048575
+  %14 = icmp eq i32 %13, 0
+  br i1 %14, label %45, label %15
 
-9:                                                ; preds = %1
-  switch i64 %7, label %16 [
-    i64 0, label %10
-    i64 9218868437227405312, label %13
-  ]
+15:                                               ; preds = %1
+  %16 = icmp ugt i32 %10, 2044
+  br i1 %16, label %51, label %17
 
-10:                                               ; preds = %9
-  %11 = or disjoint i64 %6, 9218868437227405312
-  %12 = bitcast i64 %11 to double
-  br label %32
+17:                                               ; preds = %15
+  %18 = or disjoint i32 %13, 1048576
+  %19 = uitofp i32 %18 to float
+  %20 = tail call float @llvm.agx.rcp.f32(float noundef %19)
+  %21 = fmul float %20, 0x4280000000000000
+  %22 = fadd float %21, 5.000000e-01
+  %23 = fptoui float %22 to i32
+  %24 = shl i32 %23, 1
+  %25 = or disjoint i32 %24, 1
+  %26 = zext i32 %25 to i64
+  %27 = zext nneg i32 %18 to i64
+  %28 = mul nuw nsw i64 %26, %27
+  %29 = icmp ult i64 %28, 4398046511104
+  %30 = zext i1 %29 to i32
+  %31 = add i32 %30, %23
+  %32 = add i32 %24, -1
+  %33 = zext i32 %32 to i64
+  %34 = mul nuw nsw i64 %33, %27
+  %35 = icmp ugt i64 %34, 4398046511104
+  %36 = sext i1 %35 to i32
+  %37 = add i32 %31, %36
+  %38 = and i64 %6, 9218868437227405312
+  %39 = and i32 %37, 1048575
+  %40 = zext nneg i32 %39 to i64
+  %41 = shl nuw nsw i64 %40, 32
+  %42 = sub nsw i64 %41, %38
+  %43 = add nsw i64 %42, 9209861237972664320
+  %44 = or i64 %43, %7
+  br label %51
 
-13:                                               ; preds = %9
-  %14 = and i64 %2, -9223372036854775808
-  %15 = bitcast i64 %14 to double
-  br label %32
+45:                                               ; preds = %1
+  %46 = icmp ugt i32 %10, 2045
+  %47 = and i64 %6, 9218868437227405312
+  %48 = sub nsw i64 9214364837600034816, %47
+  %49 = select i1 %46, i64 0, i64 %48
+  %50 = or i64 %49, %7
+  br label %51
 
-16:                                               ; preds = %9
-  %17 = bitcast i64 %6 to double
-  %18 = fdiv double 1.000000e+00, %17
-  %19 = bitcast double %18 to i64
-  %20 = and i64 %19, 9218868437227405312
-  %21 = icmp eq i64 %20, 9218868437227405312
-  %22 = lshr i64 %19, 32
-  %23 = and i64 %22, 1
-  %24 = add nuw nsw i64 %23, 2147483647
-  %25 = select i1 %21, i64 0, i64 %24
-  %26 = add i64 %25, %19
-  %27 = and i64 %26, 9218868437227405312
-  %28 = icmp eq i64 %27, 0
-  %29 = select i1 %28, i64 -9223372036854775808, i64 -4294967296
-  %30 = and i64 %29, %26
-  %31 = bitcast i64 %30 to double
-  br label %32
-
-32:                                               ; preds = %1, %16, %13, %10
-  %33 = phi double [ %12, %10 ], [ %15, %13 ], [ %31, %16 ], [ 0x7FFFFFFF00000000, %1 ]
-  ret double %33
+51:                                               ; preds = %17, %15, %45
+  %52 = phi i64 [ %50, %45 ], [ %44, %17 ], [ %7, %15 ]
+  %53 = icmp eq i64 %8, 9218868437227405312
+  %54 = select i1 %53, i64 %7, i64 %52
+  %55 = icmp eq i64 %8, 0
+  %56 = or disjoint i64 %7, 9218868437227405312
+  %57 = select i1 %55, i64 %56, i64 %54
+  %58 = icmp ugt i64 %8, 9218868437227405312
+  %59 = select i1 %58, i64 9223372032559808512, i64 %57
+  %60 = bitcast i64 %59 to double
+  ret double %60
 }
 
-; Function Attrs: alwaysinline mustprogress nofree norecurse nosync nounwind willreturn memory(none)
+; Function Attrs: alwaysinline mustprogress nofree nosync nounwind willreturn memory(none)
 define dso_local double @__zluda_ptx_impl_rsqrt_approx_ftz_f64(double noundef %0) local_unnamed_addr #3 {
   %2 = bitcast double %0 to i64
   %3 = and i64 %2, 9218868437227405312
@@ -43215,53 +43237,82 @@ define dso_local double @__zluda_ptx_impl_rsqrt_approx_ftz_f64(double noundef %0
   %5 = select i1 %4, i64 -9223372036854775808, i64 -4294967296
   %6 = and i64 %5, %2
   %7 = and i64 %6, 9223372032559808512
-  %8 = icmp ugt i64 %7, 9218868437227405312
-  br i1 %8, label %36, label %9
+  %8 = lshr i64 %7, 52
+  %9 = trunc i64 %8 to i32
+  %10 = add nsw i32 %9, -1023
+  %11 = lshr exact i64 %6, 32
+  %12 = trunc i64 %11 to i32
+  %13 = and i32 %12, 1048575
+  %14 = ashr i32 %10, 1
+  %15 = or disjoint i32 %13, 1048576
+  %16 = and i32 %10, 1
+  %17 = shl nuw nsw i32 %15, %16
+  %18 = icmp eq i32 %17, 1048576
+  br i1 %18, label %19, label %23
 
-9:                                                ; preds = %1
-  %10 = icmp sgt i64 %6, -1
-  %11 = icmp eq i64 %7, 0
-  %12 = or i1 %10, %11
-  br i1 %12, label %13, label %36
+19:                                               ; preds = %1
+  %20 = sub nsw i32 1023, %14
+  %21 = zext nneg i32 %20 to i64
+  %22 = shl nuw nsw i64 %21, 52
+  br label %55
 
-13:                                               ; preds = %9
-  br i1 %11, label %14, label %17
+23:                                               ; preds = %1
+  %24 = sub nsw i32 1022, %14
+  %25 = uitofp i32 %17 to float
+  %26 = tail call float @llvm.agx.rsqrt.f32(float noundef %25)
+  %27 = fmul float %26, 0x41E0000000000000
+  %28 = fadd float %27, 5.000000e-01
+  %29 = fptoui float %28 to i32
+  %30 = shl i32 %29, 1
+  %31 = or disjoint i32 %30, 1
+  %32 = zext i32 %31 to i64
+  %33 = add i32 %30, -1
+  %34 = zext i32 %33 to i64
+  %35 = zext nneg i32 %17 to i128
+  %36 = mul nuw i64 %32, %32
+  %37 = zext nneg i32 %17 to i64
+  %38 = tail call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %37, i64 %36)
+  %39 = extractvalue { i64, i1 } %38, 1
+  %40 = xor i1 %39, true
+  %41 = zext i1 %40 to i32
+  %42 = mul nuw i64 %34, %34
+  %43 = zext i64 %42 to i128
+  %44 = mul nuw nsw i128 %43, %35
+  %45 = icmp ugt i128 %44, 18446744073709551616
+  %46 = sext i1 %45 to i32
+  %47 = add i32 %41, %29
+  %48 = add i32 %47, %46
+  %49 = zext nneg i32 %24 to i64
+  %50 = shl nuw nsw i64 %49, 52
+  %51 = and i32 %48, 1048575
+  %52 = zext nneg i32 %51 to i64
+  %53 = shl nuw nsw i64 %52, 32
+  %54 = or disjoint i64 %53, %50
+  br label %55
 
-14:                                               ; preds = %13
-  %15 = or disjoint i64 %6, 9218868437227405312
-  %16 = bitcast i64 %15 to double
-  br label %36
-
-17:                                               ; preds = %13
-  %18 = icmp eq i64 %6, 9218868437227405312
-  br i1 %18, label %36, label %19
-
-19:                                               ; preds = %17
-  %20 = bitcast i64 %6 to double
-  %21 = tail call double @llvm.sqrt.f64(double %20)
-  %22 = fdiv double 1.000000e+00, %21
-  %23 = bitcast double %22 to i64
-  %24 = and i64 %23, 9218868437227405312
-  %25 = icmp eq i64 %24, 9218868437227405312
-  %26 = lshr i64 %23, 32
-  %27 = and i64 %26, 1
-  %28 = add nuw nsw i64 %27, 2147483647
-  %29 = select i1 %25, i64 0, i64 %28
-  %30 = add i64 %29, %23
-  %31 = and i64 %30, 9218868437227405312
-  %32 = icmp eq i64 %31, 0
-  %33 = select i1 %32, i64 -9223372036854775808, i64 -4294967296
-  %34 = and i64 %33, %30
-  %35 = bitcast i64 %34 to double
-  br label %36
-
-36:                                               ; preds = %1, %9, %17, %19, %14
-  %37 = phi double [ %16, %14 ], [ %35, %19 ], [ 0.000000e+00, %17 ], [ 0x7FFFFFFF00000000, %9 ], [ 0x7FFFFFFF00000000, %1 ]
-  ret double %37
+55:                                               ; preds = %23, %19
+  %56 = phi i64 [ %22, %19 ], [ %54, %23 ]
+  %57 = icmp eq i64 %7, 0
+  %58 = or disjoint i64 %6, 9218868437227405312
+  %59 = icmp eq i64 %6, 9218868437227405312
+  %60 = select i1 %59, i64 0, i64 %56
+  %61 = select i1 %57, i64 %58, i64 %60
+  %62 = icmp ugt i64 %7, 9218868437227405312
+  %63 = icmp slt i64 %6, 0
+  %64 = icmp ne i64 %7, 0
+  %65 = and i1 %63, %64
+  %66 = or i1 %62, %65
+  %67 = bitcast i64 %61 to double
+  %68 = select i1 %66, double 0x7FFFFFFF00000000, double %67
+  ret double %68
 }
 
-; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
-declare double @llvm.sqrt.f64(double)
+; Function Attrs: mustprogress nofree nosync nounwind willreturn memory(none)
+
+; Function Attrs: mustprogress nofree nosync nounwind willreturn memory(none)
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64)
 
 
 

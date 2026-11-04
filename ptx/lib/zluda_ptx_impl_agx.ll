@@ -1554,14 +1554,15 @@ define float @__zluda_ptx_impl_div_f32_part2(float %x, float %y, float %fma4, fl
 
 ; tanh(x) = sign(x) * (1 - e) / (1 + e) with e = exp(-2|x|), which cannot
 ; overflow; below 2^-6, where 1 - e cancels, x - x^3 / 3 (relative error
-; under 2^-27).
+; under 2^-27). The quotient is the reciprocal of 1 + e (in [1, 2]) times
+; 1 - e (arcp): its 2^-22 is far inside tanh.approx's 2^-11.
 define float @__zluda_ptx_impl_tanh_f32(float %x) #0 {
   %ax = call float @llvm.fabs.f32(float %x)
   %s = fmul float %ax, 0xC007154760000000
   %e = call float @llvm.agx.exp2.f32(float %s)
   %num = fsub float 1.0, %e
   %den = fadd float 1.0, %e
-  %t = fdiv float %num, %den
+  %t = fdiv arcp float %num, %den
   %r = call float @llvm.copysign.f32(float %t, float %x)
   %x2 = fmul float %x, %x
   %c = fmul float %x2, 0xBFD5555560000000

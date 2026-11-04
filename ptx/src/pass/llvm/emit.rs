@@ -3964,24 +3964,17 @@ impl<'a> MethodEmitContext<'a> {
         let c = |v: u64| unsafe { LLVMConstInt(i32_type, v, 0) };
         let toward_zero = data.rounding == ast::RoundingMode::Zero;
         unsafe {
-            // round value >> shift to nearest even (or toward zero)
-            let round = |this: &mut Self, value: LLVMValueRef, shift: LLVMValueRef| {
-                let q = LLVMBuildLShr(b, value, shift, LLVM_UNNAMED.as_ptr());
+            // value >> shift rounded to nearest even (or toward zero): one addition of half a unit, less one
+            // unless the kept part is odd (ties to even), then the shift
+            let round = |_this: &mut Self, value: LLVMValueRef, shift: LLVMValueRef| {
                 if toward_zero {
-                    return q;
+                    return LLVMBuildLShr(b, value, shift, LLVM_UNNAMED.as_ptr());
                 }
                 let one = c(1);
-                let unit = LLVMBuildShl(b, one, shift, LLVM_UNNAMED.as_ptr());
-                let mask = LLVMBuildSub(b, unit, one, LLVM_UNNAMED.as_ptr());
-                let rest = LLVMBuildAnd(b, value, mask, LLVM_UNNAMED.as_ptr());
-                let half = LLVMBuildLShr(b, unit, one, LLVM_UNNAMED.as_ptr());
-                let above = LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntUGT, rest, half, LLVM_UNNAMED.as_ptr());
-                let tie = LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntEQ, rest, half, LLVM_UNNAMED.as_ptr());
-                let odd = LLVMBuildTrunc(b, q, LLVMInt1TypeInContext(this.context), LLVM_UNNAMED.as_ptr());
-                let tie_up = LLVMBuildAnd(b, tie, odd, LLVM_UNNAMED.as_ptr());
-                let up = LLVMBuildOr(b, above, tie_up, LLVM_UNNAMED.as_ptr());
-                let up = LLVMBuildZExt(b, up, i32_type, LLVM_UNNAMED.as_ptr());
-                LLVMBuildAdd(b, q, up, LLVM_UNNAMED.as_ptr())
+                let odd = LLVMBuildAnd(b, LLVMBuildLShr(b, value, shift, LLVM_UNNAMED.as_ptr()), one, LLVM_UNNAMED.as_ptr());
+                let half = LLVMBuildShl(b, one, LLVMBuildSub(b, shift, one, LLVM_UNNAMED.as_ptr()), LLVM_UNNAMED.as_ptr());
+                let bias = LLVMBuildAdd(b, LLVMBuildSub(b, half, one, LLVM_UNNAMED.as_ptr()), odd, LLVM_UNNAMED.as_ptr());
+                LLVMBuildLShr(b, LLVMBuildAdd(b, value, bias, LLVM_UNNAMED.as_ptr()), shift, LLVM_UNNAMED.as_ptr())
             };
             let magnitude = LLVMBuildAnd(b, bits, c(0x7fff_ffff), LLVM_UNNAMED.as_ptr());
             let negative = LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntSLT, bits, c(0), LLVM_UNNAMED.as_ptr());
@@ -3990,7 +3983,6 @@ impl<'a> MethodEmitContext<'a> {
             let min_exponent_field = 127 + 1 - bias;
             let is_normal = LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntUGE, exponent, c(min_exponent_field), LLVM_UNNAMED.as_ptr());
             let rebiased = LLVMBuildSub(b, magnitude, c((127 - bias) << 23), LLVM_UNNAMED.as_ptr());
-            let normal = round(self, rebiased, c(23 - mantissa_bits));
             // subnormal: the significand shifted by the missing exponent
             let significand = LLVMBuildOr(
                 b,
@@ -4000,8 +3992,11 @@ impl<'a> MethodEmitContext<'a> {
             );
             let shift = LLVMBuildSub(b, c(min_exponent_field + 23 - mantissa_bits), exponent, LLVM_UNNAMED.as_ptr());
             let shift = self.emit_int_intrinsic("llvm.umin", i32_type, &[shift, c(31)]);
-            let subnormal = round(self, significand, shift);
-            let code = LLVMBuildSelect(b, is_normal, normal, subnormal, LLVM_UNNAMED.as_ptr());
+            // one rounding: the rebiased bits of a normal result, the significand shifted by the missing exponent of
+            // a subnormal one (a carry out of either is the next code up)
+            let value = LLVMBuildSelect(b, is_normal, rebiased, significand, LLVM_UNNAMED.as_ptr());
+            let shift = LLVMBuildSelect(b, is_normal, c(23 - mantissa_bits), shift, LLVM_UNNAMED.as_ptr());
+            let code = round(self, value, shift);
             // saturation (also of infinities)
             let code = self.emit_int_intrinsic("llvm.umin", i32_type, &[code, c(top)]);
             let signed = LLVMBuildOr(b, code, c(1 << (element_bits - 1)), LLVM_UNNAMED.as_ptr());
@@ -4101,14 +4096,21 @@ impl<'a> MethodEmitContext<'a> {
                     LLVMBuildShl(b, mantissa, c(10 - mantissa_bits), LLVM_UNNAMED.as_ptr()),
                     LLVM_UNNAMED.as_ptr(),
                 );
-                // subnormal: normalized in f16, top bit at position p
-                let false_ = LLVMConstInt(LLVMInt1TypeInContext(self.context), 0, 0);
-                let leading = self.emit_int_intrinsic("llvm.ctlz", i32_type, &[mantissa, false_]);
-                let position = LLVMBuildSub(b, c(31), leading, LLVM_UNNAMED.as_ptr());
-                let f16_exponent = LLVMBuildAdd(b, position, c(1 + 15 - bias - mantissa_bits), LLVM_UNNAMED.as_ptr());
-                let f16_mantissa = LLVMBuildShl(b, mantissa, LLVMBuildSub(b, c(10), position, LLVM_UNNAMED.as_ptr()), LLVM_UNNAMED.as_ptr());
-                let f16_mantissa = LLVMBuildAnd(b, f16_mantissa, c(0x3ff), LLVM_UNNAMED.as_ptr());
-                let subnormal = LLVMBuildOr(b, LLVMBuildShl(b, f16_exponent, c(10), LLVM_UNNAMED.as_ptr()), f16_mantissa, LLVM_UNNAMED.as_ptr());
+                // subnormal: mantissa 2^(1 - bias - M), a normal f16: the f32 of the (small) integer mantissa,
+                // exact, its exponent moved (f32 exponent field E: f16 field E - 111 - bias - M) and its top bits
+                let f32_type = LLVMFloatTypeInContext(self.context);
+                let float_bits = LLVMBuildBitCast(
+                    b,
+                    LLVMBuildUIToFP(b, mantissa, f32_type, LLVM_UNNAMED.as_ptr()),
+                    i32_type,
+                    LLVM_UNNAMED.as_ptr(),
+                );
+                let subnormal = LLVMBuildSub(
+                    b,
+                    LLVMBuildLShr(b, float_bits, c(13), LLVM_UNNAMED.as_ptr()),
+                    c((111 + bias + mantissa_bits) << 10),
+                    LLVM_UNNAMED.as_ptr(),
+                );
                 let is_zero = LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntEQ, mantissa, c(0), LLVM_UNNAMED.as_ptr());
                 let subnormal = LLVMBuildSelect(b, is_zero, c(0), subnormal, LLVM_UNNAMED.as_ptr());
                 let is_normal = LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntNE, exponent, c(0), LLVM_UNNAMED.as_ptr());

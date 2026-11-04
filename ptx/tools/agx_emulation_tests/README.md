@@ -11,6 +11,8 @@ PTX-formalization test format (`.buffer` / `.launch` / `.expect`), with expected
 - `atomic-incdec.ptx`: `atom.inc.u32` / `atom.dec.u32` on one address: 32 threads with per-thread limits (each
   returned value, in lane order) and 256 threads with one limit (the final value);
 - `atomic-groups.ptx`: 256 threads in 8 SIMD groups: the final u64 sum, s64 minimum and count;
+- `div16.ptx`: `div` / `rem` of s8, u8, s16 and u16 values, 1,024 pairs each (edges, random, small and zero
+  divisors);
 - `brev64.ptx`: `brev.b64` of 256 values;
 - `div64c.ptx`: `div.u64` / `rem.u64` by constants;
 - `mulhi64.ptx`: `mul.hi.u64`, `mul.hi.s64` and `mul.lo.u64` of 512 pairs (edges, random, ones-heavy).

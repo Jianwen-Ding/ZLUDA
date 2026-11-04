@@ -10,7 +10,8 @@ PTX-formalization test format (`.buffer` / `.launch` / `.expect`), with expected
   compare-and-swap chain, every returned value and the memory (the lane-order serialization the backend uses);
 - `atomic-groups.ptx`: 256 threads in 8 SIMD groups: the final u64 sum, s64 minimum and count;
 - `brev64.ptx`: `brev.b64` of 256 values;
-- `div64c.ptx`: `div.u64` / `rem.u64` by constants.
+- `div64c.ptx`: `div.u64` / `rem.u64` by constants;
+- `mulhi64.ptx`: `mul.hi.u64`, `mul.hi.s64` and `mul.lo.u64` of 512 pairs (edges, random, ones-heavy).
 
 `gen_all.sh DIR` writes the larger generated sets (several MB): f64 add / sub / mul, fma and div / sqrt (random,
 edge, denormal, overflow and cancellation operands; with `ZEROS=1` 40% zeros), float fma rounded toward zero / up

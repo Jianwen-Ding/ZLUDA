@@ -2872,6 +2872,39 @@ exit:
   ret void
 }
 
+; A row of %bytes (a multiple of 8) in 8-byte chunks: no swizzle splits an
+; 8-byte chunk (they move bits 3 and up), so each is one load and store at
+; its own swizzled address
+define void @__zluda_ptx_impl_agx_tma_row8(i64 %g, i32 %rel, i32 %window, i32 %mode, i32 %bytes, i32 %dir) #3 {
+entry:
+  %load = icmp eq i32 %dir, -1
+  br label %loop
+loop:
+  %o = phi i32 [ 0, %entry ], [ %o.n, %step ]
+  %sr = add i32 %rel, %o
+  %sw = call i32 @__zluda_ptx_impl_agx_tma_swizzle(i32 %mode, i32 %sr)
+  %sa = add i32 %window, %sw
+  %sp = inttoptr i32 %sa to ptr addrspace(3)
+  %o64 = zext i32 %o to i64
+  %ga = add i64 %g, %o64
+  %gp = inttoptr i64 %ga to ptr addrspace(1)
+  br i1 %load, label %ld, label %st
+ld:
+  %v = load <2 x i32>, ptr addrspace(1) %gp, align 8
+  store <2 x i32> %v, ptr addrspace(3) %sp, align 8
+  br label %step
+st:
+  %w = load <2 x i32>, ptr addrspace(3) %sp, align 8
+  store <2 x i32> %w, ptr addrspace(1) %gp, align 8
+  br label %step
+step:
+  %o.n = add i32 %o, 8
+  %more = icmp ult i32 %o.n, %bytes
+  br i1 %more, label %loop, label %exit
+exit:
+  ret void
+}
+
 define i32 @__zluda_ptx_impl_agx_tma_tile(ptr %tm, i32 %c0, i32 %c1, i32 %c2, i32 %c3, i32 %c4, i32 %smem, i32 %dir) #3 {
 entry:
   %w1 = call i64 @__zluda_ptx_impl_agx_tma_word(ptr %tm, i32 1)
@@ -2982,14 +3015,20 @@ elements:
   %v0123 = mul i32 %v012, %cnt3
   %count = mul i32 %v0123, %cnt4
   %bytes = mul i32 %count, %eb
-  ; whole rows in 16-byte chunks (__zluda_ptx_impl_agx_tma_row) where the box's
-  ; dimension 0 is a multiple of 16 bytes of consecutive elements copied or
+  ; whole rows in 16- or 8-byte chunks (__zluda_ptx_impl_agx_tma_row, _row8) where
+  ; the box's dimension 0 is a multiple of 8 bytes of consecutive elements copied or
   ; stored (not reduced or inspected) (mode 5's 8-byte flip swaps the halves
   ; of a chunk, which __zluda_ptx_impl_agx_tma_row does); each row also needs
   ; to be in bounds and 16-byte aligned (checked at its start in the loop)
   %rowbytes = mul i32 %cnt0, %eb
+  ; (chunks of 16 bytes where the row is a multiple of 16, else of 8)
   %rb16 = and i32 %rowbytes, 15
-  %rbok = icmp eq i32 %rb16, 0
+  %rb16z = icmp eq i32 %rb16, 0
+  %chunk = select i1 %rb16z, i32 16, i32 8
+  %chm1 = sub i32 %chunk, 1
+  %chm164 = zext i32 %chm1 to i64
+  %rb8 = and i32 %rowbytes, 7
+  %rbok = icmp eq i32 %rb8, 0
   %unit0 = icmp eq i32 %e0, 1
   %copydir = icmp ult i32 %dir, -2
   %copying = xor i1 %copydir, true
@@ -3063,9 +3102,9 @@ rowcheck:
   %g0end = add i64 %g0w, %cnt0w
   %g0lo = icmp sge i64 %g0w, 0
   %g0hi = icmp ule i64 %g0end, %d0
-  %ga15 = and i64 %gaddr, 15
+  %ga15 = and i64 %gaddr, %chm164
   %gal = icmp eq i64 %ga15, 0
-  %sa15 = and i32 %rel, 15
+  %sa15 = and i32 %rel, %chm1
   %sal = icmp eq i32 %sa15, 0
   %rw3 = and i1 %inhi, %g0lo
   ; (its start in bounds: d0 - g0 > 0 below)
@@ -3077,7 +3116,9 @@ rowcheck:
   ; rest element by element
   %inb = sub i64 %d0, %g0w
   %inbb = mul i64 %inb, %eb64
-  %inbc = and i64 %inbb, -16
+  %chneg = sub i32 0, %chunk
+  %chneg64 = sext i32 %chneg to i64
+  %inbc = and i64 %inbb, %chneg64
   %rb64 = zext i32 %rowbytes to i64
   %partb = select i1 %g0hi, i64 %rb64, i64 %inbc
   %part = trunc i64 %partb to i32
@@ -3085,7 +3126,14 @@ rowcheck:
   %rowgo = and i1 %rowok, %some
   br i1 %rowgo, label %rowcopy, label %perelem
 rowcopy:
+  br i1 %rb16z, label %rowcopy16, label %rowcopy8
+rowcopy16:
   call void @__zluda_ptx_impl_agx_tma_row(i64 %gaddr, i32 %rel, i32 %window, i32 %mode, i32 %part, i32 %dir)
+  br label %rowdone
+rowcopy8:
+  call void @__zluda_ptx_impl_agx_tma_row8(i64 %gaddr, i32 %rel, i32 %window, i32 %mode, i32 %part, i32 %dir)
+  br label %rowdone
+rowdone:
   %partn = udiv i32 %part, %eb
   %partm1 = sub i32 %partn, 1
   br label %next
@@ -3126,9 +3174,9 @@ reduce:
   call void @__zluda_ptx_impl_agx_tma_red(i64 %gaddr, i32 %et, i32 %dir, i64 %sv)
   br label %next
 next:
-  %hits.n = phi i32 [ %hits, %load_fill ], [ %hits, %out ], [ %hits, %store ], [ %hits, %reduce ], [ %hits, %inspect ], [ %hits.e, %inspect_elem ], [ %hits, %rowcopy ]
+  %hits.n = phi i32 [ %hits, %load_fill ], [ %hits, %out ], [ %hits, %store ], [ %hits, %reduce ], [ %hits, %inspect ], [ %hits.e, %inspect_elem ], [ %hits, %rowdone ]
   ; the elements of a row copied at once beyond the first
-  %skip = phi i32 [ 0, %load_fill ], [ 0, %out ], [ 0, %store ], [ 0, %reduce ], [ 0, %inspect ], [ 0, %inspect_elem ], [ %partm1, %rowcopy ]
+  %skip = phi i32 [ 0, %load_fill ], [ 0, %out ], [ 0, %store ], [ 0, %reduce ], [ 0, %inspect ], [ 0, %inspect_elem ], [ %partm1, %rowdone ]
   ; advance (q0, ..., q4) through the box, dim 0 fastest
   %q0.p = add i32 %q0, 1
   %q0.i = add i32 %q0.p, %skip
@@ -3677,14 +3725,17 @@ entry:
   ; copied or stored, with a swizzle that keeps 16-byte chunks whole; each
   ; pixel also needs its channels in bounds, contiguous and 16-byte aligned
   %rowbytes = mul i32 %box0, %eb
+  ; (chunks of 16 bytes where the channels are a multiple of 16 bytes, else
+  ; of 8; mode 5's flip is __zluda_ptx_impl_agx_tma_row's)
   %rb16 = and i32 %rowbytes, 15
-  %rbok = icmp eq i32 %rb16, 0
+  %rb16z = icmp eq i32 %rb16, 0
+  %chm1 = select i1 %rb16z, i32 15, i32 7
+  %chm164 = zext i32 %chm1 to i64
+  %rb8 = and i32 %rowbytes, 7
+  %rbok = icmp eq i32 %rb8, 0
   %copydir = icmp ult i32 %dir, -2
   %copying = xor i1 %copydir, true
-  %mode5 = icmp eq i32 %mode_s, 5
-  %swzok = xor i1 %mode5, true
-  %rowable0 = and i1 %rbok, %copying
-  %rowable = and i1 %rowable0, %swzok
+  %rowable = and i1 %rbok, %copying
   %box0m1 = sub i32 %box0, 1
   %lastoff = mul i32 %box0m1, %eb
   %lastoff64 = zext i32 %lastoff to i64
@@ -3723,9 +3774,9 @@ rowcheck:
   %glast = call i64 @__zluda_ptx_impl_agx_tma_im2col_addr(ptr %tm, i32 %c0, i32 %c1, i32 %c2, i32 %c3, i32 %c4, i32 %i0, i32 %i1, i32 %i2, i32 %mode, i32 %elast, i32 %eb)
   %gwant = add i64 %gaddr, %lastoff64
   %contig = icmp eq i64 %glast, %gwant
-  %ga15 = and i64 %gaddr, 15
+  %ga15 = and i64 %gaddr, %chm164
   %gal = icmp eq i64 %ga15, 0
-  %sa15 = and i32 %rel, 15
+  %sa15 = and i32 %rel, %chm1
   %sal = icmp eq i32 %sa15, 0
   %al = and i1 %gal, %sal
   %rowok = and i1 %contig, %al
@@ -3733,7 +3784,14 @@ rowcheck:
 rowfail:
   br label %elem
 rowcopy:
+  br i1 %rb16z, label %rowcopy16, label %rowcopy8
+rowcopy16:
   call void @__zluda_ptx_impl_agx_tma_row(i64 %gaddr, i32 %rel, i32 %window, i32 %mode_s, i32 %rowbytes, i32 %dir)
+  br label %rowdone
+rowcopy8:
+  call void @__zluda_ptx_impl_agx_tma_row8(i64 %gaddr, i32 %rel, i32 %window, i32 %mode_s, i32 %rowbytes, i32 %dir)
+  br label %rowdone
+rowdone:
   %e.row = add i32 %e, %box0
   br label %next
 elem:
@@ -3747,9 +3805,9 @@ elem:
   %col.e = select i1 %colw, i32 0, i32 %col.i
   br label %next
 next:
-  %e.next = phi i32 [ %e.row, %rowcopy ], [ %e.one, %elem ]
-  %col.n = phi i32 [ 0, %rowcopy ], [ %col.e, %elem ]
-  %tryrows.n = phi i1 [ %tryrows, %rowcopy ], [ %tryrows.e, %elem ]
+  %e.next = phi i32 [ %e.row, %rowdone ], [ %e.one, %elem ]
+  %col.n = phi i32 [ 0, %rowdone ], [ %col.e, %elem ]
+  %tryrows.n = phi i1 [ %tryrows, %rowdone ], [ %tryrows.e, %elem ]
   %more = icmp ult i32 %e.next, %count
   br i1 %more, label %loop, label %exit
 exit:

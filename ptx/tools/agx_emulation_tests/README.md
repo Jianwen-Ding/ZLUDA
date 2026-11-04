@@ -19,6 +19,8 @@ PTX-formalization test format (`.buffer` / `.launch` / `.expect`), with expected
 - `brev64.ptx`: `brev.b64` of 256 values;
 - `div64c.ptx`: `div.u64` / `rem.u64` by constants;
 - `mulhi64.ptx`: `mul.hi.u64`, `mul.hi.s64` and `mul.lo.u64` of 512 pairs (edges, random, ones-heavy).
+- `div32.ptx`: `div` / `rem` `.u32` / `.s32` of 512 pairs (all pairs of edge values, random), division by 0 and -1 as
+  ZLUDA defines them;
 - `lop3.ptx`: `lop3.b32` with each of the 256 constant tables on 128 operand triples;
 - `shf.ptx`: `shf.l` / `shf.r` `.wrap` / `.clamp` of 256 pairs with every shift amount 0..63;
 - `f16_directed.ptx`: `cvt.{rz,rm,rp,rn}.f16.f32` of 4,096 floats (half boundaries and midpoints ±1 float ulp,

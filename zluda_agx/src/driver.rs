@@ -1618,7 +1618,8 @@ fn agx_lineinfo() -> bool {
 }
 
 /// `ZLUDA_AGX_FAST_MMA=1`: compute `mma` and `wmma` of f16, bf16 and tf32 with the SIMD-group matrix
-/// multiply-accumulate (zoc --fast-mma) instead of exact sums.
+/// multiply-accumulate (zoc --fast-mma) instead of exact sums also with `ZLUDA_ROUNDING_STRICT` (without it, the AIR
+/// route always does).
 fn agx_fast_mma() -> bool {
     std::env::var("ZLUDA_AGX_FAST_MMA").is_ok_and(|v| !v.is_empty() && v != "0")
 }
@@ -1706,9 +1707,9 @@ fn compile_or_cached(sources: &[&[u8]], cpu: &str, cached_only: bool) -> Result<
         options.push("no-uniform-constants");
     }
     // PTX goes to AIR and the AGX backend compiles that AIR (zoc --target air). The modes the AIR route does not
-    // implement (Mesa's strict instructions, checked accesses, line tables, SIMD-group mma) still take the direct
-    // route, where ZLUDA_AGX_VIA_AIR=1 raises the AGX IR to AIR (experimental).
-    let direct = mesa || checked || lineinfo || fast_mma;
+    // implement (Mesa's strict instructions, checked accesses, line tables) still take the direct route, where
+    // ZLUDA_AGX_VIA_AIR=1 raises the AGX IR to AIR (experimental).
+    let direct = mesa || checked || lineinfo;
     if !direct {
         options.push("air");
     }

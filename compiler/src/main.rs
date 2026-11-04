@@ -63,7 +63,8 @@ pub struct Options {
     #[bpaf(long("fast-mma"))]
     /// AGX: compute mma and wmma with f16, bf16 or tf32 A and B with the
     /// SIMD-group matrix multiply-accumulate in f32 (the matrix unit on G14):
-    /// much faster than the exact sums, rounded at every step
+    /// much faster than the exact sums, rounded at every step. The default
+    /// without --strict-fp (--target air); with it, this flag still asks for it
     fast_mma: bool,
 
     #[bpaf(long("lineinfo"))]

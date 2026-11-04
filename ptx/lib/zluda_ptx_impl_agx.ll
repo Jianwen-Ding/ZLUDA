@@ -3622,17 +3622,84 @@ entry:
   %none = and i1 %is3, %neg_w
   %empty = icmp eq i32 %count, 0
   %skip = or i1 %empty, %none
-  br i1 %skip, label %exit, label %loop
+  ; a pixel's channels (box0 consecutive elements) at once in 16-byte chunks
+  ; (__zluda_ptx_impl_agx_tma_row) where they are a multiple of 16 bytes,
+  ; copied or stored, with a swizzle that keeps 16-byte chunks whole; each
+  ; pixel also needs its channels in bounds, contiguous and 16-byte aligned
+  %rowbytes = mul i32 %box0, %eb
+  %rb16 = and i32 %rowbytes, 15
+  %rbok = icmp eq i32 %rb16, 0
+  %copydir = icmp ult i32 %dir, -2
+  %copying = xor i1 %copydir, true
+  %mode5 = icmp eq i32 %mode_s, 5
+  %swzok = xor i1 %mode5, true
+  %rowable0 = and i1 %rbok, %copying
+  %rowable = and i1 %rowable0, %swzok
+  %box0m1 = sub i32 %box0, 1
+  %lastoff = mul i32 %box0m1, %eb
+  %lastoff64 = zext i32 %lastoff to i64
+  br i1 %skip, label %exit, label %start
+start:
+  br i1 %rowable, label %loop, label %simple
+; copies that cannot take rows: one element at a time
+simple:
+  %se = phi i32 [ 0, %start ], [ %se.next, %simple ]
+  %sg = call i64 @__zluda_ptx_impl_agx_tma_im2col_addr(ptr %tm, i32 %c0, i32 %c1, i32 %c2, i32 %c3, i32 %c4, i32 %i0, i32 %i1, i32 %i2, i32 %mode, i32 %se, i32 %eb)
+  %soob = icmp slt i64 %sg, 0
+  %seoff = mul i32 %se, %eb
+  %srel = add i32 %smem_rel, %seoff
+  %sswz = call i32 @__zluda_ptx_impl_agx_tma_swizzle(i32 %mode_s, i32 %srel)
+  %ssaddr = add i32 %window, %sswz
+  call void @__zluda_ptx_impl_agx_tma_elem(i64 %sg, i1 %soob, i32 %ssaddr, i32 %eb, i32 %et, i64 %fill, i32 %dir)
+  %se.next = add i32 %se, 1
+  %smore = icmp ult i32 %se.next, %count
+  br i1 %smore, label %simple, label %exit
 loop:
-  %e = phi i32 [ 0, %entry ], [ %e.next, %loop ]
+  %e = phi i32 [ 0, %start ], [ %e.next, %next ]
+  %col = phi i32 [ 0, %start ], [ %col.n, %next ]
+  ; (a pixel that fails the check stops the tries: the layout is the same for all)
+  %tryrows = phi i1 [ true, %start ], [ %tryrows.n, %next ]
   %gaddr = call i64 @__zluda_ptx_impl_agx_tma_im2col_addr(ptr %tm, i32 %c0, i32 %c1, i32 %c2, i32 %c3, i32 %c4, i32 %i0, i32 %i1, i32 %i2, i32 %mode, i32 %e, i32 %eb)
   %oob = icmp slt i64 %gaddr, 0
   %eoff = mul i32 %e, %eb
   %rel = add i32 %smem_rel, %eoff
+  %col0 = icmp eq i32 %col, 0
+  %try0 = and i1 %tryrows, %col0
+  %inb = xor i1 %oob, true
+  %try = and i1 %try0, %inb
+  br i1 %try, label %rowcheck, label %elem
+rowcheck:
+  %elast = add i32 %e, %box0m1
+  %glast = call i64 @__zluda_ptx_impl_agx_tma_im2col_addr(ptr %tm, i32 %c0, i32 %c1, i32 %c2, i32 %c3, i32 %c4, i32 %i0, i32 %i1, i32 %i2, i32 %mode, i32 %elast, i32 %eb)
+  %gwant = add i64 %gaddr, %lastoff64
+  %contig = icmp eq i64 %glast, %gwant
+  %ga15 = and i64 %gaddr, 15
+  %gal = icmp eq i64 %ga15, 0
+  %sa15 = and i32 %rel, 15
+  %sal = icmp eq i32 %sa15, 0
+  %al = and i1 %gal, %sal
+  %rowok = and i1 %contig, %al
+  br i1 %rowok, label %rowcopy, label %rowfail
+rowfail:
+  br label %elem
+rowcopy:
+  call void @__zluda_ptx_impl_agx_tma_row(i64 %gaddr, i32 %rel, i32 %window, i32 %mode_s, i32 %rowbytes, i32 %dir)
+  %e.row = add i32 %e, %box0
+  br label %next
+elem:
+  %tryrows.e = phi i1 [ %tryrows, %loop ], [ false, %rowfail ]
   %swizzled = call i32 @__zluda_ptx_impl_agx_tma_swizzle(i32 %mode_s, i32 %rel)
   %saddr = add i32 %window, %swizzled
   call void @__zluda_ptx_impl_agx_tma_elem(i64 %gaddr, i1 %oob, i32 %saddr, i32 %eb, i32 %et, i64 %fill, i32 %dir)
-  %e.next = add i32 %e, 1
+  %e.one = add i32 %e, 1
+  %col.i = add i32 %col, 1
+  %colw = icmp eq i32 %col.i, %box0
+  %col.e = select i1 %colw, i32 0, i32 %col.i
+  br label %next
+next:
+  %e.next = phi i32 [ %e.row, %rowcopy ], [ %e.one, %elem ]
+  %col.n = phi i32 [ 0, %rowcopy ], [ %col.e, %elem ]
+  %tryrows.n = phi i1 [ %tryrows, %rowcopy ], [ %tryrows.e, %elem ]
   %more = icmp ult i32 %e.next, %count
   br i1 %more, label %loop, label %exit
 exit:

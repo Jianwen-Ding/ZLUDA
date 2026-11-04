@@ -104,8 +104,10 @@ pub(super) fn helper_name(instruction: &ast::Instruction<SpirvWord>) -> Option<S
         _ => return None,
     };
     let mut name = helper.name();
+    // (a wmma.mma runs as mma.sync tiles of n = 8: the tile decides)
     if let Helper::Mma(d) | Helper::WmmaMma(d) = helper {
-        if is_fast(&d) && FAST_MMA.with(|f| f.get()) {
+        let tile = if matches!(helper, Helper::WmmaMma(_)) { tiles(&d).tile } else { d };
+        if is_fast(&tile) && FAST_MMA.with(|f| f.get()) {
             name.push_str("_fast");
         }
     }

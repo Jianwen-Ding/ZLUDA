@@ -4924,11 +4924,13 @@ impl<'a> MethodEmitContext<'a> {
         data: &ast::VideoSimdDetails,
         a: LLVMValueRef,
         b: LLVMValueRef,
+        c: LLVMValueRef,
     ) -> Option<LLVMValueRef> {
         if data.mask.is_some() || data.asel.is_some() || data.bsel.is_some() {
             return None;
         }
-        if data.add {
+        // (.add: the lanes' sum, of absolute differences only)
+        if data.add && (data.op != ast::VideoOp::Absdiff || data.saturate || data.lanes != 4) {
             return None;
         }
         let signed = data.dtype.kind() == ast::ScalarKind::Signed;
@@ -4956,8 +4958,6 @@ impl<'a> MethodEmitContext<'a> {
             let mask = |m| sub(shl(m, 1), lshr(m, w - 1));
             // a lane's unsigned borrow of x - y (result r): the top bit
             let borrow = |x, y, r| and(or(and(not(x), y), and(not(xor(x, y)), r)), k(h));
-            // (the minimum, maximum and absolute difference stay a lane at a time: from the borrows' masks they
-            // are longer)
             let op = data.op;
             let result = match op {
                 ast::VideoOp::Add | ast::VideoOp::Sub => {
@@ -4984,6 +4984,29 @@ impl<'a> MethodEmitContext<'a> {
                 _ if signed => return None,
                 // (a + b + 1) >> 1 in each lane
                 ast::VideoOp::Avrg => sub(or(a, b), and(lshr(xor(a, b), 1), k(l))),
+                // unsigned: the lanes where a < b (the borrows of a - b), s their bits of a ^ b; a ^ s is the
+                // maximum and b ^ s the minimum of each lane, and their difference the absolute difference (no lane
+                // borrows: each lane's maximum is at least its minimum)
+                // (bytes only: 16-bit lanes are register halves, as cheap a lane at a time: vmin2 +4%,
+                // vabsdiff2.add +11% this way)
+                ast::VideoOp::Min | ast::VideoOp::Max | ast::VideoOp::Absdiff if w == 8 => {
+                    let below = mask(borrow(a, b, sub_wrap(a, b)));
+                    let s = and(xor(a, b), below);
+                    match op {
+                        ast::VideoOp::Min => xor(b, s),
+                        ast::VideoOp::Max => xor(a, s),
+                        _ => {
+                            let d = sub(xor(a, s), xor(b, s));
+                            if !data.add {
+                                d
+                            } else {
+                                // the bytes' sum: pairs in 16-bit lanes (at most 510 each), then the two lanes
+                                let pairs = add(and(d, k(0x00ff_00ff)), and(lshr(d, 8), k(0x00ff_00ff)));
+                                add(add(and(pairs, k(0xffff)), lshr(pairs, 16)), c)
+                            }
+                        }
+                    }
+                }
                 _ => return None,
             };
             Some(result)
@@ -4999,7 +5022,7 @@ impl<'a> MethodEmitContext<'a> {
         let a = self.resolver.value(arguments.src1)?;
         let b = self.resolver.value(arguments.src2)?;
         let c = self.resolver.value(arguments.src3)?;
-        if let Some(result) = self.emit_video_simd_swar(&data, a, b) {
+        if let Some(result) = self.emit_video_simd_swar(&data, a, b, c) {
             self.resolver.register(arguments.dst, result);
             return Ok(());
         }

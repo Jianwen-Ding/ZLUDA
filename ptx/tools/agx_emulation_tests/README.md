@@ -8,6 +8,8 @@ PTX-formalization test format (`.buffer` / `.launch` / `.expect`), with expected
 
 - `atomic-uniform.ptx`: 32 threads of one SIMD group on one address: f64 add, u64 add, s64 min and a
   compare-and-swap chain, every returned value and the memory (the lane-order serialization the backend uses);
+- `atomic-incdec.ptx`: `atom.inc.u32` / `atom.dec.u32` on one address: 32 threads with per-thread limits (each
+  returned value, in lane order) and 256 threads with one limit (the final value);
 - `atomic-groups.ptx`: 256 threads in 8 SIMD groups: the final u64 sum, s64 minimum and count;
 - `brev64.ptx`: `brev.b64` of 256 values;
 - `div64c.ptx`: `div.u64` / `rem.u64` by constants;

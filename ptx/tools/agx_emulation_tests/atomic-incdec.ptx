@@ -1,0 +1,35 @@
+// atom.inc.u32 / atom.dec.u32 on one address: one SIMD group with per-thread limits (lane order, as the
+// backend's one-address batch serializes them: its returned values), and 256 threads in 8 groups with one limit
+// (the final value, the same in any order). Expected values from Python.
+.version 8.0
+.target sm_80
+.address_size 64
+.visible .entry k(.param .u64 py, .param .u64 pc, .param .u64 pri, .param .u64 prd)
+{
+  .reg .u64 %p<8>; .reg .u32 %t, %y, %r;
+  ld.param.u64 %p0, [py]; ld.param.u64 %p1, [pc]; ld.param.u64 %p2, [pri]; ld.param.u64 %p3, [prd];
+  mov.u32 %t, %tid.x; mul.wide.u32 %p4, %t, 4;
+  add.u64 %p5, %p0, %p4; ld.global.u32 %y, [%p5];
+  atom.global.inc.u32 %r, [%p1], %y; add.u64 %p6, %p2, %p4; st.global.u32 [%p6], %r;
+  add.u64 %p7, %p1, 4;
+  atom.global.dec.u32 %r, [%p7], %y; add.u64 %p6, %p3, %p4; st.global.u32 [%p6], %r;
+  ret;
+}
+.visible .entry k2(.param .u64 pc)
+{
+  .reg .u64 %p0; .reg .u32 %r;
+  ld.param.u64 %p0, [pc];
+  atom.global.inc.u32 %r, [%p0], 1000;
+  ret;
+}
+.buffer Y .u32 = { 7, 5, 100, 0, 3, 3, 1, 4294967295, 3, 7, 4294967295, 3, 4294967295, 5, 3, 3, 100, 100, 3, 5, 3, 4294967295, 100, 3, 1, 4294967295, 3, 5, 0, 0, 4294967295, 3 };
+.buffer C .u32 = { 2, 1 };
+.buffer RI .u32 [32];
+.buffer RD .u32 [32];
+.launch k <<< 1, 32 >>> (Y, C, RI, RD);
+.expect RI .u32 = { 2, 3, 4, 5, 0, 1, 2, 0, 1, 2, 3, 4, 0, 1, 2, 3, 0, 1, 2, 3, 4, 0, 1, 2, 3, 0, 1, 2, 3, 0, 0, 1 };
+.expect RD .u32 = { 1, 0, 5, 4, 0, 3, 2, 1, 0, 3, 2, 1, 0, 4294967295, 5, 3, 2, 1, 0, 3, 2, 1, 0, 100, 3, 1, 0, 3, 2, 0, 0, 4294967295 };
+.expect C .u32 = { 2, 3 };
+.buffer C2 .u32 = { 990 };
+.launch k2 <<< 2, 128 >>> (C2);
+.expect C2 .u32 = { 245 };

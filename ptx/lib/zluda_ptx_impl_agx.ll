@@ -2905,6 +2905,29 @@ exit:
   ret void
 }
 
+; The %n elements of a row reduced (op %dir) into global memory from %g, read
+; from the shared image at their swizzled addresses
+define void @__zluda_ptx_impl_agx_tma_redrow(i64 %g, i32 %rel, i32 %window, i32 %mode, i32 %eb, i32 %et, i32 %dir, i32 %n) #3 {
+entry:
+  %eb64 = zext i32 %eb to i64
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %i.n, %loop ]
+  %ga = phi i64 [ %g, %entry ], [ %ga.n, %loop ]
+  %o = mul i32 %i, %eb
+  %sr = add i32 %rel, %o
+  %sw = call i32 @__zluda_ptx_impl_agx_tma_swizzle(i32 %mode, i32 %sr)
+  %sa = add i32 %window, %sw
+  %v = call i64 @__zluda_ptx_impl_agx_tma_load_shared(i32 %sa, i32 %eb)
+  call void @__zluda_ptx_impl_agx_tma_red(i64 %ga, i32 %et, i32 %dir, i64 %v)
+  %ga.n = add i64 %ga, %eb64
+  %i.n = add i32 %i, 1
+  %more = icmp ult i32 %i.n, %n
+  br i1 %more, label %loop, label %exit
+exit:
+  ret void
+}
+
 define i32 @__zluda_ptx_impl_agx_tma_tile(ptr %tm, i32 %c0, i32 %c1, i32 %c2, i32 %c3, i32 %c4, i32 %smem, i32 %dir) #3 {
 entry:
   %w1 = call i64 @__zluda_ptx_impl_agx_tma_word(ptr %tm, i32 1)
@@ -3039,15 +3062,100 @@ elements:
   %cnt0w = zext i32 %cnt0 to i64
   %cnt0m1 = sub i32 %cnt0, 1
   %empty = icmp eq i32 %count, 0
-  br i1 %empty, label %exit, label %loop
+  ; reductions (op %dir >= 0) of unit-stride rows: a loop over the rows, each
+  ; row's address and bounds once and its elements in bounds reduced
+  ; (__zluda_ptx_impl_agx_tma_redrow)
+  %reducing = icmp sge i32 %dir, 0
+  %redable = and i1 %unit0, %reducing
+  br i1 %empty, label %exit, label %pick
+pick:
+  br i1 %redable, label %rrow, label %loop
+rrow:
+  %rq1 = phi i32 [ 0, %pick ], [ %rq1.n, %rnext ]
+  %rq2 = phi i32 [ 0, %pick ], [ %rq2.n, %rnext ]
+  %rq3 = phi i32 [ 0, %pick ], [ %rq3.n, %rnext ]
+  %rq4 = phi i32 [ 0, %pick ], [ %rq4.n, %rnext ]
+  %rrows = phi i32 [ 0, %pick ], [ %rrows.n, %rnext ]
+  %rt1 = mul i32 %rq1, %e1
+  %rg1 = add i32 %c1, %rt1
+  %rt2 = mul i32 %rq2, %e2
+  %rg2 = add i32 %c2, %rt2
+  %rt3 = mul i32 %rq3, %e3
+  %rg3 = add i32 %c3, %rt3
+  %rt4 = mul i32 %rq4, %e4
+  %rg4 = add i32 %c4, %rt4
+  %rg1w = sext i32 %rg1 to i64
+  %rg2w = sext i32 %rg2 to i64
+  %rg3w = sext i32 %rg3 to i64
+  %rg4w = sext i32 %rg4 to i64
+  %ro1a = icmp uge i64 %rg1w, %d1
+  %ro1 = and i1 %ro1a, %r1
+  %ro2a = icmp uge i64 %rg2w, %d2
+  %ro2 = and i1 %ro2a, %r2
+  %ro3a = icmp uge i64 %rg3w, %d3
+  %ro3 = and i1 %ro3a, %r3
+  %ro4a = icmp uge i64 %rg4w, %d4
+  %ro4 = and i1 %ro4a, %r4
+  %roo1 = or i1 %ro1, %ro2
+  %roo2 = or i1 %roo1, %ro3
+  %rhi = or i1 %roo2, %ro4
+  ; the elements x of the row in bounds: max(0, -c0) <= x < min(cnt0, d0 - c0)
+  %c0w = sext i32 %c0 to i64
+  %negc0 = sub i64 0, %c0w
+  %rlo = call i64 @llvm.smax.i64(i64 %negc0, i64 0)
+  %rlim = sub i64 %d0, %c0w
+  %rhi0 = call i64 @llvm.smin.i64(i64 %cnt0w, i64 %rlim)
+  %rsome = icmp slt i64 %rlo, %rhi0
+  %rin = xor i1 %rhi, true
+  %rgo = and i1 %rin, %rsome
+  br i1 %rgo, label %rred, label %rnext
+rred:
+  %rlo32 = trunc i64 %rlo to i32
+  %rn64 = sub i64 %rhi0, %rlo
+  %rn = trunc i64 %rn64 to i32
+  %rx = add i64 %c0w, %rlo
+  %ra0 = mul i64 %rx, %eb64
+  %ra1 = mul i64 %rg1w, %s1
+  %ra2 = mul i64 %rg2w, %s2
+  %ra3 = mul i64 %rg3w, %s3
+  %ra4 = mul i64 %rg4w, %s4
+  %ra01 = add i64 %ra0, %ra1
+  %ra012 = add i64 %ra01, %ra2
+  %ra0123 = add i64 %ra012, %ra3
+  %roff = add i64 %ra0123, %ra4
+  %rgaddr = add i64 %base, %roff
+  %relem = mul i32 %rrows, %cnt0
+  %relem2 = add i32 %relem, %rlo32
+  %reoff = mul i32 %relem2, %eb
+  %rrel = add i32 %smem_rel, %reoff
+  call void @__zluda_ptx_impl_agx_tma_redrow(i64 %rgaddr, i32 %rrel, i32 %window, i32 %mode, i32 %eb, i32 %et, i32 %dir, i32 %rn)
+  br label %rnext
+rnext:
+  %rq1.i = add i32 %rq1, 1
+  %rw1c = icmp eq i32 %rq1.i, %cnt1
+  %rq1.n = select i1 %rw1c, i32 0, i32 %rq1.i
+  %rk1 = zext i1 %rw1c to i32
+  %rq2.i = add i32 %rq2, %rk1
+  %rw2c = icmp eq i32 %rq2.i, %cnt2
+  %rq2.n = select i1 %rw2c, i32 0, i32 %rq2.i
+  %rk2 = zext i1 %rw2c to i32
+  %rq3.i = add i32 %rq3, %rk2
+  %rw3c = icmp eq i32 %rq3.i, %cnt3
+  %rq3.n = select i1 %rw3c, i32 0, i32 %rq3.i
+  %rk3 = zext i1 %rw3c to i32
+  %rq4.n = add i32 %rq4, %rk3
+  %rrows.n = add i32 %rrows, 1
+  %rows = udiv i32 %count, %cnt0
+  %rmore = icmp ult i32 %rrows.n, %rows
+  br i1 %rmore, label %rrow, label %exit
 loop:
-  %e = phi i32 [ 0, %elements ], [ %e.next, %next ]
-  %q0 = phi i32 [ 0, %elements ], [ %q0.n, %next ]
-  %q1 = phi i32 [ 0, %elements ], [ %q1.n, %next ]
-  %q2 = phi i32 [ 0, %elements ], [ %q2.n, %next ]
-  %q3 = phi i32 [ 0, %elements ], [ %q3.n, %next ]
-  %q4 = phi i32 [ 0, %elements ], [ %q4.n, %next ]
-  %hits = phi i32 [ 0, %elements ], [ %hits.n, %next ]
+  %e = phi i32 [ 0, %pick ], [ %e.next, %next ]
+  %q0 = phi i32 [ 0, %pick ], [ %q0.n, %next ]
+  %q1 = phi i32 [ 0, %pick ], [ %q1.n, %next ]
+  %q2 = phi i32 [ 0, %pick ], [ %q2.n, %next ]
+  %q3 = phi i32 [ 0, %pick ], [ %q3.n, %next ]
+  %q4 = phi i32 [ 0, %pick ], [ %q4.n, %next ]
+  %hits = phi i32 [ 0, %pick ], [ %hits.n, %next ]
   %t0 = mul i32 %q0, %e0
   %g0 = add i32 %c0, %t0
   %t1 = mul i32 %q1, %e1
@@ -3201,7 +3309,7 @@ next:
   %more = icmp ult i32 %e.next, %count
   br i1 %more, label %loop, label %exit
 exit:
-  %hits.f = phi i32 [ 0, %elements ], [ %hits.n, %next ]
+  %hits.f = phi i32 [ 0, %elements ], [ %hits.n, %next ], [ 0, %rnext ]
   %result = select i1 %inspecting, i32 %hits.f, i32 %bytes
   ret i32 %result
 }

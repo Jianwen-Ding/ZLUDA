@@ -4650,6 +4650,83 @@ impl<'a> MethodEmitContext<'a> {
         Ok(())
     }
 
+    // The common forms of the SIMD video instructions on the whole word at once (SWAR): the lanes in place (no
+    // selectors, mask or .add), one signedness for all three types; add / sub (wrapping or saturated) and the
+    // unsigned average. H is the lanes' top bits, L the rest: an
+    // addition of the L parts cannot carry across lanes, and the top bits are their xor; a lane's carry (borrow)
+    // out of the top is the majority of the operands' top bits and the complement of the result's (of a, not b
+    // and the result's, for a borrow); a mask of whole lanes is (m << 1) - (m >> (w - 1)) of their top bits m.
+    fn emit_video_simd_swar(
+        &mut self,
+        data: &ast::VideoSimdDetails,
+        a: LLVMValueRef,
+        b: LLVMValueRef,
+    ) -> Option<LLVMValueRef> {
+        if data.mask.is_some() || data.asel.is_some() || data.bsel.is_some() {
+            return None;
+        }
+        if data.add {
+            return None;
+        }
+        let signed = data.dtype.kind() == ast::ScalarKind::Signed;
+        if data.atype.kind() != data.dtype.kind() || data.btype.kind() != data.dtype.kind() {
+            return None;
+        }
+        let w = 32 / data.lanes as u64;
+        let (h, l) = if w == 8 { (0x8080_8080u64, 0x7f7f_7f7fu64) } else { (0x8000_8000u64, 0x7fff_7fffu64) };
+        let i32_type = get_scalar_type(self.context, ast::ScalarType::B32);
+        let bld = self.builder;
+        let k = |v: u64| unsafe { LLVMConstInt(i32_type, v, 0) };
+        let n = LLVM_UNNAMED.as_ptr();
+        unsafe {
+            let and = |x, y| LLVMBuildAnd(bld, x, y, n);
+            let or = |x, y| LLVMBuildOr(bld, x, y, n);
+            let xor = |x, y| LLVMBuildXor(bld, x, y, n);
+            let not = |x| LLVMBuildNot(bld, x, n);
+            let add = |x, y| LLVMBuildAdd(bld, x, y, n);
+            let sub = |x, y| LLVMBuildSub(bld, x, y, n);
+            let shl = |x, y| LLVMBuildShl(bld, x, k(y), n);
+            let lshr = |x, y| LLVMBuildLShr(bld, x, k(y), n);
+            // lanes wrapping: a + b and a - b
+            let add_wrap = |x, y| xor(add(and(x, k(l)), and(y, k(l))), and(xor(x, y), k(h)));
+            let sub_wrap = |x, y| xor(sub(or(x, k(h)), and(y, k(l))), and(not(xor(x, y)), k(h)));
+            let mask = |m| sub(shl(m, 1), lshr(m, w - 1));
+            // a lane's unsigned borrow of x - y (result r): the top bit
+            let borrow = |x, y, r| and(or(and(not(x), y), and(not(xor(x, y)), r)), k(h));
+            // (the minimum, maximum and absolute difference stay a lane at a time: from the borrows' masks they
+            // are longer)
+            let op = data.op;
+            let result = match op {
+                ast::VideoOp::Add | ast::VideoOp::Sub => {
+                    let is_add = op == ast::VideoOp::Add;
+                    let r = if is_add { add_wrap(a, b) } else { sub_wrap(a, b) };
+                    if !data.saturate {
+                        r
+                    } else if !signed {
+                        if is_add {
+                            let carry = and(or(and(a, b), and(or(a, b), not(r))), k(h));
+                            or(r, mask(carry))
+                        } else {
+                            and(r, not(mask(borrow(a, b, r))))
+                        }
+                    } else {
+                        // overflow: the operands' signs (alike for +, different for -) differ from the result's;
+                        // such a lane is the largest (a positive) or smallest (a negative) value
+                        let same = if is_add { not(xor(a, b)) } else { xor(a, b) };
+                        let m = mask(and(and(same, xor(a, r)), k(h)));
+                        let bound = add(k(l), lshr(and(a, k(h)), w - 1));
+                        or(and(r, not(m)), and(bound, m))
+                    }
+                }
+                _ if signed => return None,
+                // (a + b + 1) >> 1 in each lane
+                ast::VideoOp::Avrg => sub(or(a, b), and(lshr(xor(a, b), 1), k(l))),
+                _ => return None,
+            };
+            Some(result)
+        }
+    }
+
     fn emit_video_simd(
         &mut self,
         data: ast::VideoSimdDetails,
@@ -4659,6 +4736,10 @@ impl<'a> MethodEmitContext<'a> {
         let a = self.resolver.value(arguments.src1)?;
         let b = self.resolver.value(arguments.src2)?;
         let c = self.resolver.value(arguments.src3)?;
+        if let Some(result) = self.emit_video_simd_swar(&data, a, b) {
+            self.resolver.register(arguments.dst, result);
+            return Ok(());
+        }
         let lanes = data.lanes as u32;
         let width = 32 / lanes;
         // Selector digits are written from the most significant lane down

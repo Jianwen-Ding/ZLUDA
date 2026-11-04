@@ -9089,7 +9089,17 @@ impl<'a> MethodEmitContext<'a> {
             self.resolver.value(arguments.src3)?,
         );
         let lut = self.resolver.value(arguments.src_lut)?;
-        let result = unsafe {
+        let constant_lut = unsafe {
+            if LLVMIsAConstantInt(lut).is_null() {
+                None
+            } else {
+                Some((LLVMConstIntGetZExtValue(lut) & 0xff) as u8)
+            }
+        };
+        let result = if let Some(t) = constant_lut {
+            unsafe { emit_lop3_constant(b, i32_type, t, x, y, z) }
+        } else {
+            unsafe {
             let c = |v: u64| LLVMConstInt(i32_type, v, 0);
             let not = |v: LLVMValueRef| LLVMBuildNot(b, v, LLVM_UNNAMED.as_ptr());
             let mut acc = c(0);
@@ -9104,6 +9114,7 @@ impl<'a> MethodEmitContext<'a> {
                 acc = LLVMBuildOr(b, acc, LLVMBuildAnd(b, term, mask, LLVM_UNNAMED.as_ptr()), LLVM_UNNAMED.as_ptr());
             }
             acc
+            }
         };
         self.resolver.register(arguments.dst, result);
         if let (Some(op), Some(p), Some(q)) = (data, arguments.dst_pred, arguments.src_pred) {
@@ -9394,6 +9405,105 @@ impl<'a> MethodEmitContext<'a> {
 }
 
 // (exponent bits, mantissa bits, largest finite magnitude code, NaN code)
+// A two-input function as LLVM operations: t's bit (p << 1 | q) is the result for the inputs p, q (one bit
+// operation each on AGX, whose bitop takes any two-input table)
+unsafe fn emit_bit2(b: LLVMBuilderRef, ty: LLVMTypeRef, t: u8, p: LLVMValueRef, q: LLVMValueRef) -> LLVMValueRef {
+    let n = LLVM_UNNAMED.as_ptr();
+    let not = |v| LLVMBuildNot(b, v, n);
+    match t & 0xf {
+        0x0 => LLVMConstInt(ty, 0, 0),
+        0xf => LLVMConstAllOnes(ty),
+        0x8 => LLVMBuildAnd(b, p, q, n),
+        0x4 => LLVMBuildAnd(b, p, not(q), n),
+        0x2 => LLVMBuildAnd(b, not(p), q, n),
+        0x1 => not(LLVMBuildOr(b, p, q, n)),
+        0xc => p,
+        0xa => q,
+        0x3 => not(p),
+        0x5 => not(q),
+        0x6 => LLVMBuildXor(b, p, q, n),
+        0x9 => not(LLVMBuildXor(b, p, q, n)),
+        0xe => LLVMBuildOr(b, p, q, n),
+        0x7 => not(LLVMBuildAnd(b, p, q, n)),
+        0xd => LLVMBuildOr(b, p, not(q), n),
+        _ => LLVMBuildOr(b, not(p), q, n), // 0xb
+    }
+}
+
+// The cost (operations) of a two-input table
+fn bit2_cost(t: u8) -> u32 {
+    match t & 0xf {
+        0x0 | 0xf | 0xc | 0xa => 0,
+        _ => 1,
+    }
+}
+
+// lop3 with a constant table (as nvcc emits for all logic): a small expression instead of the eight minterms,
+// which InstCombine does not minimize (0x96, a ^ b ^ c, was eight instructions). Tables of the inputs
+// (a, b, c) = (0xf0, 0xcc, 0xaa); a function of two inputs is one operation; otherwise T(g(u, v), w) (two)
+// where one exists, else f0 ^ ((f0 ^ f1) & w) with f0 / f1 the function at w = 0 / 1 (four)
+unsafe fn emit_lop3_constant(
+    b: LLVMBuilderRef,
+    ty: LLVMTypeRef,
+    t: u8,
+    x: LLVMValueRef,
+    y: LLVMValueRef,
+    z: LLVMValueRef,
+) -> LLVMValueRef {
+    let vars = [(x, 0xf0u8), (y, 0xcc), (z, 0xaa)];
+    // the table of a two-input function g of tables tu, tv
+    let apply = |g: u8, tu: u8, tv: u8| -> u8 {
+        let mut r = 0u8;
+        for i in 0..8 {
+            let p = (tu >> i) & 1;
+            let q = (tv >> i) & 1;
+            r |= ((g >> (p << 1 | q)) & 1) << i;
+        }
+        r
+    };
+    // two inputs (or fewer)
+    for (i, j) in [(0, 1), (0, 2), (1, 2)] {
+        for g in 0..16u8 {
+            if apply(g, vars[i].1, vars[j].1) == t {
+                return emit_bit2(b, ty, g, vars[i].0, vars[j].0);
+            }
+        }
+    }
+    // T(g(u, v), w)
+    let mut best: Option<(u32, usize, usize, usize, u8, u8)> = None;
+    for (i, j, k) in [(0, 1, 2), (0, 2, 1), (1, 2, 0)] {
+        for g in 0..16u8 {
+            let tg = apply(g, vars[i].1, vars[j].1);
+            for o in 0..16u8 {
+                if apply(o, tg, vars[k].1) == t {
+                    let cost = bit2_cost(g) + bit2_cost(o);
+                    if best.map_or(true, |b| cost < b.0) {
+                        best = Some((cost, i, j, k, g, o));
+                    }
+                }
+            }
+        }
+    }
+    if let Some((_, i, j, k, g, o)) = best {
+        let inner = emit_bit2(b, ty, g, vars[i].0, vars[j].0);
+        return emit_bit2(b, ty, o, inner, vars[k].0);
+    }
+    // f0 ^ ((f0 ^ f1) & w), w the last input; f0 / f1 the two-input tables at w = 0 / 1
+    let (u, v, w) = (vars[0].0, vars[1].0, vars[2].0);
+    let mut f0 = 0u8;
+    let mut f1 = 0u8;
+    for pq in 0..4u8 {
+        let (p, q) = (pq >> 1, pq & 1);
+        let i0 = (p << 2) | (q << 1);
+        f0 |= ((t >> i0) & 1) << pq;
+        f1 |= ((t >> (i0 | 1)) & 1) << pq;
+    }
+    let n = LLVM_UNNAMED.as_ptr();
+    let e0 = emit_bit2(b, ty, f0, u, v);
+    let d = emit_bit2(b, ty, f0 ^ f1, u, v);
+    LLVMBuildXor(b, e0, LLVMBuildAnd(b, d, w, n), n)
+}
+
 fn mini_format(format: ast::MiniFormat) -> (u64, u64, u64, u64) {
     match format {
         ast::MiniFormat::E4m3x2 => (4, 3, 0x7e, 0x7f),

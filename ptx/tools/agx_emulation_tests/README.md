@@ -19,6 +19,8 @@ PTX-formalization test format (`.buffer` / `.launch` / `.expect`), with expected
 - `brev64.ptx`: `brev.b64` of 256 values;
 - `div64c.ptx`: `div.u64` / `rem.u64` by constants;
 - `mulhi64.ptx`: `mul.hi.u64`, `mul.hi.s64` and `mul.lo.u64` of 512 pairs (edges, random, ones-heavy).
+- `f16_directed.ptx`: `cvt.{rz,rm,rp,rn}.f16.f32` of 4,096 floats (half boundaries and midpoints ±1 float ulp,
+  half and float denormals, overflow edges, infinities, random).
 
 `gen_all.sh DIR` writes the larger generated sets (several MB): f64 add / sub / mul, fma and div / sqrt (random,
 edge, denormal, overflow and cancellation operands; with `ZEROS=1` 40% zeros), float fma rounded toward zero / up

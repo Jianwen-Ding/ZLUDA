@@ -165,6 +165,7 @@ fn main_core() -> Result<(), CompilerError> {
             opts.strict_fp,
             opts.strict_fp_f32_textures,
             opts.stack_size,
+            opts.fast_mma,
             opts.object_only,
             opts.agx_only,
         );
@@ -354,6 +355,7 @@ fn compile_air(
     strict_fp: bool,
     f32_textures: bool,
     stack_size: u32,
+    fast_mma: bool,
     object_only: bool,
     agx_only: bool,
 ) -> Result<(), CompilerError> {
@@ -376,7 +378,7 @@ fn compile_air(
                 llvm_zluda::compile_air::set_thread_jobs(Some(1));
                 // (the module's kernels are independent: it has no other functions)
                 llvm_zluda::compile_air::set_thread_independent(Some(true));
-                let r = compile_air(&[part.clone()], &part_sink, arch.clone(), ignore_errors, strict_fp, f32_textures, stack_size, true, true);
+                let r = compile_air(&[part.clone()], &part_sink, arch.clone(), ignore_errors, strict_fp, f32_textures, stack_size, fast_mma, true, true);
                 r.map_err(|e| e.to_string())?;
                 let object = object.into_inner().ok_or("a part made no object")?;
                 Ok(object)
@@ -408,7 +410,7 @@ fn compile_air(
         }
     }
     let options =
-        ptx::Options { target: ptx::Target::Air, strict_fp, f32_textures, stack_size, ..ptx::Options::default() };
+        ptx::Options { target: ptx::Target::Air, strict_fp, f32_textures, stack_size, fast_mma, ..ptx::Options::default() };
     let llvm = ptx_to_llvm(ignore_errors, !object_only, &texts[0], options)?;
     if !object_only {
         sink(&llvm.llvm_ir, "ll".to_string());
@@ -445,6 +447,7 @@ fn compile_air(
     _strict_fp: bool,
     _f32_textures: bool,
     _stack_size: u32,
+    _fast_mma: bool,
     _object_only: bool,
     _agx_only: bool,
 ) -> Result<(), CompilerError> {
@@ -553,6 +556,7 @@ fn serve_one(args: &[String], texts: &[String]) -> Result<(Vec<u8>, Vec<u8>), St
             opts.strict_fp,
             opts.strict_fp_f32_textures,
             opts.stack_size,
+            opts.fast_mma,
             opts.object_only,
             // (a served request returns only the object and the assembly)
             true,

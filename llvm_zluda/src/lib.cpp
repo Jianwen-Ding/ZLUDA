@@ -3227,20 +3227,94 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
 
 LLVM_C_EXTERN_C_END
 
+// --fast-mma on the Air target: the 8x8x8 SIMD-group matrix multiply-add of the mma helpers
+// (__zluda_air.simdgroup.matrix.fma.v2f32, agx_matrix.rs) as an AIR hint that agx-lower-air makes
+// llvm.agx.simdgroup.matrix.fma (the matrix unit). Each thread holds (r, c) and (r, c + 1) of A, B, C and D, with
+// r = 4 (t / 16) + (t / 2) % 4 and c = 4 ((t / 8) % 2) + 2 (t % 2) for lane t; the body, for other consumers, is
+// the same fused multiply-adds in k order: acc = fma(A[r][k], B[k][c + j], acc), the operands fetched with
+// SIMD-group shuffles from the lanes holding them, (t & 0x16) | 8 (k / 4) | (k / 2) % 2 for A[r][k] and
+// 16 (k / 4) + 2 (k % 4) | (t & 0x9) for B[k][c]. (+lane: AIR's system values make the lane the body reads a
+// trailing operand.) Returns the calls rewritten.
+static int airMatrixFmaHint(Module *Mod)
+{
+    Function *Fma = Mod->getFunction("__zluda_air.simdgroup.matrix.fma.v2f32");
+    if (!Fma || !Fma->isDeclaration())
+        return 0;
+    int count = 0;
+    if (!Fma->use_empty())
+    {
+        LLVMContext &ctx = Mod->getContext();
+        Function *Hint = Function::Create(Fma->getFunctionType(), GlobalValue::InternalLinkage,
+                                          "__air_hint.agx.simdgroup.matrix.fma.v2f32", Mod);
+        Hint->addFnAttr(Attribute::NoInline);
+        Hint->addFnAttr(Attribute::NoUnwind);
+        Hint->addFnAttr(Attribute::WillReturn);
+        Hint->addFnAttr(Attribute::Convergent);
+        Hint->setMemoryEffects(MemoryEffects::none());
+        Hint->addFnAttr("air-hint", "call:llvm.agx.simdgroup.matrix.fma.v2f32|----|+lane");
+        IRBuilder<> B(BasicBlock::Create(ctx, "", Hint));
+        Type *I32 = B.getInt32Ty(), *I16 = B.getInt16Ty(), *F32 = B.getFloatTy();
+        auto attrs = [&](Function *F) {
+            F->addFnAttr(Attribute::Convergent);
+            F->addFnAttr(Attribute::NoUnwind);
+            F->addFnAttr(Attribute::WillReturn);
+            F->setMemoryEffects(MemoryEffects::none());
+        };
+        FunctionCallee Lane = Mod->getOrInsertFunction("air.thread_index_in_simdgroup", FunctionType::get(I32, false));
+        FunctionCallee Shuffle =
+            Mod->getOrInsertFunction("air.simd_shuffle.u.i32", FunctionType::get(I32, {I32, I16}, false));
+        attrs(cast<Function>(Lane.getCallee()));
+        attrs(cast<Function>(Shuffle.getCallee()));
+        Value *t = B.CreateCall(Lane);
+        Value *rowLanes = B.CreateAnd(t, 0x16), *colLanes = B.CreateAnd(t, 0x9);
+        Value *a[2], *b[2], *acc[2];
+        for (unsigned j = 0; j < 2; j++)
+        {
+            a[j] = B.CreateBitCast(B.CreateExtractElement(Hint->getArg(0), j), I32);
+            b[j] = B.CreateBitCast(B.CreateExtractElement(Hint->getArg(1), j), I32);
+            acc[j] = B.CreateExtractElement(Hint->getArg(2), j);
+        }
+        auto fetch = [&](Value *v, Value *lane) {
+            return B.CreateBitCast(B.CreateCall(Shuffle, {v, B.CreateTrunc(lane, I16)}), F32);
+        };
+        for (unsigned k = 0; k < 8; k++)
+        {
+            Value *ak = fetch(a[k % 2], B.CreateOr(rowLanes, 8 * (k / 4) + (k / 2) % 2));
+            Value *bLane = B.CreateOr(colLanes, 16 * (k / 4) + 2 * (k % 4));
+            for (unsigned j = 0; j < 2; j++)
+                acc[j] = B.CreateIntrinsic(Intrinsic::fma, {F32}, {ak, fetch(b[j], bLane), acc[j]});
+        }
+        Value *r = PoisonValue::get(Fma->getReturnType());
+        for (unsigned j = 0; j < 2; j++)
+            r = B.CreateInsertElement(r, acc[j], j);
+        B.CreateRet(r);
+        for (User *U : make_early_inc_range(Fma->users()))
+            if (auto *CI = dyn_cast<CallInst>(U); CI && CI->getCalledFunction() == Fma)
+            {
+                CI->setCalledFunction(Hint);
+                count++;
+            }
+    }
+    if (Fma->use_empty())
+        Fma->eraseFromParent();
+    return count;
+}
+
 LLVM_C_EXTERN_C_BEGIN
 
 // ZLUDA_AGX target Air: the texture unit's sample (__zluda_air.texture.sample.unit, zluda_ptx_impl_air.ll) as an
 // AIR hint, which agx-lower-air makes llvm.agx.texture.sample: an internal noinline function whose "air-hint"
 // names it. Its body, what a consumer without AGX's texture heap runs (never: no runtime of its makes the
 // descriptors that select this sample), gives the operands back, not a constant. Made after the optimizations,
-// which would drop operands that are constants at every call (the dimensions). Returns the calls rewritten.
+// which would drop operands that are constants at every call (the dimensions). With it the matrix multiply-add of
+// --fast-mma (airMatrixFmaHint). Returns the calls rewritten.
 int LLVMZludaAirTextureSampleHint(LLVMModuleRef M)
 {
     Module *Mod = unwrap(M);
+    int count = airMatrixFmaHint(Mod);
     Function *Unit = Mod->getFunction("__zluda_air.texture.sample.unit");
     if (!Unit)
-        return 0;
-    int count = 0;
+        return count;
     if (!Unit->use_empty())
     {
         LLVMContext &ctx = Mod->getContext();

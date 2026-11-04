@@ -12,8 +12,9 @@
 ; Address spaces are ZLUDA's (generic 0, global 1, shared 3, constant 4,
 ; private 5); llvm_zluda's AIR compilation maps them to AIR's.
 ;
-; Not yet defined (a module using it does not link): the 8x8 SIMD-group
-; matrix multiply-add.
+; The 8x8 SIMD-group matrix multiply-add of --fast-mma
+; (__zluda_air.simdgroup.matrix.fma.v2f32) stays a declaration: llvm_zluda
+; makes it an AIR hint after the optimizations (LLVMZludaAirTextureSampleHint).
 
 ; System values
 declare <3 x i32> @air.thread_position_in_threadgroup.v3i32() #4

@@ -24,7 +24,8 @@ PTX-formalization test format (`.buffer` / `.launch` / `.expect`), with expected
 
 `gen_all.sh DIR` writes the larger generated sets (several MB): f64 add / sub / mul, fma and div / sqrt (random,
 edge, denormal, overflow and cancellation operands; with `ZEROS=1` 40% zeros), float fma rounded toward zero / up
-/ down, the f64 conversions to and from f32 and 32- / 64-bit integers, rounding to integral values (cvt.rmi / rpi / rzi / rni),
+/ down, float add / sub / mul in those directions (operands around the fast paths' bounds 2^-102, 2^-70, 2^126,
+cancellations, exact zero sums), the f64 conversions to and from f32 and 32- / 64-bit integers, rounding to integral values (cvt.rmi / rpi / rzi / rni),
 and 2048 64-bit div / rem pairs.
 
     ptx/tools/agx_emulation_tests/gen_all.sh /tmp/emu

@@ -3778,6 +3778,20 @@ impl<'a> MethodEmitContext<'a> {
     ) -> Result<LLVMValueRef, TranslateError> {
         let llvm_type = get_scalar_type(self.context, type_);
         let zero = unsafe { LLVMConstNull(llvm_type) };
+        let element = type_.packed_type().unwrap_or(type_);
+        if self.target.is_air()
+            && matches!(element, ast::ScalarType::F16 | ast::ScalarType::BF16 | ast::ScalarType::F32)
+        {
+            // AGX: x > 0 ? x : +0, then the canonical NaN: two compare-selects
+            // instead of a maximum (a maximum, its own NaN test and the
+            // signed-zero fix) followed by the canonical NaN
+            let positive = unsafe {
+                let b = self.builder;
+                let gt = LLVMBuildFCmp(b, LLVMRealPredicate::LLVMRealOGT, src, zero, LLVM_UNNAMED.as_ptr());
+                LLVMBuildSelect(b, gt, src, zero, LLVM_UNNAMED.as_ptr())
+            };
+            return Ok(self.emit_canonical_nan_of(type_, src, positive));
+        }
         let intrinsic = format!("llvm.maximum.{}\0", LLVMTypeDisplay(type_));
         let result = self.emit_intrinsic(
             unsafe { CStr::from_bytes_with_nul_unchecked(intrinsic.as_bytes()) },
@@ -3791,6 +3805,16 @@ impl<'a> MethodEmitContext<'a> {
     // A NaN value (or element) replaced by the canonical NaN of its type, on AGX: the results of min, max and .relu
     // other than f64 (whose NaN payloads are kept)
     fn emit_canonical_nan(&mut self, type_: ast::ScalarType, value: LLVMValueRef) -> LLVMValueRef {
+        self.emit_canonical_nan_of(type_, value, value)
+    }
+
+    // `value`, or the canonical NaN where `test` is a NaN
+    fn emit_canonical_nan_of(
+        &mut self,
+        type_: ast::ScalarType,
+        test: LLVMValueRef,
+        value: LLVMValueRef,
+    ) -> LLVMValueRef {
         let element = type_.packed_type().unwrap_or(type_);
         let canonical: u64 = match element {
             ast::ScalarType::F16 | ast::ScalarType::BF16 => 0x7fff,
@@ -3809,7 +3833,7 @@ impl<'a> MethodEmitContext<'a> {
                 let mut ns = [nan, nan];
                 nan = LLVMConstVector(ns.as_mut_ptr(), 2);
             }
-            let is_nan = LLVMBuildFCmp(b, LLVMRealPredicate::LLVMRealUNO, value, value, LLVM_UNNAMED.as_ptr());
+            let is_nan = LLVMBuildFCmp(b, LLVMRealPredicate::LLVMRealUNO, test, test, LLVM_UNNAMED.as_ptr());
             LLVMBuildSelect(b, is_nan, nan, value, LLVM_UNNAMED.as_ptr())
         }
     }

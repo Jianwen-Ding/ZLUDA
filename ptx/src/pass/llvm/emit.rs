@@ -4112,33 +4112,42 @@ impl<'a> MethodEmitContext<'a> {
                 // the upper byte of an f16
                 LLVMBuildShl(b, magnitude, c(8), LLVM_UNNAMED.as_ptr())
             } else {
-                let exponent = LLVMBuildLShr(b, magnitude, c(mantissa_bits), LLVM_UNNAMED.as_ptr());
-                let mantissa = LLVMBuildAnd(b, magnitude, c((1 << mantissa_bits) - 1), LLVM_UNNAMED.as_ptr());
-                let normal = LLVMBuildOr(
+                // The magnitude's fields in the f16's (the mantissa at its top) with the exponent rebiased: the
+                // f16 of a normal element. A subnormal one (exponent 0) is then f = 2^-bias (1 + m), its value
+                // 2^(1 - bias) m = 2 f - 2^(1 - bias): one f16 fma, exact (f and the result are f16 normals or
+                // zero), instead of normalizing its mantissa
+                let i16_type = get_scalar_type(self.context, ast::ScalarType::B16);
+                let f16_type = LLVMHalfTypeInContext(self.context);
+                let placed = LLVMBuildAdd(
                     b,
-                    LLVMBuildShl(b, LLVMBuildAdd(b, exponent, c(15 - bias), LLVM_UNNAMED.as_ptr()), c(10), LLVM_UNNAMED.as_ptr()),
-                    LLVMBuildShl(b, mantissa, c(10 - mantissa_bits), LLVM_UNNAMED.as_ptr()),
+                    LLVMBuildShl(b, magnitude, c(10 - mantissa_bits), LLVM_UNNAMED.as_ptr()),
+                    c((15 - bias) << 10),
                     LLVM_UNNAMED.as_ptr(),
                 );
-                // subnormal: mantissa 2^(1 - bias - M), a normal f16: the f32 of the (small) integer mantissa,
-                // exact, its exponent moved (f32 exponent field E: f16 field E - 111 - bias - M) and its top bits
-                let f32_type = LLVMFloatTypeInContext(self.context);
-                let float_bits = LLVMBuildBitCast(
+                let placed16 = LLVMBuildTrunc(b, placed, i16_type, LLVM_UNNAMED.as_ptr());
+                let f = LLVMBuildBitCast(b, placed16, f16_type, LLVM_UNNAMED.as_ptr());
+                let fma = c"llvm.fma.f16";
+                let subnormal = self
+                    .emit_intrinsic(
+                        fma,
+                        None,
+                        vec![&ast::ScalarType::F16.into()],
+                        vec![
+                            (f, f16_type),
+                            (LLVMConstReal(f16_type, 2.0), f16_type),
+                            (LLVMConstReal(f16_type, -((2.0f64).powi(1 - bias as i32))), f16_type),
+                        ],
+                    )
+                    .unwrap();
+                let subnormal = LLVMBuildBitCast(b, subnormal, i16_type, LLVM_UNNAMED.as_ptr());
+                let is_subnormal =
+                    LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntULT, magnitude, c(1 << mantissa_bits), LLVM_UNNAMED.as_ptr());
+                LLVMBuildZExt(
                     b,
-                    LLVMBuildUIToFP(b, mantissa, f32_type, LLVM_UNNAMED.as_ptr()),
+                    LLVMBuildSelect(b, is_subnormal, subnormal, placed16, LLVM_UNNAMED.as_ptr()),
                     i32_type,
                     LLVM_UNNAMED.as_ptr(),
-                );
-                let subnormal = LLVMBuildSub(
-                    b,
-                    LLVMBuildLShr(b, float_bits, c(13), LLVM_UNNAMED.as_ptr()),
-                    c((111 + bias + mantissa_bits) << 10),
-                    LLVM_UNNAMED.as_ptr(),
-                );
-                let is_zero = LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntEQ, mantissa, c(0), LLVM_UNNAMED.as_ptr());
-                let subnormal = LLVMBuildSelect(b, is_zero, c(0), subnormal, LLVM_UNNAMED.as_ptr());
-                let is_normal = LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntNE, exponent, c(0), LLVM_UNNAMED.as_ptr());
-                LLVMBuildSelect(b, is_normal, normal, subnormal, LLVM_UNNAMED.as_ptr())
+                )
             };
             let value = LLVMBuildOr(b, value, sign, LLVM_UNNAMED.as_ptr());
             let is_nan = match format {

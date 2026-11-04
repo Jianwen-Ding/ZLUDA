@@ -25,6 +25,9 @@ PTX-formalization test format (`.buffer` / `.launch` / `.expect`), with expected
 - `shf.ptx`: `shf.l` / `shf.r` `.wrap` / `.clamp` of 256 pairs with every shift amount 0..63;
 - `f16_directed.ptx`: `cvt.{rz,rm,rp,rn}.f16.f32` of 4,096 floats (half boundaries and midpoints ±1 float ulp,
   half and float denormals, overflow edges, infinities, random);
+- `tma-edge-*.ptx`: `cp.async.bulk.tensor` 2D tile loads and stores whose rows run past the end of the tensor in both
+  dimensions or start before it, with the swizzle modes none, 32B, 128B and 128B with 32B atoms and the 8-byte flip,
+  and NaN fill (`gen/tma_edges.py`, expected from the PTX ISA's swizzle tables);
 - `mini_encode.ptx`: `cvt.rn.satfinite` of f32 pairs to e4m3x2, e5m2x2, e2m3x2, e3m2x2, e2m1x2 and relu.e4m3x2 at
   every code's value, the midpoints between codes (ties) and a quarter either side, each ±1 float ulp, with
   saturation, infinities, NaNs and float subnormals (`gen/mini_encode.py`, expected from exact rationals; its `f16`

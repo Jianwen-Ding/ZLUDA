@@ -2813,7 +2813,8 @@ exit:
 define void @__zluda_ptx_impl_agx_tma_row(i64 %g, i32 %rel, i32 %window, i32 %mode, i32 %bytes, i32 %dir) #3 {
 entry:
   %load = icmp eq i32 %dir, -1
-  br label %loop
+  %m5 = icmp eq i32 %mode, 5
+  br i1 %m5, label %loop5, label %loop
 loop:
   %o = phi i32 [ 0, %entry ], [ %o.n, %step ]
   %sr = add i32 %rel, %o
@@ -2836,6 +2837,37 @@ step:
   %o.n = add i32 %o, 16
   %more = icmp ult i32 %o.n, %bytes
   br i1 %more, label %loop, label %exit
+; mode 5's 8-byte flip keeps a chunk's 16-byte block, its halves swapped where
+; bit 3 of the swizzled address is set
+loop5:
+  %o5 = phi i32 [ 0, %entry ], [ %o5.n, %step5 ]
+  %sr5 = add i32 %rel, %o5
+  %sw5 = call i32 @__zluda_ptx_impl_agx_tma_swizzle(i32 5, i32 %sr5)
+  %sw16 = and i32 %sw5, -16
+  %fb = and i32 %sw5, 8
+  %flip = icmp ne i32 %fb, 0
+  %sa5 = add i32 %window, %sw16
+  %sp5 = inttoptr i32 %sa5 to ptr addrspace(3)
+  %o564 = zext i32 %o5 to i64
+  %ga5 = add i64 %g, %o564
+  %gp5 = inttoptr i64 %ga5 to ptr addrspace(1)
+  br i1 %load, label %ld5, label %st5
+ld5:
+  %v5 = load <4 x i32>, ptr addrspace(1) %gp5, align 16
+  %vs = shufflevector <4 x i32> %v5, <4 x i32> poison, <4 x i32> <i32 2, i32 3, i32 0, i32 1>
+  %vf = select i1 %flip, <4 x i32> %vs, <4 x i32> %v5
+  store <4 x i32> %vf, ptr addrspace(3) %sp5, align 16
+  br label %step5
+st5:
+  %w5 = load <4 x i32>, ptr addrspace(3) %sp5, align 16
+  %ws = shufflevector <4 x i32> %w5, <4 x i32> poison, <4 x i32> <i32 2, i32 3, i32 0, i32 1>
+  %wf = select i1 %flip, <4 x i32> %ws, <4 x i32> %w5
+  store <4 x i32> %wf, ptr addrspace(1) %gp5, align 16
+  br label %step5
+step5:
+  %o5.n = add i32 %o5, 16
+  %more5 = icmp ult i32 %o5.n, %bytes
+  br i1 %more5, label %loop5, label %exit
 exit:
   ret void
 }
@@ -2952,9 +2984,9 @@ elements:
   %bytes = mul i32 %count, %eb
   ; whole rows in 16-byte chunks (__zluda_ptx_impl_agx_tma_row) where the box's
   ; dimension 0 is a multiple of 16 bytes of consecutive elements copied or
-  ; stored (not reduced or inspected) and the swizzle keeps 16-byte chunks
-  ; whole (not mode 5's 8-byte flip); each row also needs to be in bounds and
-  ; 16-byte aligned (checked in the loop)
+  ; stored (not reduced or inspected) (mode 5's 8-byte flip swaps the halves
+  ; of a chunk, which __zluda_ptx_impl_agx_tma_row does); each row also needs
+  ; to be in bounds and 16-byte aligned (checked at its start in the loop)
   %rowbytes = mul i32 %cnt0, %eb
   %rb16 = and i32 %rowbytes, 15
   %rbok = icmp eq i32 %rb16, 0
@@ -2962,12 +2994,9 @@ elements:
   %copydir = icmp ult i32 %dir, -2
   %copying = xor i1 %copydir, true
   %dirok = icmp slt i32 %dir, 0
-  %mode5 = icmp eq i32 %mode, 5
-  %swzok = xor i1 %mode5, true
   %ra = and i1 %rbok, %unit0
   %rb = and i1 %ra, %copying
-  %rc = and i1 %rb, %dirok
-  %rowable = and i1 %rc, %swzok
+  %rowable = and i1 %rb, %dirok
   %cnt0w = zext i32 %cnt0 to i64
   %cnt0m1 = sub i32 %cnt0, 1
   %empty = icmp eq i32 %count, 0
@@ -3021,10 +3050,12 @@ loop:
   %gaddr = add i64 %base, %off
   %eoff = mul i32 %e, %eb
   %rel = add i32 %smem_rel, %eoff
-  %swizzled = call i32 @__zluda_ptx_impl_agx_tma_swizzle(i32 %mode, i32 %rel)
-  %saddr = add i32 %window, %swizzled
-  ; the start of a row in bounds and aligned: the row at once
+  ; the start of a row in bounds and aligned: the row at once (checked only
+  ; at the start of a row of a box that allows it)
   %q0z = icmp eq i32 %q0, 0
+  %rw1 = and i1 %rowable, %q0z
+  br i1 %rw1, label %rowcheck, label %perelem
+rowcheck:
   %hi1 = or i1 %o1, %o2
   %hi2 = or i1 %hi1, %o3
   %hi = or i1 %hi2, %o4
@@ -3036,17 +3067,31 @@ loop:
   %gal = icmp eq i64 %ga15, 0
   %sa15 = and i32 %rel, 15
   %sal = icmp eq i32 %sa15, 0
-  %rw1 = and i1 %rowable, %q0z
-  %rw2 = and i1 %rw1, %inhi
-  %rw3 = and i1 %rw2, %g0lo
-  %rw4 = and i1 %rw3, %g0hi
+  %rw3 = and i1 %inhi, %g0lo
+  ; (its start in bounds: d0 - g0 > 0 below)
+  %in0 = xor i1 %o0, true
+  %rw4 = and i1 %rw3, %in0
   %rw5 = and i1 %rw4, %gal
   %rowok = and i1 %rw5, %sal
-  br i1 %rowok, label %rowcopy, label %perelem
+  ; a row past the end of dimension 0: its whole chunks in bounds at once, the
+  ; rest element by element
+  %inb = sub i64 %d0, %g0w
+  %inbb = mul i64 %inb, %eb64
+  %inbc = and i64 %inbb, -16
+  %rb64 = zext i32 %rowbytes to i64
+  %partb = select i1 %g0hi, i64 %rb64, i64 %inbc
+  %part = trunc i64 %partb to i32
+  %some = icmp ne i32 %part, 0
+  %rowgo = and i1 %rowok, %some
+  br i1 %rowgo, label %rowcopy, label %perelem
 rowcopy:
-  call void @__zluda_ptx_impl_agx_tma_row(i64 %gaddr, i32 %rel, i32 %window, i32 %mode, i32 %rowbytes, i32 %dir)
+  call void @__zluda_ptx_impl_agx_tma_row(i64 %gaddr, i32 %rel, i32 %window, i32 %mode, i32 %part, i32 %dir)
+  %partn = udiv i32 %part, %eb
+  %partm1 = sub i32 %partn, 1
   br label %next
 perelem:
+  %swizzled = call i32 @__zluda_ptx_impl_agx_tma_swizzle(i32 %mode, i32 %rel)
+  %saddr = add i32 %window, %swizzled
   br i1 %inspecting, label %inspect, label %copy
 inspect:
   br i1 %oob, label %next, label %inspect_elem
@@ -3083,7 +3128,7 @@ reduce:
 next:
   %hits.n = phi i32 [ %hits, %load_fill ], [ %hits, %out ], [ %hits, %store ], [ %hits, %reduce ], [ %hits, %inspect ], [ %hits.e, %inspect_elem ], [ %hits, %rowcopy ]
   ; the elements of a row copied at once beyond the first
-  %skip = phi i32 [ 0, %load_fill ], [ 0, %out ], [ 0, %store ], [ 0, %reduce ], [ 0, %inspect ], [ 0, %inspect_elem ], [ %cnt0m1, %rowcopy ]
+  %skip = phi i32 [ 0, %load_fill ], [ 0, %out ], [ 0, %store ], [ 0, %reduce ], [ 0, %inspect ], [ 0, %inspect_elem ], [ %partm1, %rowcopy ]
   ; advance (q0, ..., q4) through the box, dim 0 fastest
   %q0.p = add i32 %q0, 1
   %q0.i = add i32 %q0.p, %skip

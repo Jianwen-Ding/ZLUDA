@@ -1563,13 +1563,17 @@ define float @__zluda_ptx_impl_tanh_f32(float %x) #0 {
   %num = fsub float 1.0, %e
   %den = fadd float 1.0, %e
   %t = fdiv arcp float %num, %den
-  %r = call float @llvm.copysign.f32(float %t, float %x)
   %x2 = fmul float %x, %x
   %c = fmul float %x2, 0xBFD5555560000000
-  %small.m = call float @llvm.fma.f32(float %x, float %c, float %x)
-  %small.r = call float @llvm.copysign.f32(float %small.m, float %x)
+  %small.m = call float @llvm.fma.f32(float %ax, float %c, float %ax)
   %small = fcmp olt float %ax, 0x3F90000000000000
-  %res = select i1 %small, float %small.r, float %r
+  %m = select i1 %small, float %small.m, float %t
+  ; both magnitudes are non-negative: the sign of x or-ed in (no clearing)
+  %mb = bitcast float %m to i32
+  %xb = bitcast float %x to i32
+  %sb = and i32 %xb, -2147483648
+  %rb = or i32 %mb, %sb
+  %res = bitcast i32 %rb to float
   ret float %res
 }
 

@@ -2034,6 +2034,13 @@ int LLVMZludaAirSharedLikeAgx(LLVMModuleRef M)
                         New->insertBefore(I.getIterator());
                     Op.set(New);
                 }
+        // An address folded from integers: a getelementptr on a null shared pointer, in the numbers
+        // the integers hold, so from the block (the cluster windows of PTX-formalization tcg2-1).
+        SmallVector<GetElementPtrInst *, 4> NullBased;
+        for (Instruction &I : instructions(*F))
+            if (auto *GEP = dyn_cast<GetElementPtrInst>(&I);
+                GEP && GEP->getAddressSpace() == 3 && isa<ConstantPointerNull>(GEP->getPointerOperand()))
+                NullBased.push_back(GEP);
         SmallVector<Instruction *, 32> Casts;
         for (Instruction &I : instructions(*F))
             if ((isa<IntToPtrInst>(I) && I.getType()->getPointerAddressSpace() == 3) ||
@@ -2044,6 +2051,8 @@ int LLVMZludaAirSharedLikeAgx(LLVMModuleRef M)
         IRBuilder<> Entry(&*F->getEntryBlock().getFirstInsertionPt());
         Value *First = Entry.CreateInBoundsGEP(Ty, Block, {ConstantInt::get(I64, 0), ConstantInt::get(I64, 0)});
         Value *BaseInt = Entry.CreatePtrToInt(First, I64);
+        for (GetElementPtrInst *GEP : NullBased)
+            GEP->setOperand(0, First);
         // ZLUDA_AIR_ZERO_SHARED=1: shared memory that starts as zero, as it does on AGX's
         // functional simulator and in the K semantics of PTX, for checks against them:
         // PTX leaves it undefined, and a GPU's holds what ran before. Not for applications:

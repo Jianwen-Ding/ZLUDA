@@ -59,7 +59,8 @@ fn air_impl_bitcode() {
             })
             .collect::<Vec<_>>()
             .join("\n")
-            + "\ndeclare void @air.wg.barrier(i32, i32)\n";
+            // (as zluda_ptx_impl_air.ll declares it: the first declaration linked is the one kept)
+            + "\ndeclare void @air.wg.barrier(i32, i32) convergent nounwind willreturn\n";
         let shared_ll = out_dir.join("zluda_ptx_impl_air_shared.ll");
         std::fs::write(&shared_ll, shared).unwrap();
         let shared_bc = out_dir.join("zluda_ptx_impl_air_shared.bc");

@@ -1129,7 +1129,10 @@ with `mov_imm` instead, in the driver and `zoc` and, at build time, for the agx_
 `ZLUDA_AGX_VIA_AIR=1` (experimental) compiles through upstream AIR instead of straight to AGX: the optimized AGX IR is
 written as AIR (`agx-raise-to-air`, what AIR does not have as hints with AIR emulations, double precision in software),
 the AIR target's portable passes make it upstream AIR, and the AGX backend compiles that, restoring the hinted AGX
-operations. `zoc` also writes `NAME.air`. On the PTX-formalization tests the results are the direct path's, and in the
+operations. `zoc` also writes `NAME.portable.air`, which that AGX code is compiled from (`llc -mtriple=agx` gives the same
+object from the file), and `NAME.air`, a copy changed for Metal. `ptx/tools/agx_air_roundtrip_zoc.py` stands in for `zoc` in the
+checks and compiles the AGX code from that file, failing if the object differs; `--strict-fp` is not in the file for
+`--target agx`, so `llc` needs its target features too. On the PTX-formalization tests the results are the direct path's, and in the
 agx-bench model the code is as fast; `ZLUDA_AGX_LLVM_ARGS=-agx-air-native-hints=false` runs the AIR emulations instead,
 as a consumer without AGX's operations would. See `llvm/docs/AIR/AIRHints.rst` in the LLVM fork.
 

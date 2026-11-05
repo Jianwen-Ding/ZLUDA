@@ -350,7 +350,12 @@ pub fn compile_agx_linked(
     // kernel arguments do not change.
     if via_air() {
         let metal = Some(linked.clone());
-        let (mut bitcode, _) = to_air(&linked, &target_machine, &pb_options, false)?;
+        // NAME.portable.air is what the AGX code below is compiled from, so reading it back gives the same code
+        let (portable, _) = to_air(&linked, &target_machine, &pb_options, false)?;
+        if let Some(hook) = compiler_hook {
+            hook(&portable, String::from("portable.air"));
+        }
+        let mut bitcode = portable;
         let mut globals = None;
         if let Some(metal) = metal {
             (bitcode, globals) = to_air(&metal, &target_machine, &pb_options, true)?;

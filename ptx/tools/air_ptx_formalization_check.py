@@ -227,9 +227,14 @@ def compile_module(args, module, tmp):
                        capture_output=True, text=True, timeout=args.timeout)
     if r.returncode != 0:
         return 'LLC-ERROR', (r.stderr.strip().splitlines() or ['?'])[-1][:300]
-    dis = lambda p: subprocess.run([args.llvm_dis, p, '-o', '-'], capture_output=True, text=True,
-                                   timeout=args.timeout).stdout
+    def dis(p):
+        return subprocess.run([args.llvm_dis, p, '-o', '-'], capture_output=True, text=True, timeout=args.timeout)
     portable, metal_text = dis(air), dis(metal)
+    # (an unreadable file must not read as a module without kernels)
+    for name, r in (('m.air', portable), ('m.metal.air', metal_text)):
+        if r.returncode != 0:
+            return 'LLC-ERROR', name + ': ' + (r.stderr.strip().splitlines() or ['llvm-dis failed'])[-1][:300]
+    portable, metal_text = portable.stdout, metal_text.stdout
     # static threadgroup bytes and the cluster shape, from the AGX compilation of the same AIR (with --arch none,
     # a second compilation with AGX code, in a directory of its own)
     agx_dir = tmp

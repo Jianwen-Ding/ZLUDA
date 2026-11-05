@@ -18,8 +18,8 @@ relocations and symbols); it is placed in the heap like a harness buffer, its re
 and bound at each kernel's zluda_globals argument, so .expect / .patch of globals work and globals keep their values
 between launches.
 
-Not supported here (reported UNSUPPORTED): tensor maps, multimem, fabric, clusters and
-.address_size 32 modules.
+Not supported here (reported UNSUPPORTED): tensor maps, multimem, fabric and clusters. In .address_size 32 modules
+an address is an offset in the heap, and the kernel's hidden base is the heap's address.
 
     python3 ptx/tools/air_ptx_formalization_check.py --zoc target/debug/zoc --llc $LLVM/bin/llc \\
         --llvm-dis $LLVM/bin/llvm-dis PTX-formalization/tests/*.ptx
@@ -297,6 +297,9 @@ def launch_buffers(info, name, ps, ops, dyn, value, syms, percta=None):
             # the per-CTA global memory: the launch's region
             pbufs.append((a[1], b'\0' * 16, [(0, {'own_buffer': percta(int(role.split(':')[1]))})]))
             continue
+        if role == 'address32-base':
+            pbufs.append((a[1], bytes(16), [(0, 0)]))
+            continue
         if role is not None:
             raise Unsupported('hidden argument ' + role)
         if k >= len(ps):
@@ -310,6 +313,9 @@ def launch_buffers(info, name, ps, ops, dyn, value, syms, percta=None):
             target = syms.get(o) if size == 8 else None
         else:
             bits, target = value(o, t)
+        if size == 4 and target is not None:
+            # (a 32-bit address: its offset in the heap, from the hidden base)
+            bits, target = target - BASE, None
         data = bytearray(bits.to_bytes(size, 'little'))
         data += b'\0' * ((-len(data)) % 16 or (16 if not data else 0))
         pbufs.append((a[1], data, [(0, target - BASE)] if target is not None else []))
@@ -397,8 +403,6 @@ def run_test(path, args):
     for d in dirs:
         if d.split()[0] in UNSUPPORTED_DIRECTIVES:
             return 'UNSUPPORTED', 'harness directive ' + d.split()[0]
-    if re.search(r'^\s*\.address_size\s+32\b', module, re.M):
-        return 'UNSUPPORTED', '.address_size 32'
     with tempfile.TemporaryDirectory() as tmp:
         status, info = compile_module(args, module, tmp)
         if status:
@@ -409,6 +413,10 @@ def run_test(path, args):
         heap = Heap()
         syms, bufs = {}, {}
         globals_off = load_globals(tmp, heap, syms, bufs)
+        # .address_size 32: an address is an offset in the heap, whose address is the kernel's hidden base; nothing
+        # is at offset 0, which would be a null address
+        if globals_off is None and re.search(r'^\s*\.address_size\s+32\b', module, re.M):
+            heap.top = 16
         failures, passed, skipped, unsupported = [], 0, 0, []
         skipped_launches, tainted_bufs = [], set()
         pending = []  # launches of the next job: (kernel, grid, block, dyn, launch_buffers)

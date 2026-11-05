@@ -577,6 +577,7 @@ fn metal_air(
         _ => None,
     };
     stage("Metal copy: globals buffer, shared layout");
+    unsafe { crate::ffi::LLVMZludaAirAddress32Offsets(metal.get()) };
     unsafe { crate::ffi::LLVMZludaAirSharedLikeAgx(metal.get()) };
     run(&metal, c"air-portable", air, options)?;
     stage("Metal copy: air-portable");

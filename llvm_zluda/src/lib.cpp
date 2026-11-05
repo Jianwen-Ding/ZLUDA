@@ -1945,6 +1945,47 @@ void LLVMZludaAirDropPollBarriers(LLVMModuleRef M)
     }
 }
 
+// .address_size 32 in the module for Metal: a 32-bit address is an offset from the kernel's
+// hidden base (for AGX the base is 0, so the low bits of a variable's address are the offset).
+// So a variable's address, in device or constant memory, is the pointer minus the base, not
+// the low bits of a 64-bit device address. Returns how many were changed.
+int LLVMZludaAirAddress32Offsets(LLVMModuleRef M)
+{
+    int Changed = 0;
+    for (Function &F : *unwrap(M))
+    {
+        if (F.isDeclaration())
+            continue;
+        Argument *BaseArg = nullptr;
+        for (Argument &A : F.args())
+            if (F.getAttributes().getParamAttr(A.getArgNo(), "agx-hidden").getValueAsString() == "address32-base")
+                BaseArg = &A;
+        if (!BaseArg)
+            continue;
+        SmallVector<PtrToIntInst *, 4> Casts;
+        for (Instruction &I : instructions(F))
+            if (auto *C = dyn_cast<PtrToIntInst>(&I); C && C->getType()->isIntegerTy(32))
+            {
+                unsigned AS = C->getPointerAddressSpace();
+                if (AS == 1 || AS == 2)
+                    Casts.push_back(C);
+            }
+        if (Casts.empty())
+            continue;
+        IRBuilder<> Entry(&*F.getEntryBlock().getFirstInsertionPt());
+        Value *Base = Entry.CreateLoad(Entry.getInt64Ty(), BaseArg);
+        for (PtrToIntInst *C : Casts)
+        {
+            IRBuilder<> B(C);
+            Value *Wide = B.CreatePtrToInt(C->getPointerOperand(), B.getInt64Ty());
+            C->replaceAllUsesWith(B.CreateTrunc(B.CreateSub(Wide, Base), C->getType()));
+            C->eraseFromParent();
+            Changed++;
+        }
+    }
+    return Changed;
+}
+
 // The module for Metal: shared memory as AGX numbers it. A PTX program may hold shared
 // addresses as numbers (the descriptors of tcgen05.mma and tcgen05.cp, %reserved_smem_*,
 // comparisons with them), computed for AGX's layout: the variables a kernel uses, in

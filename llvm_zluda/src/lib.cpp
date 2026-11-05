@@ -1,5 +1,6 @@
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-parameter"
+#include <llvm/ADT/MapVector.h>
 #include <llvm-c/Core.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Type.h>
@@ -1318,7 +1319,7 @@ LLVM_C_EXTERN_C_END
 
 LLVM_C_EXTERN_C_BEGIN
 
-// ZLUDA_AGX_VIA_AIR, the .air written for Metal: Metal compiles no writable
+// The .air written for Metal: Metal compiles no writable
 // program-scope variables (MSL has none; a module with a device global
 // crashes its compiler on an M2 Max), so a PTX module's .global variables
 // become one device buffer. The functions other than kernels that use them
@@ -1903,12 +1904,45 @@ void LLVMZludaAirDropPollBarriers(LLVMModuleRef M)
         return;
     Module *Mod = unwrap(M);
     SmallVector<Instruction *, 8> Dead;
+    SmallPtrSet<Function *, 4> Polling;
     for (Function &F : *Mod)
         for (Instruction &I : instructions(F))
             if (I.getMetadata("zluda.poll.barrier"))
+            {
                 Dead.push_back(&I);
+                Polling.insert(&F);
+            }
     for (Instruction *I : Dead)
         I->eraseFromParent();
+    // Threads of a SIMD-group run under one mask: while one polls, the others wait. A program
+    // whose thread writes what another then polls for ("if (rank == 1) write; if (rank == 0)
+    // poll") relies on the first branch finishing before the second. Metal's compiler threads two
+    // branches on one value into "if (rank == 0) poll; else write", which never ends (PTX-formalization
+    // async-generic). Each such branch reads its condition through a volatile copy, which no
+    // compiler can correlate.
+    for (Function *F : Polling)
+    {
+        MapVector<Value *, SmallVector<CondBrInst *, 2>> Branches;
+        for (BasicBlock &BB : *F)
+            if (auto *Br = dyn_cast<CondBrInst>(BB.getTerminator()); Br && isa<Instruction>(Br->getCondition()))
+                Branches[Br->getCondition()].push_back(Br);
+        IRBuilder<> Entry(&*F->getEntryBlock().getFirstInsertionPt());
+        for (auto &[Cond, Users] : Branches)
+        {
+            auto *Def = cast<Instruction>(Cond);
+            if (Users.size() < 2 || isa<PHINode>(Def) || Def->isTerminator())
+                continue;
+            AllocaInst *Slot = Entry.CreateAlloca(Entry.getInt32Ty());
+            IRBuilder<> Save(Def->getNextNode());
+            Save.CreateStore(Save.CreateZExt(Def, Save.getInt32Ty()), Slot, /*isVolatile=*/true);
+            for (CondBrInst *Br : Users)
+            {
+                IRBuilder<> B(Br);
+                Value *V = B.CreateLoad(B.getInt32Ty(), Slot, /*isVolatile=*/true);
+                Br->setCondition(B.CreateICmpNE(V, B.getInt32(0)));
+            }
+        }
+    }
 }
 
 // The module for Metal: shared memory as AGX numbers it. A PTX program may hold shared
@@ -1978,11 +2012,15 @@ int LLVMZludaAirSharedLikeAgx(LLVMModuleRef M)
         auto *Block = new GlobalVariable(*Mod, Ty, false, GlobalValue::InternalLinkage, UndefValue::get(Ty),
                                          F->getName() + ".shared", nullptr, GlobalValue::NotThreadLocal, 3);
         Block->setAlignment(MaxAlign);
+        // (generic addresses hold the same offsets: the AIR target's casts to and from generic)
+        F->addFnAttr("air-shared-block", Block->getName());
         bool UsesDynamic = false;
         for (GlobalVariable *GV : Dynamics)
             for (User *U : GV->users())
                 if (auto *I = dyn_cast<Instruction>(U); I && I->getFunction() == F)
                     UsesDynamic = true;
+        if (UsesDynamic)
+            F->addFnAttr("air-shared-dynamic");
         // integers from literal addresses become instructions, so that they get the base
         for (Instruction &I : instructions(*F))
             for (Use &Op : I.operands())
@@ -2058,7 +2096,7 @@ int LLVMZludaAirSharedLikeAgx(LLVMModuleRef M)
     return Count;
 }
 
-// ZLUDA_AGX_VIA_AIR, the .air for Metal: the shared memory registers in
+// The .air for Metal: the shared memory registers in
 // Metal's numbering of threadgroup addresses. AGX numbers shared memory from
 // 0 (static variables in module order, then the dynamic shared memory), so
 // zluda_ptx_impl_agx.ll computes sizes and offsets alike. Metal numbers its
@@ -2149,7 +2187,7 @@ LLVM_C_EXTERN_C_END
 
 LLVM_C_EXTERN_C_BEGIN
 
-// ZLUDA_AGX_VIA_AIR, the .air for Metal: function pointers without Metal's
+// The .air for Metal: function pointers without Metal's
 // function pointers. AIR has no call stack and the AIR target inlines every
 // call, so an indirect call becomes a choice among the functions it can call:
 // those of its type whose address the module takes, which are all a CUDA

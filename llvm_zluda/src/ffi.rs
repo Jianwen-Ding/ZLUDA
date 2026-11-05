@@ -128,6 +128,7 @@ extern "C" {
     pub fn LLVMZludaAirInlineGlobalUsers(module: LLVMModuleRef) -> i32;
     pub fn LLVMZludaAirSharedLayout(module: LLVMModuleRef) -> i32;
     pub fn LLVMZludaAirDropPollBarriers(module: LLVMModuleRef);
+    pub fn LLVMZludaAirSharedLikeAgx(module: LLVMModuleRef) -> i32;
     pub fn LLVMZludaSetAirPrimitives(air: i32);
     pub fn LLVMZludaAirStaticRounding(module: LLVMModuleRef, strict: i32) -> i32;
     pub fn LLVMZludaAirDropCompareFlushes(module: LLVMModuleRef) -> i32;

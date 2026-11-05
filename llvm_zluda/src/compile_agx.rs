@@ -469,6 +469,9 @@ fn to_air(
         LLVMRelocMode::LLVMRelocDefault,
         LLVMCodeModel::LLVMCodeModelDefault,
     );
+    if buffer_globals {
+        unsafe { crate::ffi::LLVMZludaAirSharedLikeAgx(module.get()) };
+    }
     run(c"air-portable", &air)?;
     let buffer = unsafe { llvm_sys::bit_writer::LLVMWriteBitcodeToMemoryBuffer(module.get()) };
     let bytes = unsafe {

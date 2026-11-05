@@ -1909,6 +1909,142 @@ void LLVMZludaAirDropPollBarriers(LLVMModuleRef M)
         I->eraseFromParent();
 }
 
+// The module for Metal: shared memory as AGX numbers it. A PTX program may hold shared
+// addresses as numbers (the descriptors of tcgen05.mma and tcgen05.cp, %reserved_smem_*,
+// comparisons with them), computed for AGX's layout: the variables a kernel uses, in
+// module order, from 0. Metal reorders separate variables and numbers them from its own
+// base. So each kernel's static variables are one threadgroup variable in that layout,
+// and an integer holds the offset in it: the base is subtracted where a pointer becomes
+// an integer and added where an integer becomes a pointer, which cancel out in the usual
+// address computation. (Dynamic shared memory keeps Metal's numbers, from 0x80000000.)
+// A module with shared variables that a function other than a kernel uses keeps them.
+// Returns the number of kernels changed.
+int LLVMZludaAirSharedLikeAgx(LLVMModuleRef M)
+{
+    Module *Mod = unwrap(M);
+    const DataLayout &DL = Mod->getDataLayout();
+    LLVMContext &Ctx = Mod->getContext();
+    constexpr uint64_t DynamicBase = 0x80000000;
+    SmallVector<GlobalVariable *, 8> Statics, Dynamics;
+    for (GlobalVariable &GV : Mod->globals())
+    {
+        if (GV.getAddressSpace() != 3 || !GV.getValueType()->isSized())
+            continue;
+        // (the launch's bytes: a value of ZLUDA's, not a variable of the program)
+        if (GV.getName().starts_with("__zluda_agx_"))
+            continue;
+        if (DL.getTypeAllocSize(GV.getValueType()))
+            Statics.push_back(&GV);
+        else
+            Dynamics.push_back(&GV);
+    }
+    if (Statics.empty())
+        return 0;
+    for (GlobalVariable *GV : Statics)
+        convertUsersOfConstantsToInstructions({GV});
+    DenseMap<Function *, SmallPtrSet<GlobalVariable *, 8>> Used;
+    for (GlobalVariable *GV : Statics)
+        for (User *U : GV->users())
+        {
+            auto *I = dyn_cast<Instruction>(U);
+            if (!I)
+                return 0;
+            Function *F = I->getFunction();
+            if (!F->use_empty())
+                return 0;
+            Used[F].insert(GV);
+        }
+    Type *I8 = Type::getInt8Ty(Ctx);
+    Type *I64 = Type::getInt64Ty(Ctx);
+    int Count = 0;
+    for (auto &[F, Vars] : Used)
+    {
+        uint64_t Size = 0;
+        Align MaxAlign(1);
+        SmallVector<std::pair<GlobalVariable *, uint64_t>, 8> Layout;
+        for (GlobalVariable *GV : Statics)
+        {
+            if (!Vars.count(GV))
+                continue;
+            Align A = DL.getValueOrABITypeAlignment(GV->getAlign(), GV->getValueType());
+            Size = alignTo(Size, A);
+            Layout.push_back({GV, Size});
+            Size += DL.getTypeAllocSize(GV->getValueType());
+            MaxAlign = std::max(MaxAlign, A);
+        }
+        auto *Ty = ArrayType::get(I8, Size);
+        auto *Block = new GlobalVariable(*Mod, Ty, false, GlobalValue::InternalLinkage, UndefValue::get(Ty),
+                                         F->getName() + ".shared", nullptr, GlobalValue::NotThreadLocal, 3);
+        Block->setAlignment(MaxAlign);
+        bool UsesDynamic = false;
+        for (GlobalVariable *GV : Dynamics)
+            for (User *U : GV->users())
+                if (auto *I = dyn_cast<Instruction>(U); I && I->getFunction() == F)
+                    UsesDynamic = true;
+        // integers from literal addresses become instructions, so that they get the base
+        for (Instruction &I : instructions(*F))
+            for (Use &Op : I.operands())
+                if (auto *CE = dyn_cast<ConstantExpr>(Op.get());
+                    CE && CE->getOpcode() == Instruction::IntToPtr && CE->getType()->getPointerAddressSpace() == 3)
+                {
+                    Instruction *New = CE->getAsInstruction();
+                    if (auto *PN = dyn_cast<PHINode>(&I))
+                        New->insertBefore(PN->getIncomingBlock(Op)->getTerminator()->getIterator());
+                    else
+                        New->insertBefore(I.getIterator());
+                    Op.set(New);
+                }
+        SmallVector<Instruction *, 32> Casts;
+        for (Instruction &I : instructions(*F))
+            if ((isa<IntToPtrInst>(I) && I.getType()->getPointerAddressSpace() == 3) ||
+                (isa<PtrToIntInst>(I) && I.getOperand(0)->getType()->getPointerAddressSpace() == 3))
+                Casts.push_back(&I);
+        // (through instructions: the AIR target retypes a byte array by rewriting the
+        // getelementptrs of it, and would leave a constant's use on a second array)
+        IRBuilder<> Entry(&*F->getEntryBlock().getFirstInsertionPt());
+        Value *First = Entry.CreateInBoundsGEP(Ty, Block, {ConstantInt::get(I64, 0), ConstantInt::get(I64, 0)});
+        Value *BaseInt = Entry.CreatePtrToInt(First, I64);
+        for (auto [GV, Offset] : Layout)
+        {
+            Value *At = Entry.CreateInBoundsGEP(I8, First, ConstantInt::get(I64, Offset));
+            for (Use &U : make_early_inc_range(GV->uses()))
+                if (auto *I = dyn_cast<Instruction>(U.getUser()); I && I->getFunction() == F)
+                    U.set(At);
+        }
+        // Base + X, or X - Base, but for the numbers of dynamic shared memory.
+        auto Rebase = [&](IRBuilder<> &B, Value *X, bool Add) -> Value *
+        {
+            Type *T = X->getType();
+            Value *Base = B.CreateZExtOrTrunc(BaseInt, T);
+            Value *R = Add ? B.CreateAdd(X, Base) : B.CreateSub(X, Base);
+            if (!UsesDynamic)
+                return R;
+            Value *IsDynamic = B.CreateICmpUGE(X, ConstantInt::get(T, DynamicBase));
+            return B.CreateSelect(IsDynamic, X, R);
+        };
+        for (Instruction *I : Casts)
+        {
+            if (isa<IntToPtrInst>(I))
+            {
+                IRBuilder<> B(I);
+                I->setOperand(0, Rebase(B, I->getOperand(0), true));
+            }
+            else
+            {
+                IRBuilder<> B(I->getNextNode());
+                Value *R = Rebase(B, I, false);
+                I->replaceUsesWithIf(R, [&](Use &U)
+                                     { return U.getUser() != R && !(UsesDynamic && isa<Instruction>(U.getUser()) && cast<Instruction>(U.getUser())->getParent() == cast<Instruction>(R)->getParent() && (isa<ICmpInst>(U.getUser()) || (isa<BinaryOperator>(U.getUser()) && U.getUser() == cast<SelectInst>(R)->getFalseValue()))); });
+            }
+        }
+        Count++;
+    }
+    for (GlobalVariable *GV : Statics)
+        if (GV->use_empty())
+            GV->eraseFromParent();
+    return Count;
+}
+
 // ZLUDA_AGX_VIA_AIR, the .air for Metal: the shared memory registers in
 // Metal's numbering of threadgroup addresses. AGX numbers shared memory from
 // 0 (static variables in module order, then the dynamic shared memory), so

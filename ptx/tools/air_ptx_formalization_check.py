@@ -55,7 +55,7 @@ DEVICE_LOCK = os.environ.get('AIR_DEVICE_LOCK', '/scratch/air-device.lock')
 GPU_TIMEOUT_MS = 2000
 # The lock table of emulated atomics (llvm/lib/Target/AIR/AIRLowerAtomicRMW.h: kAtomicLockCount words).
 LOCK_TABLE_BYTES = 4096
-COMPILE_TIMEOUT_MS = int(os.environ.get('AIR_COMPILE_TIMEOUT_MS', 5000))
+COMPILE_TIMEOUT_MS = int(os.environ.get('AIR_COMPILE_TIMEOUT_MS', 15000))
 # Error texts of a request the service gave up on: a hang to record, never to retry.
 TIMED_OUT = ('gpu_timeout_ms=', 'compile_timeout_ms=', 'Refusing GPU work', 'timed out after')
 

@@ -18,7 +18,7 @@ relocations and symbols); it is placed in the heap like a harness buffer, its re
 and bound at each kernel's zluda_globals argument, so .expect / .patch of globals work and globals keep their values
 between launches.
 
-Not supported here (reported UNSUPPORTED): textures, surfaces, samplers, tensor maps, multimem, fabric, clusters and
+Not supported here (reported UNSUPPORTED): tensor maps, multimem, fabric, clusters and
 .address_size 32 modules.
 
     python3 ptx/tools/air_ptx_formalization_check.py --zoc target/debug/zoc --llc $LLVM/bin/llc \\
@@ -40,7 +40,7 @@ import agx_ptx_formalization_check as h  # noqa: E402
 from agx_ptx_formalization_check import SIZES, Unsupported  # noqa: E402
 
 BASE = h.BASE
-UNSUPPORTED_DIRECTIVES = ('.tensormap', '.multimem', '.fabric', '.cooplaunch')
+UNSUPPORTED_DIRECTIVES = ('.tensormap', '.multimem', '.fabric')
 TRANSIENT = ('XPC_ERROR_CONNECTION_INTERRUPTED', 'did not reply')
 
 
@@ -278,7 +278,7 @@ def load_globals(tmp, heap, syms, bufs):
     return 0
 
 
-def launch_buffers(info, name, ps, ops, dyn, value, syms):
+def launch_buffers(info, name, ps, ops, dyn, value, syms, percta=None):
     """The parameter buffers of a launch of kernel `name`: (location index, bytes, [(offset, heap target)])."""
     kernels, roles, agx = info['kernels'], info['roles'], info['agx']
     if len(ops) != len(ps):
@@ -292,6 +292,10 @@ def launch_buffers(info, name, ps, ops, dyn, value, syms):
         if role == 'threadgroup-bytes':
             data = (agx[name]['shared'] + dyn).to_bytes(4, 'little')
             pbufs.append((a[1], data + b'\0' * 12, []))
+            continue
+        if role is not None and role.startswith('perctamemory:') and percta:
+            # the per-CTA global memory: the launch's region
+            pbufs.append((a[1], b'\0' * 16, [(0, {'own_buffer': percta(int(role.split(':')[1]))})]))
             continue
         if role is not None:
             raise Unsupported('hidden argument ' + role)
@@ -332,11 +336,17 @@ def make_job(info, heap, pending, globals_off):
     for name, grid, block, dyn, pbufs in pending:
         bindings = []
         for loc, data, ppatches in pbufs:
-            bindings.append({'index': loc, 'buffer': len(buffers)})
-            for off, t in ppatches:
-                patches.append({'buffer': len(buffers), 'offset': off, 'target_buffer': 0,
-                                'target_offset': t})
+            own = len(buffers)
+            bindings.append({'index': loc, 'buffer': own})
             buffers.append({'size': len(data), 'data': b64(data)})
+            for off, t in ppatches:
+                if isinstance(t, dict):
+                    # memory of its own (a Metal buffer's address has the alignment the heap's offsets lack)
+                    patches.append({'buffer': own, 'offset': off, 'target_buffer': len(buffers),
+                                    'target_offset': 0})
+                    buffers.append({'size': t['own_buffer'], 'data': b64(bytes(t['own_buffer']))})
+                else:
+                    patches.append({'buffer': own, 'offset': off, 'target_buffer': 0, 'target_offset': t})
         for a in kernels[name]:
             if a[0] == 'globals':
                 bindings.append({'index': a[1], 'buffer': 0, 'offset': globals_off})
@@ -493,8 +503,8 @@ def run_test(path, args):
                 for k, v in enumerate(vals):
                     bits, target = value(v, t)
                     heap.write(base + k * SIZES[t], SIZES[t], bits, target)
-            elif kw == '.launch':
-                m = re.fullmatch(r'\.launch ([\w$.]+) <<<\s*(\([^)]*\)|\d+)\s*,\s*(\([^)]*\)|\d+)\s*(,\s*(\d+))?\s*>>>'
+            elif kw in ('.launch', '.cooplaunch'):
+                m = re.fullmatch(r'\.\w+ ([\w$.]+) <<<\s*(\([^)]*\)|\d+)\s*,\s*(\([^)]*\)|\d+)\s*(,\s*(\d+))?\s*>>>'
                                  r'\s*\((.*)\)', d)
                 if not m:
                     raise Unsupported(d)
@@ -511,7 +521,8 @@ def run_test(path, args):
                 grid, block = h.parse_dim(m.group(2)), h.parse_dim(m.group(3))
                 dyn = int(m.group(5)) if m.group(5) else 0
                 ps = params.get(name, [])
-                pbufs = launch_buffers(info, name, ps, ops, dyn, value, syms)
+                pbufs = launch_buffers(info, name, ps, ops, dyn, value, syms,
+                                       lambda size: size * grid[0] * grid[1] * grid[2])
                 pending.append((name, grid, block, dyn, pbufs))
             elif kw == '.expect':
                 err = flush()

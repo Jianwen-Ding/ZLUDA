@@ -5,4 +5,4 @@ Every poll is bounded, so none can hang the GPU.
   `ZLUDA_AIR_POLLERS_AS_THEY_COME=1`.
 - `i-seq`: the same by hand, as two branches on a volatile, with a writer that takes 1000 steps.
 - `k-after`: a write every thread does after the poller's branch. Starves if that code has no copy of its own.
-- `i-mutual`: threads that wait for each other. **Expected to fail** on `O[3]` until that is emulated.
+- `i-mutual`, `n-mutual`: threads that wait for each other, in sequence and on the two sides of a branch.

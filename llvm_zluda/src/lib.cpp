@@ -1953,7 +1953,7 @@ static bool zludaLoopWaitsForMemory(const Loop &L)
 // other side runs first, with a second branch on a volatile copy of the condition, which no compiler
 // can correlate. Threads that wait for each other are not helped.
 // Returns how many branches changed.
-static int zludaRunWaitersLast(Function &F)
+static int zludaRunWaitersLast(Function &F, bool &BothWait)
 {
     if (F.isDeclaration() || !F.getReturnType()->isVoidTy())
         return 0;
@@ -2009,6 +2009,10 @@ static int zludaRunWaitersLast(Function &F)
                 bool Clean = !Rest.count(&BB) && llvm::none_of(SideSet, [&](BasicBlock *X) { return Rest.count(X); }) &&
                              llvm::any_of(Waiting, [&](Loop *L) { return SideSet.count(L->getHeader()) != 0; }) &&
                              llvm::none_of(Waiting, [&](Loop *L) { return Rest.count(L->getHeader()) != 0; });
+                // (the thread on this side waits, and so may those in what follows: for each other)
+                if (llvm::any_of(Waiting, [&](Loop *L) { return SideSet.count(L->getHeader()) != 0; }) &&
+                    llvm::any_of(Waiting, [&](Loop *L) { return Rest.count(L->getHeader()) != 0; }))
+                    BothWait = true;
                 uint64_t Size = 0;
                 for (BasicBlock *X : Rest)
                 {
@@ -2037,6 +2041,8 @@ static int zludaRunWaitersLast(Function &F)
             auto waits = [&](const SmallPtrSetImpl<BasicBlock *> &Set) {
                 return llvm::any_of(Waiting, [&](Loop *L) { return Set.count(L->getHeader()) != 0; });
             };
+            if (waits(SA) && waits(SB))
+                BothWait = true;
             if (waits(SA) == waits(SB))
                 continue;
             Site = &BB;
@@ -2122,6 +2128,7 @@ static int zludaRunWaitersLast(Function &F)
         IRBuilder<> CB(Check);
         Value *Cond = CB.CreateICmpNE(CB.CreateLoad(CB.getInt32Ty(), Copy, /*isVolatile=*/true), CB.getInt32(0));
         CB.CreateCondBr(Cond, FirstOnTrue ? After : Second, FirstOnTrue ? Second : After);
+        Done.insert(Check);
         DominatorTree DT2(F);
         SmallVector<AllocaInst *, 32> Promotable;
         for (AllocaInst *A : Slots)
@@ -2133,6 +2140,132 @@ static int zludaRunWaitersLast(Function &F)
     return Changed;
 }
 
+// Threads that wait for each other: no order of the sides helps. The function runs as one loop that
+// executes the next block of each thread per iteration. All paths meet at one latch: with a branch back
+// to the head from each block, Metal runs one path's loop to its end (or until its polls run out) before
+// the others; through one latch the threads alternate, block by block, on an M2 Max. Threads that were
+// together stay together. A barrier needs all the threads of a SIMD-group at once, so threads at one
+// wait at the head until all that have not returned are there.
+static void zludaRunThreadsInTurn(Function &F)
+{
+    LLVMContext &Ctx = F.getContext();
+    Module *M = F.getParent();
+    const DataLayout &DL = M->getDataLayout();
+    std::function<bool(Function *, SmallPtrSetImpl<Function *> &)> HasBarrier =
+        [&](Function *Callee, SmallPtrSetImpl<Function *> &Visited) {
+            if (!Callee || !Visited.insert(Callee).second)
+                return false;
+            if (Callee->getName() == "air.wg.barrier")
+                return true;
+            for (Instruction &I : instructions(*Callee))
+                if (auto *C = dyn_cast<CallInst>(&I); C && HasBarrier(C->getCalledFunction(), Visited))
+                    return true;
+            return false;
+        };
+    SmallVector<CallInst *, 4> Barriers;
+    for (Instruction &I : instructions(F))
+        if (auto *C = dyn_cast<CallInst>(&I))
+        {
+            SmallPtrSet<Function *, 8> Visited;
+            if (HasBarrier(C->getCalledFunction(), Visited))
+                Barriers.push_back(C);
+        }
+    SmallPtrSet<BasicBlock *, 4> BarrierBlocks;
+    for (CallInst *C : Barriers)
+    {
+        BasicBlock *BB = C->getParent();
+        if (C != &BB->front() || BB->isEntryBlock())
+            BB = BB->splitBasicBlock(C->getIterator());
+        BB->splitBasicBlock(std::next(C->getIterator()));
+        BarrierBlocks.insert(BB);
+    }
+    BasicBlock &Entry = F.getEntryBlock();
+    BasicBlock::iterator AllocaPoint = Entry.begin();
+    SmallVector<PHINode *, 16> Phis;
+    SmallVector<Instruction *, 32> Values;
+    for (BasicBlock &BB : F)
+        for (Instruction &I : BB)
+        {
+            if (auto *Phi = dyn_cast<PHINode>(&I))
+                Phis.push_back(Phi);
+            else if (!(isa<AllocaInst>(I) && BB.isEntryBlock()) && I.isUsedOutsideOfBlock(&BB))
+                Values.push_back(&I);
+        }
+    SmallVector<AllocaInst *, 32> Slots;
+    for (Instruction *I : Values)
+        if (AllocaInst *A = DemoteRegToStack(*I, false, AllocaPoint))
+            Slots.push_back(A);
+    for (PHINode *Phi : Phis)
+        if (AllocaInst *A = DemotePHIToStack(Phi, AllocaPoint))
+            Slots.push_back(A);
+    IRBuilder<> EntryB(&*AllocaPoint);
+    AllocaInst *Next = EntryB.CreateAlloca(EntryB.getInt32Ty(), DL.getAllocaAddrSpace(), nullptr, "zluda.next.block");
+    SmallVector<BasicBlock *, 32> Blocks;
+    for (BasicBlock &BB : F)
+        if (!BB.isEntryBlock())
+            Blocks.push_back(&BB);
+    BasicBlock *Head = BasicBlock::Create(Ctx, "zluda.threads", &F);
+    BasicBlock *Latch = BasicBlock::Create(Ctx, "zluda.latch", &F);
+    IRBuilder<>(Latch).CreateBr(Head);
+    DenseMap<BasicBlock *, BasicBlock *> Turn;
+    DenseMap<BasicBlock *, unsigned> Ids;
+    for (BasicBlock *BB : Blocks)
+    {
+        unsigned Id = Ids.size() + 1;
+        Ids[BB] = Id;
+        BasicBlock *T = BasicBlock::Create(Ctx, "zluda.turn", &F);
+        IRBuilder<> B(T);
+        B.CreateStore(B.getInt32(Id), Next, /*isVolatile=*/true);
+        B.CreateBr(Latch);
+        Turn[BB] = T;
+    }
+    for (BasicBlock *BB : Blocks)
+    {
+        Instruction *Term = BB->getTerminator();
+        for (unsigned K = 0; K < Term->getNumSuccessors(); K++)
+            Term->setSuccessor(K, Term->getSuccessor(K) == BB ? Latch : Turn.lookup(Term->getSuccessor(K)));
+    }
+    // The loop is entered at its head, not through the latch, which would make the latch the loop's
+    // header, and each path to it a branch back: one branch back, or the threads do not alternate.
+    BasicBlock *Enter = BasicBlock::Create(Ctx, "zluda.enter", &F);
+    IRBuilder<>(Enter).CreateBr(Head);
+    {
+        Instruction *Term = Entry.getTerminator();
+        for (unsigned K = 0; K < Term->getNumSuccessors(); K++)
+        {
+            BasicBlock *T = BasicBlock::Create(Ctx, "zluda.first", &F);
+            IRBuilder<> B(T);
+            B.CreateStore(B.getInt32(Ids.lookup(Term->getSuccessor(K))), Next, /*isVolatile=*/true);
+            B.CreateBr(Enter);
+            Term->setSuccessor(K, T);
+        }
+    }
+    IRBuilder<> H(Head);
+    Value *Id = H.CreateLoad(H.getInt32Ty(), Next, /*isVolatile=*/true);
+    BasicBlock *Dispatch = Head;
+    if (!BarrierBlocks.empty())
+    {
+        FunctionCallee Ballot =
+            M->getOrInsertFunction("air.simd_ballot.i64", FunctionType::get(H.getInt64Ty(), {H.getInt1Ty()}, false));
+        Value *At = H.getFalse();
+        for (BasicBlock *BB : BarrierBlocks)
+            At = H.CreateOr(At, H.CreateICmpEQ(Id, H.getInt32(Ids.lookup(BB))));
+        Value *Missing = H.CreateICmpNE(H.CreateCall(Ballot, {At}), H.CreateCall(Ballot, {H.getTrue()}));
+        Dispatch = BasicBlock::Create(Ctx, "zluda.next", &F);
+        H.CreateCondBr(H.CreateAnd(At, Missing), Latch, Dispatch);
+    }
+    IRBuilder<> D(Dispatch);
+    SwitchInst *Sw = D.CreateSwitch(Id, Blocks.empty() ? Latch : Blocks.front(), Blocks.size());
+    for (BasicBlock *BB : Blocks)
+        Sw->addCase(D.getInt32(Ids.lookup(BB)), BB);
+    DominatorTree DT(F);
+    SmallVector<AllocaInst *, 32> Promotable;
+    for (AllocaInst *A : Slots)
+        if (isAllocaPromotable(A))
+            Promotable.push_back(A);
+    PromoteMemToReg(Promotable, DT);
+}
+
 // The barriers between the polls of try_wait (!zluda.poll.barrier), for the module
 // for Metal. AGX's functional simulator needs them to switch SIMD-groups; on a GPU
 // the threads poll at the same time, and those that stop polling first leave the
@@ -2142,7 +2275,32 @@ void LLVMZludaAirDropPollBarriers(LLVMModuleRef M)
     Module *Mod = unwrap(M);
     if (!getenv("ZLUDA_AIR_POLLERS_AS_THEY_COME"))
         for (Function &F : *Mod)
-            zludaRunWaitersLast(F);
+        {
+            bool BothWait = false;
+            zludaRunWaitersLast(F, BothWait);
+            // (ZLUDA_AIR_THREADS_IN_TURN: every function that waits, for comparisons)
+            bool Any = false;
+            if (getenv("ZLUDA_AIR_THREADS_IN_TURN") && !F.isDeclaration())
+            {
+                DominatorTree DT(F);
+                LoopInfo LI(DT);
+                for (Loop *L : LI.getLoopsInPreorder())
+                    Any |= zludaLoopWaitsForMemory(*L);
+            }
+            // Each value lives through the head of the loop, so the code grows with blocks times values
+            // (to 300 times in functions of the tensor core helpers): only small functions.
+            uint64_t Instructions = 0;
+            for (BasicBlock &BB : F)
+                Instructions += BB.size();
+            // SIMD-group functions see the threads that arrive together, which this would change
+            // (tc-5: the lowest active lane acts for the warp).
+            bool Collective = false;
+            for (Instruction &I : instructions(F))
+                if (auto *C = dyn_cast<CallBase>(&I))
+                    Collective |= !C->getCalledFunction() || C->getCalledFunction()->getName().contains("simd");
+            if (Any || (BothWait && !Collective && F.size() <= 64 && Instructions <= 1024))
+                zludaRunThreadsInTurn(F);
+        }
     if (getenv("ZLUDA_AIR_KEEP_POLL_BARRIERS"))
         return;
     SmallVector<Instruction *, 8> Dead;

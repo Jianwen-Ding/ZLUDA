@@ -2288,6 +2288,43 @@ static void zludaRunThreadsInTurn(Function &F)
     SwitchInst *Sw = D.CreateSwitch(Id, Blocks.empty() ? Latch : Blocks.front(), Blocks.size());
     for (BasicBlock *BB : Blocks)
         Sw->addCase(D.getInt32(Ids.lookup(BB)), BB);
+    // Values stay in private memory: as phis at the head, the code grows with blocks times values (300
+    // times in tensor core helpers), and try_wait in a 64-thread group ran out of polls. Pointers and
+    // flags are held as integers, which Metal otherwise rejects or AIR does not have.
+    if (!getenv("ZLUDA_AIR_TURN_AS_PHIS"))
+    {
+        for (AllocaInst *A : Slots)
+        {
+            Type *T = A->getAllocatedType();
+            bool Flag = T->isIntegerTy(1);
+            if (!T->isPointerTy() && !Flag)
+                continue;
+            IRBuilder<> AB(A);
+            Type *Held = Flag ? AB.getInt32Ty() : AB.getInt64Ty();
+            AllocaInst *W = AB.CreateAlloca(Held, A->getAddressSpace());
+            SmallVector<User *, 8> Users(A->users());
+            for (User *U : Users)
+            {
+                if (auto *L = dyn_cast<LoadInst>(U))
+                {
+                    IRBuilder<> B(L);
+                    Value *V = B.CreateLoad(Held, W);
+                    Value *P = Flag ? B.CreateICmpNE(V, B.getInt32(0)) : B.CreateIntToPtr(V, T);
+                    L->replaceAllUsesWith(P);
+                    L->eraseFromParent();
+                }
+                else if (auto *St = dyn_cast<StoreInst>(U))
+                {
+                    IRBuilder<> B(St);
+                    B.CreateStore(Flag ? B.CreateZExt(St->getValueOperand(), Held)
+                                       : B.CreatePtrToInt(St->getValueOperand(), Held), W);
+                    St->eraseFromParent();
+                }
+            }
+            A->eraseFromParent();
+        }
+        return;
+    }
     DominatorTree DT(F);
     SmallVector<AllocaInst *, 32> Promotable;
     for (AllocaInst *A : Slots)

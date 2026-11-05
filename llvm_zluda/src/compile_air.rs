@@ -331,6 +331,8 @@ pub fn compile_air(
 
     run(&linked, c"air-portable", &air, &options)?;
     stage("portable: air-portable");
+    // Invalid AIR is an error here, before anything reads it: the AGX path never reaches the writer's checks in llc.
+    run(&linked, c"air-verify", &air, &options)?;
     diagnostics.check()?;
     let mut portable = bitcode(&linked);
     if let Some(hook) = compiler_hook.filter(|_| !agx_only) {
@@ -578,6 +580,8 @@ fn metal_air(
     unsafe { crate::ffi::LLVMZludaAirSharedLikeAgx(metal.get()) };
     run(&metal, c"air-portable", air, options)?;
     stage("Metal copy: air-portable");
+    // (the Metal form's own checks, air-verify-metal, run in llc's writer, which lowers this file)
+    run(&metal, c"air-verify", air, options)?;
     diagnostics.check()?;
     metal.verify().map_err(|e| format!("the AIR for Metal is broken: {e}"))?;
     let metal_air = bitcode(&metal);

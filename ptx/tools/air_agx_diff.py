@@ -548,9 +548,14 @@ def main():
     ap.add_argument('--skip-hang', default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                          'air_ptx_formalization_hangs.txt'),
                     help='hang list ("TEST KERNEL" lines): never sent; a request that times out is added to it')
+    ap.add_argument('--zero-shared', action='store_true',
+                    help='shared memory starts as zero on the AIR side too (ZLUDA_AIR_ZERO_SHARED=1): the programs '
+                         'that read it before writing it, which PTX leaves undefined, then compare')
     ap.add_argument('--dry-run', action='store_true',
                     help='compile and build every request (logged to --progress) without sending or simulating')
     args = ap.parse_args()
+    if args.zero_shared:
+        os.environ['ZLUDA_AIR_ZERO_SHARED'] = '1'
     if args.tools:
         for attr, tool in (('zoc', 'zoc'), ('llc', 'llc'), ('llvm_dis', 'llvm-dis'), ('readelf', 'llvm-readelf'),
                            ('objcopy', 'llvm-objcopy')):

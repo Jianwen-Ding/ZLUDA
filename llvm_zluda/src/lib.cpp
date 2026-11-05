@@ -2004,6 +2004,17 @@ int LLVMZludaAirSharedLikeAgx(LLVMModuleRef M)
         IRBuilder<> Entry(&*F->getEntryBlock().getFirstInsertionPt());
         Value *First = Entry.CreateInBoundsGEP(Ty, Block, {ConstantInt::get(I64, 0), ConstantInt::get(I64, 0)});
         Value *BaseInt = Entry.CreatePtrToInt(First, I64);
+        // ZLUDA_AIR_ZERO_SHARED=1: shared memory that starts as zero, as it does on AGX's
+        // functional simulator and in the K semantics of PTX, for checks against them:
+        // PTX leaves it undefined, and a GPU's holds what ran before. Not for applications:
+        // every thread of every launch writes all of it.
+        if (const char *Zero = getenv("ZLUDA_AIR_ZERO_SHARED"); Zero && Zero[0] == '1')
+        {
+            Entry.CreateMemSet(First, Entry.getInt8(0), Entry.getInt32(Size), MaybeAlign(MaxAlign));
+            FunctionCallee Barrier = Mod->getOrInsertFunction(
+                "air.wg.barrier", FunctionType::get(Type::getVoidTy(Ctx), {Entry.getInt32Ty(), Entry.getInt32Ty()}, false));
+            Entry.CreateCall(Barrier, {Entry.getInt32(2), Entry.getInt32(1)});
+        }
         for (auto [GV, Offset] : Layout)
         {
             Value *At = Entry.CreateInBoundsGEP(I8, First, ConstantInt::get(I64, Offset));

@@ -1128,6 +1128,10 @@ Kernels read their 32-bit constants too wide for an immediate from uniform regis
 arguments): fewer general purpose registers and more resident SIMD-groups. `ZLUDA_AGX_UNIFORM_CONSTANTS=0` compiles
 with `mov_imm` instead, in the driver and `zoc` and, at build time, for the agx_libs kernels.
 
+`ZLUDA_AIR_ZERO_SHARED=1` makes the AIR for Metal zero its shared memory at the start of a kernel, for checks against
+results computed with shared memory that starts as zero (the simulator, the K semantics). PTX leaves it undefined, and a
+GPU's holds what ran before; this costs every launch, so it is not for applications.
+
 `ZLUDA_AGX_VIA_AIR=1` (experimental) compiles through upstream AIR instead of straight to AGX: the optimized AGX IR is
 written as AIR (`agx-raise-to-air`, what AIR does not have as hints with AIR emulations, double precision in software),
 the AIR target's portable passes make it upstream AIR, and the AGX backend compiles that, restoring the hinted AGX

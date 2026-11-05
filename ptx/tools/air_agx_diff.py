@@ -548,6 +548,8 @@ def main():
     ap.add_argument('--skip-hang', default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                          'air_ptx_formalization_hangs.txt'),
                     help='hang list ("TEST KERNEL" lines): never sent; a request that times out is added to it')
+    ap.add_argument('--strict-fp', action='store_true',
+                    help='compile with zoc --strict-fp: every class of difference then counts')
     ap.add_argument('--zero-shared', action='store_true',
                     help='shared memory starts as zero on the AIR side too (ZLUDA_AIR_ZERO_SHARED=1): the programs '
                          'that read it before writing it, which PTX leaves undefined, then compare')

@@ -1668,13 +1668,7 @@ fn compile_or_cached(sources: &[&[u8]], cpu: &str, cached_only: bool) -> Result<
     if sources.len() > 1 {
         options.push("link");
     }
-    if mesa {
-        options.push("agx-strict");
-    }
     let checked = agx_checked();
-    if checked {
-        options.push("agx-checked");
-    }
     // (in the cache key: a strict build and a fast one of the same source differ)
     let strict_fp = strict_fp();
     if strict_fp {
@@ -1685,9 +1679,6 @@ fn compile_or_cached(sources: &[&[u8]], cpu: &str, cached_only: bool) -> Result<
         options.push("strict-fp-f32-textures");
     }
     let lineinfo = agx_lineinfo() && !checked;
-    if lineinfo {
-        options.push("lineinfo");
-    }
     let fast_mma = agx_fast_mma();
     if fast_mma {
         options.push("fast-mma");
@@ -1706,39 +1697,32 @@ fn compile_or_cached(sources: &[&[u8]], cpu: &str, cached_only: bool) -> Result<
     if std::env::var("ZLUDA_AGX_UNIFORM_CONSTANTS").is_ok_and(|v| v == "0") {
         options.push("no-uniform-constants");
     }
-    // PTX goes to AIR and the AGX backend compiles that AIR (zoc --target air). The modes the AIR route does not
-    // implement (Mesa's strict instructions, checked accesses, line tables) still take the direct route, where
-    // ZLUDA_AGX_VIA_AIR=1 raises the AGX IR to AIR (experimental).
-    let direct = mesa || checked || lineinfo;
-    if !direct {
-        options.push("air");
+    // PTX goes to AIR and the AGX backend compiles that AIR (zoc --target air), the only route. It does not implement
+    // these modes: an error, not code without what was asked for.
+    for (on, name) in [(mesa, "ZLUDA_AGX_STRICT"), (checked, "ZLUDA_AGX_CHECKED"), (lineinfo, "ZLUDA_AGX_LINEINFO")] {
+        if on {
+            return Err(format!("{name}: not implemented on the PTX -> AIR -> AGX route"));
+        }
     }
-    if direct && std::env::var("ZLUDA_AGX_VIA_AIR").is_ok_and(|v| v == "1") {
-        options.push("via-air");
-    }
+    options.push("air");
     let key = Key { source, chip: cpu, compiler: &compiler, options: &options };
     let compiled = std::cell::Cell::new(false);
     let started = Instant::now();
     let compile = || -> Result<(Vec<u8>, String), String> {
         compiled.set(true);
         if crate::log_enabled() {
-            eprintln!("[zluda_agx] invoking zoc: PTX modules={}, bytes={}, target={cpu}, air={}", sources.len(), sources.iter().map(|s| s.len()).sum::<usize>(), !direct);
+            eprintln!("[zluda_agx] invoking zoc: PTX modules={}, bytes={}, target={cpu}, ", sources.len(), sources.iter().map(|s| s.len()).sum::<usize>());
         }
-        let target = if direct { "agx" } else { "air" };
-        let mut args: Vec<String> = ["--target", target, "--arch", cpu, "--object-only"].iter().map(|a| a.to_string()).collect();
         // (the AGX object alone: no AIR for Metal, which nothing on Asahi reads)
-        args.extend((!direct).then(|| "--agx-only".to_string()));
-        args.extend(mesa.then(|| "--agx-strict".to_string()));
-        args.extend(checked.then(|| "--agx-checked".to_string()));
+        let mut args: Vec<String> = ["--target", "air", "--arch", cpu, "--object-only", "--agx-only"].iter().map(|a| a.to_string()).collect();
         args.extend(strict_fp.then(|| "--strict-fp".to_string()));
-        args.extend((f32_textures && !direct).then(|| "--strict-fp-f32-textures".to_string()));
-        args.extend(lineinfo.then(|| "--lineinfo".to_string()));
+        args.extend(f32_textures.then(|| "--strict-fp-f32-textures".to_string()));
         args.extend(fast_mma.then(|| "--fast-mma".to_string()));
         args.extend((stack_size != DEFAULT_STACK_SIZE).then(|| format!("--stack-size={stack_size}")));
         // a large module (Blender Cycles: 13 MB of PTX, 75 kernels) a kernel at a time, with called functions kept
         // as calls: fully inlined, Cycles' largest kernel alone did not fit in 8 GB (llvm_zluda AIR_EXPERIMENTS.md).
         // Its own zoc: the options are LLVM's, for the whole process.
-        let large = !direct && sources.iter().map(|s| s.len()).sum::<usize>() > LARGE_MODULE_BYTES;
+        let large = sources.iter().map(|s| s.len()).sum::<usize>() > LARGE_MODULE_BYTES;
         let served = if large { None } else { zoc_server::compile(&zoc, &args, sources) };
         if let Some(result) = served {
             if crate::log_enabled() {
@@ -4842,7 +4826,7 @@ mod tests {
         }
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../ptx/src/test/spirv_run/");
         let (add, mul) = (std::fs::read(format!("{dir}add.ptx")).unwrap(), std::fs::read(format!("{dir}mul_lo.ptx")).unwrap());
-        let args: Vec<String> = ["--target", "agx", "--arch", "agx-g14c", "--object-only"].iter().map(|a| a.to_string()).collect();
+        let args: Vec<String> = ["--target", "air", "--arch", "agx-g14c", "--object-only", "--agx-only"].iter().map(|a| a.to_string()).collect();
         // the server is the process's: other tests compiling at the same time make it busy (None) for a moment
         let served = |sources: &[&[u8]]| {
             for _ in 0..1000 {

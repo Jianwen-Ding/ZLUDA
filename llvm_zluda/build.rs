@@ -225,7 +225,7 @@ fn llvm_config(llvm_config_path: &PathBuf) -> io::Result<(String, String, String
     }
     if agx_enabled() {
         cmd.arg("agx");
-        // The AIR target, for the experimental PTX -> AIR -> AGX path (ZLUDA_AGX_VIA_AIR), when the LLVM build has it
+        // The AIR target, for the PTX -> AIR path (zoc --target air), when the LLVM build has it
         if has_component(llvm_config_path, "air") {
             cmd.arg("air");
             println!("cargo:rustc-cfg=zluda_air");

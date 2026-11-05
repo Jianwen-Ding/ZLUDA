@@ -273,8 +273,6 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
     fn kernel_call_convention(&self) -> u32 {
         match self.target {
             Target::Amdgpu => LLVMCallConv::LLVMAMDGPUKERNELCallConv as u32,
-            // CallingConv::AGX_KERNEL, which llvm-sys does not know.
-            Target::Agx => 128,
             // AIR kernels have the C calling convention and the "air-kernel" attribute
             Target::Air => LLVMCallConv::LLVMCCallConv as u32,
         }
@@ -5809,8 +5807,8 @@ impl<'a> MethodEmitContext<'a> {
             // (under --strict-fp as a square root and a division, whose NaNs the strict mode canonicalizes; AIR's
             // rsqrt gives Metal's NaN)
             (Target::Air, ast::ScalarType::F32, _) if self.strict_fp => c"llvm.agx.rsqrt.ieee.f32",
-            (Target::Agx | Target::Air, ast::ScalarType::F32, _) => c"llvm.agx.rsqrt.f32",
-            (Target::Agx | Target::Air, _, _) => return Err(error_unreachable()),
+            (Target::Air, ast::ScalarType::F32, _) => c"llvm.agx.rsqrt.f32",
+            (Target::Air, _, _) => return Err(error_unreachable()),
             (_, ast::ScalarType::F32, FloatingPointMode::Normal) => c"llvm.amdgcn.rsq.f32",
             (_, ast::ScalarType::F32, FloatingPointMode::Constrained) => {
                 c"llvm.amdgcn.constrained.rsq.f32"

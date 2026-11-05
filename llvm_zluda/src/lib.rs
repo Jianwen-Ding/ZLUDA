@@ -17,5 +17,3 @@ pub use ffi::*;
 
 #[cfg(feature = "amdgpu")]
 pub use compile::compile;
-#[cfg(feature = "agx")]
-pub use compile_agx::{compile_agx, compile_agx_linked, AgxOptions};

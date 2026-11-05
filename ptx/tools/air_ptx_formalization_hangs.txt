@@ -1,4 +1,7 @@
 # Requests that hang the AIR service's Mac (the Metal compiler or the GPU never finishes; the runner times out after
 # 30 s and the Mac's display can freeze meanwhile). air_ptx_formalization_check.py never sends them. One line per
-# kernel: TEST KERNEL.
+# kernel: TEST.ptx KERNEL (the file name, with .ptx: a line without it matches nothing).
 #
+# 2026-11-05: air_agx_diff.py request timed out: GPU command 0 (kernel k) exceeded gpu_timeout_ms=2000. Metal cannot cancel a running command buffer, so it may keep the 
+# 2026-11-05: air_agx_diff.py request timed out: Compiling the pipeline for kernel k3 exceeded compile_timeout_ms=5000; the runner stopped waiting for the Metal compiler
+tc-94b-3.ptx k3

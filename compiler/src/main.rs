@@ -12,8 +12,6 @@ use std::{env, mem};
 mod error;
 
 const DEFAULT_ARCH: &'static str = "gfx1100";
-#[cfg(feature = "agx")]
-const DEFAULT_AGX_ARCH: &'static str = llvm_zluda::compile_agx::AGX_DEFAULT_CPU;
 
 #[derive(Debug, Clone, Bpaf)]
 #[bpaf(options, version)]
@@ -27,10 +25,8 @@ pub struct Options {
     arch: Option<String>,
 
     #[bpaf(long("target"), argument("TARGET"))]
-    /// GPU family: amdgpu (default); air (Apple GPUs: PTX to portable AIR, for
-    /// Metal and, with an agx-* --arch, the AGX backend); or agx, the older
-    /// route to the AGX backend without AIR, superseded by air and kept while
-    /// zluda_agx still compiles with it. An agx-* --arch alone selects agx
+    /// GPU family: amdgpu (default) or air (Apple GPUs: PTX to AIR, then AGX with
+    /// an agx-* --arch, and the lowered AIR for Metal). An agx-* --arch alone selects air
     target: Option<String>,
 
     #[bpaf(long("ignore-errors"))]
@@ -49,28 +45,12 @@ pub struct Options {
     /// filtering, instead of the software double precision sampler (an error margin for textures only)
     strict_fp_f32_textures: bool,
 
-    #[bpaf(long("agx-strict"))]
-    /// AGX: emit only the instructions Mesa's asahi compiler emits for the
-    /// same GPU (M1 and M2 only); any other is an error
-    agx_strict: bool,
-
-    #[bpaf(long("agx-checked"))]
-    /// AGX: check every memory access (bounds, null, alignment) and report
-    /// the first bad one with its source location; the runtime must pass the
-    /// checked-mode arguments (ZLUDA_AGX_CHECKED=1). Slower
-    agx_checked: bool,
-
     #[bpaf(long("fast-mma"))]
     /// AGX: compute mma and wmma with f16, bf16 or tf32 A and B with the
     /// SIMD-group matrix multiply-accumulate in f32 (the matrix unit on G14):
     /// much faster than the exact sums, rounded at every step. The default
     /// without --strict-fp (--target air); with it, this flag still asks for it
     fast_mma: bool,
-
-    #[bpaf(long("lineinfo"))]
-    /// AGX: keep the PTX `.loc` source positions as a DWARF line table in the
-    /// object (as nvcc -lineinfo), for tools that map a PC to a source line
-    lineinfo: bool,
 
     #[bpaf(long("object-only"))]
     /// AGX: write the object alone (no LLVM IR, no assembly): the faster
@@ -132,16 +112,15 @@ fn main_core() -> Result<(), CompilerError> {
     output_path.push(filename_base);
 
     let target = match opts.target.as_deref() {
-        Some("agx") => ptx::Target::Agx,
         Some("air") => ptx::Target::Air,
         Some("amdgpu") => ptx::Target::Amdgpu,
         Some(other) => {
             return Err(CompilerError::GenericError {
                 cause: None,
-                message: format!("unknown target '{other}' (expected amdgpu, agx or air)"),
+                message: format!("unknown target '{other}' (expected amdgpu or air)"),
             })
         }
-        None if opts.arch.as_deref().is_some_and(|a| a.starts_with("agx")) => ptx::Target::Agx,
+        None if opts.arch.as_deref().is_some_and(|a| a.starts_with("agx")) => ptx::Target::Air,
         None => ptx::Target::Amdgpu,
     };
     if target == ptx::Target::Air {
@@ -171,35 +150,6 @@ fn main_core() -> Result<(), CompilerError> {
             opts.agx_only,
         );
     }
-    if target == ptx::Target::Agx {
-        let mut texts = vec![String::from_utf8(fs::read(&ptx_path)?).map_err(|e| e.utf8_error())?];
-        for path in &others {
-            texts.push(String::from_utf8(fs::read(path)?).map_err(|e| e.utf8_error())?);
-        }
-        let object_only = opts.object_only;
-        let sink = |bytes: &Vec<u8>, extension: String| {
-            let output_path = output_path.with_extension(extension);
-            if object_only {
-                fs::write(&output_path, bytes).unwrap();
-            } else {
-                write_to_file(bytes, &output_path).unwrap();
-            }
-        };
-        return compile_agx(
-            &texts,
-            &sink,
-            opts.arch,
-            opts.ignore_errors,
-            opts.strict_fp,
-            opts.agx_strict,
-            opts.agx_checked,
-            opts.lineinfo,
-            opts.stack_size,
-            opts.fast_mma,
-            opts.object_only,
-        );
-    }
-
     if !others.is_empty() {
         return Err(CompilerError::GenericError {
             cause: None,
@@ -270,79 +220,6 @@ fn compile_amdgpu(
         cause: None,
         message: "zoc was built without the amdgpu feature".to_string(),
     })
-}
-
-/// Compile for Apple GPUs. Writes the LLVM IR (.ll, linked.ll, opt.ll), the
-/// assembly (.asm) and the ELF object (.o).
-#[cfg(feature = "agx")]
-fn compile_agx(
-    texts: &[String],
-    sink: &dyn Fn(&Vec<u8>, String),
-    arch: Option<String>,
-    ignore_errors: bool,
-    strict_fp: bool,
-    agx_strict: bool,
-    checked: bool,
-    lineinfo: bool,
-    stack_size: u32,
-    fast_mma: bool,
-    object_only: bool,
-) -> Result<(), CompilerError> {
-    let agx_options = llvm_zluda::AgxOptions { strict_fp, agx_strict, checked, object_only };
-    let arch = arch.unwrap_or_else(|| DEFAULT_AGX_ARCH.to_owned());
-    let llvm = ptx_to_llvm(
-        ignore_errors,
-        !object_only,
-        &texts[0],
-        ptx::Options {
-            target: ptx::Target::Agx,
-            strict_fp,
-            f32_textures: false,
-            // checked mode names the source of a bad access
-            debug_locations: checked || lineinfo,
-            stack_size,
-            fast_mma,
-        },
-    )?;
-    if !object_only {
-        sink(&llvm.llvm_ir, "ll".to_string());
-    }
-    // the other modules, translated on their own and linked as LLVM IR
-    let mut other_ir = Vec::new();
-    for ptx in &texts[1..] {
-        let other = ptx_to_llvm(
-            ignore_errors,
-            true,
-            ptx,
-            ptx::Options {
-                target: ptx::Target::Agx,
-                strict_fp,
-                f32_textures: false,
-                debug_locations: checked || lineinfo,
-                stack_size,
-                fast_mma,
-            },
-        )?;
-        other_ir.push(other.llvm_ir);
-    }
-    let other_ir: Vec<&[u8]> = other_ir.iter().map(|v| &v[..]).collect();
-    let compiler_hook = |bytes: &Vec<u8>, extension: String| sink(bytes, extension);
-    let mut start = Instant::now();
-    llvm_zluda::compile_agx_linked(
-        &llvm.context,
-        &arch,
-        agx_options,
-        llvm.main,
-        &other_ir,
-        llvm.linked_bitcode,
-        Some(&compiler_hook),
-    )
-    .map_err(|message| CompilerError::GenericError {
-        cause: None,
-        message,
-    })?;
-    report_pass_time("compile_agx", &mut start);
-    Ok(())
 }
 
 /// `--target air`: PTX to portable AIR (NAME.portable.air), the AIR for Metal (NAME.air, with NAME.air.globals)
@@ -455,26 +332,6 @@ fn compile_air(
     Err(CompilerError::GenericError { cause: None, message: "zoc was built without the agx feature".to_string() })
 }
 
-#[cfg(not(feature = "agx"))]
-fn compile_agx(
-    _texts: &[String],
-    _sink: &dyn Fn(&Vec<u8>, String),
-    _arch: Option<String>,
-    _ignore_errors: bool,
-    _strict_fp: bool,
-    _agx_strict: bool,
-    _checked: bool,
-    _lineinfo: bool,
-    _stack_size: u32,
-    _fast_mma: bool,
-    _object_only: bool,
-) -> Result<(), CompilerError> {
-    Err(CompilerError::GenericError {
-        cause: None,
-        message: "zoc was built without the agx feature".to_string(),
-    })
-}
-
 /// `zoc --serve`: compile requests from stdin, one after another in this process, so that a runtime pays for
 /// starting LLVM once rather than per module (zluda_agx). Little-endian; a request is the zoc arguments other than
 /// the files (u32 count, then u32 length and bytes each) and the PTX sources (u32 count, then u64 length and bytes
@@ -546,10 +403,8 @@ fn serve_one(args: &[String], texts: &[String]) -> Result<(Vec<u8>, Vec<u8>), St
             outputs.borrow_mut().insert(extension, bytes.clone());
         }
     };
-    // the target as zoc's command line takes it (--target air: PTX through AIR; it compiled every served request
-    // with the direct route before)
     match opts.target.as_deref() {
-        Some("air") => compile_air(
+        Some("air") | None => compile_air(
             texts,
             &sink,
             opts.arch,
@@ -562,20 +417,7 @@ fn serve_one(args: &[String], texts: &[String]) -> Result<(Vec<u8>, Vec<u8>), St
             // (a served request returns only the object and the assembly)
             true,
         ),
-        Some("agx") | None => compile_agx(
-            texts,
-            &sink,
-            opts.arch,
-            opts.ignore_errors,
-            opts.strict_fp,
-            opts.agx_strict,
-            opts.agx_checked,
-            opts.lineinfo,
-            opts.stack_size,
-            opts.fast_mma,
-            opts.object_only,
-        ),
-        Some(other) => return Err(format!("zoc --serve compiles for agx or air, not {other}")),
+        Some(other) => return Err(format!("zoc --serve compiles for air, not {other}")),
     }
     .map_err(|e| e.to_string())?;
     let mut outputs = outputs.into_inner();

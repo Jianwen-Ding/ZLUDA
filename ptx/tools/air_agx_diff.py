@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """Differential test of ZLUDA's two Apple GPU paths on the PTX-formalization test programs.
 
-Each program is compiled once with ZLUDA_AGX_VIA_AIR=1 (zoc --target agx), which writes NAME.air (portable AIR) and
-NAME.o (AGX code compiled from that AIR by agx-lower-air). Every launch of the harness then runs, with identical
+Each program is compiled once with zoc --target air, which writes NAME.air (AIR for Metal) and NAME.o (AGX code
+compiled from the portable AIR by agx-lower-air). Every launch of the harness then runs, with identical
 inputs, on
   air    the AIR, packaged for Metal (llc -mtriple=air -air-output=air), on the Apple GPU behind the AIR service
          (as air_ptx_formalization_check.py runs it), and
   agx    NAME.o on the functional AGX simulator agx_run (as agx_ptx_formalization_check.py runs it),
-and, with --direct, also on
-  direct the AGX code of the direct PTX -> AGX path (zoc without ZLUDA_AGX_VIA_AIR) on agx_run,
-which separates bugs of the AIR raise / AGX lowering from bugs of the PTX front end.
 
 Consecutive launches run as one service job on the AIR side; after each job (or each launch, with --per-launch)
 ALL harness buffers and the module's global variables are compared bit for bit between the sides, whatever the
@@ -33,7 +30,7 @@ The AIR service rules of air_ptx_formalization_check.py apply: one request at a 
 request named in --progress before it is sent, never a kernel of the hang list; a request that times out stops all
 device work and is added to the hang list (it is never resent).
 
-    python3 ptx/tools/air_agx_diff.py --tools /scratch/diff-tools --agx-run .../agx_run --direct \\
+    python3 ptx/tools/air_agx_diff.py --tools /scratch/diff-tools --agx-run .../agx_run \\
         --progress progress.txt --json diff.json PTX-formalization/tests/*.ptx
 """
 
@@ -194,7 +191,7 @@ def run_program(path, args):
     if re.search(r'^\s*\.address_size\s+32\b', module, re.M):
         return {'status': 'UNSUPPORTED', 'detail': '.address_size 32'}
     with tempfile.TemporaryDirectory() as tmp:
-        tmp_air, tmp_direct = os.path.join(tmp, 'air'), os.path.join(tmp, 'direct')
+        tmp_air = os.path.join(tmp, 'air')
         os.makedirs(tmp_air)
         status, info = air.compile_module(args, module, tmp_air)
         if status:
@@ -210,16 +207,6 @@ def run_program(path, args):
         air_gnames = dict(bufs)  # global name -> [addr, 'b8', size] in the heap
         harness_syms = {}
         sides = [AgxSide('agx', tmp_air, args, module, harness_syms)]
-        if args.direct:
-            os.makedirs(tmp_direct)
-            st, detail = h.compile_ptx(args, module, tmp_direct)
-            if st:
-                res['notes'].append('direct: %s %s' % (st, detail[:200]))
-                direct_tainted = set()
-            else:
-                d = AgxSide('direct', tmp_direct, args, module, harness_syms)
-                direct_tainted = detail[2]
-                sides.append(d)
         gtypes = {}
         for m in re.finditer(r'\.(?:global|const)\s+(?:\.align\s+\d+\s+)?(?:\.v\d\s+)?\.(\w+)\s+([\w$]+)', module):
             if m.group(1) in SIZES:
@@ -279,7 +266,7 @@ def run_program(path, args):
             for s in sides:
                 reads[s.label] = s.read
             cols = ['air'] + [s.label for s in sides if not s.error]
-            pairs = [('air', 'agx')] + ([('air', 'direct'), ('agx', 'direct')] if 'direct' in cols else [])
+            pairs = [('air', 'agx')]
             for p, q in pairs:
                 if p not in cols or q not in cols:
                     continue
@@ -488,11 +475,6 @@ def run_program(path, args):
                 pending.append((name, air_grid, air_block, dyn, pbufs))
                 job_kernels.append(name)
                 for s in sides:
-                    if s.label == 'direct' and (direct_tainted is None or name in direct_tainted
-                                                or name not in s.kernels):
-                        if not s.error:
-                            s.error = 'kernel %s not compiled on the direct path' % name
-                        continue
                     s.run(name, ps, ops, grid, block, dyn)
                 if args.per_launch:
                     st = flush('after #%d %s' % (di, name))
@@ -565,7 +547,6 @@ def main():
     ap.add_argument('--arch', default='agx-g14g')
     ap.add_argument('--queue', default=os.environ.get('AIR_QUEUE', '/air'))
     ap.add_argument('--timeout', type=int, default=120)
-    ap.add_argument('--direct', action='store_true', help='also run the direct PTX -> AGX code (a third column)')
     ap.add_argument('--per-launch', action='store_true', help='one service job, and one comparison, per launch')
     ap.add_argument('--ulps', type=int, default=16, help='largest ULP distance of class ulp')
     ap.add_argument('--max-diffs', type=int, default=4, help='differing elements listed per pair')
@@ -577,8 +558,6 @@ def main():
                     help='hang list ("TEST KERNEL" lines): never sent; a request that times out is added to it')
     ap.add_argument('--strict-fp', action='store_true',
                     help='compile with zoc --strict-fp: every class of difference then counts')
-    ap.add_argument('--via-agx', dest='via_agx', action='store_true',
-                    help='the older route (ZLUDA_AGX_VIA_AIR=1 zoc --target agx) instead of zoc --target air')
     ap.add_argument('--zero-shared', action='store_true',
                     help='shared memory starts as zero on the AIR side too (ZLUDA_AIR_ZERO_SHARED=1): the programs '
                          'that read it before writing it, which PTX leaves undefined, then compare')

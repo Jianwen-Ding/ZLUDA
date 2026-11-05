@@ -3,9 +3,9 @@
 
 zoc compiles its AGX object from the module in memory, so reading the file it wrote is never tested by zoc alone.
 This stands in for zoc in the checks (--zoc): it runs zoc, rebuilds NAME.o and NAME.asm from NAME.portable.air with
-llc, as zoc would have made them, and fails if the object differs. --target agx needs ZLUDA_AGX_VIA_AIR=1.
+llc, as zoc would have made them, and fails if the object differs. Only --target air writes that file.
 
-    ZLUDA_AGX_VIA_AIR=1 ZOC=target/release/zoc LLVM_BIN=$LLVM/bin python3 ptx/tools/agx_ptx_formalization_check.py \\
+    ZOC=target/release/zoc LLVM_BIN=$LLVM/bin python3 ptx/tools/agx_ptx_formalization_check.py \\
         --zoc ptx/tools/agx_air_roundtrip_zoc.py --agx-run .../agx_run PTX-formalization/tests/*.ptx
 """
 
@@ -31,14 +31,10 @@ def main():
         flags.append('-agx-uniform-constants')
     if os.environ.get('ZLUDA_AGX_LAUNCH_DIVISORS') != '0':
         flags.append('-agx-launch-divisors')
-    if '--strict-fp' in args and value('--target') != 'air':
-        flags.append('-mattr=+ieee-fp32,+canonical-nan')
-    source = path('.portable.air')
-    if value('--target') == 'air':
-        # (zoc --target air optimizes for AGX first, ZLUDA_AIR_AGX_PIPELINE)
-        source = path('.agx.bc')
-        subprocess.run([os.path.join(bin_dir, 'opt'), *flags, '-passes=default<O3>', path('.portable.air'), '-o', source],
-                       check=True)
+    # (zoc --target air optimizes for AGX first, ZLUDA_AIR_AGX_PIPELINE)
+    source = path('.agx.bc')
+    subprocess.run([os.path.join(bin_dir, 'opt'), *flags, '-passes=default<O3>', path('.portable.air'), '-o', source],
+                   check=True)
     llc = os.path.join(bin_dir, 'llc')
     subprocess.run([llc, *flags, '-filetype=obj', source, '-o', path('.rt.o')], check=True)
     subprocess.run([llc, *flags, source, '-o', path('.asm')], check=True)

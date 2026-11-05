@@ -59,6 +59,9 @@ COMPILE_TIMEOUT_MS = 5000
 TIMED_OUT = ('gpu_timeout_ms=', 'compile_timeout_ms=', 'Refusing GPU work', 'timed out after')
 
 
+DEVICE_STOPPED = []
+
+
 def is_hang(error):
     return any(t in (error or '') for t in TIMED_OUT)
 
@@ -74,6 +77,9 @@ def submit(job, queue, tries=4, transient=TRANSIENT):
     import time
     sys.path.insert(0, os.environ.get('AIR_CLIENT', '/air/client'))
     from client import submit as service_submit
+    # After a hang nothing more is sent: the Mac's display can freeze while the GPU is stuck.
+    if DEVICE_STOPPED:
+        return {'ok': False, 'error': 'device work stopped after a hang: ' + DEVICE_STOPPED[0]}
     if job.get('op') == 'execute':
         job.setdefault('gpu_timeout_ms', GPU_TIMEOUT_MS)
         job.setdefault('compile_timeout_ms', COMPILE_TIMEOUT_MS)
@@ -86,6 +92,7 @@ def submit(job, queue, tries=4, transient=TRANSIENT):
             except TimeoutError as e:
                 reply = {'ok': False, 'error': str(e)}
             if is_hang(reply.get('error')):
+                DEVICE_STOPPED.append(reply['error'][:200])
                 deadline = time.monotonic() + 60
                 while time.monotonic() < deadline:
                     caps = service_submit({'op': 'capabilities'}, queue, timeout=60)
@@ -208,15 +215,11 @@ def load_hang_list(path):
 
 
 def compile_module(args, module, tmp):
-    """zoc --target air (PTX straight to AIR: NAME.air for Metal, and the AGX code of the portable AIR), or with
-    --via-agx the older route (ZLUDA_AGX_VIA_AIR=1 zoc --target agx); then Metal's AIR (llc).
+    """zoc --target air (PTX straight to AIR: NAME.air for Metal, and the AGX code of the portable AIR); then
+    Metal's AIR (llc).
     Returns (status, detail) of a failure, or (None, info): info has 'air' (Metal AIR bytes), 'kernels'
     (air_kernels), 'roles' (hidden_roles), 'agx' (kernel_info's kernels of m.o), 'tainted', 'rejected'."""
-    if getattr(args, 'via_agx', False):
-        status, detail = h.compile_ptx(args, module, tmp, env=dict(os.environ, ZLUDA_AGX_VIA_AIR='1'),
-                                       product='m.air')
-    else:
-        status, detail = h.compile_ptx(args, module, tmp, product='m.air', target='air')
+    status, detail = h.compile_ptx(args, module, tmp, product='m.air', target='air')
     if status:
         return status, detail
     _, rejected, tainted = detail
@@ -568,8 +571,6 @@ def main():
                     help='zoc --arch: the AIR as compiled with AGX code (the default) or, with none, for Metal alone')
     ap.add_argument('--strict-fp', dest='strict_fp', action='store_true',
                     help='zoc --strict-fp: PTX floating point exactly (canonical NaNs...)')
-    ap.add_argument('--via-agx', action='store_true',
-                    help='the older route: AIR raised from ZLUDA\'s AGX IR (ZLUDA_AGX_VIA_AIR=1 zoc --target agx)')
     ap.add_argument('--queue', default=os.environ.get('AIR_QUEUE', '/air'))
     ap.add_argument('--timeout', type=int, default=120)
     ap.add_argument('--max-failures', type=int, default=4, help='failing elements listed per test')

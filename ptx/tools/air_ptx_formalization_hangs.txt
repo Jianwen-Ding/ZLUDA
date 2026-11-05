@@ -18,3 +18,5 @@ cvt-10.ptx k18
 cvt-11.ptx k18
 # 2026-11-04: air_agx_diff.py request timed out: Compiling the pipeline for kernel k3 exceeded compile_timeout_ms=5000; the runner stopped waiting for the Metal compiler
 tc-94b-3.ptx k3
+# 2026-11-05: air_agx_diff.py request timed out: GPU command 0 (kernel k) exceeded gpu_timeout_ms=2000. Metal cannot cancel a running command buffer, so it may keep the 
+tc-alloc-exclusive.ptx k

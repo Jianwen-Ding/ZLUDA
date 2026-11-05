@@ -1978,7 +1978,8 @@ int LLVMZludaAirSharedLikeAgx(LLVMModuleRef M)
         return 0;
     for (GlobalVariable *GV : Statics)
         convertUsersOfConstantsToInstructions({GV});
-    DenseMap<Function *, SmallPtrSet<GlobalVariable *, 8>> Used;
+    // (in module order: the order of the variables below is in the .air, the same for the same input)
+    MapVector<Function *, SmallPtrSet<GlobalVariable *, 8>> Used;
     for (GlobalVariable *GV : Statics)
         for (User *U : GV->users())
         {

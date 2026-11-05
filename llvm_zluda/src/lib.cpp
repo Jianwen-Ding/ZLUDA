@@ -28,6 +28,7 @@
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include <llvm/Transforms/Utils/Local.h>
 #include <llvm/Transforms/Utils/PromoteMemToReg.h>
+#include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Analysis/PostDominators.h>
 #include <llvm/IR/InstIterator.h>
 #include <llvm/IR/PatternMatch.h>
@@ -1950,7 +1951,7 @@ static bool zludaLoopWaitsForMemory(const Loop &L)
 // a thread that waits on one side for what a thread on the other writes can wait forever (either
 // order of the sides, on an M2 Max). So when one side of a branch waits and the other does not, the
 // other side runs first, with a second branch on a volatile copy of the condition, which no compiler
-// can correlate. Threads that wait for each other, or for what follows the branch, are not helped.
+// can correlate. Threads that wait for each other are not helped.
 // Returns how many branches changed.
 static int zludaRunWaitersLast(Function &F)
 {
@@ -1989,6 +1990,7 @@ static int zludaRunWaitersLast(Function &F)
             return Set;
         };
         BasicBlock *Site = nullptr, *First = nullptr, *Second = nullptr, *Merge = nullptr;
+        bool CloneRest = false;
         for (BasicBlock &BB : F)
         {
             auto *Br = dyn_cast<CondBrInst>(BB.getTerminator());
@@ -1997,8 +1999,38 @@ static int zludaRunWaitersLast(Function &F)
             auto *Node = PDT.getNode(&BB);
             BasicBlock *M = Node && Node->getIDom() ? Node->getIDom()->getBlock() : nullptr;
             BasicBlock *A = Br->getSuccessor(0), *B = Br->getSuccessor(1);
+            // One side is empty: the other threads wait at what follows the branch, so that runs
+            // first in a copy of its own, unless a barrier there would see the threads arrive apart.
             if (A == M || B == M)
-                continue;
+            {
+                BasicBlock *Side = A == M ? B : A;
+                auto Rest = reach(M, nullptr);
+                auto SideSet = reach(Side, M);
+                bool Clean = !Rest.count(&BB) && llvm::none_of(SideSet, [&](BasicBlock *X) { return Rest.count(X); }) &&
+                             llvm::any_of(Waiting, [&](Loop *L) { return SideSet.count(L->getHeader()) != 0; }) &&
+                             llvm::none_of(Waiting, [&](Loop *L) { return Rest.count(L->getHeader()) != 0; });
+                uint64_t Size = 0;
+                for (BasicBlock *X : Rest)
+                {
+                    Size += X->size();
+                    for (Instruction &I : *X)
+                        if (auto *C = dyn_cast<CallBase>(&I))
+                        {
+                            Function *Callee = C->getCalledFunction();
+                            if (!Callee || !Callee->isDeclaration() || Callee->getName().contains("barrier") ||
+                                Callee->getName().contains("simd"))
+                                Clean = false;
+                        }
+                }
+                if (!Clean || Size > 4096)
+                    continue;
+                Site = &BB;
+                First = M;
+                Second = Side;
+                Merge = nullptr;
+                CloneRest = true;
+                break;
+            }
             auto SA = reach(A, M), SB = reach(B, M);
             if (SA.count(&BB) || SB.count(&BB) || llvm::any_of(SA, [&](BasicBlock *X) { return SB.count(X); }))
                 continue;
@@ -2038,9 +2070,29 @@ static int zludaRunWaitersLast(Function &F)
             if (AllocaInst *A = DemotePHIToStack(Phi, AllocaPoint))
                 Slots.push_back(A);
 
-        auto FirstSet = reach(First, Merge);
         auto *Br = cast<CondBrInst>(Site->getTerminator());
         bool FirstOnTrue = Br->getSuccessor(0) == First;
+        if (CloneRest)
+        {
+            auto Rest = reach(First, nullptr);
+            SmallVector<BasicBlock *, 16> Originals;
+            for (BasicBlock &B : F)
+                if (Rest.count(&B))
+                    Originals.push_back(&B);
+            ValueToValueMapTy Map;
+            SmallVector<BasicBlock *, 16> Copies;
+            for (BasicBlock *B : Originals)
+            {
+                BasicBlock *C = CloneBasicBlock(B, Map, ".first", &F);
+                Map[B] = C;
+                Copies.push_back(C);
+            }
+            remapInstructionsInBlocks(Copies, Map);
+            Done.insert(Copies.begin(), Copies.end());
+            First = cast<BasicBlock>(Map[First]);
+            Br->setSuccessor(FirstOnTrue ? 0 : 1, First);
+        }
+        auto FirstSet = reach(First, Merge);
         IRBuilder<> EntryB(&*AllocaPoint);
         AllocaInst *Copy = EntryB.CreateAlloca(EntryB.getInt32Ty(), F.getDataLayout().getAllocaAddrSpace(), nullptr, "zluda.side");
         IRBuilder<> SB(Br);

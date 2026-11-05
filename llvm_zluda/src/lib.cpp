@@ -1991,6 +1991,7 @@ static int zludaRunWaitersLast(Function &F, bool &BothWait)
         };
         BasicBlock *Site = nullptr, *First = nullptr, *Second = nullptr, *Merge = nullptr;
         bool CloneRest = false;
+        Instruction *StopAt = nullptr;
         for (BasicBlock &BB : F)
         {
             auto *Br = dyn_cast<CondBrInst>(BB.getTerminator());
@@ -1999,40 +2000,60 @@ static int zludaRunWaitersLast(Function &F, bool &BothWait)
             auto *Node = PDT.getNode(&BB);
             BasicBlock *M = Node && Node->getIDom() ? Node->getIDom()->getBlock() : nullptr;
             BasicBlock *A = Br->getSuccessor(0), *B = Br->getSuccessor(1);
-            // One side is empty: the other threads wait at what follows the branch, so that runs
-            // first in a copy of its own, unless a barrier there would see the threads arrive apart.
+            // One side is empty: the other threads wait at what follows the branch, so that runs first
+            // in a copy of its own, up to the first barrier or SIMD-group function, if there is one: all
+            // threads meet again before it, which needs them together.
             if (A == M || B == M)
             {
                 BasicBlock *Side = A == M ? B : A;
-                auto Rest = reach(M, nullptr);
                 auto SideSet = reach(Side, M);
-                bool Clean = !Rest.count(&BB) && llvm::none_of(SideSet, [&](BasicBlock *X) { return Rest.count(X); }) &&
-                             llvm::any_of(Waiting, [&](Loop *L) { return SideSet.count(L->getHeader()) != 0; }) &&
-                             llvm::none_of(Waiting, [&](Loop *L) { return Rest.count(L->getHeader()) != 0; });
-                // (the thread on this side waits, and so may those in what follows: for each other)
-                if (llvm::any_of(Waiting, [&](Loop *L) { return SideSet.count(L->getHeader()) != 0; }) &&
-                    llvm::any_of(Waiting, [&](Loop *L) { return Rest.count(L->getHeader()) != 0; }))
-                    BothWait = true;
+                if (!llvm::any_of(Waiting, [&](Loop *L) { return SideSet.count(L->getHeader()) != 0; }))
+                    continue;
+                SmallVector<Instruction *, 2> Stops;
+                SmallPtrSet<BasicBlock *, 16> Prefix;
+                SmallVector<BasicBlock *, 16> Work{M};
                 uint64_t Size = 0;
-                for (BasicBlock *X : Rest)
+                while (!Work.empty())
                 {
-                    Size += X->size();
+                    BasicBlock *X = Work.pop_back_val();
+                    if (!Prefix.insert(X).second)
+                        continue;
+                    Instruction *Stop = nullptr;
                     for (Instruction &I : *X)
                         if (auto *C = dyn_cast<CallBase>(&I))
                         {
                             Function *Callee = C->getCalledFunction();
                             if (!Callee || !Callee->isDeclaration() || Callee->getName().contains("barrier") ||
                                 Callee->getName().contains("simd"))
-                                Clean = false;
+                            {
+                                Stop = &I;
+                                break;
+                            }
                         }
+                    if (Stop)
+                    {
+                        Stops.push_back(Stop);
+                        continue;
+                    }
+                    Size += X->size();
+                    append_range(Work, successors(X));
                 }
-                if (!Clean || Size > 4096)
+                // (the thread on this side waits, and so may those in what follows: for each other)
+                if (llvm::any_of(Waiting, [&](Loop *L) { return Prefix.count(L->getHeader()) != 0; }))
+                {
+                    BothWait = true;
+                    continue;
+                }
+                if (Prefix.count(&BB) || llvm::any_of(SideSet, [&](BasicBlock *X) { return Prefix.count(X) != 0; }) ||
+                    Stops.size() > 1 || (Stops.size() == 1 && Stops[0]->getParent() == M && Stops[0] == &M->front()) ||
+                    Size > 4096)
                     continue;
                 Site = &BB;
                 First = M;
                 Second = Side;
                 Merge = nullptr;
                 CloneRest = true;
+                StopAt = Stops.empty() ? nullptr : Stops[0];
                 break;
             }
             auto SA = reach(A, M), SB = reach(B, M);
@@ -2055,6 +2076,13 @@ static int zludaRunWaitersLast(Function &F, bool &BothWait)
             return Changed;
         Done.insert(Site);
 
+        // (the threads meet at a block of its own, which starts with what needs them together)
+        if (StopAt)
+        {
+            BasicBlock *X = StopAt->getParent();
+            Merge = StopAt == &X->front() ? X : X->splitBasicBlock(StopAt->getIterator());
+        }
+
         // No value lives across the new paths: in memory for now.
         BasicBlock &Entry = F.getEntryBlock();
         BasicBlock::iterator AllocaPoint = Entry.begin();
@@ -2063,9 +2091,10 @@ static int zludaRunWaitersLast(Function &F, bool &BothWait)
         for (BasicBlock &BB : F)
             for (Instruction &I : BB)
             {
+                // (a phi used outside its block too, first: as a phi alone, its load would stay in its block)
                 if (auto *Phi = dyn_cast<PHINode>(&I))
                     Phis.push_back(Phi);
-                else if (!(isa<AllocaInst>(I) && BB.isEntryBlock()) && I.isUsedOutsideOfBlock(&BB))
+                if (!(isa<AllocaInst>(I) && BB.isEntryBlock()) && I.isUsedOutsideOfBlock(&BB))
                     Values.push_back(&I);
             }
         SmallVector<AllocaInst *, 32> Slots;
@@ -2080,7 +2109,7 @@ static int zludaRunWaitersLast(Function &F, bool &BothWait)
         bool FirstOnTrue = Br->getSuccessor(0) == First;
         if (CloneRest)
         {
-            auto Rest = reach(First, nullptr);
+            auto Rest = reach(First, Merge);
             SmallVector<BasicBlock *, 16> Originals;
             for (BasicBlock &B : F)
                 if (Rest.count(&B))
@@ -2186,9 +2215,10 @@ static void zludaRunThreadsInTurn(Function &F)
     for (BasicBlock &BB : F)
         for (Instruction &I : BB)
         {
+            // (a phi used outside its block too, first: as a phi alone, its load would stay in its block)
             if (auto *Phi = dyn_cast<PHINode>(&I))
                 Phis.push_back(Phi);
-            else if (!(isa<AllocaInst>(I) && BB.isEntryBlock()) && I.isUsedOutsideOfBlock(&BB))
+            if (!(isa<AllocaInst>(I) && BB.isEntryBlock()) && I.isUsedOutsideOfBlock(&BB))
                 Values.push_back(&I);
         }
     SmallVector<AllocaInst *, 32> Slots;

@@ -189,7 +189,7 @@ def run_program(path, args):
         module, dirs = h.split_program(f.read())
     module = h.lower_coll_test(module)
     for d in dirs:
-        if d.split()[0] in air.UNSUPPORTED_DIRECTIVES:
+        if d.split()[0] in air.UNSUPPORTED_DIRECTIVES and d.split()[0] != '.tensormap':
             return {'status': 'UNSUPPORTED', 'detail': 'harness directive ' + d.split()[0]}
     if re.search(r'^\s*\.address_size\s+32\b', module, re.M):
         return {'status': 'UNSUPPORTED', 'detail': '.address_size 32'}
@@ -414,6 +414,27 @@ def run_program(path, args):
                     heap.write(addr + k * SIZES[t], SIZES[t], bits, target)
                     for s in sides:
                         s.write(addr + k * SIZES[t], SIZES[t], h.lit_bits(v, t, s.all_syms()))
+            elif kw == '.tensormap':
+                # 16 words in memory, like a buffer that is not compared: word 3 is an address
+                m = re.fullmatch(r'\.tensormap ([\w$.]+) \.(\w+) ([\w$.]+) \.dims \{(.*?)\} \.strides \{(.*?)\} '
+                                 r'\.box \{(.*?)\} \.swizzle (\d+)(?: \.im2col \{(.*?)\} \{(.*?)\} \.estrides \{(.*?)\})?\s*;?', d)
+                if not m:
+                    raise Unsupported(d)
+                ints = lambda g: [int(v, 0) for v in h.split_vals(g)] if g and g.strip() else []
+                im2col = None if m.group(8) is None else (ints(m.group(8)), ints(m.group(9)), ints(m.group(10)))
+                addr = BASE + ((heap.top + 255) & ~255)
+                heap.top = (addr - BASE) + 128
+                heap.ensure(heap.top)
+                air_syms[m.group(1)] = addr
+                harness_syms[m.group(1)] = addr
+                source = m.group(3)
+                shape = (m.group(2), ints(m.group(4)), ints(m.group(5)), ints(m.group(6)), int(m.group(7)), im2col)
+                for k, v in enumerate(h.tensormap_words(shape[0], air_syms[source], *shape[1:])):
+                    heap.write(addr + 8 * k, 8, v, air_syms[source] if k == 3 else None)
+                for s in sides:
+                    s.mem.ensure(heap.top)
+                    for k, v in enumerate(h.tensormap_words(shape[0], s.addr(source), *shape[1:])):
+                        s.write(addr + 8 * k, 8, v)
             elif kw in ('.patch', '.append'):
                 st = flush('before #%d %s' % (di, kw))
                 if st:
@@ -452,13 +473,19 @@ def run_program(path, args):
                     continue
                 if any(o in tainted_bufs for o in ops):
                     tainted_bufs.update(ops)
-                if list(agx[name]['cluster']) != [1, 1, 1]:
-                    raise Unsupported('cluster launch')
                 grid, block = h.parse_dim(m.group(2)), h.parse_dim(m.group(3))
+                # a cluster runs as one threadgroup (LLVMZludaAgxLowerClusters), as on the AGX side
+                cluster = list(agx[name]['cluster'])
+                air_grid, air_block = list(grid), list(block)
+                if cluster != [1, 1, 1]:
+                    if any(grid[j] % cluster[j] for j in range(3)):
+                        raise Unsupported('grid not a multiple of the cluster dimensions')
+                    air_grid = [grid[j] // cluster[j] for j in range(3)]
+                    air_block = [block[0], block[1], block[2] * cluster[0] * cluster[1] * cluster[2]]
                 dyn = int(m.group(5)) if m.group(5) else 0
                 ps = params.get(name, [])
                 pbufs = air.launch_buffers(info, name, ps, ops, dyn, air_value, air_syms)
-                pending.append((name, grid, block, dyn, pbufs))
+                pending.append((name, air_grid, air_block, dyn, pbufs))
                 job_kernels.append(name)
                 for s in sides:
                     if s.label == 'direct' and (direct_tainted is None or name in direct_tainted

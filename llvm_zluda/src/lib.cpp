@@ -1899,6 +1899,8 @@ LLVM_C_EXTERN_C_BEGIN
 // others' barriers unmatched, so the threadgroup never finishes.
 void LLVMZludaAirDropPollBarriers(LLVMModuleRef M)
 {
+    if (getenv("ZLUDA_AIR_KEEP_POLL_BARRIERS"))
+        return;
     Module *Mod = unwrap(M);
     SmallVector<Instruction *, 8> Dead;
     for (Function &F : *Mod)

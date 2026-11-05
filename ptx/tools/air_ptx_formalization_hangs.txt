@@ -1,26 +1,7 @@
 # Requests that hang the AIR service's Mac (the Metal compiler or the GPU never finishes; the runner times out after
 # 30 s and the Mac's display can freeze meanwhile). air_ptx_formalization_check.py never sends them. One line per
-# kernel: TEST KERNEL.
+# kernel: TEST.ptx KERNEL (the file name, with .ptx: a line without it matches nothing). A kernel that is only
+# slow to compile is not a hang: tc-94b-3 k3 takes 4.5 s, and passes (M2 Max, 2026-11-05).
 #
-# 2026-10-28: the request after cvt-N.ptx k17 timed out: k18 of one of cvt-0..cvt-11 (half -> 64-bit integer in
-# cvt-0..5, bfloat -> 8-bit integer in cvt-6..11, directed rounding). Which one is not known; all are listed.
-cvt-0.ptx k18
-cvt-1.ptx k18
-cvt-2.ptx k18
-cvt-3.ptx k18
-cvt-4.ptx k18
-cvt-5.ptx k18
-cvt-6.ptx k18
-cvt-7.ptx k18
-cvt-8.ptx k18
-cvt-9.ptx k18
-cvt-10.ptx k18
-cvt-11.ptx k18
-# 2026-11-04: air_agx_diff.py request timed out: Compiling the pipeline for kernel k3 exceeded compile_timeout_ms=5000; the runner stopped waiting for the Metal compiler
-tc-94b-3.ptx k3
 # 2026-11-05: air_agx_diff.py request timed out: GPU command 0 (kernel k) exceeded gpu_timeout_ms=2000. Metal cannot cancel a running command buffer, so it may keep the 
-tc-alloc-exclusive.ptx k
-# 2026-11-05: air_agx_diff.py request timed out: Compiling the pipeline for kernel k8 exceeded compile_timeout_ms=5000; the runner stopped waiting for the Metal compiler
-tc-94b-8.ptx k8
 # 2026-11-05: air_agx_diff.py request timed out: Compiling the pipeline for kernel k3 exceeded compile_timeout_ms=5000; the runner stopped waiting for the Metal compiler
-tcbs-3.ptx k3

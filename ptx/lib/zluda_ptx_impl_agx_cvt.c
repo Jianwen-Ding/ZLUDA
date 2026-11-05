@@ -624,6 +624,18 @@ static uint32 tmem_key(void) {
     return x + nx * (y + ny * z) + 1;
 }
 
+// After an allocation: the CTA owns the slab. The last dealloc of another warp may have
+// just released it, or another CTA claimed it (false: the allocation's bits are undone).
+static int tmem_reown(int slab, uint32 key, uint32 bits) {
+    uint32 expected = 0;
+    if (__atomic_compare_exchange_n(&__zluda_agx_tmem_owner[slab], &expected, key, 0, __ATOMIC_ACQ_REL,
+                                    __ATOMIC_ACQUIRE) ||
+        expected == key)
+        return 1;
+    __atomic_fetch_and(&__zluda_agx_tmem_map[slab], ~bits, __ATOMIC_ACQ_REL);
+    return 0;
+}
+
 static int tmem_find(uint32 key) {
     for (int i = 0; i < TMEM_SLABS; i++)
         if (__atomic_load_n(&__zluda_agx_tmem_owner[i], __ATOMIC_ACQUIRE) == key)
@@ -654,7 +666,8 @@ uint32 __zluda_ptx_impl_agx_tmem_alloc(uint32 ncols, uint32 leader, uint32 exclu
         return 0;
     if (exclusive ? (ncols < 32 || ncols > 576 || (ncols & 31)) : (ncols < 32 || ncols > 512 || (ncols & (ncols - 1))))
         __builtin_trap();
-    int slab = tmem_claim(tmem_key());
+    uint32 key = tmem_key();
+    int slab = tmem_claim(key);
     uint32 n = ncols / 32;
     uint32 ones = (1u << n) - 1;
     for (;;) {
@@ -662,7 +675,8 @@ uint32 __zluda_ptx_impl_agx_tmem_alloc(uint32 ncols, uint32 leader, uint32 exclu
         if (exclusive) {
             uint32 expected = 0;
             if (__atomic_compare_exchange_n(&__zluda_agx_tmem_map[slab], &expected, ones | TMEM_EXCLUSIVE, 0,
-                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) &&
+                tmem_reown(slab, key, ones | TMEM_EXCLUSIVE))
                 return 0;
             continue;
         }
@@ -671,10 +685,12 @@ uint32 __zluda_ptx_impl_agx_tmem_alloc(uint32 ncols, uint32 leader, uint32 exclu
         uint32 b = 0;
         while (b + n <= 16 && (map & (ones << b)))
             b += n;
+        // (tcgen05.alloc blocks until the columns are free: another warp holds them)
         if (b + n > 16)
-            __builtin_trap();
+            continue;
         if (__atomic_compare_exchange_n(&__zluda_agx_tmem_map[slab], &map, map | (ones << b), 0, __ATOMIC_ACQ_REL,
-                                        __ATOMIC_ACQUIRE))
+                                        __ATOMIC_ACQUIRE) &&
+            tmem_reown(slab, key, ones << b))
             return b * 32;
     }
 }
@@ -694,9 +710,12 @@ void __zluda_ptx_impl_agx_tmem_zero(uint32 taddr, uint32 ncols, uint32 lane) {
 void __zluda_ptx_impl_agx_tmem_dealloc(uint32 taddr, uint32 ncols, uint32 leader, uint32 exclusive) {
     if (!leader)
         return;
-    int slab = tmem_find(tmem_key());
+    int slab;
+    do
+        slab = tmem_find(tmem_key());
+    while (slab < 0);
     uint32 column = taddr & 0xffff;
-    if (slab < 0 || (column & 31) || ncols < 32 || ncols > (exclusive ? 576 : 512))
+    if ((column & 31) || ncols < 32 || ncols > (exclusive ? 576 : 512))
         __builtin_trap();
     uint32 n = ncols / 32;
     uint32 bits = ((1u << n) - 1) << (column / 32);
@@ -705,15 +724,24 @@ void __zluda_ptx_impl_agx_tmem_dealloc(uint32 taddr, uint32 ncols, uint32 leader
     uint32 old = __atomic_fetch_and(&__zluda_agx_tmem_map[slab], ~bits, __ATOMIC_ACQ_REL);
     if ((old & bits) != bits)
         __builtin_trap();
-    if ((old & ~bits) == 0)
+    if ((old & ~bits) == 0) {
         __atomic_store_n(&__zluda_agx_tmem_owner[slab], 0, __ATOMIC_RELEASE);
+        // (an allocation of another warp that came just before the release)
+        if (__atomic_load_n(&__zluda_agx_tmem_map[slab], __ATOMIC_ACQUIRE) != 0) {
+            uint32 expected = 0;
+            __atomic_compare_exchange_n(&__zluda_agx_tmem_owner[slab], &expected, tmem_key(), 0, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE);
+        }
+    }
 }
 
 // The address of the CTA's tensor memory: lane l, column c is the 32-bit word l * TMEM_COLS + c
 uint64 __zluda_ptx_impl_agx_tmem_base(void) {
-    int slab = tmem_find(tmem_key());
-    if (slab < 0)
-        __builtin_trap();
+    // (the owner word may be between the last dealloc of another warp and its re-claim)
+    int slab;
+    do
+        slab = tmem_find(tmem_key());
+    while (slab < 0);
     return (uint64)(unsigned long)&__zluda_agx_tmem_pool[slab * TMEM_WORDS];
 }
 

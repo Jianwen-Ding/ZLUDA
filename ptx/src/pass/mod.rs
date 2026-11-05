@@ -40,7 +40,6 @@ static ZLUDA_PTX_IMPL_CONSTRAINED: &'static [u8] =
     include_bytes!("../../lib/zluda_ptx_impl_constrained.bc");
 // lib/zluda_ptx_impl_agx.ll (textual LLVM IR, see the comment at its top) as bitcode when build.rs could assemble
 // it, else as it is.
-static ZLUDA_PTX_IMPL_AGX: &'static [u8] = include_bytes!(concat!(env!("OUT_DIR"), "/zluda_ptx_impl_agx.bc"));
 // The Air target's helpers: the AIR helpers on lib/zluda_ptx_impl_air.ll's primitives (see build.rs);
 // empty when build.rs had no LLVM to build them with.
 static ZLUDA_PTX_IMPL_AIR: &'static [u8] = include_bytes!(concat!(env!("OUT_DIR"), "/zluda_ptx_impl_air.bc"));
@@ -71,25 +70,18 @@ pub enum Target {
     /// AMD GPUs, with the AMDGPU LLVM backend.
     #[default]
     Amdgpu,
-    /// Apple GPUs, with the experimental AGX LLVM backend. Kernels use the
-    /// agx_kernel calling convention and the helper functions are linked
-    /// from lib/zluda_ptx_impl_agx.bc. Superseded by Air, the first-class
-    /// target for Apple GPUs (whose AIR the AGX backend compiles as well);
-    /// kept while zluda_agx compiles with it.
-    Agx,
-    /// Upstream AIR, the first-class target for Apple GPUs: portable AIR,
+    /// Apple GPUs, through upstream AIR: portable AIR,
     /// which the AIR target's Metal pipeline
-    /// packages for Metal and the AGX backend compiles (agx-lower-air). PTX
-    /// semantics are those of the Agx target; the IR is AIR's: air-kernel
+    /// packages for Metal and the AGX backend compiles (agx-lower-air). The
+    /// IR is AIR's: air-kernel
     /// kernels, AIR's system values and SIMD-group functions, no AGX
     /// intrinsics.
     Air,
 }
 
 impl Target {
-    /// An AIR target (Agx or Air): the PTX semantics they share.
     pub fn is_air(self) -> bool {
-        matches!(self, Target::Agx | Target::Air)
+        matches!(self, Target::Air)
     }
 }
 
@@ -375,8 +367,6 @@ impl Module {
     pub fn linked_bitcode(&self) -> &'static [u8] {
         if self.target == Target::Air {
             ZLUDA_PTX_IMPL_AIR
-        } else if self.target == Target::Agx {
-            ZLUDA_PTX_IMPL_AGX
         } else if self.constrained_fp {
             ZLUDA_PTX_IMPL_CONSTRAINED
         } else {

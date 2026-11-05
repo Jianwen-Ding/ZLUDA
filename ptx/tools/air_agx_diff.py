@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """Differential test of ZLUDA's two Apple GPU paths on the PTX-formalization test programs.
 
-Each program is compiled once with ZLUDA_AGX_VIA_AIR=1 (zoc --target agx), which writes NAME.air (portable AIR) and
-NAME.o (AGX code compiled from that AIR by agx-lower-air). Every launch of the harness then runs, with identical
+Each program is compiled once with zoc --target air, which writes NAME.air (AIR for Metal) and NAME.o (AGX code
+compiled from the portable AIR by agx-lower-air). Every launch of the harness then runs, with identical
 inputs, on
   air    the AIR, packaged for Metal (llc -mtriple=air -air-output=air), on the Apple GPU behind the AIR service
          (as air_ptx_formalization_check.py runs it), and
   agx    NAME.o on the functional AGX simulator agx_run (as agx_ptx_formalization_check.py runs it),
-and, with --direct, also on
-  direct the AGX code of the direct PTX -> AGX path (zoc without ZLUDA_AGX_VIA_AIR) on agx_run,
-which separates bugs of the AIR raise / AGX lowering from bugs of the PTX front end.
 
 Consecutive launches run as one service job on the AIR side; after each job (or each launch, with --per-launch)
 ALL harness buffers and the module's global variables are compared bit for bit between the sides, whatever the
@@ -33,7 +30,7 @@ The AIR service rules of air_ptx_formalization_check.py apply: one request at a 
 request named in --progress before it is sent, never a kernel of the hang list; a request that times out stops all
 device work and is added to the hang list (it is never resent).
 
-    python3 ptx/tools/air_agx_diff.py --tools /scratch/diff-tools --agx-run .../agx_run --direct \\
+    python3 ptx/tools/air_agx_diff.py --tools /scratch/diff-tools --agx-run .../agx_run \\
         --progress progress.txt --json diff.json PTX-formalization/tests/*.ptx
 """
 
@@ -189,12 +186,12 @@ def run_program(path, args):
         module, dirs = h.split_program(f.read())
     module = h.lower_coll_test(module)
     for d in dirs:
-        if d.split()[0] in air.UNSUPPORTED_DIRECTIVES:
+        if d.split()[0] in ('.multimem', '.fabric'):
             return {'status': 'UNSUPPORTED', 'detail': 'harness directive ' + d.split()[0]}
     if re.search(r'^\s*\.address_size\s+32\b', module, re.M):
         return {'status': 'UNSUPPORTED', 'detail': '.address_size 32'}
     with tempfile.TemporaryDirectory() as tmp:
-        tmp_air, tmp_direct = os.path.join(tmp, 'air'), os.path.join(tmp, 'direct')
+        tmp_air = os.path.join(tmp, 'air')
         os.makedirs(tmp_air)
         status, info = air.compile_module(args, module, tmp_air)
         if status:
@@ -210,16 +207,6 @@ def run_program(path, args):
         air_gnames = dict(bufs)  # global name -> [addr, 'b8', size] in the heap
         harness_syms = {}
         sides = [AgxSide('agx', tmp_air, args, module, harness_syms)]
-        if args.direct:
-            os.makedirs(tmp_direct)
-            st, detail = h.compile_ptx(args, module, tmp_direct)
-            if st:
-                res['notes'].append('direct: %s %s' % (st, detail[:200]))
-                direct_tainted = set()
-            else:
-                d = AgxSide('direct', tmp_direct, args, module, harness_syms)
-                direct_tainted = detail[2]
-                sides.append(d)
         gtypes = {}
         for m in re.finditer(r'\.(?:global|const)\s+(?:\.align\s+\d+\s+)?(?:\.v\d\s+)?\.(\w+)\s+([\w$]+)', module):
             if m.group(1) in SIZES:
@@ -279,7 +266,7 @@ def run_program(path, args):
             for s in sides:
                 reads[s.label] = s.read
             cols = ['air'] + [s.label for s in sides if not s.error]
-            pairs = [('air', 'agx')] + ([('air', 'direct'), ('agx', 'direct')] if 'direct' in cols else [])
+            pairs = [('air', 'agx')]
             for p, q in pairs:
                 if p not in cols or q not in cols:
                     continue
@@ -414,6 +401,27 @@ def run_program(path, args):
                     heap.write(addr + k * SIZES[t], SIZES[t], bits, target)
                     for s in sides:
                         s.write(addr + k * SIZES[t], SIZES[t], h.lit_bits(v, t, s.all_syms()))
+            elif kw == '.tensormap':
+                # 16 words in memory, like a buffer that is not compared: word 3 is an address
+                m = re.fullmatch(r'\.tensormap ([\w$.]+) \.(\w+) ([\w$.]+) \.dims \{(.*?)\} \.strides \{(.*?)\} '
+                                 r'\.box \{(.*?)\} \.swizzle (\d+)(?: \.im2col \{(.*?)\} \{(.*?)\} \.estrides \{(.*?)\})?\s*;?', d)
+                if not m:
+                    raise Unsupported(d)
+                ints = lambda g: [int(v, 0) for v in h.split_vals(g)] if g and g.strip() else []
+                im2col = None if m.group(8) is None else (ints(m.group(8)), ints(m.group(9)), ints(m.group(10)))
+                addr = BASE + ((heap.top + 255) & ~255)
+                heap.top = (addr - BASE) + 128
+                heap.ensure(heap.top)
+                air_syms[m.group(1)] = addr
+                harness_syms[m.group(1)] = addr
+                source = m.group(3)
+                shape = (m.group(2), ints(m.group(4)), ints(m.group(5)), ints(m.group(6)), int(m.group(7)), im2col)
+                for k, v in enumerate(h.tensormap_words(shape[0], air_syms[source], *shape[1:])):
+                    heap.write(addr + 8 * k, 8, v, air_syms[source] if k == 3 else None)
+                for s in sides:
+                    s.mem.ensure(heap.top)
+                    for k, v in enumerate(h.tensormap_words(shape[0], s.addr(source), *shape[1:])):
+                        s.write(addr + 8 * k, 8, v)
             elif kw in ('.patch', '.append'):
                 st = flush('before #%d %s' % (di, kw))
                 if st:
@@ -452,20 +460,21 @@ def run_program(path, args):
                     continue
                 if any(o in tainted_bufs for o in ops):
                     tainted_bufs.update(ops)
-                if list(agx[name]['cluster']) != [1, 1, 1]:
-                    raise Unsupported('cluster launch')
                 grid, block = h.parse_dim(m.group(2)), h.parse_dim(m.group(3))
+                # a cluster runs as one threadgroup (LLVMZludaAgxLowerClusters), as on the AGX side
+                cluster = list(agx[name]['cluster'])
+                air_grid, air_block = list(grid), list(block)
+                if cluster != [1, 1, 1]:
+                    if any(grid[j] % cluster[j] for j in range(3)):
+                        raise Unsupported('grid not a multiple of the cluster dimensions')
+                    air_grid = [grid[j] // cluster[j] for j in range(3)]
+                    air_block = [block[0], block[1], block[2] * cluster[0] * cluster[1] * cluster[2]]
                 dyn = int(m.group(5)) if m.group(5) else 0
                 ps = params.get(name, [])
                 pbufs = air.launch_buffers(info, name, ps, ops, dyn, air_value, air_syms)
-                pending.append((name, grid, block, dyn, pbufs))
+                pending.append((name, air_grid, air_block, dyn, pbufs))
                 job_kernels.append(name)
                 for s in sides:
-                    if s.label == 'direct' and (direct_tainted is None or name in direct_tainted
-                                                or name not in s.kernels):
-                        if not s.error:
-                            s.error = 'kernel %s not compiled on the direct path' % name
-                        continue
                     s.run(name, ps, ops, grid, block, dyn)
                 if args.per_launch:
                     st = flush('after #%d %s' % (di, name))
@@ -538,7 +547,6 @@ def main():
     ap.add_argument('--arch', default='agx-g14g')
     ap.add_argument('--queue', default=os.environ.get('AIR_QUEUE', '/air'))
     ap.add_argument('--timeout', type=int, default=120)
-    ap.add_argument('--direct', action='store_true', help='also run the direct PTX -> AGX code (a third column)')
     ap.add_argument('--per-launch', action='store_true', help='one service job, and one comparison, per launch')
     ap.add_argument('--ulps', type=int, default=16, help='largest ULP distance of class ulp')
     ap.add_argument('--max-diffs', type=int, default=4, help='differing elements listed per pair')
@@ -548,9 +556,16 @@ def main():
     ap.add_argument('--skip-hang', default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                          'air_ptx_formalization_hangs.txt'),
                     help='hang list ("TEST KERNEL" lines): never sent; a request that times out is added to it')
+    ap.add_argument('--strict-fp', action='store_true',
+                    help='compile with zoc --strict-fp: every class of difference then counts')
+    ap.add_argument('--zero-shared', action='store_true',
+                    help='shared memory starts as zero on the AIR side too (ZLUDA_AIR_ZERO_SHARED=1): the programs '
+                         'that read it before writing it, which PTX leaves undefined, then compare')
     ap.add_argument('--dry-run', action='store_true',
                     help='compile and build every request (logged to --progress) without sending or simulating')
     args = ap.parse_args()
+    if args.zero_shared:
+        os.environ['ZLUDA_AIR_ZERO_SHARED'] = '1'
     if args.tools:
         for attr, tool in (('zoc', 'zoc'), ('llc', 'llc'), ('llvm_dis', 'llvm-dis'), ('readelf', 'llvm-readelf'),
                            ('objcopy', 'llvm-objcopy')):

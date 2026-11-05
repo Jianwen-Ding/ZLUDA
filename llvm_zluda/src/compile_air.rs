@@ -331,6 +331,8 @@ pub fn compile_air(
 
     run(&linked, c"air-portable", &air, &options)?;
     stage("portable: air-portable");
+    // Invalid AIR is an error here, before anything reads it: the AGX path never reaches the writer's checks in llc.
+    run(&linked, c"air-verify", &air, &options)?;
     diagnostics.check()?;
     let mut portable = bitcode(&linked);
     if let Some(hook) = compiler_hook.filter(|_| !agx_only) {
@@ -548,6 +550,7 @@ fn metal_air(
             metal
         }
     };
+    unsafe { crate::ffi::LLVMZludaAirDropPollBarriers(metal.get()) };
     unsafe { LLVMZludaAirSharedLayout(metal.get()) };
     // ZLUDA_AIR_SALT: an unused stack array, its length from the string, at the start of each kernel of the Metal
     // copy, which makes Metal compile the pipelines anew instead of taking them from its cache, which ignores
@@ -568,14 +571,21 @@ fn metal_air(
     }
     let mut json = std::ptr::null_mut();
     let mut err = std::ptr::null_mut();
+    if unsafe { crate::ffi::LLVMZludaAirTablesInGlobals(metal.get(), &mut err) } < 0 {
+        return Err(Message::new(unsafe { CStr::from_ptr(err) }).to_str().to_string());
+    }
     let metal_globals = match unsafe { LLVMZludaAirGlobalsToBuffer(metal.get(), &mut json, &mut err) } {
         -1 => return Err(Message::new(unsafe { CStr::from_ptr(err) }).to_str().to_string()),
         1 => Some(Message::new(unsafe { CStr::from_ptr(json) }).to_str().to_string()),
         _ => None,
     };
     stage("Metal copy: globals buffer, shared layout");
+    unsafe { crate::ffi::LLVMZludaAirAddress32Offsets(metal.get()) };
+    unsafe { crate::ffi::LLVMZludaAirSharedLikeAgx(metal.get()) };
     run(&metal, c"air-portable", air, options)?;
     stage("Metal copy: air-portable");
+    // (the Metal form's own checks, air-verify-metal, run in llc's writer, which lowers this file)
+    run(&metal, c"air-verify", air, options)?;
     diagnostics.check()?;
     metal.verify().map_err(|e| format!("the AIR for Metal is broken: {e}"))?;
     let metal_air = bitcode(&metal);

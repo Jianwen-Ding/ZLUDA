@@ -18,8 +18,9 @@ relocations and symbols); it is placed in the heap like a harness buffer, its re
 and bound at each kernel's zluda_globals argument, so .expect / .patch of globals work and globals keep their values
 between launches.
 
-Not supported here (reported UNSUPPORTED): textures, surfaces, samplers, tensor maps, multimem, fabric, clusters and
-.address_size 32 modules.
+Not supported here (reported UNSUPPORTED): clusters. In .address_size 32 modules an address is an offset in the heap,
+and the kernel's hidden base is the heap's address. The multimem and fabric tables are variables of the globals buffer
+(LLVMZludaAirTablesInGlobals), which the .multimem and .fabric directives fill; a multimem window is only a number.
 
     python3 ptx/tools/air_ptx_formalization_check.py --zoc target/debug/zoc --llc $LLVM/bin/llc \\
         --llvm-dis $LLVM/bin/llvm-dis PTX-formalization/tests/*.ptx
@@ -40,7 +41,7 @@ import agx_ptx_formalization_check as h  # noqa: E402
 from agx_ptx_formalization_check import SIZES, Unsupported  # noqa: E402
 
 BASE = h.BASE
-UNSUPPORTED_DIRECTIVES = ('.tensormap', '.multimem', '.fabric', '.cooplaunch')
+UNSUPPORTED_DIRECTIVES = ()
 TRANSIENT = ('XPC_ERROR_CONNECTION_INTERRUPTED', 'did not reply')
 
 
@@ -54,9 +55,12 @@ DEVICE_LOCK = os.environ.get('AIR_DEVICE_LOCK', '/scratch/air-device.lock')
 GPU_TIMEOUT_MS = 2000
 # The lock table of emulated atomics (llvm/lib/Target/AIR/AIRLowerAtomicRMW.h: kAtomicLockCount words).
 LOCK_TABLE_BYTES = 4096
-COMPILE_TIMEOUT_MS = 5000
+COMPILE_TIMEOUT_MS = int(os.environ.get('AIR_COMPILE_TIMEOUT_MS', 15000))
 # Error texts of a request the service gave up on: a hang to record, never to retry.
 TIMED_OUT = ('gpu_timeout_ms=', 'compile_timeout_ms=', 'Refusing GPU work', 'timed out after')
+
+
+DEVICE_STOPPED = []
 
 
 def is_hang(error):
@@ -74,6 +78,9 @@ def submit(job, queue, tries=4, transient=TRANSIENT):
     import time
     sys.path.insert(0, os.environ.get('AIR_CLIENT', '/air/client'))
     from client import submit as service_submit
+    # After a hang nothing more is sent: the Mac's display can freeze while the GPU is stuck.
+    if DEVICE_STOPPED:
+        return {'ok': False, 'error': 'device work stopped after a hang: ' + DEVICE_STOPPED[0]}
     if job.get('op') == 'execute':
         job.setdefault('gpu_timeout_ms', GPU_TIMEOUT_MS)
         job.setdefault('compile_timeout_ms', COMPILE_TIMEOUT_MS)
@@ -86,6 +93,7 @@ def submit(job, queue, tries=4, transient=TRANSIENT):
             except TimeoutError as e:
                 reply = {'ok': False, 'error': str(e)}
             if is_hang(reply.get('error')):
+                DEVICE_STOPPED.append(reply['error'][:200])
                 deadline = time.monotonic() + 60
                 while time.monotonic() < deadline:
                     caps = service_submit({'op': 'capabilities'}, queue, timeout=60)
@@ -208,15 +216,11 @@ def load_hang_list(path):
 
 
 def compile_module(args, module, tmp):
-    """zoc --target air (PTX straight to AIR: NAME.air for Metal, and the AGX code of the portable AIR), or with
-    --via-agx the older route (ZLUDA_AGX_VIA_AIR=1 zoc --target agx); then Metal's AIR (llc).
+    """zoc --target air (PTX straight to AIR: NAME.air for Metal, and the AGX code of the portable AIR); then
+    Metal's AIR (llc).
     Returns (status, detail) of a failure, or (None, info): info has 'air' (Metal AIR bytes), 'kernels'
     (air_kernels), 'roles' (hidden_roles), 'agx' (kernel_info's kernels of m.o), 'tainted', 'rejected'."""
-    if getattr(args, 'via_agx', False):
-        status, detail = h.compile_ptx(args, module, tmp, env=dict(os.environ, ZLUDA_AGX_VIA_AIR='1'),
-                                       product='m.air')
-    else:
-        status, detail = h.compile_ptx(args, module, tmp, product='m.air', target='air')
+    status, detail = h.compile_ptx(args, module, tmp, product='m.air', target='air')
     if status:
         return status, detail
     _, rejected, tainted = detail
@@ -275,7 +279,7 @@ def load_globals(tmp, heap, syms, bufs):
     return 0
 
 
-def launch_buffers(info, name, ps, ops, dyn, value, syms):
+def launch_buffers(info, name, ps, ops, dyn, value, syms, percta=None):
     """The parameter buffers of a launch of kernel `name`: (location index, bytes, [(offset, heap target)])."""
     kernels, roles, agx = info['kernels'], info['roles'], info['agx']
     if len(ops) != len(ps):
@@ -290,6 +294,13 @@ def launch_buffers(info, name, ps, ops, dyn, value, syms):
             data = (agx[name]['shared'] + dyn).to_bytes(4, 'little')
             pbufs.append((a[1], data + b'\0' * 12, []))
             continue
+        if role is not None and role.startswith('perctamemory:') and percta:
+            # the per-CTA global memory: the launch's region
+            pbufs.append((a[1], b'\0' * 16, [(0, {'own_buffer': percta(int(role.split(':')[1]))})]))
+            continue
+        if role == 'address32-base':
+            pbufs.append((a[1], bytes(16), [(0, 0)]))
+            continue
         if role is not None:
             raise Unsupported('hidden argument ' + role)
         if k >= len(ps):
@@ -303,6 +314,9 @@ def launch_buffers(info, name, ps, ops, dyn, value, syms):
             target = syms.get(o) if size == 8 else None
         else:
             bits, target = value(o, t)
+        if size == 4 and target is not None:
+            # (a 32-bit address: its offset in the heap, from the hidden base)
+            bits, target = target - BASE, None
         data = bytearray(bits.to_bytes(size, 'little'))
         data += b'\0' * ((-len(data)) % 16 or (16 if not data else 0))
         pbufs.append((a[1], data, [(0, target - BASE)] if target is not None else []))
@@ -329,11 +343,17 @@ def make_job(info, heap, pending, globals_off):
     for name, grid, block, dyn, pbufs in pending:
         bindings = []
         for loc, data, ppatches in pbufs:
-            bindings.append({'index': loc, 'buffer': len(buffers)})
-            for off, t in ppatches:
-                patches.append({'buffer': len(buffers), 'offset': off, 'target_buffer': 0,
-                                'target_offset': t})
+            own = len(buffers)
+            bindings.append({'index': loc, 'buffer': own})
             buffers.append({'size': len(data), 'data': b64(data)})
+            for off, t in ppatches:
+                if isinstance(t, dict):
+                    # memory of its own (a Metal buffer's address has the alignment the heap's offsets lack)
+                    patches.append({'buffer': own, 'offset': off, 'target_buffer': len(buffers),
+                                    'target_offset': 0})
+                    buffers.append({'size': t['own_buffer'], 'data': b64(bytes(t['own_buffer']))})
+                else:
+                    patches.append({'buffer': own, 'offset': off, 'target_buffer': 0, 'target_offset': t})
         for a in kernels[name]:
             if a[0] == 'globals':
                 bindings.append({'index': a[1], 'buffer': 0, 'offset': globals_off})
@@ -384,8 +404,6 @@ def run_test(path, args):
     for d in dirs:
         if d.split()[0] in UNSUPPORTED_DIRECTIVES:
             return 'UNSUPPORTED', 'harness directive ' + d.split()[0]
-    if re.search(r'^\s*\.address_size\s+32\b', module, re.M):
-        return 'UNSUPPORTED', '.address_size 32'
     with tempfile.TemporaryDirectory() as tmp:
         status, info = compile_module(args, module, tmp)
         if status:
@@ -396,6 +414,11 @@ def run_test(path, args):
         heap = Heap()
         syms, bufs = {}, {}
         globals_off = load_globals(tmp, heap, syms, bufs)
+        mm_count = 0
+        # .address_size 32: an address is an offset in the heap, whose address is the kernel's hidden base; nothing
+        # is at offset 0, which would be a null address
+        if globals_off is None and re.search(r'^\s*\.address_size\s+32\b', module, re.M):
+            heap.top = 16
         failures, passed, skipped, unsupported = [], 0, 0, []
         skipped_launches, tainted_bufs = [], set()
         pending = []  # launches of the next job: (kernel, grid, block, dyn, launch_buffers)
@@ -404,6 +427,8 @@ def run_test(path, args):
         def value(o, t):
             """A literal or symbol at type t: (bits, heap target or None)."""
             if o in syms:
+                if syms[o] >= h.MM_BASE:
+                    return syms[o], None  # (a multimem window: never read as memory)
                 return syms[o], syms[o]
             return h.lit_bits(o, t, syms), None
 
@@ -448,6 +473,46 @@ def run_test(path, args):
                 for k, v in enumerate(vals):
                     bits, target = value(v, t)
                     heap.write(addr + k * SIZES[t], SIZES[t], bits, target)
+            elif kw == '.tensormap':
+                # 16 words in memory, like a buffer: word 3 is an address
+                m = re.fullmatch(r'\.tensormap ([\w$.]+) \.(\w+) ([\w$.]+) \.dims \{(.*?)\} \.strides \{(.*?)\} '
+                                 r'\.box \{(.*?)\} \.swizzle (\d+)(?: \.im2col \{(.*?)\} \{(.*?)\} \.estrides \{(.*?)\})?\s*;?', d)
+                if not m:
+                    raise Unsupported(d)
+                ints = lambda g: [int(v, 0) for v in h.split_vals(g)] if g and g.strip() else []
+                im2col = None if m.group(8) is None else (ints(m.group(8)), ints(m.group(9)), ints(m.group(10)))
+                addr = BASE + ((heap.top + 255) & ~255)
+                heap.top = (addr - BASE) + 128
+                heap.ensure(heap.top)
+                syms[m.group(1)] = addr
+                bufs[m.group(1)] = [addr, 'u64', 16]
+                source = syms[m.group(3)]
+                for k, v in enumerate(h.tensormap_words(m.group(2), source, ints(m.group(4)), ints(m.group(5)),
+                                                        ints(m.group(6)), int(m.group(7)), im2col)):
+                    heap.write(addr + 8 * k, 8, v, source if k == 3 else None)
+            elif kw in ('.multimem', '.fabric'):
+                multimem = kw == '.multimem'
+                m = re.fullmatch(r'\.multimem ([\w$.]+) \.size (\d+) \{(.*?)\}\s*;?' if multimem else
+                                 r'\.fabric (\d+) \.size (\d+) \{(.*?)\}\s*;?', d)
+                if not m:
+                    raise Unsupported(d)
+                members = [syms[b.strip()] for b in m.group(3).split(',') if b.strip()]
+                if len(members) > 7:
+                    raise Unsupported('more than 7 devices')
+                table = syms.get('__zluda_mm_table' if multimem else '__zluda_fab_table')
+                if multimem:
+                    entry = mm_count
+                    mm_count += 1
+                    syms[m.group(1)] = h.MM_BASE + mm_count * h.MM_WINDOW
+                else:
+                    entry = int(m.group(1))
+                if table is not None:  # (no table: the module does not read it)
+                    row = table + 64 * entry
+                    heap.write(row, 4, len(members))
+                    if not multimem:
+                        heap.write(row + 4, 4, int(m.group(2)))
+                    for i, a in enumerate(members):
+                        heap.write(row + 8 + 8 * i, 8, a, a)
             elif kw in ('.texture', '.sampler', '.surface'):
                 # The descriptors of PTX-formalization's model (agx_ptx_formalization_check.object_words), with no
                 # hardware slot (word 16 bit 63 clear): the helpers sample in software from device memory, the
@@ -490,8 +555,8 @@ def run_test(path, args):
                 for k, v in enumerate(vals):
                     bits, target = value(v, t)
                     heap.write(base + k * SIZES[t], SIZES[t], bits, target)
-            elif kw == '.launch':
-                m = re.fullmatch(r'\.launch ([\w$.]+) <<<\s*(\([^)]*\)|\d+)\s*,\s*(\([^)]*\)|\d+)\s*(,\s*(\d+))?\s*>>>'
+            elif kw in ('.launch', '.cooplaunch'):
+                m = re.fullmatch(r'\.\w+ ([\w$.]+) <<<\s*(\([^)]*\)|\d+)\s*,\s*(\([^)]*\)|\d+)\s*(,\s*(\d+))?\s*>>>'
                                  r'\s*\((.*)\)', d)
                 if not m:
                     raise Unsupported(d)
@@ -508,7 +573,8 @@ def run_test(path, args):
                 grid, block = h.parse_dim(m.group(2)), h.parse_dim(m.group(3))
                 dyn = int(m.group(5)) if m.group(5) else 0
                 ps = params.get(name, [])
-                pbufs = launch_buffers(info, name, ps, ops, dyn, value, syms)
+                pbufs = launch_buffers(info, name, ps, ops, dyn, value, syms,
+                                       lambda size: size * grid[0] * grid[1] * grid[2])
                 pending.append((name, grid, block, dyn, pbufs))
             elif kw == '.expect':
                 err = flush()
@@ -568,8 +634,6 @@ def main():
                     help='zoc --arch: the AIR as compiled with AGX code (the default) or, with none, for Metal alone')
     ap.add_argument('--strict-fp', dest='strict_fp', action='store_true',
                     help='zoc --strict-fp: PTX floating point exactly (canonical NaNs...)')
-    ap.add_argument('--via-agx', action='store_true',
-                    help='the older route: AIR raised from ZLUDA\'s AGX IR (ZLUDA_AGX_VIA_AIR=1 zoc --target agx)')
     ap.add_argument('--queue', default=os.environ.get('AIR_QUEUE', '/air'))
     ap.add_argument('--timeout', type=int, default=120)
     ap.add_argument('--max-failures', type=int, default=4, help='failing elements listed per test')

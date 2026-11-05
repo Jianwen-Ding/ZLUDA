@@ -1,5 +1,6 @@
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-parameter"
+#include <llvm/ADT/MapVector.h>
 #include <llvm-c/Core.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Type.h>
@@ -25,6 +26,10 @@
 #include <llvm/Support/KnownFPClass.h>
 #include <llvm/Transforms/Utils/ModuleUtils.h>
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
+#include <llvm/Transforms/Utils/Local.h>
+#include <llvm/Transforms/Utils/PromoteMemToReg.h>
+#include <llvm/Transforms/Utils/Cloning.h>
+#include <llvm/Analysis/PostDominators.h>
 #include <llvm/IR/InstIterator.h>
 #include <llvm/IR/PatternMatch.h>
 #include <llvm/IR/IntrinsicInst.h>
@@ -1318,7 +1323,7 @@ LLVM_C_EXTERN_C_END
 
 LLVM_C_EXTERN_C_BEGIN
 
-// ZLUDA_AGX_VIA_AIR, the .air written for Metal: Metal compiles no writable
+// The .air written for Metal: Metal compiles no writable
 // program-scope variables (MSL has none; a module with a device global
 // crashes its compiler on an M2 Max), so a PTX module's .global variables
 // become one device buffer. The functions other than kernels that use them
@@ -1893,7 +1898,776 @@ LLVM_C_EXTERN_C_END
 
 LLVM_C_EXTERN_C_BEGIN
 
-// ZLUDA_AGX_VIA_AIR, the .air for Metal: the shared memory registers in
+// Whether the loop waits for memory another thread writes: an exit depends on a volatile or
+// atomic read, or on a test-and-set whose operands the loop does not change. A compare-and-swap
+// of a value the loop computes is an update, in which some thread always succeeds.
+static bool zludaLoopWaitsForMemory(const Loop &L)
+{
+    auto cas = [](const Instruction *I) -> const Value * {
+        if (auto *CX = dyn_cast<AtomicCmpXchgInst>(I))
+            return CX->getNewValOperand();
+        if (auto *C = dyn_cast<CallInst>(I); C && C->getCalledFunction() &&
+            C->getCalledFunction()->getName().contains("atomic") && C->getCalledFunction()->getName().contains(".cmpxchg."))
+            return C->getArgOperand(2);
+        return nullptr;
+    };
+    for (BasicBlock *BB : L.blocks())
+        for (Instruction &I : *BB)
+            if (const Value *Desired = cas(&I); Desired && !L.isLoopInvariant(Desired))
+                return false;
+    SmallVector<Value *, 8> Work;
+    SmallVector<BasicBlock *, 4> Exiting;
+    L.getExitingBlocks(Exiting);
+    for (BasicBlock *BB : Exiting)
+        if (auto *Br = dyn_cast<CondBrInst>(BB->getTerminator()))
+            Work.push_back(Br->getCondition());
+    SmallPtrSet<Value *, 16> Seen;
+    while (!Work.empty())
+    {
+        auto *I = dyn_cast<Instruction>(Work.pop_back_val());
+        if (!I || !L.contains(I) || !Seen.insert(I).second)
+            continue;
+        if (auto *Ld = dyn_cast<LoadInst>(I))
+        {
+            if ((Ld->isAtomic() || Ld->isVolatile()) && !isa<AllocaInst>(getUnderlyingObject(Ld->getPointerOperand())))
+                return true;
+            continue;
+        }
+        if (cas(I))
+            return true; // (its desired value is the same in all iterations: above)
+        if (auto *RMW = dyn_cast<AtomicRMWInst>(I))
+        {
+            if (RMW->getOperation() == AtomicRMWInst::Xchg && L.isLoopInvariant(RMW->getValOperand()))
+                return true;
+            continue;
+        }
+        for (Value *Op : I->operands())
+            Work.push_back(Op);
+    }
+    return false;
+}
+
+// Threads of a SIMD-group run under one mask: the group runs one side of a branch until it ends, and
+// a thread that waits on one side for what a thread on the other writes can wait forever (either
+// order of the sides, on an M2 Max). So when one side of a branch waits and the other does not, the
+// other side runs first, with a second branch on a volatile copy of the condition, which no compiler
+// can correlate. Threads that wait for each other are not helped.
+// Returns how many branches changed.
+static int zludaRunWaitersLast(Function &F, bool &BothWait)
+{
+    if (F.isDeclaration() || !F.getReturnType()->isVoidTy())
+        return 0;
+    LLVMContext &Ctx = F.getContext();
+    int Changed = 0;
+    SmallPtrSet<BasicBlock *, 8> Done;
+    for (int Round = 0; Round < 32; Round++)
+    {
+        DominatorTree DT(F);
+        LoopInfo LI(DT);
+        PostDominatorTree PDT(F);
+        SmallPtrSet<Loop *, 4> Waiting;
+        for (Loop *L : LI.getLoopsInPreorder())
+            if (zludaLoopWaitsForMemory(*L))
+                Waiting.insert(L);
+        if (Waiting.empty())
+            return Changed;
+        auto inWaiting = [&](BasicBlock *BB) {
+            for (Loop *L = LI.getLoopFor(BB); L; L = L->getParentLoop())
+                if (Waiting.count(L))
+                    return true;
+            return false;
+        };
+        auto reach = [&](BasicBlock *Start, BasicBlock *Stop) {
+            SmallPtrSet<BasicBlock *, 16> Set;
+            SmallVector<BasicBlock *, 16> Work{Start};
+            while (!Work.empty())
+            {
+                BasicBlock *B = Work.pop_back_val();
+                if (B == Stop || !Set.insert(B).second)
+                    continue;
+                append_range(Work, successors(B));
+            }
+            return Set;
+        };
+        BasicBlock *Site = nullptr, *First = nullptr, *Second = nullptr, *Merge = nullptr;
+        bool CloneRest = false;
+        Instruction *StopAt = nullptr;
+        for (BasicBlock &BB : F)
+        {
+            auto *Br = dyn_cast<CondBrInst>(BB.getTerminator());
+            if (!Br || Done.count(&BB) || inWaiting(&BB))
+                continue;
+            auto *Node = PDT.getNode(&BB);
+            BasicBlock *M = Node && Node->getIDom() ? Node->getIDom()->getBlock() : nullptr;
+            BasicBlock *A = Br->getSuccessor(0), *B = Br->getSuccessor(1);
+            // One side is empty: the other threads wait at what follows the branch, so that runs first
+            // in a copy of its own, up to the first barrier or SIMD-group function, if there is one: all
+            // threads meet again before it, which needs them together.
+            if (A == M || B == M)
+            {
+                BasicBlock *Side = A == M ? B : A;
+                auto SideSet = reach(Side, M);
+                if (!llvm::any_of(Waiting, [&](Loop *L) { return SideSet.count(L->getHeader()) != 0; }))
+                    continue;
+                SmallVector<Instruction *, 2> Stops;
+                SmallPtrSet<BasicBlock *, 16> Prefix;
+                SmallVector<BasicBlock *, 16> Work{M};
+                uint64_t Size = 0;
+                while (!Work.empty())
+                {
+                    BasicBlock *X = Work.pop_back_val();
+                    if (!Prefix.insert(X).second)
+                        continue;
+                    Instruction *Stop = nullptr;
+                    for (Instruction &I : *X)
+                        if (auto *C = dyn_cast<CallBase>(&I))
+                        {
+                            Function *Callee = C->getCalledFunction();
+                            if (!Callee || !Callee->isDeclaration() || Callee->getName().contains("barrier") ||
+                                Callee->getName().contains("simd"))
+                            {
+                                Stop = &I;
+                                break;
+                            }
+                        }
+                    if (Stop)
+                    {
+                        Stops.push_back(Stop);
+                        continue;
+                    }
+                    Size += X->size();
+                    append_range(Work, successors(X));
+                }
+                // (the thread on this side waits, and so may those in what follows: for each other)
+                if (llvm::any_of(Waiting, [&](Loop *L) { return Prefix.count(L->getHeader()) != 0; }))
+                {
+                    BothWait = true;
+                    continue;
+                }
+                if (Prefix.count(&BB) || llvm::any_of(SideSet, [&](BasicBlock *X) { return Prefix.count(X) != 0; }) ||
+                    Stops.size() > 1 || (Stops.size() == 1 && Stops[0]->getParent() == M && Stops[0] == &M->front()) ||
+                    Size > 4096)
+                    continue;
+                Site = &BB;
+                First = M;
+                Second = Side;
+                Merge = nullptr;
+                CloneRest = true;
+                StopAt = Stops.empty() ? nullptr : Stops[0];
+                break;
+            }
+            auto SA = reach(A, M), SB = reach(B, M);
+            if (SA.count(&BB) || SB.count(&BB) || llvm::any_of(SA, [&](BasicBlock *X) { return SB.count(X); }))
+                continue;
+            auto waits = [&](const SmallPtrSetImpl<BasicBlock *> &Set) {
+                return llvm::any_of(Waiting, [&](Loop *L) { return Set.count(L->getHeader()) != 0; });
+            };
+            if (waits(SA) && waits(SB))
+                BothWait = true;
+            if (waits(SA) == waits(SB))
+                continue;
+            Site = &BB;
+            First = waits(SA) ? B : A;
+            Second = waits(SA) ? A : B;
+            Merge = M;
+            break;
+        }
+        if (!Site)
+            return Changed;
+        Done.insert(Site);
+
+        // (the threads meet at a block of its own, which starts with what needs them together)
+        if (StopAt)
+        {
+            BasicBlock *X = StopAt->getParent();
+            Merge = StopAt == &X->front() ? X : X->splitBasicBlock(StopAt->getIterator());
+        }
+
+        // No value lives across the new paths: in memory for now.
+        BasicBlock &Entry = F.getEntryBlock();
+        BasicBlock::iterator AllocaPoint = Entry.begin();
+        SmallVector<PHINode *, 16> Phis;
+        SmallVector<Instruction *, 32> Values;
+        for (BasicBlock &BB : F)
+            for (Instruction &I : BB)
+            {
+                // (a phi used outside its block too, first: as a phi alone, its load would stay in its block)
+                if (auto *Phi = dyn_cast<PHINode>(&I))
+                    Phis.push_back(Phi);
+                if (!(isa<AllocaInst>(I) && BB.isEntryBlock()) && I.isUsedOutsideOfBlock(&BB))
+                    Values.push_back(&I);
+            }
+        SmallVector<AllocaInst *, 32> Slots;
+        for (Instruction *I : Values)
+            if (AllocaInst *A = DemoteRegToStack(*I, false, AllocaPoint))
+                Slots.push_back(A);
+        for (PHINode *Phi : Phis)
+            if (AllocaInst *A = DemotePHIToStack(Phi, AllocaPoint))
+                Slots.push_back(A);
+
+        auto *Br = cast<CondBrInst>(Site->getTerminator());
+        bool FirstOnTrue = Br->getSuccessor(0) == First;
+        if (CloneRest)
+        {
+            auto Rest = reach(First, Merge);
+            SmallVector<BasicBlock *, 16> Originals;
+            for (BasicBlock &B : F)
+                if (Rest.count(&B))
+                    Originals.push_back(&B);
+            ValueToValueMapTy Map;
+            SmallVector<BasicBlock *, 16> Copies;
+            for (BasicBlock *B : Originals)
+            {
+                BasicBlock *C = CloneBasicBlock(B, Map, ".first", &F);
+                Map[B] = C;
+                Copies.push_back(C);
+            }
+            remapInstructionsInBlocks(Copies, Map);
+            Done.insert(Copies.begin(), Copies.end());
+            First = cast<BasicBlock>(Map[First]);
+            Br->setSuccessor(FirstOnTrue ? 0 : 1, First);
+        }
+        auto FirstSet = reach(First, Merge);
+        IRBuilder<> EntryB(&*AllocaPoint);
+        AllocaInst *Copy = EntryB.CreateAlloca(EntryB.getInt32Ty(), F.getDataLayout().getAllocaAddrSpace(), nullptr, "zluda.side");
+        IRBuilder<> SB(Br);
+        SB.CreateStore(SB.CreateZExt(Br->getCondition(), SB.getInt32Ty()), Copy, /*isVolatile=*/true);
+        BasicBlock *Check = BasicBlock::Create(Ctx, "zluda.waiters", &F);
+        BasicBlock *After = Merge;
+        if (!After)
+        {
+            After = BasicBlock::Create(Ctx, "zluda.return", &F);
+            ReturnInst::Create(Ctx, After);
+        }
+        // the side that does not wait goes on to the check instead of what follows the branch
+        for (BasicBlock *B : FirstSet)
+        {
+            Instruction *Term = B->getTerminator();
+            if (isa<ReturnInst>(Term) && !Merge)
+            {
+                IRBuilder<>(Term).CreateBr(Check);
+                Term->eraseFromParent();
+                continue;
+            }
+            for (unsigned K = 0; K < Term->getNumSuccessors(); K++)
+                if (Term->getSuccessor(K) == Merge)
+                    Term->setSuccessor(K, Check);
+        }
+        Br->setSuccessor(FirstOnTrue ? 1 : 0, Check);
+        IRBuilder<> CB(Check);
+        Value *Cond = CB.CreateICmpNE(CB.CreateLoad(CB.getInt32Ty(), Copy, /*isVolatile=*/true), CB.getInt32(0));
+        CB.CreateCondBr(Cond, FirstOnTrue ? After : Second, FirstOnTrue ? Second : After);
+        Done.insert(Check);
+        DominatorTree DT2(F);
+        SmallVector<AllocaInst *, 32> Promotable;
+        for (AllocaInst *A : Slots)
+            if (isAllocaPromotable(A))
+                Promotable.push_back(A);
+        PromoteMemToReg(Promotable, DT2);
+        Changed++;
+    }
+    return Changed;
+}
+
+// Threads that wait for each other: no order of the sides helps. The function runs as one loop that
+// executes the next block of each thread per iteration. All paths meet at one latch: with a branch back
+// to the head from each block, Metal runs one path's loop to its end (or until its polls run out) before
+// the others; through one latch the threads alternate, block by block, on an M2 Max. Threads that were
+// together stay together. A barrier needs all the threads of a SIMD-group at once, so threads at one
+// wait at the head until all that have not returned are there.
+static void zludaRunThreadsInTurn(Function &F)
+{
+    LLVMContext &Ctx = F.getContext();
+    Module *M = F.getParent();
+    const DataLayout &DL = M->getDataLayout();
+    std::function<bool(Function *, SmallPtrSetImpl<Function *> &)> HasBarrier =
+        [&](Function *Callee, SmallPtrSetImpl<Function *> &Visited) {
+            if (!Callee || !Visited.insert(Callee).second)
+                return false;
+            if (Callee->getName() == "air.wg.barrier")
+                return true;
+            for (Instruction &I : instructions(*Callee))
+                if (auto *C = dyn_cast<CallInst>(&I); C && HasBarrier(C->getCalledFunction(), Visited))
+                    return true;
+            return false;
+        };
+    SmallVector<CallInst *, 4> Barriers;
+    for (Instruction &I : instructions(F))
+        if (auto *C = dyn_cast<CallInst>(&I))
+        {
+            SmallPtrSet<Function *, 8> Visited;
+            if (HasBarrier(C->getCalledFunction(), Visited))
+                Barriers.push_back(C);
+        }
+    SmallPtrSet<BasicBlock *, 4> BarrierBlocks;
+    for (CallInst *C : Barriers)
+    {
+        BasicBlock *BB = C->getParent();
+        if (C != &BB->front() || BB->isEntryBlock())
+            BB = BB->splitBasicBlock(C->getIterator());
+        BB->splitBasicBlock(std::next(C->getIterator()));
+        BarrierBlocks.insert(BB);
+    }
+    BasicBlock &Entry = F.getEntryBlock();
+    BasicBlock::iterator AllocaPoint = Entry.begin();
+    SmallVector<PHINode *, 16> Phis;
+    SmallVector<Instruction *, 32> Values;
+    for (BasicBlock &BB : F)
+        for (Instruction &I : BB)
+        {
+            // (a phi used outside its block too, first: as a phi alone, its load would stay in its block)
+            if (auto *Phi = dyn_cast<PHINode>(&I))
+                Phis.push_back(Phi);
+            if (!(isa<AllocaInst>(I) && BB.isEntryBlock()) && I.isUsedOutsideOfBlock(&BB))
+                Values.push_back(&I);
+        }
+    SmallVector<AllocaInst *, 32> Slots;
+    for (Instruction *I : Values)
+        if (AllocaInst *A = DemoteRegToStack(*I, false, AllocaPoint))
+            Slots.push_back(A);
+    for (PHINode *Phi : Phis)
+        if (AllocaInst *A = DemotePHIToStack(Phi, AllocaPoint))
+            Slots.push_back(A);
+    IRBuilder<> EntryB(&*AllocaPoint);
+    AllocaInst *Next = EntryB.CreateAlloca(EntryB.getInt32Ty(), DL.getAllocaAddrSpace(), nullptr, "zluda.next.block");
+    SmallVector<BasicBlock *, 32> Blocks;
+    for (BasicBlock &BB : F)
+        if (!BB.isEntryBlock())
+            Blocks.push_back(&BB);
+    BasicBlock *Head = BasicBlock::Create(Ctx, "zluda.threads", &F);
+    BasicBlock *Latch = BasicBlock::Create(Ctx, "zluda.latch", &F);
+    IRBuilder<>(Latch).CreateBr(Head);
+    DenseMap<BasicBlock *, BasicBlock *> Turn;
+    DenseMap<BasicBlock *, unsigned> Ids;
+    for (BasicBlock *BB : Blocks)
+    {
+        unsigned Id = Ids.size() + 1;
+        Ids[BB] = Id;
+        BasicBlock *T = BasicBlock::Create(Ctx, "zluda.turn", &F);
+        IRBuilder<> B(T);
+        B.CreateStore(B.getInt32(Id), Next, /*isVolatile=*/true);
+        B.CreateBr(Latch);
+        Turn[BB] = T;
+    }
+    for (BasicBlock *BB : Blocks)
+    {
+        Instruction *Term = BB->getTerminator();
+        for (unsigned K = 0; K < Term->getNumSuccessors(); K++)
+            Term->setSuccessor(K, Term->getSuccessor(K) == BB ? Latch : Turn.lookup(Term->getSuccessor(K)));
+    }
+    // The loop is entered at its head, not through the latch, which would make the latch the loop's
+    // header, and each path to it a branch back: one branch back, or the threads do not alternate.
+    BasicBlock *Enter = BasicBlock::Create(Ctx, "zluda.enter", &F);
+    IRBuilder<>(Enter).CreateBr(Head);
+    {
+        Instruction *Term = Entry.getTerminator();
+        for (unsigned K = 0; K < Term->getNumSuccessors(); K++)
+        {
+            BasicBlock *T = BasicBlock::Create(Ctx, "zluda.first", &F);
+            IRBuilder<> B(T);
+            B.CreateStore(B.getInt32(Ids.lookup(Term->getSuccessor(K))), Next, /*isVolatile=*/true);
+            B.CreateBr(Enter);
+            Term->setSuccessor(K, T);
+        }
+    }
+    IRBuilder<> H(Head);
+    Value *Id = H.CreateLoad(H.getInt32Ty(), Next, /*isVolatile=*/true);
+    BasicBlock *Dispatch = Head;
+    if (!BarrierBlocks.empty())
+    {
+        FunctionCallee Ballot =
+            M->getOrInsertFunction("air.simd_ballot.i64", FunctionType::get(H.getInt64Ty(), {H.getInt1Ty()}, false));
+        Value *At = H.getFalse();
+        for (BasicBlock *BB : BarrierBlocks)
+            At = H.CreateOr(At, H.CreateICmpEQ(Id, H.getInt32(Ids.lookup(BB))));
+        Value *Missing = H.CreateICmpNE(H.CreateCall(Ballot, {At}), H.CreateCall(Ballot, {H.getTrue()}));
+        Dispatch = BasicBlock::Create(Ctx, "zluda.next", &F);
+        H.CreateCondBr(H.CreateAnd(At, Missing), Latch, Dispatch);
+    }
+    IRBuilder<> D(Dispatch);
+    SwitchInst *Sw = D.CreateSwitch(Id, Blocks.empty() ? Latch : Blocks.front(), Blocks.size());
+    for (BasicBlock *BB : Blocks)
+        Sw->addCase(D.getInt32(Ids.lookup(BB)), BB);
+    DominatorTree DT(F);
+    SmallVector<AllocaInst *, 32> Promotable;
+    for (AllocaInst *A : Slots)
+        if (isAllocaPromotable(A))
+            Promotable.push_back(A);
+    PromoteMemToReg(Promotable, DT);
+}
+
+// The barriers between the polls of try_wait (!zluda.poll.barrier), for the module
+// for Metal. AGX's functional simulator needs them to switch SIMD-groups; on a GPU
+// the threads poll at the same time, and those that stop polling first leave the
+// others' barriers unmatched, so the threadgroup never finishes.
+void LLVMZludaAirDropPollBarriers(LLVMModuleRef M)
+{
+    Module *Mod = unwrap(M);
+    if (!getenv("ZLUDA_AIR_POLLERS_AS_THEY_COME"))
+        for (Function &F : *Mod)
+        {
+            bool BothWait = false;
+            zludaRunWaitersLast(F, BothWait);
+            // (ZLUDA_AIR_THREADS_IN_TURN: every function that waits, for comparisons)
+            bool Any = false;
+            if (getenv("ZLUDA_AIR_THREADS_IN_TURN") && !F.isDeclaration())
+            {
+                DominatorTree DT(F);
+                LoopInfo LI(DT);
+                for (Loop *L : LI.getLoopsInPreorder())
+                    Any |= zludaLoopWaitsForMemory(*L);
+            }
+            // Each value lives through the head of the loop, so the code grows with blocks times values
+            // (to 300 times in functions of the tensor core helpers): only small functions.
+            uint64_t Instructions = 0;
+            for (BasicBlock &BB : F)
+                Instructions += BB.size();
+            // SIMD-group functions see the threads that arrive together, which this would change
+            // (tc-5: the lowest active lane acts for the warp).
+            bool Collective = false;
+            for (Instruction &I : instructions(F))
+                if (auto *C = dyn_cast<CallBase>(&I))
+                    Collective |= !C->getCalledFunction() || C->getCalledFunction()->getName().contains("simd");
+            if (Any || (BothWait && !Collective && F.size() <= 64 && Instructions <= 1024))
+                zludaRunThreadsInTurn(F);
+        }
+    if (getenv("ZLUDA_AIR_KEEP_POLL_BARRIERS"))
+        return;
+    SmallVector<Instruction *, 8> Dead;
+    SmallPtrSet<Function *, 4> Polling;
+    for (Function &F : *Mod)
+        for (Instruction &I : instructions(F))
+            if (I.getMetadata("zluda.poll.barrier"))
+            {
+                Dead.push_back(&I);
+                Polling.insert(&F);
+            }
+    for (Instruction *I : Dead)
+        I->eraseFromParent();
+    // Threads of a SIMD-group run under one mask: while one polls, the others wait. A program
+    // whose thread writes what another then polls for ("if (rank == 1) write; if (rank == 0)
+    // poll") relies on the first branch finishing before the second. Metal's compiler threads two
+    // branches on one value into "if (rank == 0) poll; else write", which never ends (PTX-formalization
+    // async-generic). Each such branch reads its condition through a volatile copy, which no
+    // compiler can correlate.
+    for (Function *F : Polling)
+    {
+        MapVector<Value *, SmallVector<CondBrInst *, 2>> Branches;
+        for (BasicBlock &BB : *F)
+            if (auto *Br = dyn_cast<CondBrInst>(BB.getTerminator()); Br && isa<Instruction>(Br->getCondition()))
+                Branches[Br->getCondition()].push_back(Br);
+        IRBuilder<> Entry(&*F->getEntryBlock().getFirstInsertionPt());
+        for (auto &[Cond, Users] : Branches)
+        {
+            auto *Def = cast<Instruction>(Cond);
+            if (Users.size() < 2 || isa<PHINode>(Def) || Def->isTerminator())
+                continue;
+            AllocaInst *Slot = Entry.CreateAlloca(Entry.getInt32Ty());
+            IRBuilder<> Save(Def->getNextNode());
+            Save.CreateStore(Save.CreateZExt(Def, Save.getInt32Ty()), Slot, /*isVolatile=*/true);
+            for (CondBrInst *Br : Users)
+            {
+                IRBuilder<> B(Br);
+                Value *V = B.CreateLoad(B.getInt32Ty(), Slot, /*isVolatile=*/true);
+                Br->setCondition(B.CreateICmpNE(V, B.getInt32(0)));
+            }
+        }
+    }
+}
+
+// The multimem and fabric tables in the module for Metal. The helpers (zluda_ptx_impl_agx_cvt.c)
+// read them at fixed addresses, which AGX's memory has and Metal cannot give. There they are
+// variables of the globals buffer, which whoever launches fills: entries as at the fixed
+// addresses. An address of a table left in the module is an error: it would fault on the GPU.
+// (Optimization folds an index's scale in: MM_BASE - 64 + field, for window k + 1.)
+int LLVMZludaAirTablesInGlobals(LLVMModuleRef M, char **error)
+{
+    constexpr int64_t MMBase = 0x700000000000, FabBase = 0x6ff000000000, TableBytes = 256 * 64;
+    Module *Mod = unwrap(M);
+    LLVMContext &Ctx = Mod->getContext();
+    Type *I8 = Type::getInt8Ty(Ctx);
+    Type *I64 = Type::getInt64Ty(Ctx);
+    GlobalVariable *Tables[2] = {nullptr, nullptr};
+    auto table = [&](int K) {
+        if (!Tables[K])
+        {
+            auto *Ty = ArrayType::get(I8, TableBytes);
+            Tables[K] = new GlobalVariable(*Mod, Ty, false, GlobalValue::InternalLinkage, ConstantAggregateZero::get(Ty),
+                                           K ? "__zluda_fab_table" : "__zluda_mm_table", nullptr,
+                                           GlobalValue::NotThreadLocal, 1);
+            Tables[K]->setAlignment(Align(64));
+        }
+        return Tables[K];
+    };
+    // The table and the distance from its start, of a constant that is an address in one
+    auto inTable = [&](const ConstantInt *C) -> std::optional<std::pair<int, int64_t>> {
+        if (C->getBitWidth() != 64)
+            return std::nullopt;
+        int64_t V = C->getSExtValue();
+        if (V >= MMBase - 64 && V < MMBase + TableBytes)
+            return std::make_pair(0, V - MMBase);
+        if (V >= FabBase && V < FabBase + TableBytes)
+            return std::make_pair(1, V - FabBase);
+        return std::nullopt;
+    };
+    auto pointer = [&](std::pair<int, int64_t> At) -> Constant * {
+        return ConstantExpr::getGetElementPtr(I8, table(At.first), ConstantInt::getSigned(I64, At.second));
+    };
+    int Changed = 0;
+    for (Function &F : *Mod)
+        for (Instruction &I : instructions(F))
+        {
+            bool Arithmetic = isa<IntToPtrInst>(I) || I.getOpcode() == Instruction::Add || I.getOpcode() == Instruction::Or;
+            for (Use &U : I.operands())
+            {
+                if (auto *CI = dyn_cast<ConstantInt>(U.get()); CI && Arithmetic)
+                {
+                    if (auto At = inTable(CI))
+                    {
+                        U.set(ConstantExpr::getPtrToInt(pointer(*At), I64));
+                        Changed++;
+                    }
+                }
+                else if (auto *CE = dyn_cast<ConstantExpr>(U.get()); CE && CE->getOpcode() == Instruction::IntToPtr)
+                {
+                    if (auto *CI = dyn_cast<ConstantInt>(CE->getOperand(0)))
+                        if (auto At = inTable(CI))
+                        {
+                            U.set(ConstantExpr::getPointerBitCastOrAddrSpaceCast(pointer(*At), CE->getType()));
+                            Changed++;
+                        }
+                }
+            }
+        }
+    // Nothing is left, however it is nested
+    for (Function &F : *Mod)
+        for (Instruction &I : instructions(F))
+        {
+            SmallVector<const Value *, 8> Work(I.op_begin(), I.op_end());
+            SmallPtrSet<const Value *, 8> Seen;
+            while (!Work.empty())
+            {
+                const Value *V = Work.pop_back_val();
+                if (!isa<Constant>(V) || isa<GlobalValue>(V) || !Seen.insert(V).second)
+                    continue;
+                if (auto *CE = dyn_cast<ConstantExpr>(V); CE && CE->getOpcode() == Instruction::IntToPtr)
+                    if (auto *CI = dyn_cast<ConstantInt>(CE->getOperand(0)); CI && inTable(CI))
+                    {
+                        std::string Text = "a multimem or fabric table address is left in " + F.getName().str();
+                        *error = LLVMCreateMessage(Text.c_str());
+                        return -1;
+                    }
+                if (auto *C = dyn_cast<ConstantExpr>(V))
+                    for (const Use &Op : C->operands())
+                        Work.push_back(Op.get());
+            }
+        }
+    return Changed;
+}
+
+// .address_size 32 in the module for Metal: a 32-bit address is an offset from the kernel's
+// hidden base (for AGX the base is 0, so the low bits of a variable's address are the offset).
+// So a variable's address, in device or constant memory, is the pointer minus the base, not
+// the low bits of a 64-bit device address. Returns how many were changed.
+int LLVMZludaAirAddress32Offsets(LLVMModuleRef M)
+{
+    int Changed = 0;
+    for (Function &F : *unwrap(M))
+    {
+        if (F.isDeclaration())
+            continue;
+        Argument *BaseArg = nullptr;
+        for (Argument &A : F.args())
+            if (F.getAttributes().getParamAttr(A.getArgNo(), "agx-hidden").getValueAsString() == "address32-base")
+                BaseArg = &A;
+        if (!BaseArg)
+            continue;
+        SmallVector<PtrToIntInst *, 4> Casts;
+        for (Instruction &I : instructions(F))
+            if (auto *C = dyn_cast<PtrToIntInst>(&I); C && C->getType()->isIntegerTy(32))
+            {
+                unsigned AS = C->getPointerAddressSpace();
+                if (AS == 1 || AS == 2)
+                    Casts.push_back(C);
+            }
+        if (Casts.empty())
+            continue;
+        IRBuilder<> Entry(&*F.getEntryBlock().getFirstInsertionPt());
+        Value *Base = Entry.CreateLoad(Entry.getInt64Ty(), BaseArg);
+        for (PtrToIntInst *C : Casts)
+        {
+            IRBuilder<> B(C);
+            Value *Wide = B.CreatePtrToInt(C->getPointerOperand(), B.getInt64Ty());
+            C->replaceAllUsesWith(B.CreateTrunc(B.CreateSub(Wide, Base), C->getType()));
+            C->eraseFromParent();
+            Changed++;
+        }
+    }
+    return Changed;
+}
+
+// The module for Metal: shared memory as AGX numbers it. A PTX program may hold shared
+// addresses as numbers (the descriptors of tcgen05.mma and tcgen05.cp, %reserved_smem_*,
+// comparisons with them), computed for AGX's layout: the variables a kernel uses, in
+// module order, from 0. Metal reorders separate variables and numbers them from its own
+// base. So each kernel's static variables are one threadgroup variable in that layout,
+// and an integer holds the offset in it: the base is subtracted where a pointer becomes
+// an integer and added where an integer becomes a pointer, which cancel out in the usual
+// address computation. (Dynamic shared memory keeps Metal's numbers, from 0x80000000.)
+// A module with shared variables that a function other than a kernel uses keeps them.
+// Returns the number of kernels changed.
+int LLVMZludaAirSharedLikeAgx(LLVMModuleRef M)
+{
+    Module *Mod = unwrap(M);
+    const DataLayout &DL = Mod->getDataLayout();
+    LLVMContext &Ctx = Mod->getContext();
+    constexpr uint64_t DynamicBase = 0x80000000;
+    SmallVector<GlobalVariable *, 8> Statics, Dynamics;
+    for (GlobalVariable &GV : Mod->globals())
+    {
+        if (GV.getAddressSpace() != 3 || !GV.getValueType()->isSized())
+            continue;
+        // (the launch's bytes: a value of ZLUDA's, not a variable of the program)
+        if (GV.getName().starts_with("__zluda_agx_"))
+            continue;
+        if (DL.getTypeAllocSize(GV.getValueType()))
+            Statics.push_back(&GV);
+        else
+            Dynamics.push_back(&GV);
+    }
+    if (Statics.empty())
+        return 0;
+    for (GlobalVariable *GV : Statics)
+        convertUsersOfConstantsToInstructions({GV});
+    // (in module order: the order of the variables below is in the .air, the same for the same input)
+    MapVector<Function *, SmallPtrSet<GlobalVariable *, 8>> Used;
+    for (GlobalVariable *GV : Statics)
+        for (User *U : GV->users())
+        {
+            auto *I = dyn_cast<Instruction>(U);
+            if (!I)
+                return 0;
+            Function *F = I->getFunction();
+            if (!F->use_empty())
+                return 0;
+            Used[F].insert(GV);
+        }
+    Type *I8 = Type::getInt8Ty(Ctx);
+    Type *I64 = Type::getInt64Ty(Ctx);
+    int Count = 0;
+    for (auto &[F, Vars] : Used)
+    {
+        uint64_t Size = 0;
+        Align MaxAlign(1);
+        SmallVector<std::pair<GlobalVariable *, uint64_t>, 8> Layout;
+        for (GlobalVariable *GV : Statics)
+        {
+            if (!Vars.count(GV))
+                continue;
+            Align A = DL.getValueOrABITypeAlignment(GV->getAlign(), GV->getValueType());
+            Size = alignTo(Size, A);
+            Layout.push_back({GV, Size});
+            Size += DL.getTypeAllocSize(GV->getValueType());
+            MaxAlign = std::max(MaxAlign, A);
+        }
+        auto *Ty = ArrayType::get(I8, Size);
+        auto *Block = new GlobalVariable(*Mod, Ty, false, GlobalValue::InternalLinkage, UndefValue::get(Ty),
+                                         F->getName() + ".shared", nullptr, GlobalValue::NotThreadLocal, 3);
+        Block->setAlignment(MaxAlign);
+        // (generic addresses hold the same offsets: the AIR target's casts to and from generic)
+        F->addFnAttr("air-shared-block", Block->getName());
+        bool UsesDynamic = false;
+        for (GlobalVariable *GV : Dynamics)
+            for (User *U : GV->users())
+                if (auto *I = dyn_cast<Instruction>(U); I && I->getFunction() == F)
+                    UsesDynamic = true;
+        if (UsesDynamic)
+            F->addFnAttr("air-shared-dynamic");
+        // integers from literal addresses become instructions, so that they get the base
+        for (Instruction &I : instructions(*F))
+            for (Use &Op : I.operands())
+                if (auto *CE = dyn_cast<ConstantExpr>(Op.get());
+                    CE && CE->getOpcode() == Instruction::IntToPtr && CE->getType()->getPointerAddressSpace() == 3)
+                {
+                    Instruction *New = CE->getAsInstruction();
+                    if (auto *PN = dyn_cast<PHINode>(&I))
+                        New->insertBefore(PN->getIncomingBlock(Op)->getTerminator()->getIterator());
+                    else
+                        New->insertBefore(I.getIterator());
+                    Op.set(New);
+                }
+        // An address folded from integers: a getelementptr on a null shared pointer, in the numbers
+        // the integers hold, so from the block (the cluster windows of PTX-formalization tcg2-1).
+        SmallVector<GetElementPtrInst *, 4> NullBased;
+        for (Instruction &I : instructions(*F))
+            if (auto *GEP = dyn_cast<GetElementPtrInst>(&I);
+                GEP && GEP->getAddressSpace() == 3 && isa<ConstantPointerNull>(GEP->getPointerOperand()))
+                NullBased.push_back(GEP);
+        SmallVector<Instruction *, 32> Casts;
+        for (Instruction &I : instructions(*F))
+            if ((isa<IntToPtrInst>(I) && I.getType()->getPointerAddressSpace() == 3) ||
+                (isa<PtrToIntInst>(I) && I.getOperand(0)->getType()->getPointerAddressSpace() == 3))
+                Casts.push_back(&I);
+        // (through instructions: the AIR target retypes a byte array by rewriting the
+        // getelementptrs of it, and would leave a constant's use on a second array)
+        IRBuilder<> Entry(&*F->getEntryBlock().getFirstInsertionPt());
+        Value *First = Entry.CreateInBoundsGEP(Ty, Block, {ConstantInt::get(I64, 0), ConstantInt::get(I64, 0)});
+        Value *BaseInt = Entry.CreatePtrToInt(First, I64);
+        for (GetElementPtrInst *GEP : NullBased)
+            GEP->setOperand(0, First);
+        // ZLUDA_AIR_ZERO_SHARED=1: shared memory that starts as zero, as it does on AGX's
+        // functional simulator and in the K semantics of PTX, for checks against them:
+        // PTX leaves it undefined, and a GPU's holds what ran before. Not for applications:
+        // every thread of every launch writes all of it.
+        if (const char *Zero = getenv("ZLUDA_AIR_ZERO_SHARED"); Zero && Zero[0] == '1')
+        {
+            Entry.CreateMemSet(First, Entry.getInt8(0), Entry.getInt32(Size), MaybeAlign(MaxAlign));
+            FunctionCallee Barrier = Mod->getOrInsertFunction(
+                "air.wg.barrier", FunctionType::get(Type::getVoidTy(Ctx), {Entry.getInt32Ty(), Entry.getInt32Ty()}, false));
+            Entry.CreateCall(Barrier, {Entry.getInt32(2), Entry.getInt32(1)});
+        }
+        for (auto [GV, Offset] : Layout)
+        {
+            Value *At = Entry.CreateInBoundsGEP(I8, First, ConstantInt::get(I64, Offset));
+            for (Use &U : make_early_inc_range(GV->uses()))
+                if (auto *I = dyn_cast<Instruction>(U.getUser()); I && I->getFunction() == F)
+                    U.set(At);
+        }
+        // Base + X, or X - Base, but for the numbers of dynamic shared memory.
+        auto Rebase = [&](IRBuilder<> &B, Value *X, bool Add) -> Value *
+        {
+            Type *T = X->getType();
+            Value *Base = B.CreateZExtOrTrunc(BaseInt, T);
+            Value *R = Add ? B.CreateAdd(X, Base) : B.CreateSub(X, Base);
+            if (!UsesDynamic)
+                return R;
+            Value *IsDynamic = B.CreateICmpUGE(X, ConstantInt::get(T, DynamicBase));
+            return B.CreateSelect(IsDynamic, X, R);
+        };
+        for (Instruction *I : Casts)
+        {
+            if (isa<IntToPtrInst>(I))
+            {
+                IRBuilder<> B(I);
+                I->setOperand(0, Rebase(B, I->getOperand(0), true));
+            }
+            else
+            {
+                IRBuilder<> B(I->getNextNode());
+                Value *R = Rebase(B, I, false);
+                I->replaceUsesWithIf(R, [&](Use &U)
+                                     { return U.getUser() != R && !(UsesDynamic && isa<Instruction>(U.getUser()) && cast<Instruction>(U.getUser())->getParent() == cast<Instruction>(R)->getParent() && (isa<ICmpInst>(U.getUser()) || (isa<BinaryOperator>(U.getUser()) && U.getUser() == cast<SelectInst>(R)->getFalseValue()))); });
+            }
+        }
+        Count++;
+    }
+    for (GlobalVariable *GV : Statics)
+        if (GV->use_empty())
+            GV->eraseFromParent();
+    return Count;
+}
+
+// The .air for Metal: the shared memory registers in
 // Metal's numbering of threadgroup addresses. AGX numbers shared memory from
 // 0 (static variables in module order, then the dynamic shared memory), so
 // zluda_ptx_impl_agx.ll computes sizes and offsets alike. Metal numbers its
@@ -1984,7 +2758,7 @@ LLVM_C_EXTERN_C_END
 
 LLVM_C_EXTERN_C_BEGIN
 
-// ZLUDA_AGX_VIA_AIR, the .air for Metal: function pointers without Metal's
+// The .air for Metal: function pointers without Metal's
 // function pointers. AIR has no call stack and the AIR target inlines every
 // call, so an indirect call becomes a choice among the functions it can call:
 // those of its type whose address the module takes, which are all a CUDA

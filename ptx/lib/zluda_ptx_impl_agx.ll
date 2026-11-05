@@ -1978,7 +1978,10 @@ define zeroext i1 @__zluda_ptx_impl_agx_mbarrier_test_wait(ptr addrspace(3) %mba
 ; try_wait waits at a threadgroup barrier between polls, so that the other
 ; SIMD-groups run until they wait or exit (the functional simulator only
 ; switches SIMD-groups at barriers), for a bounded number of polls: PTX
-; programs retry while it returns false.
+; programs retry while it returns false. A GPU's SIMD-groups run at the same time,
+; and threads that stop polling after different numbers of polls would leave the
+; barriers of the others unmatched: the module for Metal drops these barriers
+; (!zluda.poll.barrier, LLVMZludaAirDropPollBarriers).
 define zeroext i1 @__zluda_ptx_impl_agx_mbarrier_try_wait(ptr addrspace(3) %mbar, i32 %parity) #1 {
 entry:
   br label %loop
@@ -1991,7 +1994,7 @@ loop:
   %again = and i1 %not.done, %more
   br i1 %again, label %wait, label %exit
 wait:
-  call void @llvm.agx.threadgroup.barrier()
+  call void @llvm.agx.threadgroup.barrier(), !zluda.poll.barrier !{}
   br label %loop
 exit:
   ret i1 %done
@@ -2022,7 +2025,7 @@ loop:
   %again = and i1 %not.done, %more
   br i1 %again, label %wait, label %exit
 wait:
-  call void @llvm.agx.threadgroup.barrier()
+  call void @llvm.agx.threadgroup.barrier(), !zluda.poll.barrier !{}
   br label %loop
 exit:
   ret i1 %done
@@ -34515,6 +34518,28 @@ define dso_local i64 @__zluda_ptx_impl_agx_spd_iter(i32 noundef %0, i32 noundef 
   br i1 %78, label %20, label %41, !llvm.loop !20009
 }
 
+; After an allocation: the CTA owns the slab. The last dealloc of another warp may have
+; just released it, or another CTA claimed it (false: the allocation's bits are undone).
+define internal zeroext i1 @__zluda_agx_tmem_reown(i32 %slab, i32 %key, i32 %bits) {
+  %i = zext nneg i32 %slab to i64
+  %owner = getelementptr inbounds [4 x i32], ptr addrspace(1) @__zluda_agx_tmem_owner, i64 0, i64 %i
+  %r = cmpxchg ptr addrspace(1) %owner, i32 0, i32 %key acq_rel acquire, align 4
+  %old = extractvalue { i32, i1 } %r, 0
+  %won = extractvalue { i32, i1 } %r, 1
+  %same = icmp eq i32 %old, %key
+  %ok = or i1 %won, %same
+  br i1 %ok, label %done, label %undo
+
+undo:
+  %map = getelementptr inbounds [4 x i32], ptr addrspace(1) @__zluda_agx_tmem_map, i64 0, i64 %i
+  %mask = xor i32 %bits, -1
+  %u = atomicrmw and ptr addrspace(1) %map, i32 %mask acq_rel, align 4
+  br label %done
+
+done:
+  ret i1 %ok
+}
+
 ; Function Attrs: nounwind
 define dso_local i32 @__zluda_ptx_impl_agx_tmem_alloc(i32 noundef %0, i32 noundef %1, i32 noundef %2) local_unnamed_addr #3 {
   %4 = icmp eq i32 %1, 0
@@ -34619,8 +34644,16 @@ define dso_local i32 @__zluda_ptx_impl_agx_tmem_alloc(i32 noundef %0, i32 nounde
 74:                                               ; preds = %71
   %75 = cmpxchg ptr addrspace(1) %69, i32 0, i32 %70 acq_rel acquire, align 4
   %76 = extractvalue { i32, i1 } %75, 1
-  %77 = select i1 %76, i32 1, i32 3
-  %78 = select i1 %76, i32 0, i32 %72
+  br i1 %76, label %xown, label %xown.done
+
+xown:
+  %xown.ok = call zeroext i1 @__zluda_agx_tmem_reown(i32 %64, i32 %31, i32 %70)
+  br label %xown.done
+
+xown.done:
+  %xown.r = phi i1 [ false, %74 ], [ %xown.ok, %xown ]
+  %77 = select i1 %xown.r, i32 1, i32 3
+  %78 = select i1 %xown.r, i32 0, i32 %72
   br label %100
 
 79:                                               ; preds = %71
@@ -34641,11 +34674,7 @@ define dso_local i32 @__zluda_ptx_impl_agx_tmem_alloc(i32 noundef %0, i32 nounde
 
 89:                                               ; preds = %81, %85
   %90 = icmp ugt i32 %83, 16
-  br i1 %90, label %91, label %92
-
-91:                                               ; preds = %89
-  tail call void @llvm.trap()
-  unreachable
+  br i1 %90, label %100, label %92
 
 92:                                               ; preds = %89
   %93 = shl i32 %67, %82
@@ -34653,13 +34682,21 @@ define dso_local i32 @__zluda_ptx_impl_agx_tmem_alloc(i32 noundef %0, i32 nounde
   %95 = cmpxchg ptr addrspace(1) %69, i32 %73, i32 %94 acq_rel acquire, align 4
   %96 = extractvalue { i32, i1 } %95, 1
   %97 = shl nuw nsw i32 %82, 5
-  %98 = zext i1 %96 to i32
-  %99 = select i1 %96, i32 %97, i32 %72
+  br i1 %96, label %own, label %own.done
+
+own:
+  %own.ok = call zeroext i1 @__zluda_agx_tmem_reown(i32 %64, i32 %31, i32 %93)
+  br label %own.done
+
+own.done:
+  %own.r = phi i1 [ false, %92 ], [ %own.ok, %own ]
+  %98 = zext i1 %own.r to i32
+  %99 = select i1 %own.r, i32 %97, i32 %72
   br label %100
 
-100:                                              ; preds = %79, %92, %74
-  %101 = phi i32 [ %77, %74 ], [ %98, %92 ], [ 3, %79 ]
-  %102 = phi i32 [ %78, %74 ], [ %99, %92 ], [ %72, %79 ]
+100:                                              ; preds = %79, %own.done, %xown.done, %89
+  %101 = phi i32 [ %77, %xown.done ], [ %98, %own.done ], [ 3, %79 ], [ 3, %89 ]
+  %102 = phi i32 [ %78, %xown.done ], [ %99, %own.done ], [ %72, %79 ], [ %72, %89 ]
   switch i32 %101, label %104 [
     i32 0, label %103
     i32 3, label %103
@@ -34757,6 +34794,9 @@ define dso_local i64 @__zluda_ptx_impl_agx_tmem_base() local_unnamed_addr #3 {
   %8 = mul i32 %7, %4
   %9 = add i32 %1, 1
   %10 = add i32 %9, %8
+  br label %find
+
+find:
   %11 = load atomic i32, ptr addrspace(1) @__zluda_agx_tmem_owner acquire, align 4
   %12 = icmp eq i32 %11, %10
   br i1 %12, label %23, label %13
@@ -34778,13 +34818,9 @@ define dso_local i64 @__zluda_ptx_impl_agx_tmem_base() local_unnamed_addr #3 {
   br label %23
 
 23:                                               ; preds = %0, %13, %16, %19
-  %24 = phi i32 [ 0, %0 ], [ 1, %13 ], [ 2, %16 ], [ %22, %19 ]
+  %24 = phi i32 [ 0, %find ], [ 1, %13 ], [ 2, %16 ], [ %22, %19 ]
   %25 = icmp slt i32 %24, 0
-  br i1 %25, label %26, label %27
-
-26:                                               ; preds = %23
-  tail call void @llvm.trap()
-  unreachable
+  br i1 %25, label %find, label %27
 
 27:                                               ; preds = %23
   %28 = shl nuw nsw i32 %24, 17
@@ -34810,6 +34846,9 @@ define dso_local void @__zluda_ptx_impl_agx_tmem_dealloc(i32 noundef %0, i32 nou
   %14 = mul i32 %13, %10
   %15 = add i32 %7, 1
   %16 = add i32 %15, %14
+  br label %find
+
+find:
   %17 = load atomic i32, ptr addrspace(1) @__zluda_agx_tmem_owner acquire, align 4
   %18 = icmp eq i32 %17, %16
   br i1 %18, label %29, label %19
@@ -34831,9 +34870,9 @@ define dso_local void @__zluda_ptx_impl_agx_tmem_dealloc(i32 noundef %0, i32 nou
   br label %29
 
 29:                                               ; preds = %6, %19, %22, %25
-  %30 = phi i32 [ 0, %6 ], [ 1, %19 ], [ 2, %22 ], [ %28, %25 ]
+  %30 = phi i32 [ 0, %find ], [ 1, %19 ], [ 2, %22 ], [ %28, %25 ]
   %31 = icmp slt i32 %30, 0
-  br i1 %31, label %41, label %32
+  br i1 %31, label %find, label %32
 
 32:                                               ; preds = %29
   %33 = and i32 %0, 31
@@ -34881,6 +34920,12 @@ define dso_local void @__zluda_ptx_impl_agx_tmem_dealloc(i32 noundef %0, i32 nou
 61:                                               ; preds = %58
   %62 = getelementptr inbounds [4 x i32], ptr addrspace(1) @__zluda_agx_tmem_owner, i64 0, i64 %51
   store atomic i32 0, ptr addrspace(1) %62 release, align 4
+  %again = load atomic i32, ptr addrspace(1) %52 acquire, align 4
+  %taken = icmp ne i32 %again, 0
+  br i1 %taken, label %restore, label %63
+
+restore:
+  %restored = cmpxchg ptr addrspace(1) %62, i32 0, i32 %16 acq_rel acquire, align 4
   br label %63
 
 63:                                               ; preds = %58, %61, %4

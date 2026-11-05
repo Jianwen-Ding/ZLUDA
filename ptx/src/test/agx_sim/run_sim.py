@@ -27,7 +27,7 @@ def f32(x):
 
 def compile_ptx(a, tmp, *names, strict=False):
     out = os.path.join(tmp, "out")
-    cmd = [a.zoc, "--target", "agx", "--arch", a.chip, "--output-dir", out] + (["--strict-fp"] if strict else [])
+    cmd = [a.zoc, "--target", "air", "--arch", a.chip, "--output-dir", out] + (["--strict-fp"] if strict else [])
     r = subprocess.run(cmd + [os.path.join(HERE, n) for n in names], capture_output=True, text=True)
     if r.returncode:
         raise RuntimeError("zoc: " + r.stderr[-400:])

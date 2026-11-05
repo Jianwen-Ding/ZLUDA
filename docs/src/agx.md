@@ -38,19 +38,17 @@ LLD; `agx` selects the AGX backend. Both can be enabled together.
 
 ## Compiling
 
-**AIR is the first-class target.** `zoc --target air` compiles PTX straight to
-upstream AIR (Metal's IR): the portable AIR (`.portable.air`), the AIR for Metal
-(`.air`, with `.air.globals`), and, with an AGX `--arch`, the AGX object compiled
-from that same AIR (`.o`, `.asm`):
+PTX compiles to AGX through AIR, the only route for Apple GPUs. `zoc --target air` compiles PTX to upstream AIR
+(Metal's IR) and gives, from that one AIR module, the AGX object and, as the alternative, the AIR lowered for Metal:
+
+```
+.ptx -> .portable.air -> .o, .asm     the AGX backend (agx-lower-air), with an agx-* --arch
+                      -> .air         lowered for Metal (with .air.globals)
+```
 
 ```
 zoc --target air --arch agx-g14g kernel.ptx
 ```
-
-The AGX code it gives is as good as the older route's below (4.4% fewer
-instructions over the PTX-formalization tests), which is kept only while
-`zluda_agx` still compiles with it. **`--target agx` is superseded**: new work
-goes to `--target air`.
 
 `--agx-only` (what `zluda_agx` passes, and what every `zoc --serve` request implies) makes the AGX object alone: no
 AIR for Metal and no portable AIR output, whose copy of the module and passes cost time and memory for nothing on
@@ -62,14 +60,8 @@ also get a light cleanup in AIR's address spaces and O3 a kernel at a time inste
 (`ZLUDA_AIR_AS_PIPELINE=o3` / `light+` to choose); modules whose kernels share functions (Blender Cycles) keep the
 whole-module O3.
 
-The older route, from PTX to the AGX backend without AIR:
-
-```
-zoc --target agx --arch agx-g14g kernel.ptx
-```
-
 `--arch` takes any processor of the backend (`agx-g13g` for M1 to
-`agx-g15d` for M3 Ultra; an `agx-` architecture implies `--target agx`).
+`agx-g15d` for M3 Ultra; an `agx-` architecture implies `--target air`).
 `zoc` writes the translated LLVM IR (`.ll`), the IR linked with the helper
 functions and optimized (`.linked.ll`, `.opt.ll`), the assembly (`.asm`) and
 an ELF object (`.o`) with each kernel's machine code in `.text`.
@@ -715,6 +707,8 @@ section; cluster scope fences are GPU scope ones):
   switches SIMD-groups only at barriers. On hardware the barriers of
   waiting SIMD-groups meet each other and those of `bar.sync`, so a
   `try_wait` can release a `bar.sync` of another SIMD-group early.
+  The AIR for Metal has no such barriers (threads that stop polling first would
+  leave the others' unmatched), and `try_wait` only polls there.
   `test_wait` only polls.
 * `mbarrier.init.layout::v1` sets bit 24 of word 1 (bits 0-23 hold the
   expected count), and `.layout::v1` objects record more state there: bit 25
@@ -911,7 +905,18 @@ floating point operations are constrained intrinsics with dynamic rounding,
 which the backend's `agx-lower-fp-env` pass lowers with the register's value
 at each operation.
 
+
+What compliance costs on `.ptx -> .air -> .agx` (2026-11-05): the checks and the Metal-only fixes change no AGX code. Against
+the build before them, the AGX objects of 14 Geekbench modules and 35 test programs are byte-identical in both modes, the portable
+AIR of 54 programs is identical, compile time is within noise (Cycles through AIR: 372.9 s -> 360.3 s) and peak memory is
+the same (Cycles: 10,180 -> 10,184 MB). Of Cycles' 75 kernels compiled alone, 74 give a byte-identical AGX object; `shade_volume` passed the comparison's limit of 57 minutes and was not compared. Strict mode itself is what costs: on those Geekbench modules 61% more code and 24% more
+compile time, and in the simulator's cost model, on 21 launches of test programs, 1.23 times the total cycles (geomean 1.33, median
+1.00, worst 5.11). Default mode stays the driver's default for that reason; 165 of the 841 PTX-formalization programs need strict
+mode for their exact results, on the simulator, and all 841 pass with it.
+
 ## Strict instruction mode (`agx-strict`)
+
+**Not available from PTX:** `zoc --agx-strict` and `ZLUDA_AGX_STRICT` are gone with the direct route; the backend feature and the library kernels' builds remain. The rest of this section describes that route.
 
 `zoc --agx-strict` (and `ZLUDA_AGX_STRICT=1` for `zluda_agx`) compiles for M1 and M2 using only the instruction forms
 that Mesa's asahi compiler emits for the same GPU: the LLVM backend's `agx-strict` feature (`llvm/docs/AGXUsage.rst` in
@@ -939,6 +944,8 @@ Results (2026-10-21, simulator):
   it the float atomic add on M2.
 
 ## Checked mode (`agx-checked`)
+
+**Not available from PTX:** `zoc --agx-checked`, `ZLUDA_AGX_CHECKED` and `zoc --lineinfo` / `ZLUDA_AGX_LINEINFO` are gone with the direct route; the backend feature remains. The rest of this section describes that route.
 
 `zoc --agx-checked` (and `ZLUDA_AGX_CHECKED=1` for `zluda_agx`) builds kernels that check their own memory accesses, as
 compute-sanitizer's memcheck does on NVIDIA GPUs: the LLVM backend's `agx-checked` feature (`llvm/docs/AGXUsage.rst`
@@ -1126,15 +1133,12 @@ Kernels read their 32-bit constants too wide for an immediate from uniform regis
 arguments): fewer general purpose registers and more resident SIMD-groups. `ZLUDA_AGX_UNIFORM_CONSTANTS=0` compiles
 with `mov_imm` instead, in the driver and `zoc` and, at build time, for the agx_libs kernels.
 
-`ZLUDA_AGX_VIA_AIR=1` (experimental) compiles through upstream AIR instead of straight to AGX: the optimized AGX IR is
-written as AIR (`agx-raise-to-air`, what AIR does not have as hints with AIR emulations, double precision in software),
-the AIR target's portable passes make it upstream AIR, and the AGX backend compiles that, restoring the hinted AGX
-operations. `zoc` also writes `NAME.portable.air`, which that AGX code is compiled from (`llc -mtriple=agx` gives the same
-object from the file), and `NAME.air`, a copy changed for Metal. `ptx/tools/agx_air_roundtrip_zoc.py` stands in for `zoc` in the
-checks and compiles the AGX code from that file, failing if the object differs; `--strict-fp` is not in the file for
-`--target agx`, so `llc` needs its target features too. On the PTX-formalization tests the results are the direct path's, and in the
-agx-bench model the code is as fast; `ZLUDA_AGX_LLVM_ARGS=-agx-air-native-hints=false` runs the AIR emulations instead,
-as a consumer without AGX's operations would. See `llvm/docs/AIR/AIRHints.rst` in the LLVM fork.
+`ZLUDA_AIR_ZERO_SHARED=1` makes the AIR for Metal zero its shared memory at the start of a kernel, for checks against
+results computed with shared memory that starts as zero (the simulator, the K semantics). PTX leaves it undefined, and a
+GPU's holds what ran before; this costs every launch, so it is not for applications.
+
+`ptx/tools/agx_air_roundtrip_zoc.py` stands in for `zoc --target air` in the checks and compiles the AGX code from
+`NAME.portable.air`, failing if the object differs.
 
 `agx_bench_kernel MODULE KERNEL --grid ... --block ... ARG...` times one kernel the way an application keeps the GPU
 busy (launches queued back to back between two events) and prints a hash of each buffer afterwards, so that two builds

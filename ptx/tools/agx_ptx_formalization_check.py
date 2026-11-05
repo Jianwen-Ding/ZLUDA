@@ -4,7 +4,7 @@
 Each test of PTX-formalization (https://github.com/Jianwen-Ding/PTX-formalization,
 tests/*.ptx) is a PTX module followed by a host harness (.buffer / .launch /
 .expect ...) whose .expect values are the results of the K semantics of PTX.
-This script compiles the module with `zoc --target agx`, runs every launch on
+This script compiles the module with `zoc --target air`, runs every launch on
 the functional AGX simulator (`agx_run` of
 https://github.com/Jianwen-Ding/AGX-Performance-Simulator) and checks the
 .expect directives bit-exactly, like `krun` does.
@@ -648,8 +648,6 @@ def simulate(args, tmp, name, k, ps, ops, grid, block, dyn, syms, mem, globals_m
            '--dump', '%#x=%d:%s' % (GLOBALS_BASE, len(globals_mem), f_glob)] + list(extra)
     for u, v in uniforms:
         cmd += ['--uniform', '%d=%d' % (u, v)]
-    if getattr(args, 'agx_strict', False):
-        cmd += ['--agx-strict', args.arch]
     if getattr(args, 'cost_file', None):
         # the AGX Performance Simulator's prediction of the launch over the same memory (before agx_run writes it)
         dcmd = [args.agx_dispatch, f_code,
@@ -705,8 +703,8 @@ def simulate(args, tmp, name, k, ps, ops, grid, block, dyn, syms, mem, globals_m
     return None
 
 
-def compile_ptx(args, module, tmp, extra=(), env=None, product='m.o', target='agx'):
-    """Compile module (PTX text) with zoc --target agx into tmp, dropping the statements the front end rejects.
+def compile_ptx(args, module, tmp, extra=(), env=None, product='m.o', target='air'):
+    """Compile module (PTX text) with zoc --target air into tmp, dropping the statements the front end rejects.
     Returns (status, detail) of a failure, or (None, (zoc output, rejected statements, tainted functions or None
     when nothing can be attributed))."""
     src = os.path.join(tmp, 'm.ptx')
@@ -719,8 +717,6 @@ def compile_ptx(args, module, tmp, extra=(), env=None, product='m.o', target='ag
             flags.append('--strict-fp')
         if getattr(args, 'f32_textures', False):
             flags.append('--strict-fp-f32-textures')
-        if getattr(args, 'agx_strict', False):
-            flags.append('--agx-strict')
         # (--arch none: the AIR only, as compiled for Metal alone)
         arch = [] if args.arch == 'none' else ['--arch', args.arch]
         # (the object alone, as the runtime compiles: the assembly took as long again, 60 s of tex-mip's 170)
@@ -764,7 +760,7 @@ def run_test(path, args):
         if d.split()[0] in UNSUPPORTED:
             return 'UNSUPPORTED', 'harness directive ' + d.split()[0]
     with tempfile.TemporaryDirectory() as tmp:
-        status, detail = compile_ptx(args, module, tmp, target=getattr(args, 'target', 'agx'))
+        status, detail = compile_ptx(args, module, tmp, target=getattr(args, 'target', 'air'))
         if status:
             return status, detail
         out, rejected, tainted = detail
@@ -1033,8 +1029,7 @@ def main():
     ap.add_argument('tests', nargs='+', help='PTX-formalization test programs (tests/*.ptx)')
     ap.add_argument('--zoc', default='zoc')
     ap.add_argument('--agx-run', dest='agx_run', default='agx_run')
-    ap.add_argument('--target', default='agx', choices=('agx', 'air'),
-                    help='zoc --target: agx (ZLUDA\'s AGX IR) or air (PTX to portable AIR, then the AGX backend)')
+    ap.add_argument('--target', default='air', choices=('air',), help='zoc --target')
     ap.add_argument('--readelf', default='llvm-readelf')
     ap.add_argument('--objcopy', default='llvm-objcopy')
     ap.add_argument('--arch', default='agx-g14g')
@@ -1042,9 +1037,6 @@ def main():
                     help='compile with zoc --strict-fp (software IEEE binary32, canonical NaNs)')
     ap.add_argument('--strict-fp-f32-textures', dest='f32_textures', action='store_true',
                     help='with --strict-fp: zoc --strict-fp-f32-textures (texture filtering in f32)')
-    ap.add_argument('--agx-strict', action='store_true',
-                    help='compile with zoc --agx-strict (only the instructions Mesa emits) and run agx_run '
-                         '--agx-strict for --arch, so that any other instruction fails the test')
     ap.add_argument('--ulp', type=int, default=0,
                     help='also accept float results within this many units in the last place (any NaN for a NaN), '
                          'counted apart (PASS~)')

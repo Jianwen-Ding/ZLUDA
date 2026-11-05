@@ -1,37 +1,45 @@
-//! Compilation of the PTX run tests for Apple GPUs with the AGX backend.
+//! Compilation of the PTX run tests for Apple GPUs: PTX -> AIR -> AGX.
 //!
 //! There is no AGX runtime yet, so these tests check that the kernels
-//! translate, link with zluda_ptx_impl_agx.ll and generate code, and compare
+//! translate, link with zluda_ptx_impl_air.ll and generate code, and compare
 //! the generated code of a few kernels with the expected assembly.
 
 use crate::pass::{self, Target};
 use ptx_parser as ast;
 use std::path::PathBuf;
 
-fn compile(ptx: &str, cpu: &str) -> Result<llvm_zluda::compile_agx::AgxCompilation, String> {
-    compile_with(ptx, cpu, false)
+struct Compiled {
+    object: Vec<u8>,
+    assembly: Vec<u8>,
 }
 
-fn compile_with(
-    ptx: &str,
-    cpu: &str,
-    agx_strict: bool,
-) -> Result<llvm_zluda::compile_agx::AgxCompilation, String> {
+/// PTX -> AIR -> AGX, as zoc --target air --agx-only.
+fn compile(ptx: &str, cpu: &str) -> Result<Compiled, String> {
     let ast = ast::parse_module_checked(ptx).map_err(|e| format!("parse: {e:?}"))?;
     let attributes = pass::Attributes {
         clock_rate: 1_398_000,
     };
-    let module = pass::to_llvm_module_for_target(ast, attributes, Target::Agx, |_| {})
+    let module = pass::to_llvm_module_for_target(ast, attributes, Target::Air, |_| {})
         .map_err(|e| format!("translate: {e}"))?;
     let impl_ir = module.linked_bitcode();
-    llvm_zluda::compile_agx(
+    let assembly = std::cell::RefCell::new(Vec::new());
+    let hook = |bytes: &Vec<u8>, extension: String| {
+        if extension == "asm" {
+            *assembly.borrow_mut() = bytes.clone();
+        }
+    };
+    let out = llvm_zluda::compile_air::compile_air(
         &module.context,
-        cpu,
-        llvm_zluda::AgxOptions { strict_fp: module.strict_fp, agx_strict, checked: false, object_only: false },
         module.llvm_ir,
+        &[],
         impl_ir,
-        None,
-    )
+        Some(cpu),
+        Some(&hook),
+        false,
+        true,
+        module.strict_fp,
+    )?;
+    Ok(Compiled { object: out.agx_object.ok_or("no AGX object")?, assembly: assembly.into_inner() })
 }
 
 fn spirv_run_dir() -> PathBuf {
@@ -135,38 +143,6 @@ fn spirv_run_kernels_compile() {
     assert!(missing.is_empty(), "required kernels failed: {missing:?}");
 }
 
-/// In strict mode (`zoc --agx-strict`) the backend reports any instruction that Mesa's asahi compiler would not
-/// emit: every run test that compiles must also compile in that mode, for M1 and M2.
-#[test]
-fn spirv_run_kernels_compile_agx_strict() {
-    let mut entries: Vec<_> = std::fs::read_dir(spirv_run_dir())
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .filter(|p| p.extension().map_or(false, |e| e == "ptx"))
-        .collect();
-    entries.sort();
-    let mut failures = Vec::new();
-    let mut checked = 0;
-    for path in &entries {
-        let name = path.file_stem().unwrap().to_string_lossy().to_string();
-        let ptx = std::fs::read_to_string(path).unwrap();
-        if !matches!(std::panic::catch_unwind(|| compile(&ptx, "agx-g14g")), Ok(Ok(_))) {
-            continue;
-        }
-        for cpu in ["agx-g13g", "agx-g14c"] {
-            checked += 1;
-            match std::panic::catch_unwind(|| compile_with(&ptx, cpu, true)) {
-                Ok(Ok(out)) if !out.object.is_empty() => {}
-                Ok(Ok(_)) => failures.push(format!("{name} ({cpu}): empty object")),
-                Ok(Err(e)) => failures.push(format!("{name} ({cpu}): {}", e.lines().next().unwrap_or(""))),
-                Err(_) => failures.push(format!("{name} ({cpu}): panic")),
-            }
-        }
-    }
-    eprintln!("AGX strict mode: {} of {checked} compilations", checked - failures.len());
-    assert!(failures.is_empty(), "{failures:#?}");
-}
-
 #[test]
 fn vector_add_assembly() {
     let ptx = std::fs::read_to_string(
@@ -220,7 +196,7 @@ fn dump_ir() {
         };
         let attributes = pass::Attributes { clock_rate: 1 };
         let module = std::panic::catch_unwind(move || {
-            pass::to_llvm_module_for_target(ast, attributes, Target::Agx, |_| {})
+            pass::to_llvm_module_for_target(ast, attributes, Target::Air, |_| {})
         });
         if let Ok(Ok(module)) = module {
             let ir = module.llvm_ir.print_module_to_string();
@@ -256,7 +232,7 @@ fn loc_becomes_debug_locations() {
 "#;
     let translate = |debug_locations| {
         let ast = ast::parse_module_checked(ptx).unwrap();
-        let options = pass::Options { target: Target::Agx, debug_locations, ..Default::default() };
+        let options = pass::Options { target: Target::Air, debug_locations, ..Default::default() };
         let m = pass::to_llvm_module_with_options(ast, pass::Attributes { clock_rate: 1_398_000 }, options, |_| {}).unwrap();
         m.llvm_ir.print_module_to_string().to_str().into_owned()
     };

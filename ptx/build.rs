@@ -50,11 +50,16 @@ fn air_impl_bitcode() {
             .unwrap()
             .lines()
             .map(|l| {
+                // (directly: the tag would not survive the inlining of the primitive)
+                if l.trim_start().starts_with("call") && l.contains("!zluda.poll.barrier") {
+                    return "  call void @air.wg.barrier(i32 0, i32 1), !zluda.poll.barrier !{}".to_string();
+                }
                 let l = l.replace("@llvm.agx.", "@__zluda_air.");
                 if l.starts_with("declare") && l.contains("@__zluda_air.") { l.replace(" immarg", "") } else { l }
             })
             .collect::<Vec<_>>()
-            .join("\n");
+            .join("\n")
+            + "\ndeclare void @air.wg.barrier(i32, i32)\n";
         let shared_ll = out_dir.join("zluda_ptx_impl_air_shared.ll");
         std::fs::write(&shared_ll, shared).unwrap();
         let shared_bc = out_dir.join("zluda_ptx_impl_air_shared.bc");

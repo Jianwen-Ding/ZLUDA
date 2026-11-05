@@ -1978,7 +1978,10 @@ define zeroext i1 @__zluda_ptx_impl_agx_mbarrier_test_wait(ptr addrspace(3) %mba
 ; try_wait waits at a threadgroup barrier between polls, so that the other
 ; SIMD-groups run until they wait or exit (the functional simulator only
 ; switches SIMD-groups at barriers), for a bounded number of polls: PTX
-; programs retry while it returns false.
+; programs retry while it returns false. A GPU's SIMD-groups run at the same time,
+; and threads that stop polling after different numbers of polls would leave the
+; barriers of the others unmatched: the module for Metal drops these barriers
+; (!zluda.poll.barrier, LLVMZludaAirDropPollBarriers).
 define zeroext i1 @__zluda_ptx_impl_agx_mbarrier_try_wait(ptr addrspace(3) %mbar, i32 %parity) #1 {
 entry:
   br label %loop
@@ -1991,7 +1994,7 @@ loop:
   %again = and i1 %not.done, %more
   br i1 %again, label %wait, label %exit
 wait:
-  call void @llvm.agx.threadgroup.barrier()
+  call void @llvm.agx.threadgroup.barrier(), !zluda.poll.barrier !{}
   br label %loop
 exit:
   ret i1 %done
@@ -2022,7 +2025,7 @@ loop:
   %again = and i1 %not.done, %more
   br i1 %again, label %wait, label %exit
 wait:
-  call void @llvm.agx.threadgroup.barrier()
+  call void @llvm.agx.threadgroup.barrier(), !zluda.poll.barrier !{}
   br label %loop
 exit:
   ret i1 %done

@@ -1893,6 +1893,22 @@ LLVM_C_EXTERN_C_END
 
 LLVM_C_EXTERN_C_BEGIN
 
+// The barriers between the polls of try_wait (!zluda.poll.barrier), for the module
+// for Metal. AGX's functional simulator needs them to switch SIMD-groups; on a GPU
+// the threads poll at the same time, and those that stop polling first leave the
+// others' barriers unmatched, so the threadgroup never finishes.
+void LLVMZludaAirDropPollBarriers(LLVMModuleRef M)
+{
+    Module *Mod = unwrap(M);
+    SmallVector<Instruction *, 8> Dead;
+    for (Function &F : *Mod)
+        for (Instruction &I : instructions(F))
+            if (I.getMetadata("zluda.poll.barrier"))
+                Dead.push_back(&I);
+    for (Instruction *I : Dead)
+        I->eraseFromParent();
+}
+
 // ZLUDA_AGX_VIA_AIR, the .air for Metal: the shared memory registers in
 // Metal's numbering of threadgroup addresses. AGX numbers shared memory from
 // 0 (static variables in module order, then the dynamic shared memory), so

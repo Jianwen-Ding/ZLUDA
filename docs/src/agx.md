@@ -715,6 +715,8 @@ section; cluster scope fences are GPU scope ones):
   switches SIMD-groups only at barriers. On hardware the barriers of
   waiting SIMD-groups meet each other and those of `bar.sync`, so a
   `try_wait` can release a `bar.sync` of another SIMD-group early.
+  The AIR for Metal has no such barriers (threads that stop polling first would
+  leave the others' unmatched), and `try_wait` only polls there.
   `test_wait` only polls.
 * `mbarrier.init.layout::v1` sets bit 24 of word 1 (bits 0-23 hold the
   expected count), and `.layout::v1` objects record more state there: bit 25

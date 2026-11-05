@@ -548,6 +548,7 @@ fn metal_air(
             metal
         }
     };
+    unsafe { crate::ffi::LLVMZludaAirDropPollBarriers(metal.get()) };
     unsafe { LLVMZludaAirSharedLayout(metal.get()) };
     // ZLUDA_AIR_SALT: an unused stack array, its length from the string, at the start of each kernel of the Metal
     // copy, which makes Metal compile the pipelines anew instead of taking them from its cache, which ignores

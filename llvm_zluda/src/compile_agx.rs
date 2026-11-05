@@ -423,6 +423,9 @@ fn to_air(
         let err_msg = unsafe { llvm_sys::error::LLVMGetErrorMessage(error) };
         Err(Message::new(unsafe { CStr::from_ptr(err_msg) }).to_str().to_string())
     };
+    if buffer_globals {
+        unsafe { crate::ffi::LLVMZludaAirDropPollBarriers(module.get()) };
+    }
     run(c"agx-raise-to-air", agx)?;
     let mut globals = None;
     if buffer_globals {

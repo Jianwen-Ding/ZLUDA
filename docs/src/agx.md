@@ -909,7 +909,7 @@ at each operation.
 What compliance costs on `.ptx -> .air -> .agx` (2026-11-05): the checks and the Metal-only fixes change no AGX code. Against
 the build before them, the AGX objects of 14 Geekbench modules and 35 test programs are byte-identical in both modes, the portable
 AIR of 54 programs is identical, compile time is within noise (Cycles through AIR: 372.9 s -> 360.3 s) and peak memory is
-the same (Cycles: 10,180 -> 10,184 MB). Each of Cycles' 75 kernels compiled alone gives a byte-identical AGX object. Strict mode itself is what costs: on those Geekbench modules 61% more code and 24% more
+the same (Cycles: 10,180 -> 10,184 MB). Of Cycles' 75 kernels compiled alone, 73 give a byte-identical AGX object; `shade_shadow` and `shade_volume` passed the 6 GB limit of that comparison, on both builds. Strict mode itself is what costs: on those Geekbench modules 61% more code and 24% more
 compile time, and in the simulator's cost model, on 21 launches of test programs, 1.23 times the total cycles (geomean 1.33, median
 1.00, worst 5.11). Default mode stays the driver's default for that reason; 165 of the 841 PTX-formalization programs need strict
 mode for their exact results, on the simulator, and all 841 pass with it.

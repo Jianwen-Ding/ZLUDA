@@ -18,8 +18,9 @@ relocations and symbols); it is placed in the heap like a harness buffer, its re
 and bound at each kernel's zluda_globals argument, so .expect / .patch of globals work and globals keep their values
 between launches.
 
-Not supported here (reported UNSUPPORTED): tensor maps, multimem, fabric and clusters. In .address_size 32 modules
-an address is an offset in the heap, and the kernel's hidden base is the heap's address.
+Not supported here (reported UNSUPPORTED): clusters. In .address_size 32 modules an address is an offset in the heap,
+and the kernel's hidden base is the heap's address. The multimem and fabric tables are variables of the globals buffer
+(LLVMZludaAirTablesInGlobals), which the .multimem and .fabric directives fill; a multimem window is only a number.
 
     python3 ptx/tools/air_ptx_formalization_check.py --zoc target/debug/zoc --llc $LLVM/bin/llc \\
         --llvm-dis $LLVM/bin/llvm-dis PTX-formalization/tests/*.ptx
@@ -40,7 +41,7 @@ import agx_ptx_formalization_check as h  # noqa: E402
 from agx_ptx_formalization_check import SIZES, Unsupported  # noqa: E402
 
 BASE = h.BASE
-UNSUPPORTED_DIRECTIVES = ('.tensormap', '.multimem', '.fabric')
+UNSUPPORTED_DIRECTIVES = ()
 TRANSIENT = ('XPC_ERROR_CONNECTION_INTERRUPTED', 'did not reply')
 
 
@@ -413,6 +414,7 @@ def run_test(path, args):
         heap = Heap()
         syms, bufs = {}, {}
         globals_off = load_globals(tmp, heap, syms, bufs)
+        mm_count = 0
         # .address_size 32: an address is an offset in the heap, whose address is the kernel's hidden base; nothing
         # is at offset 0, which would be a null address
         if globals_off is None and re.search(r'^\s*\.address_size\s+32\b', module, re.M):
@@ -425,6 +427,8 @@ def run_test(path, args):
         def value(o, t):
             """A literal or symbol at type t: (bits, heap target or None)."""
             if o in syms:
+                if syms[o] >= h.MM_BASE:
+                    return syms[o], None  # (a multimem window: never read as memory)
                 return syms[o], syms[o]
             return h.lit_bits(o, t, syms), None
 
@@ -469,6 +473,46 @@ def run_test(path, args):
                 for k, v in enumerate(vals):
                     bits, target = value(v, t)
                     heap.write(addr + k * SIZES[t], SIZES[t], bits, target)
+            elif kw == '.tensormap':
+                # 16 words in memory, like a buffer: word 3 is an address
+                m = re.fullmatch(r'\.tensormap ([\w$.]+) \.(\w+) ([\w$.]+) \.dims \{(.*?)\} \.strides \{(.*?)\} '
+                                 r'\.box \{(.*?)\} \.swizzle (\d+)(?: \.im2col \{(.*?)\} \{(.*?)\} \.estrides \{(.*?)\})?\s*;?', d)
+                if not m:
+                    raise Unsupported(d)
+                ints = lambda g: [int(v, 0) for v in h.split_vals(g)] if g and g.strip() else []
+                im2col = None if m.group(8) is None else (ints(m.group(8)), ints(m.group(9)), ints(m.group(10)))
+                addr = BASE + ((heap.top + 255) & ~255)
+                heap.top = (addr - BASE) + 128
+                heap.ensure(heap.top)
+                syms[m.group(1)] = addr
+                bufs[m.group(1)] = [addr, 'u64', 16]
+                source = syms[m.group(3)]
+                for k, v in enumerate(h.tensormap_words(m.group(2), source, ints(m.group(4)), ints(m.group(5)),
+                                                        ints(m.group(6)), int(m.group(7)), im2col)):
+                    heap.write(addr + 8 * k, 8, v, source if k == 3 else None)
+            elif kw in ('.multimem', '.fabric'):
+                multimem = kw == '.multimem'
+                m = re.fullmatch(r'\.multimem ([\w$.]+) \.size (\d+) \{(.*?)\}\s*;?' if multimem else
+                                 r'\.fabric (\d+) \.size (\d+) \{(.*?)\}\s*;?', d)
+                if not m:
+                    raise Unsupported(d)
+                members = [syms[b.strip()] for b in m.group(3).split(',') if b.strip()]
+                if len(members) > 7:
+                    raise Unsupported('more than 7 devices')
+                table = syms.get('__zluda_mm_table' if multimem else '__zluda_fab_table')
+                if multimem:
+                    entry = mm_count
+                    mm_count += 1
+                    syms[m.group(1)] = h.MM_BASE + mm_count * h.MM_WINDOW
+                else:
+                    entry = int(m.group(1))
+                if table is not None:  # (no table: the module does not read it)
+                    row = table + 64 * entry
+                    heap.write(row, 4, len(members))
+                    if not multimem:
+                        heap.write(row + 4, 4, int(m.group(2)))
+                    for i, a in enumerate(members):
+                        heap.write(row + 8 + 8 * i, 8, a, a)
             elif kw in ('.texture', '.sampler', '.surface'):
                 # The descriptors of PTX-formalization's model (agx_ptx_formalization_check.object_words), with no
                 # hardware slot (word 16 bit 63 clear): the helpers sample in software from device memory, the

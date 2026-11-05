@@ -571,6 +571,9 @@ fn metal_air(
     }
     let mut json = std::ptr::null_mut();
     let mut err = std::ptr::null_mut();
+    if unsafe { crate::ffi::LLVMZludaAirTablesInGlobals(metal.get(), &mut err) } < 0 {
+        return Err(Message::new(unsafe { CStr::from_ptr(err) }).to_str().to_string());
+    }
     let metal_globals = match unsafe { LLVMZludaAirGlobalsToBuffer(metal.get(), &mut json, &mut err) } {
         -1 => return Err(Message::new(unsafe { CStr::from_ptr(err) }).to_str().to_string()),
         1 => Some(Message::new(unsafe { CStr::from_ptr(json) }).to_str().to_string()),

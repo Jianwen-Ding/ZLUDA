@@ -186,7 +186,7 @@ def run_program(path, args):
         module, dirs = h.split_program(f.read())
     module = h.lower_coll_test(module)
     for d in dirs:
-        if d.split()[0] in air.UNSUPPORTED_DIRECTIVES and d.split()[0] != '.tensormap':
+        if d.split()[0] in ('.multimem', '.fabric'):
             return {'status': 'UNSUPPORTED', 'detail': 'harness directive ' + d.split()[0]}
     if re.search(r'^\s*\.address_size\s+32\b', module, re.M):
         return {'status': 'UNSUPPORTED', 'detail': '.address_size 32'}

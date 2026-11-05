@@ -1945,6 +1945,96 @@ void LLVMZludaAirDropPollBarriers(LLVMModuleRef M)
     }
 }
 
+// The multimem and fabric tables in the module for Metal. The helpers (zluda_ptx_impl_agx_cvt.c)
+// read them at fixed addresses, which AGX's memory has and Metal cannot give. There they are
+// variables of the globals buffer, which whoever launches fills: entries as at the fixed
+// addresses. An address of a table left in the module is an error: it would fault on the GPU.
+// (Optimization folds an index's scale in: MM_BASE - 64 + field, for window k + 1.)
+int LLVMZludaAirTablesInGlobals(LLVMModuleRef M, char **error)
+{
+    constexpr int64_t MMBase = 0x700000000000, FabBase = 0x6ff000000000, TableBytes = 256 * 64;
+    Module *Mod = unwrap(M);
+    LLVMContext &Ctx = Mod->getContext();
+    Type *I8 = Type::getInt8Ty(Ctx);
+    Type *I64 = Type::getInt64Ty(Ctx);
+    GlobalVariable *Tables[2] = {nullptr, nullptr};
+    auto table = [&](int K) {
+        if (!Tables[K])
+        {
+            auto *Ty = ArrayType::get(I8, TableBytes);
+            Tables[K] = new GlobalVariable(*Mod, Ty, false, GlobalValue::InternalLinkage, ConstantAggregateZero::get(Ty),
+                                           K ? "__zluda_fab_table" : "__zluda_mm_table", nullptr,
+                                           GlobalValue::NotThreadLocal, 1);
+            Tables[K]->setAlignment(Align(64));
+        }
+        return Tables[K];
+    };
+    // The table and the distance from its start, of a constant that is an address in one
+    auto inTable = [&](const ConstantInt *C) -> std::optional<std::pair<int, int64_t>> {
+        if (C->getBitWidth() != 64)
+            return std::nullopt;
+        int64_t V = C->getSExtValue();
+        if (V >= MMBase - 64 && V < MMBase + TableBytes)
+            return std::make_pair(0, V - MMBase);
+        if (V >= FabBase && V < FabBase + TableBytes)
+            return std::make_pair(1, V - FabBase);
+        return std::nullopt;
+    };
+    auto pointer = [&](std::pair<int, int64_t> At) -> Constant * {
+        return ConstantExpr::getGetElementPtr(I8, table(At.first), ConstantInt::getSigned(I64, At.second));
+    };
+    int Changed = 0;
+    for (Function &F : *Mod)
+        for (Instruction &I : instructions(F))
+        {
+            bool Arithmetic = isa<IntToPtrInst>(I) || I.getOpcode() == Instruction::Add || I.getOpcode() == Instruction::Or;
+            for (Use &U : I.operands())
+            {
+                if (auto *CI = dyn_cast<ConstantInt>(U.get()); CI && Arithmetic)
+                {
+                    if (auto At = inTable(CI))
+                    {
+                        U.set(ConstantExpr::getPtrToInt(pointer(*At), I64));
+                        Changed++;
+                    }
+                }
+                else if (auto *CE = dyn_cast<ConstantExpr>(U.get()); CE && CE->getOpcode() == Instruction::IntToPtr)
+                {
+                    if (auto *CI = dyn_cast<ConstantInt>(CE->getOperand(0)))
+                        if (auto At = inTable(CI))
+                        {
+                            U.set(ConstantExpr::getPointerBitCastOrAddrSpaceCast(pointer(*At), CE->getType()));
+                            Changed++;
+                        }
+                }
+            }
+        }
+    // Nothing is left, however it is nested
+    for (Function &F : *Mod)
+        for (Instruction &I : instructions(F))
+        {
+            SmallVector<const Value *, 8> Work(I.op_begin(), I.op_end());
+            SmallPtrSet<const Value *, 8> Seen;
+            while (!Work.empty())
+            {
+                const Value *V = Work.pop_back_val();
+                if (!isa<Constant>(V) || isa<GlobalValue>(V) || !Seen.insert(V).second)
+                    continue;
+                if (auto *CE = dyn_cast<ConstantExpr>(V); CE && CE->getOpcode() == Instruction::IntToPtr)
+                    if (auto *CI = dyn_cast<ConstantInt>(CE->getOperand(0)); CI && inTable(CI))
+                    {
+                        std::string Text = "a multimem or fabric table address is left in " + F.getName().str();
+                        *error = LLVMCreateMessage(Text.c_str());
+                        return -1;
+                    }
+                if (auto *C = dyn_cast<ConstantExpr>(V))
+                    for (const Use &Op : C->operands())
+                        Work.push_back(Op.get());
+            }
+        }
+    return Changed;
+}
+
 // .address_size 32 in the module for Metal: a 32-bit address is an offset from the kernel's
 // hidden base (for AGX the base is 0, so the low bits of a variable's address are the offset).
 // So a variable's address, in device or constant memory, is the pointer minus the base, not

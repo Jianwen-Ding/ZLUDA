@@ -550,6 +550,8 @@ def main():
                     help='hang list ("TEST KERNEL" lines): never sent; a request that times out is added to it')
     ap.add_argument('--strict-fp', action='store_true',
                     help='compile with zoc --strict-fp: every class of difference then counts')
+    ap.add_argument('--via-agx', dest='via_agx', action='store_true',
+                    help='the older route (ZLUDA_AGX_VIA_AIR=1 zoc --target agx) instead of zoc --target air')
     ap.add_argument('--zero-shared', action='store_true',
                     help='shared memory starts as zero on the AIR side too (ZLUDA_AIR_ZERO_SHARED=1): the programs '
                          'that read it before writing it, which PTX leaves undefined, then compare')

@@ -1,0 +1,28 @@
+.version 8.6
+.target sm_90
+.address_size 64
+.visible .entry k(.param .u64 po)
+{
+    .reg .b64 %o; .reg .b32 %t, %v, %n; .reg .pred %p, %q;
+    ld.param.u64 %o, [po];
+    mov.u32 %t, %tid.x;
+    mov.u32 %n, 0;
+    setp.eq.u32 %p, %t, 0;
+    @%p bra POLL;
+WRITE: mov.u32 %v, 1;
+    st.volatile.global.u32 [%o], %v;
+    ret;
+POLL: ld.volatile.global.u32 %v, [%o];
+    add.u32 %n, %n, 1;
+    setp.ne.u32 %q, %v, 0;
+    @%q bra DONE;
+    setp.lt.u32 %q, %n, 100000;
+    @%q bra POLL;
+DONE: setp.ne.u32 %q, %v, 0;
+    selp.u32 %v, 1, 0, %q;
+    st.global.u32 [%o+4], %v;
+    ret;
+}
+.buffer O .u32 [2];
+.launch k <<< 1, 2 >>> (O);
+.expect O .u32 = { 1, 1 };

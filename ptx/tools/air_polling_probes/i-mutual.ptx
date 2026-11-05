@@ -1,0 +1,45 @@
+.version 8.6
+.target sm_90
+.address_size 64
+.visible .entry k(.param .u64 po)
+{
+    .reg .b64 %o; .reg .b32 %t, %v, %n, %s; .reg .pred %p, %q;
+    .local .align 4 .b32 c;
+    ld.param.u64 %o, [po];
+    mov.u32 %t, %tid.x;
+    mov.u32 %n, 0;
+    setp.eq.u32 %p, %t, 0;
+    selp.u32 %s, 1, 0, %p;
+    st.volatile.local.u32 [c], %s;
+    ld.volatile.local.u32 %s, [c];
+    setp.ne.u32 %q, %s, 0;
+    @%q bra AFTER;
+    // thread 1 waits for thread 0's first write, then answers
+W1: ld.volatile.global.u32 %v, [%o];
+    add.u32 %n, %n, 1;
+    setp.ne.u32 %q, %v, 0;
+    @%q bra ANSWER;
+    setp.lt.u32 %q, %n, 200000;
+    @%q bra W1;
+ANSWER: st.global.u32 [%o+12], %v;
+    mov.u32 %v, 1;
+    st.volatile.global.u32 [%o+4], %v;
+AFTER: ld.volatile.local.u32 %s, [c];
+    setp.eq.u32 %q, %s, 0;
+    @%q bra END;
+    // thread 0 writes, then waits for the answer
+    mov.u32 %v, 1;
+    st.volatile.global.u32 [%o], %v;
+    mov.u32 %n, 0;
+W0: ld.volatile.global.u32 %v, [%o+4];
+    add.u32 %n, %n, 1;
+    setp.ne.u32 %q, %v, 0;
+    @%q bra DONE;
+    setp.lt.u32 %q, %n, 200000;
+    @%q bra W0;
+DONE: st.global.u32 [%o+8], %v;
+END: ret;
+}
+.buffer O .u32 [4];
+.launch k <<< 1, 2 >>> (O);
+.expect O .u32 = { 1, 1, 1, 1 };

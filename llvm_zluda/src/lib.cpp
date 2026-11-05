@@ -26,6 +26,9 @@
 #include <llvm/Support/KnownFPClass.h>
 #include <llvm/Transforms/Utils/ModuleUtils.h>
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
+#include <llvm/Transforms/Utils/Local.h>
+#include <llvm/Transforms/Utils/PromoteMemToReg.h>
+#include <llvm/Analysis/PostDominators.h>
 #include <llvm/IR/InstIterator.h>
 #include <llvm/IR/PatternMatch.h>
 #include <llvm/IR/IntrinsicInst.h>
@@ -1894,15 +1897,202 @@ LLVM_C_EXTERN_C_END
 
 LLVM_C_EXTERN_C_BEGIN
 
+// Whether the loop waits for memory another thread writes: an exit depends on a volatile or
+// atomic read, or on a test-and-set whose operands the loop does not change. A compare-and-swap
+// of a value the loop computes is an update, in which some thread always succeeds.
+static bool zludaLoopWaitsForMemory(const Loop &L)
+{
+    auto cas = [](const Instruction *I) -> const Value * {
+        if (auto *CX = dyn_cast<AtomicCmpXchgInst>(I))
+            return CX->getNewValOperand();
+        if (auto *C = dyn_cast<CallInst>(I); C && C->getCalledFunction() &&
+            C->getCalledFunction()->getName().contains("atomic") && C->getCalledFunction()->getName().contains(".cmpxchg."))
+            return C->getArgOperand(2);
+        return nullptr;
+    };
+    for (BasicBlock *BB : L.blocks())
+        for (Instruction &I : *BB)
+            if (const Value *Desired = cas(&I); Desired && !L.isLoopInvariant(Desired))
+                return false;
+    SmallVector<Value *, 8> Work;
+    SmallVector<BasicBlock *, 4> Exiting;
+    L.getExitingBlocks(Exiting);
+    for (BasicBlock *BB : Exiting)
+        if (auto *Br = dyn_cast<CondBrInst>(BB->getTerminator()))
+            Work.push_back(Br->getCondition());
+    SmallPtrSet<Value *, 16> Seen;
+    while (!Work.empty())
+    {
+        auto *I = dyn_cast<Instruction>(Work.pop_back_val());
+        if (!I || !L.contains(I) || !Seen.insert(I).second)
+            continue;
+        if (auto *Ld = dyn_cast<LoadInst>(I))
+        {
+            if ((Ld->isAtomic() || Ld->isVolatile()) && !isa<AllocaInst>(getUnderlyingObject(Ld->getPointerOperand())))
+                return true;
+            continue;
+        }
+        if (cas(I))
+            return true; // (its desired value is the same in all iterations: above)
+        if (auto *RMW = dyn_cast<AtomicRMWInst>(I))
+        {
+            if (RMW->getOperation() == AtomicRMWInst::Xchg && L.isLoopInvariant(RMW->getValOperand()))
+                return true;
+            continue;
+        }
+        for (Value *Op : I->operands())
+            Work.push_back(Op);
+    }
+    return false;
+}
+
+// Threads of a SIMD-group run under one mask: the group runs one side of a branch until it ends, and
+// a thread that waits on one side for what a thread on the other writes can wait forever (either
+// order of the sides, on an M2 Max). So when one side of a branch waits and the other does not, the
+// other side runs first, with a second branch on a volatile copy of the condition, which no compiler
+// can correlate. Threads that wait for each other, or for what follows the branch, are not helped.
+// Returns how many branches changed.
+static int zludaRunWaitersLast(Function &F)
+{
+    if (F.isDeclaration() || !F.getReturnType()->isVoidTy())
+        return 0;
+    LLVMContext &Ctx = F.getContext();
+    int Changed = 0;
+    SmallPtrSet<BasicBlock *, 8> Done;
+    for (int Round = 0; Round < 32; Round++)
+    {
+        DominatorTree DT(F);
+        LoopInfo LI(DT);
+        PostDominatorTree PDT(F);
+        SmallPtrSet<Loop *, 4> Waiting;
+        for (Loop *L : LI.getLoopsInPreorder())
+            if (zludaLoopWaitsForMemory(*L))
+                Waiting.insert(L);
+        if (Waiting.empty())
+            return Changed;
+        auto inWaiting = [&](BasicBlock *BB) {
+            for (Loop *L = LI.getLoopFor(BB); L; L = L->getParentLoop())
+                if (Waiting.count(L))
+                    return true;
+            return false;
+        };
+        auto reach = [&](BasicBlock *Start, BasicBlock *Stop) {
+            SmallPtrSet<BasicBlock *, 16> Set;
+            SmallVector<BasicBlock *, 16> Work{Start};
+            while (!Work.empty())
+            {
+                BasicBlock *B = Work.pop_back_val();
+                if (B == Stop || !Set.insert(B).second)
+                    continue;
+                append_range(Work, successors(B));
+            }
+            return Set;
+        };
+        BasicBlock *Site = nullptr, *First = nullptr, *Second = nullptr, *Merge = nullptr;
+        for (BasicBlock &BB : F)
+        {
+            auto *Br = dyn_cast<CondBrInst>(BB.getTerminator());
+            if (!Br || Done.count(&BB) || inWaiting(&BB))
+                continue;
+            auto *Node = PDT.getNode(&BB);
+            BasicBlock *M = Node && Node->getIDom() ? Node->getIDom()->getBlock() : nullptr;
+            BasicBlock *A = Br->getSuccessor(0), *B = Br->getSuccessor(1);
+            if (A == M || B == M)
+                continue;
+            auto SA = reach(A, M), SB = reach(B, M);
+            if (SA.count(&BB) || SB.count(&BB) || llvm::any_of(SA, [&](BasicBlock *X) { return SB.count(X); }))
+                continue;
+            auto waits = [&](const SmallPtrSetImpl<BasicBlock *> &Set) {
+                return llvm::any_of(Waiting, [&](Loop *L) { return Set.count(L->getHeader()) != 0; });
+            };
+            if (waits(SA) == waits(SB))
+                continue;
+            Site = &BB;
+            First = waits(SA) ? B : A;
+            Second = waits(SA) ? A : B;
+            Merge = M;
+            break;
+        }
+        if (!Site)
+            return Changed;
+        Done.insert(Site);
+
+        // No value lives across the new paths: in memory for now.
+        BasicBlock &Entry = F.getEntryBlock();
+        BasicBlock::iterator AllocaPoint = Entry.begin();
+        SmallVector<PHINode *, 16> Phis;
+        SmallVector<Instruction *, 32> Values;
+        for (BasicBlock &BB : F)
+            for (Instruction &I : BB)
+            {
+                if (auto *Phi = dyn_cast<PHINode>(&I))
+                    Phis.push_back(Phi);
+                else if (!(isa<AllocaInst>(I) && BB.isEntryBlock()) && I.isUsedOutsideOfBlock(&BB))
+                    Values.push_back(&I);
+            }
+        SmallVector<AllocaInst *, 32> Slots;
+        for (Instruction *I : Values)
+            if (AllocaInst *A = DemoteRegToStack(*I, false, AllocaPoint))
+                Slots.push_back(A);
+        for (PHINode *Phi : Phis)
+            if (AllocaInst *A = DemotePHIToStack(Phi, AllocaPoint))
+                Slots.push_back(A);
+
+        auto FirstSet = reach(First, Merge);
+        auto *Br = cast<CondBrInst>(Site->getTerminator());
+        bool FirstOnTrue = Br->getSuccessor(0) == First;
+        IRBuilder<> EntryB(&*AllocaPoint);
+        AllocaInst *Copy = EntryB.CreateAlloca(EntryB.getInt32Ty(), F.getDataLayout().getAllocaAddrSpace(), nullptr, "zluda.side");
+        IRBuilder<> SB(Br);
+        SB.CreateStore(SB.CreateZExt(Br->getCondition(), SB.getInt32Ty()), Copy, /*isVolatile=*/true);
+        BasicBlock *Check = BasicBlock::Create(Ctx, "zluda.waiters", &F);
+        BasicBlock *After = Merge;
+        if (!After)
+        {
+            After = BasicBlock::Create(Ctx, "zluda.return", &F);
+            ReturnInst::Create(Ctx, After);
+        }
+        // the side that does not wait goes on to the check instead of what follows the branch
+        for (BasicBlock *B : FirstSet)
+        {
+            Instruction *Term = B->getTerminator();
+            if (isa<ReturnInst>(Term) && !Merge)
+            {
+                IRBuilder<>(Term).CreateBr(Check);
+                Term->eraseFromParent();
+                continue;
+            }
+            for (unsigned K = 0; K < Term->getNumSuccessors(); K++)
+                if (Term->getSuccessor(K) == Merge)
+                    Term->setSuccessor(K, Check);
+        }
+        Br->setSuccessor(FirstOnTrue ? 1 : 0, Check);
+        IRBuilder<> CB(Check);
+        Value *Cond = CB.CreateICmpNE(CB.CreateLoad(CB.getInt32Ty(), Copy, /*isVolatile=*/true), CB.getInt32(0));
+        CB.CreateCondBr(Cond, FirstOnTrue ? After : Second, FirstOnTrue ? Second : After);
+        DominatorTree DT2(F);
+        SmallVector<AllocaInst *, 32> Promotable;
+        for (AllocaInst *A : Slots)
+            if (isAllocaPromotable(A))
+                Promotable.push_back(A);
+        PromoteMemToReg(Promotable, DT2);
+        Changed++;
+    }
+    return Changed;
+}
+
 // The barriers between the polls of try_wait (!zluda.poll.barrier), for the module
 // for Metal. AGX's functional simulator needs them to switch SIMD-groups; on a GPU
 // the threads poll at the same time, and those that stop polling first leave the
 // others' barriers unmatched, so the threadgroup never finishes.
 void LLVMZludaAirDropPollBarriers(LLVMModuleRef M)
 {
+    Module *Mod = unwrap(M);
+    if (!getenv("ZLUDA_AIR_POLLERS_AS_THEY_COME"))
+        for (Function &F : *Mod)
+            zludaRunWaitersLast(F);
     if (getenv("ZLUDA_AIR_KEEP_POLL_BARRIERS"))
         return;
-    Module *Mod = unwrap(M);
     SmallVector<Instruction *, 8> Dead;
     SmallPtrSet<Function *, 4> Polling;
     for (Function &F : *Mod)

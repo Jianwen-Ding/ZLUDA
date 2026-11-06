@@ -1658,7 +1658,7 @@ fn agx_fast_mma() -> bool {
 /// options are LLVM's, for the whole process) and the stack retry below.
 const LARGE_MODULE_BYTES: usize = 4 << 20;
 /// The stack per thread a large module is first compiled with.
-const LARGE_MODULE_STACK_TRY: u32 = 12288;
+const LARGE_MODULE_STACK_TRY: u32 = 16384;
 
 /// Compiles PTX for `cpu` with zoc, through the compilation cache.
 pub(crate) fn compile_ptx(ptx: &[u8], cpu: &str) -> Result<(Vec<u8>, String), String> {

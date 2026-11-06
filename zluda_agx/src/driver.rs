@@ -3476,8 +3476,11 @@ pub(crate) unsafe fn cuOccupancyMaxPotentialBlockSizeWithFlags(
         let (m, name) = d.functions.get(&(f.0 as usize)).ok_or(CUerror::INVALID_HANDLE)?;
         let k = &d.modules[m].module.kernels[name];
         let max = k.max_threads_per_threadgroup().min(if block_size_limit == 0 { u32::MAX } else { block_size_limit as u32 });
-        // Experiment (AIR_EXPERIMENTS.md, "Options at cap 80"): the largest block size to recommend.
-        let max = std::env::var("ZLUDA_AGX_MAX_BLOCK").ok().and_then(|v| v.parse::<u32>().ok()).map_or(max, |m| max.min(m));
+        // The largest block size to recommend (ZLUDA_AGX_MAX_BLOCK, 192 by default): of the sizes that keep as many
+        // threads resident, the larger was chosen, and with fewer registers per thread (call trees capped at 72)
+        // blocks of up to 1024 threads hold a core's threads in a few blocks whose slowest SIMD-groups hold them.
+        // Blender Cycles (M2 Max, junkshop, samples per minute): 321 -> 329, and 337 -> 344 with every kernel capped.
+        let max = max.min(std::env::var("ZLUDA_AGX_MAX_BLOCK").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(192));
         let mut best = (0u32, 0u32, 0u32); // occupied threads, resident blocks, block size
         let mut candidates: Vec<u32> = (32..=max).step_by(32).collect();
         if max % 32 != 0 {

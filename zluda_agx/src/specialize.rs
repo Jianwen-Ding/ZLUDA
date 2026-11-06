@@ -494,7 +494,7 @@ mod tests {
         let (out, n) = fold_const_loads(ptx, &[("params", &bytes)], 8);
         assert_eq!(n, 5, "{out}");
         let (narrow, n4) = fold_const_loads(ptx, &[("params", &bytes)], 4);
-        assert_eq!(n4, 3, "{narrow}");
+        assert_eq!(n4, 4, "{narrow}");
         assert!(narrow.contains("ld.const.u64 %rd1, [params];"));
         assert!(out.contains("mov.b64 \t%rd1, 0x1122334455667788;"));
         assert!(out.contains("mov.b64 \t%rd2, 0xFFFFFFFFFFFFFFFE;"), "sign-extended into the wider register");

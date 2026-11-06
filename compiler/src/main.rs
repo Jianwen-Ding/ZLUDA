@@ -121,9 +121,16 @@ fn main_core() -> Result<(), CompilerError> {
         let portable = fs::read(&ptx_path)?;
         let mut flag = ptx_path.clone().into_os_string();
         flag.push(".o3");
-        let kernels_own_o3 = fs::read_to_string(&flag).is_ok_and(|f| f.trim() == "1");
-        // (portable AIR is written for large modules: their options)
-        large_module_defaults(usize::MAX);
+        let flag = fs::read_to_string(&flag).unwrap_or_default();
+        let kernels_own_o3 = flag.lines().next().is_some_and(|l| l.trim() == "1");
+        // (portable AIR is written for large modules: their options, and the register cap chosen for the module)
+        large_module_defaults(usize::MAX, false);
+        if let Some(cap) = flag.lines().nth(1).map(str::trim).filter(|c| c.starts_with("-agx-default-max-gprs")) {
+            let args = env::var("ZLUDA_AGX_LLVM_ARGS").unwrap_or_default();
+            if !args.split_whitespace().any(|a| a.starts_with("-agx-default-max-gprs")) {
+                env::set_var("ZLUDA_AGX_LLVM_ARGS", format!("{cap} {args}"));
+            }
+        }
         let kernels: Vec<String> = env::var("ZLUDA_AGX_ONLY_KERNELS")
             .map(|k| k.split(',').filter(|k| !k.is_empty()).map(str::to_string).collect())
             .unwrap_or_default();
@@ -158,7 +165,7 @@ fn main_core() -> Result<(), CompilerError> {
             texts.push(String::from_utf8(fs::read(path)?).map_err(|e| e.utf8_error())?);
         }
         if opts.arch.as_deref().is_some_and(|a| a.starts_with("agx")) {
-            large_module_defaults(texts.iter().map(|t| t.len()).sum());
+            large_module_defaults(texts.iter().map(|t| t.len()).sum(), texts.iter().any(|t| parts::defines_functions(t)));
         }
         let object_only = opts.object_only;
         let sink = |bytes: &Vec<u8>, extension: String| {
@@ -265,20 +272,32 @@ const LARGE_MODULE_BYTES: usize = 4 << 20;
 /// to relocations, which the merger of the kernels' objects resolves to one copy of each function.
 const LARGE_MODULE_LLVM_ARGS: &str = "-agx-experimental-leaf-calls -agx-measured-call-frames -agx-call-relocations";
 
+/// The register cap of every kernel of a large module whose kernels share functions (LARGE_PROGRAM_MAX_GPRS): its
+/// call trees are capped by the backend already (-agx-call-tree-max-gprs), and its other kernels run between them.
+/// Blender Cycles, M2 Max, junkshop samples per minute: 321 with its call trees capped at 72, 337 with every kernel.
+/// A module of independent kernels keeps them uncapped: llama.cpp's, capped at 72, 35-44% slower (leaf kernels
+/// declare what they use, a cap only spills there).
+const LARGE_PROGRAM_MAX_GPRS: &str = "-agx-default-max-gprs=72";
+
 /// A large module (over LARGE_MODULE_BYTES of PTX): its kernels one at a time (ZLUDA_AGX_PER_KERNEL=1) with
-/// LARGE_MODULE_LLVM_ARGS, before LLVM reads its options. ZLUDA_AGX_LARGE_MODULE=0 compiles it as a small one
-/// (every function inlined into every kernel); ZLUDA_AGX_PER_KERNEL and ZLUDA_AGX_LLVM_ARGS set by the caller stay.
-fn large_module_defaults(bytes: usize) {
+/// LARGE_MODULE_LLVM_ARGS, before LLVM reads its options, and with functions other than kernels (`functions`),
+/// LARGE_PROGRAM_MAX_GPRS. ZLUDA_AGX_LARGE_MODULE=0 compiles it as a small one (every function inlined into every
+/// kernel); ZLUDA_AGX_PER_KERNEL and ZLUDA_AGX_LLVM_ARGS set by the caller stay.
+fn large_module_defaults(bytes: usize, functions: bool) {
     if bytes <= LARGE_MODULE_BYTES || env::var("ZLUDA_AGX_LARGE_MODULE").is_ok_and(|v| v == "0") {
         return;
     }
     if env::var_os("ZLUDA_AGX_PER_KERNEL").is_none() {
         env::set_var("ZLUDA_AGX_PER_KERNEL", "1");
     }
-    let args = env::var("ZLUDA_AGX_LLVM_ARGS").unwrap_or_default();
+    let mut args = env::var("ZLUDA_AGX_LLVM_ARGS").unwrap_or_default();
     if !args.split_whitespace().any(|a| a == "-agx-experimental-leaf-calls") {
-        env::set_var("ZLUDA_AGX_LLVM_ARGS", format!("{LARGE_MODULE_LLVM_ARGS} {args}"));
+        args = format!("{LARGE_MODULE_LLVM_ARGS} {args}");
     }
+    if functions && !args.split_whitespace().any(|a| a.starts_with("-agx-default-max-gprs")) {
+        args = format!("{LARGE_PROGRAM_MAX_GPRS} {args}");
+    }
+    env::set_var("ZLUDA_AGX_LLVM_ARGS", args);
 }
 
 fn compile_air(
@@ -914,6 +933,30 @@ mod parts {
             Some(kb) => cores.min((kb * 1024 / (3 << 29)) as usize).max(1),
             None => cores.min(4),
         }
+    }
+
+    /// Whether `src` defines functions other than kernels (`.func` with a body, not `.extern`).
+    pub fn defines_functions(src: &str) -> bool {
+        let mut depth = 0i32;
+        let mut line_start = 0;
+        let bytes = src.as_bytes();
+        for i in 0..bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                b'\n' => line_start = i + 1,
+                b'.' if depth == 0 => {
+                    let rest = &src[i..];
+                    if rest.starts_with(".func") && rest[5..].starts_with(|c: char| c.is_whitespace())
+                        && !src[line_start..i].contains(".extern")
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     /// `src` in up to `n` parts of about the same size (whole kernels, in source order within each), or None: fewer

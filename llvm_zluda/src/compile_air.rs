@@ -337,12 +337,17 @@ pub fn compile_air(
     let mut portable = bitcode(&linked);
     // ZLUDA_AGX_PORTABLE_OUT=FILE (with AGX code): the portable AIR the AGX code is made from, to make other kernels'
     // code from later without the front end again (compile_agx_from_portable; zluda_agx's lazy kernels). FILE.o3
-    // records whether each kernel's module has O3 of its own (kernels_own_o3), which the AIR does not show.
+    // records whether each kernel's module has O3 of its own (kernels_own_o3), which the AIR does not show, and on a
+    // second line the register cap zoc chose for the module (-agx-default-max-gprs), for its later kernels.
     if let (Some(_), Some(path)) = (agx_cpu, std::env::var_os("ZLUDA_AGX_PORTABLE_OUT")) {
         let mut flag = path.clone();
         flag.push(".o3");
+        let cap = std::env::var("ZLUDA_AGX_LLVM_ARGS")
+            .ok()
+            .and_then(|a| a.split_whitespace().find(|a| a.starts_with("-agx-default-max-gprs")).map(str::to_string))
+            .unwrap_or_default();
         std::fs::write(&path, &portable)
-            .and_then(|()| std::fs::write(&flag, if kernels_own_o3 { "1" } else { "0" }))
+            .and_then(|()| std::fs::write(&flag, format!("{}\n{cap}\n", if kernels_own_o3 { "1" } else { "0" })))
             .map_err(|e| format!("{}: {e}", std::path::Path::new(&path).display()))?;
     }
     if let Some(hook) = compiler_hook.filter(|_| !agx_only) {

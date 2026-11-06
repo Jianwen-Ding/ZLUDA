@@ -69,6 +69,11 @@ pub struct Options {
     /// times as much
     stack_size: u32,
 
+    #[bpaf(long("from-portable"))]
+    /// AGX: the file is portable AIR that a compilation of a large module wrote (ZLUDA_AGX_PORTABLE_OUT): the AGX
+    /// object of its kernels (ZLUDA_AGX_ONLY_KERNELS: only these), without the front end again
+    from_portable: bool,
+
     #[bpaf(positional("filename"), some("a PTX file"))]
     /// PTX files. AGX links several into one object (their kernels and
     /// functions, as cuLink does); the outputs are named after the first
@@ -111,6 +116,30 @@ fn main_core() -> Result<(), CompilerError> {
     };
     output_path.push(filename_base);
 
+    if opts.from_portable {
+        let arch = opts.arch.clone().unwrap_or_default();
+        let portable = fs::read(&ptx_path)?;
+        let mut flag = ptx_path.clone().into_os_string();
+        flag.push(".o3");
+        let kernels_own_o3 = fs::read_to_string(&flag).is_ok_and(|f| f.trim() == "1");
+        // (portable AIR is written for large modules: their options)
+        large_module_defaults(usize::MAX);
+        let kernels: Vec<String> = env::var("ZLUDA_AGX_ONLY_KERNELS")
+            .map(|k| k.split(',').filter(|k| !k.is_empty()).map(str::to_string).collect())
+            .unwrap_or_default();
+        let asm_path = output_path.with_extension("asm");
+        let text_hook = |bytes: &Vec<u8>, _: String| write_to_file(bytes, &asm_path).unwrap();
+        let object = llvm_zluda::compile_air::compile_agx_from_portable(
+            &portable,
+            kernels_own_o3,
+            arch.strip_prefix("agx-").map_or("", |_| arch.as_str()),
+            &kernels,
+            (!opts.object_only).then_some(&text_hook as &dyn Fn(&Vec<u8>, String)),
+        )
+        .map_err(|message| CompilerError::GenericError { cause: None, message })?;
+        fs::write(output_path.with_extension("o"), object)?;
+        return Ok(());
+    }
     let target = match opts.target.as_deref() {
         Some("air") => ptx::Target::Air,
         Some("amdgpu") => ptx::Target::Amdgpu,

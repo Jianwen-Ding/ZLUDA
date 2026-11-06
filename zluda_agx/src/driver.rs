@@ -113,10 +113,40 @@ pub(crate) struct Driver {
 
 struct LazySource {
     ptx: std::sync::Arc<str>,
+    /// A large module's portable AIR (compile_ptx_kernel), in a directory of the module's own.
+    portable: Option<std::sync::Arc<PortableAir>>,
     kernels: std::collections::HashSet<String>,
     compiled: HashMap<String, usize>,
     pending: HashMap<String, CompileResultSlot>,
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Where a large lazily loaded module keeps its portable AIR, removed with the module.
+struct PortableAir {
+    dir: tempfile::TempDir,
+}
+
+impl PortableAir {
+    fn new() -> Option<Self> {
+        tempfile::tempdir().ok().map(|dir| PortableAir { dir })
+    }
+    fn path(&self) -> std::path::PathBuf {
+        self.dir.path().join("module.portable.air")
+    }
+}
+
+/// Compiles kernel `name` of lazily loaded PTX: alone from the module's portable AIR when it has one (a large
+/// module), else as PTX without the other entries.
+fn compile_lazy_kernel(
+    ptx: &str,
+    name: &str,
+    portable: Option<&PortableAir>,
+    cpu: &str,
+) -> Result<(Vec<u8>, String), String> {
+    match portable {
+        Some(p) => compile_ptx_kernel(ptx.as_bytes(), name, &p.path(), cpu),
+        None => compile_ptx(crate::specialize::without_other_entries(ptx, name).as_bytes(), cpu),
+    }
 }
 
 #[derive(Clone)]
@@ -133,6 +163,7 @@ type CompileResultSlot = std::sync::Arc<(
 
 fn precompile_kernels(
     ptx: std::sync::Arc<str>,
+    portable: Option<std::sync::Arc<PortableAir>>,
     names: &[String],
     cpu: String,
     workers: usize,
@@ -150,8 +181,9 @@ fn precompile_kernels(
     let worker_slots = std::sync::Arc::new(pending.clone());
     let queue = std::sync::Arc::new(Mutex::new(std::collections::VecDeque::from(names.to_vec())));
     for _ in 0..workers.min(names.len()) {
-        let (ptx, cpu, pending, queue, cancelled) = (
+        let (ptx, portable, cpu, pending, queue, cancelled) = (
             ptx.clone(),
+            portable.clone(),
             cpu.clone(),
             worker_slots.clone(),
             queue.clone(),
@@ -163,10 +195,7 @@ fn precompile_kernels(
             }
             let name = queue.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
             let Some(name) = name else { break; };
-            let result = std::panic::catch_unwind(|| {
-                let image = crate::specialize::without_other_entries(&ptx, &name);
-                compile_ptx(image.as_bytes(), &cpu)
-            })
+            let result = std::panic::catch_unwind(|| compile_lazy_kernel(&ptx, &name, portable.as_deref(), &cpu))
             .unwrap_or_else(|_| Err(format!("{name}: background compiler panicked")));
             let (lock, ready) = &*pending[&name];
             *lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
@@ -1639,15 +1668,34 @@ pub(crate) fn compile_ptx(ptx: &[u8], cpu: &str) -> Result<(Vec<u8>, String), St
 /// Compiles PTX modules into one AGX object: one module, or several linked together (`cuLink*`: functions declared
 /// `.extern` in one are defined `.visible` in another).
 pub(crate) fn compile_ptx_linked(sources: &[&[u8]], cpu: &str) -> Result<(Vec<u8>, String), String> {
-    compile_or_cached(sources, cpu, false).map(|o| o.expect("compiled"))
+    compile_or_cached(sources, cpu, false, None).map(|o| o.expect("compiled"))
+}
+
+/// Compiles kernel `kernel` of a large PTX module (over `LARGE_MODULE_BYTES`) alone, with the global data layout of
+/// the whole module's, through the compilation cache. `portable`: where the module's portable AIR is kept (zoc
+/// ZLUDA_AGX_PORTABLE_OUT): the first compilation writes it, the others make their kernel's code from it
+/// (zoc --from-portable) without the front end again (Blender Cycles: 73 s for three kernels from the PTX, 5 s from
+/// the AIR; the objects are the same).
+pub(crate) fn compile_ptx_kernel(
+    ptx: &[u8],
+    kernel: &str,
+    portable: &std::path::Path,
+    cpu: &str,
+) -> Result<(Vec<u8>, String), String> {
+    compile_or_cached(&[ptx], cpu, false, Some((kernel, portable))).map(|o| o.expect("compiled"))
 }
 
 /// The compilation cache's object for PTX, without compiling it on a miss (`None`).
 pub(crate) fn cached_ptx(ptx: &[u8], cpu: &str) -> Option<(Vec<u8>, String)> {
-    compile_or_cached(&[ptx], cpu, true).ok().flatten()
+    compile_or_cached(&[ptx], cpu, true, None).ok().flatten()
 }
 
-fn compile_or_cached(sources: &[&[u8]], cpu: &str, cached_only: bool) -> Result<Option<(Vec<u8>, String)>, String> {
+fn compile_or_cached(
+    sources: &[&[u8]],
+    cpu: &str,
+    cached_only: bool,
+    kernel: Option<(&str, &std::path::Path)>,
+) -> Result<Option<(Vec<u8>, String)>, String> {
     let zoc = zoc_path();
     let stamp = std::fs::metadata(&zoc)
         .and_then(|m| m.modified())
@@ -1704,6 +1752,11 @@ fn compile_or_cached(sources: &[&[u8]], cpu: &str, cached_only: bool) -> Result<
         }
     }
     options.push("air");
+    // (a kernel alone: its object differs from the whole module's)
+    let kernel_option = kernel.map(|(k, _)| format!("kernel={k}"));
+    if let Some(k) = &kernel_option {
+        options.push(k);
+    }
     let key = Key { source, chip: cpu, compiler: &compiler, options: &options };
     let compiled = std::cell::Cell::new(false);
     let started = Instant::now();
@@ -1737,19 +1790,37 @@ fn compile_or_cached(sources: &[&[u8]], cpu: &str, cached_only: bool) -> Result<
             paths.push(src);
         }
         // the object alone: its .agx.kernels records describe the kernels, so no IR text or assembly
+        // A kernel alone: from the module's portable AIR when an earlier compilation kept it, else from the PTX,
+        // keeping it (written aside and renamed, so that a compilation on another thread reads it whole or not at
+        // all)
+        let from_portable = kernel.filter(|(_, p)| p.exists()).map(|(_, p)| p);
+        let portable_out = kernel.filter(|_| from_portable.is_none()).map(|(_, p)| {
+            let mut tmp = p.as_os_str().to_owned();
+            tmp.push(format!(".{}.{:?}", std::process::id(), std::thread::current().id()));
+            std::path::PathBuf::from(tmp)
+        });
         let run = |stack_bytes: Option<u32>| -> Result<std::process::Output, String> {
             let mut command = std::process::Command::new(&zoc);
             if let Some(b) = stack_bytes {
                 let llvm_args = std::env::var("ZLUDA_AGX_LLVM_ARGS").unwrap_or_default();
                 command.env("ZLUDA_AGX_LLVM_ARGS", format!("-agx-measured-stack-bytes={b} {llvm_args}"));
             }
-            command
-                .args(&args)
-                .arg("--output-dir")
-                .arg(dir.path())
-                .args(&paths)
-                .output()
-                .map_err(|e| format!("{}: {e}", zoc.display()))
+            if let Some((k, _)) = kernel {
+                command.env("ZLUDA_AGX_ONLY_KERNELS", k);
+            }
+            if let Some(out) = &portable_out {
+                command.env("ZLUDA_AGX_PORTABLE_OUT", out);
+            }
+            match from_portable {
+                Some(portable) => command
+                    .args(["--target", "air", "--arch", cpu, "--object-only", "--agx-only", "--from-portable"])
+                    .arg("--output-dir")
+                    .arg(dir.path())
+                    .arg(portable),
+                None => command.args(&args).arg("--output-dir").arg(dir.path()).args(&paths),
+            }
+            .output()
+            .map_err(|e| format!("{}: {e}", zoc.display()))
         };
         // The stack the kernels reserve per thread sizes the scratch buffer, about 7 GB between 12 and 32 KB on the M2
         // Max whether or not it is touched, and the frames of called functions are only known once compiled. So a
@@ -1769,7 +1840,18 @@ fn compile_or_cached(sources: &[&[u8]], cpu: &str, cached_only: bool) -> Result<
         if crate::log_enabled() {
             eprintln!("[zluda_agx] zoc finished: {}, elapsed={:.3}s", out.status, started.elapsed().as_secs_f64());
         }
-        let object = std::fs::read(dir.path().join("module.o"))
+        if let (Some(out_path), Some((_, portable)), true) = (&portable_out, kernel, out.status.success()) {
+            let (mut flag_tmp, mut flag) = (out_path.as_os_str().to_owned(), portable.as_os_str().to_owned());
+            flag_tmp.push(".o3");
+            flag.push(".o3");
+            // (the flag first: a reader that finds the AIR finds its flag)
+            let _ = std::fs::rename(&flag_tmp, &flag).and_then(|()| std::fs::rename(out_path, portable));
+        }
+        let object_name = match from_portable {
+            Some(p) => std::path::Path::new(p.file_name().unwrap_or_default()).with_extension("o"),
+            None => std::path::PathBuf::from("module.o"),
+        };
+        let object = std::fs::read(dir.path().join(object_name))
             .map_err(|_| format!("zoc failed: {}", String::from_utf8_lossy(&out.stderr)))?;
         let asm = std::fs::read_to_string(dir.path().join("module.asm")).unwrap_or_default();
         Ok((object, asm))
@@ -2325,7 +2407,15 @@ unsafe fn load_module_data(d: &mut Driver, bytes: *const u8) -> Result<usize, CU
     // For large PTX modules, compile one entry now and defer the others
     // until cuModuleGetFunction. Keep all globals visible in each image so
     // that the later kernels can share this module's data buffer.
-    let lazy = if std::env::var("ZLUDA_AGX_LAZY_KERNELS").is_ok_and(|v| !v.is_empty() && v != "0")
+    // ZLUDA_AGX_LAZY_KERNELS: 1 for every PTX module of several kernels, 0 for none; by default a large module's
+    // (over LARGE_MODULE_BYTES, whose kernels come from its portable AIR, the front end once: compile_ptx_kernel).
+    let lazy_env = std::env::var("ZLUDA_AGX_LAZY_KERNELS").ok().filter(|v| !v.is_empty());
+    let lazy_on = match lazy_env.as_deref() {
+        Some("0") => false,
+        Some(_) => true,
+        None => image.len() > LARGE_MODULE_BYTES,
+    };
+    let lazy = if lazy_on
         && !agx_checked()
         && !image.starts_with(b"\x7fELF")
         && image.get(..8) != Some(&module::FAT_MAGIC[..])
@@ -2337,12 +2427,26 @@ unsafe fn load_module_data(d: &mut Driver, bytes: *const u8) -> Result<usize, CU
     } else {
         None
     };
-    let initial_ptx = lazy.as_ref().map(|(text, names)| crate::specialize::without_other_entries(text, &names[0]));
+    // (a large module's kernels from its portable AIR, the front end once: compile_ptx_kernel)
+    let portable = lazy.as_ref().filter(|_| image.len() > LARGE_MODULE_BYTES).and_then(|_| PortableAir::new()).map(std::sync::Arc::new);
+    let initial_ptx = lazy
+        .as_ref()
+        .filter(|_| portable.is_none())
+        .map(|(text, names)| crate::specialize::without_other_entries(text, &names[0]));
     let empty_library = (magic == 0x466243b1 || magic == 0xba55ed50) && image.is_empty();
     let m = if empty_library {
         module::Module::default()
     } else {
-        load_image(initial_ptx.as_deref().map_or(image, str::as_bytes), &cpu)?
+        match (&lazy, &portable) {
+            (Some((text, names)), Some(p)) => {
+                let (object, asm) = compile_lazy_kernel(text, &names[0], Some(p), &cpu).map_err(|e| {
+                    eprintln!("zluda_agx: {e}");
+                    CUerror::INVALID_PTX
+                })?;
+                module::Module::load(&object, &asm).map_err(|_| CUerror::INVALID_IMAGE)?
+            }
+            _ => load_image(initial_ptx.as_deref().map_or(image, str::as_bytes), &cpu)?,
+        }
     };
     let mut loaded = LoadedModule::new(&mut d.ctx.vm, m).map_err(from_io)?;
     if loaded.uses_heap() {
@@ -2396,12 +2500,13 @@ unsafe fn load_module_data(d: &mut Driver, bytes: *const u8) -> Result<usize, CU
         let workers = std::env::var("ZLUDA_AGX_PARALLEL_KERNELS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(16);
         let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pending = if workers > 0 {
-            precompile_kernels(ptx.clone(), &names[1..], cpu, workers, cancelled.clone())
+            precompile_kernels(ptx.clone(), portable.clone(), &names[1..], cpu, workers, cancelled.clone())
         } else {
             HashMap::new()
         };
         d.lazy_sources.insert(h, LazySource {
             ptx,
+            portable,
             kernels: names.into_iter().collect(),
             compiled: HashMap::new(),
             pending,
@@ -2609,6 +2714,7 @@ fn module_function(d: &mut Driver, parent: usize, name: &str) -> Result<usize, C
             } else {
                 let start = Instant::now();
                 let ptx = source.ptx.clone();
+                let portable = source.portable.clone();
                 let pending = source.pending.get(&name).cloned();
                 let module = if let Some(slot) = pending {
                     let (lock, ready) = &*slot;
@@ -2617,6 +2723,13 @@ fn module_function(d: &mut Driver, parent: usize, name: &str) -> Result<usize, C
                         result = ready.wait(result).unwrap_or_else(|e| e.into_inner());
                     }
                     let (object, asm) = result.as_ref().unwrap().clone().map_err(|e| {
+                        eprintln!("zluda_agx: {e}");
+                        CUerror::INVALID_PTX
+                    })?;
+                    module::Module::load(&object, &asm).map_err(|_| CUerror::INVALID_IMAGE)?
+                } else if let Some(p) = &portable {
+                    let cpu = d.ctx.props.llvm_cpu.clone();
+                    let (object, asm) = compile_lazy_kernel(&ptx, &name, Some(p), &cpu).map_err(|e| {
                         eprintln!("zluda_agx: {e}");
                         CUerror::INVALID_PTX
                     })?;

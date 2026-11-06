@@ -335,6 +335,16 @@ pub fn compile_air(
     run(&linked, c"air-verify", &air, &options)?;
     diagnostics.check()?;
     let mut portable = bitcode(&linked);
+    // ZLUDA_AGX_PORTABLE_OUT=FILE (with AGX code): the portable AIR the AGX code is made from, to make other kernels'
+    // code from later without the front end again (compile_agx_from_portable; zluda_agx's lazy kernels). FILE.o3
+    // records whether each kernel's module has O3 of its own (kernels_own_o3), which the AIR does not show.
+    if let (Some(_), Some(path)) = (agx_cpu, std::env::var_os("ZLUDA_AGX_PORTABLE_OUT")) {
+        let mut flag = path.clone();
+        flag.push(".o3");
+        std::fs::write(&path, &portable)
+            .and_then(|()| std::fs::write(&flag, if kernels_own_o3 { "1" } else { "0" }))
+            .map_err(|e| format!("{}: {e}", std::path::Path::new(&path).display()))?;
+    }
     if let Some(hook) = compiler_hook.filter(|_| !agx_only) {
         hook(&portable, String::from("portable.air"));
         if !object_only {
@@ -393,138 +403,9 @@ pub fn compile_air(
                 // compilation) and to admit a kernel only while the estimates of the running ones and its own fit
                 // in the memory available (four of Cycles' largest at once took 14 GB)
                 let sizes = kernel_sizes(&linked, &kernels);
-                let mut order: Vec<usize> = (0..kernels.len()).collect();
-                order.sort_by_key(|&i| std::cmp::Reverse(sizes[i]));
-                let budget = available_memory().map_or(u64::MAX, |b| b / 4 * 3);
-                let estimate: Vec<u64> = sizes.iter().map(|&n| kernel_bytes(n).min(budget)).collect();
-                if timings {
-                    for &i in order.iter().take(8) {
-                        eprintln!(
-                            "[zluda air] kernel {}: {} instructions, about {} MB",
-                            kernels[i].to_string_lossy(),
-                            sizes[i],
-                            estimate[i] >> 20
-                        );
-                    }
-                }
                 drop(linked);
                 drop(agx);
-                let jobs = THREAD_JOBS
-                    .with(|j| j.get())
-                    .or_else(|| std::env::var("ZLUDA_AGX_JOBS").ok().and_then(|v| v.parse::<usize>().ok()))
-                    .unwrap_or_else(default_jobs)
-                    .clamp(1, kernels.len());
-                // ZLUDA_AGX_INLINE_KERNELS (comma separated, or "all"): these kernels' functions inlined, no real
-                // calls (to tell a calls bug from another, and to measure calls against code size)
-                let inline_kernels: Vec<String> = std::env::var("ZLUDA_AGX_INLINE_KERNELS")
-                    .map(|v| v.split(',').map(str::to_string).collect())
-                    .unwrap_or_default();
-                let want_asm = text_hook.is_some();
-                // (started, bytes admitted, kernels running)
-                let admission = std::sync::Mutex::new((vec![false; kernels.len()], 0u64, 0usize));
-                let admitted = std::sync::Condvar::new();
-                // the next kernel to compile: the first in `order` not started whose estimate fits beside the
-                // running ones' (any when none runs); None when all have started
-                let take = || -> Option<usize> {
-                    let mut state = admission.lock().unwrap();
-                    loop {
-                        let (started, used, running) = &mut *state;
-                        let mut pending = false;
-                        for &i in &order {
-                            if started[i] {
-                                continue;
-                            }
-                            pending = true;
-                            if *running == 0 || used.saturating_add(estimate[i]) <= budget {
-                                started[i] = true;
-                                *used += estimate[i];
-                                *running += 1;
-                                return Some(i);
-                            }
-                        }
-                        if !pending {
-                            return None;
-                        }
-                        state = admitted.wait(state).unwrap();
-                    }
-                };
-                let done = |i: usize| {
-                    let mut state = admission.lock().unwrap();
-                    state.1 -= estimate[i];
-                    state.2 -= 1;
-                    admitted.notify_all();
-                };
-                let results: Vec<std::sync::Mutex<Option<Result<(Vec<u8>, Vec<u8>), String>>>> =
-                    kernels.iter().map(|_| std::sync::Mutex::new(None)).collect();
-                std::thread::scope(|scope| {
-                    for _ in 0..jobs {
-                        scope.spawn(|| {
-                            let agx = match target_machine(AGX_TRIPLE, &cpu) {
-                                Ok(agx) => agx,
-                                Err(e) => {
-                                    if let Some(i) = take() {
-                                        *results[i].lock().unwrap() = Some(Err(e));
-                                        done(i);
-                                    }
-                                    return;
-                                }
-                            };
-                            unsafe { llvm_sys::target_machine::LLVMSetTargetMachineAsmVerbosity(agx.get(), 1) };
-                            loop {
-                                let Some(i) = take() else { break };
-                                let name = &kernels[i];
-                                let started = std::time::Instant::now();
-                                let one_kernel = || -> Result<(Vec<u8>, Vec<u8>), String> {
-                                    let kctx = Context::new();
-                                    let kdiagnostics = Diagnostics::new(&kctx);
-                                    let whole = Module::try_from_bitcode_lazy(&kctx, &portable)
-                                        .ok_or("the portable AIR could not be read back for a kernel's AGX code")?;
-                                    let one = Module::from_raw(unsafe {
-                                        LLVMZludaAirKernelModule(whole.get(), name.as_ptr())
-                                    });
-                                    drop(whole);
-                                    if inline_kernels.iter().any(|k| k == "all" || k.as_bytes() == name.to_bytes()) {
-                                        inline_everything(&one);
-                                    }
-                                    if let Some(pipeline) = per_kernel_pipeline {
-                                        run(&one, pipeline, &agx, &PassBuilderOptions::new())?;
-                                    }
-                                    let mut asm = Vec::new();
-                                    if want_asm {
-                                        asm = agx
-                                            .emit_to_memory_buffer(&one.clone(), LLVMCodeGenFileType::LLVMAssemblyFile)?
-                                            .to_vec();
-                                        kdiagnostics.check()?;
-                                    }
-                                    let object =
-                                        agx.emit_to_memory_buffer(&one, LLVMCodeGenFileType::LLVMObjectFile)?.to_vec();
-                                    kdiagnostics.check()?;
-                                    Ok((object, asm))
-                                };
-                                let result = one_kernel();
-                                if timings {
-                                    let seconds = started.elapsed().as_secs_f64();
-                                    eprintln!("[zluda air] AGX code of {}: {seconds:.3} s", name.to_string_lossy());
-                                }
-                                *results[i].lock().unwrap() = Some(result);
-                                done(i);
-                            }
-                        });
-                    }
-                });
-                let mut objects = Vec::with_capacity(kernels.len());
-                let mut asm = Vec::new();
-                for r in results {
-                    let (object, kernel_asm) = r.into_inner().unwrap().ok_or("a kernel's AGX code was not made")??;
-                    objects.push(object);
-                    asm.extend(kernel_asm);
-                }
-                stage("AGX objects, a kernel at a time");
-                let object = crate::agx_merge::merge(&objects)?;
-                stage("AGX object (merged)");
-                if let Some(hook) = text_hook {
-                    hook(&asm, String::from("asm"));
-                }
+                let object = per_kernel_object(&portable, &kernels, &sizes, &cpu, per_kernel_pipeline, timings, text_hook)?;
                 if let Some(hook) = compiler_hook {
                     hook(&object, String::from("o"));
                 }
@@ -561,6 +442,190 @@ pub fn compile_air(
         }
     };
     Ok(AirCompilation { portable, metal: metal_air, metal_globals, agx_object })
+}
+
+/// The AGX object of some kernels of portable AIR that compile_air wrote (ZLUDA_AGX_PORTABLE_OUT), a kernel at a
+/// time as compile_air makes a large module's: `kernels` (all when empty), with the same global data layout as every
+/// other compilation of that AIR. `kernels_own_o3`: the FILE.o3 compile_air wrote with it.
+pub fn compile_agx_from_portable(
+    portable: &[u8],
+    kernels_own_o3: bool,
+    agx_cpu: &str,
+    kernels: &[String],
+    text_hook: Option<&dyn Fn(&Vec<u8>, String)>,
+) -> Result<Vec<u8>, String> {
+    init_globals()?;
+    let timings = std::env::var_os("ZLUDA_AIR_TIMINGS").is_some();
+    let cpu = CString::new(if agx_cpu.is_empty() { AGX_DEFAULT_CPU } else { agx_cpu }).unwrap();
+    // (as compile_air chooses the kernels' own pipeline)
+    let per_kernel_pipeline: Option<&CStr> = match std::env::var("ZLUDA_AIR_AGX_PIPELINE").as_deref() {
+        Ok("none") => None,
+        Ok("o3") => Some(c"default<O3>"),
+        _ => kernels_own_o3.then_some(c"default<O3>"),
+    };
+    let (names, sizes) = {
+        let ctx = Context::new();
+        let module =
+            Module::try_from_bitcode(&ctx, portable, None).ok_or("the portable AIR could not be read")?;
+        let mut names = kernel_names(&module);
+        if !kernels.is_empty() {
+            names.retain(|k| kernels.iter().any(|o| k.to_bytes() == o.as_bytes()));
+            if names.len() != kernels.len() {
+                return Err(format!("the portable AIR does not have all of the kernels {}", kernels.join(",")));
+            }
+        }
+        let sizes = kernel_sizes(&module, &names);
+        (names, sizes)
+    };
+    per_kernel_object(portable, &names, &sizes, &cpu, per_kernel_pipeline, timings, text_hook)
+}
+
+/// The AGX object of `kernels` of the portable AIR, a kernel at a time (each in a context of its own, read back from
+/// `portable`), merged into the object a whole-module compilation makes (agx_merge). `sizes`: each kernel's
+/// (kernel_sizes).
+#[allow(clippy::too_many_arguments)]
+fn per_kernel_object(
+    portable: &[u8],
+    kernels: &[CString],
+    sizes: &[u64],
+    cpu: &CStr,
+    per_kernel_pipeline: Option<&CStr>,
+    timings: bool,
+    text_hook: Option<&dyn Fn(&Vec<u8>, String)>,
+) -> Result<Vec<u8>, String> {
+    let phase = std::time::Instant::now();
+    let mut order: Vec<usize> = (0..kernels.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(sizes[i]));
+    let budget = available_memory().map_or(u64::MAX, |b| b / 4 * 3);
+    let estimate: Vec<u64> = sizes.iter().map(|&n| kernel_bytes(n).min(budget)).collect();
+    if timings {
+        for &i in order.iter().take(8) {
+            eprintln!(
+                "[zluda air] kernel {}: {} instructions, about {} MB",
+                kernels[i].to_string_lossy(),
+                sizes[i],
+                estimate[i] >> 20
+            );
+        }
+    }
+    let jobs = THREAD_JOBS
+        .with(|j| j.get())
+        .or_else(|| std::env::var("ZLUDA_AGX_JOBS").ok().and_then(|v| v.parse::<usize>().ok()))
+        .unwrap_or_else(default_jobs)
+        .clamp(1, kernels.len());
+    // ZLUDA_AGX_INLINE_KERNELS (comma separated, or "all"): these kernels' functions inlined, no real
+    // calls (to tell a calls bug from another, and to measure calls against code size)
+    let inline_kernels: Vec<String> = std::env::var("ZLUDA_AGX_INLINE_KERNELS")
+        .map(|v| v.split(',').map(str::to_string).collect())
+        .unwrap_or_default();
+    let want_asm = text_hook.is_some();
+    // (started, bytes admitted, kernels running)
+    let admission = std::sync::Mutex::new((vec![false; kernels.len()], 0u64, 0usize));
+    let admitted = std::sync::Condvar::new();
+    // the next kernel to compile: the first in `order` not started whose estimate fits beside the
+    // running ones' (any when none runs); None when all have started
+    let take = || -> Option<usize> {
+        let mut state = admission.lock().unwrap();
+        loop {
+            let (started, used, running) = &mut *state;
+            let mut pending = false;
+            for &i in &order {
+                if started[i] {
+                    continue;
+                }
+                pending = true;
+                if *running == 0 || used.saturating_add(estimate[i]) <= budget {
+                    started[i] = true;
+                    *used += estimate[i];
+                    *running += 1;
+                    return Some(i);
+                }
+            }
+            if !pending {
+                return None;
+            }
+            state = admitted.wait(state).unwrap();
+        }
+    };
+    let done = |i: usize| {
+        let mut state = admission.lock().unwrap();
+        state.1 -= estimate[i];
+        state.2 -= 1;
+        admitted.notify_all();
+    };
+    let results: Vec<std::sync::Mutex<Option<Result<(Vec<u8>, Vec<u8>), String>>>> =
+        kernels.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..jobs {
+            scope.spawn(|| {
+                let agx = match target_machine(AGX_TRIPLE, &cpu) {
+                    Ok(agx) => agx,
+                    Err(e) => {
+                        if let Some(i) = take() {
+                            *results[i].lock().unwrap() = Some(Err(e));
+                            done(i);
+                        }
+                        return;
+                    }
+                };
+                unsafe { llvm_sys::target_machine::LLVMSetTargetMachineAsmVerbosity(agx.get(), 1) };
+                loop {
+                    let Some(i) = take() else { break };
+                    let name = &kernels[i];
+                    let started = std::time::Instant::now();
+                    let one_kernel = || -> Result<(Vec<u8>, Vec<u8>), String> {
+                        let kctx = Context::new();
+                        let kdiagnostics = Diagnostics::new(&kctx);
+                        let whole = Module::try_from_bitcode_lazy(&kctx, &portable)
+                            .ok_or("the portable AIR could not be read back for a kernel's AGX code")?;
+                        let one = Module::from_raw(unsafe {
+                            LLVMZludaAirKernelModule(whole.get(), name.as_ptr())
+                        });
+                        drop(whole);
+                        if inline_kernels.iter().any(|k| k == "all" || k.as_bytes() == name.to_bytes()) {
+                            inline_everything(&one);
+                        }
+                        if let Some(pipeline) = per_kernel_pipeline {
+                            run(&one, pipeline, &agx, &PassBuilderOptions::new())?;
+                        }
+                        let mut asm = Vec::new();
+                        if want_asm {
+                            asm = agx
+                                .emit_to_memory_buffer(&one.clone(), LLVMCodeGenFileType::LLVMAssemblyFile)?
+                                .to_vec();
+                            kdiagnostics.check()?;
+                        }
+                        let object =
+                            agx.emit_to_memory_buffer(&one, LLVMCodeGenFileType::LLVMObjectFile)?.to_vec();
+                        kdiagnostics.check()?;
+                        Ok((object, asm))
+                    };
+                    let result = one_kernel();
+                    if timings {
+                        let seconds = started.elapsed().as_secs_f64();
+                        eprintln!("[zluda air] AGX code of {}: {seconds:.3} s", name.to_string_lossy());
+                    }
+                    *results[i].lock().unwrap() = Some(result);
+                    done(i);
+                }
+            });
+        }
+    });
+    let mut objects = Vec::with_capacity(kernels.len());
+    let mut asm = Vec::new();
+    for r in results {
+        let (object, kernel_asm) = r.into_inner().unwrap().ok_or("a kernel's AGX code was not made")??;
+        objects.push(object);
+        asm.extend(kernel_asm);
+    }
+    if timings {
+        eprintln!("[zluda air] AGX objects, a kernel at a time: {:.3} s", phase.elapsed().as_secs_f64());
+    }
+    let object = crate::agx_merge::merge(&objects)?;
+    if let Some(hook) = text_hook {
+        hook(&asm, String::from("asm"));
+    }
+    Ok(object)
 }
 
 /// The AIR for Metal from `linked` (optimized in AIR's address spaces): `source`, the copy taken before that

@@ -40,6 +40,7 @@
 #include <array>
 #include <map>
 #include <optional>
+#include <chrono>
 #include <functional>
 #include <string>
 #include <llvm/IR/CallingConv.h>
@@ -3635,6 +3636,136 @@ static Value *zludaAirRoundf(ConstrainedFPIntrinsic *C, Value *m, ZludaModeField
     return nullptr;
 }
 
+// The floating point mode a function starts in (see LLVMZludaAirStaticRounding): round to nearest, and the denormal
+// modes of its attributes (bit 4 for f32, bit 5 for f16).
+static uint32_t zludaInitialMode(Function &F)
+{
+    auto flushes = [&](const fltSemantics &sem) {
+        auto denorm = F.getDenormalMode(sem);
+        return denorm.Output != DenormalMode::IEEE && denorm.Output != DenormalMode::Dynamic;
+    };
+    return 1 | (1 << 2) | (flushes(APFloat::IEEEsingle()) ? 0x10 : 0) | (flushes(APFloat::IEEEhalf()) ? 0x20 : 0);
+}
+
+// The mode reaching each direct call of F, bit by bit: a forward data flow over F's blocks from its initial mode,
+// through the sets of the mode (the front end's (get & mask) | bits around an operation with other modifiers), with
+// each bit known (and its value) or not: paths that switch only the denormal bits leave the rounding bits known.
+// Calls are taken to leave the mode as they find it, as the front end does.
+struct ZludaKnownMode
+{
+    uint32_t known = 0, value = 0;
+    bool operator==(const ZludaKnownMode &o) const { return known == o.known && (value & known) == (o.value & o.known); }
+    bool operator!=(const ZludaKnownMode &o) const { return !(*this == o); }
+};
+
+static DenseMap<CallBase *, ZludaKnownMode> zludaModesAtCalls(Function &F, Function *Set, Function *Get)
+{
+    using K = ZludaKnownMode;
+    DenseMap<CallBase *, K> out;
+    if (F.isDeclaration())
+        return out;
+    DenseMap<BasicBlock *, K> in;
+    DenseMap<Value *, K> gets;
+    std::function<K(Value *, unsigned)> eval = [&](Value *V, unsigned depth) -> K {
+        if (auto *C = dyn_cast<ConstantInt>(V))
+            return {~0u, (uint32_t)C->getZExtValue()};
+        if (depth > 8)
+            return {};
+        if (auto *CI = dyn_cast<CallInst>(V); CI && Get && CI->getCalledFunction() == Get)
+        {
+            auto it = gets.find(CI);
+            return it == gets.end() ? K{} : it->second;
+        }
+        if (auto *BO = dyn_cast<BinaryOperator>(V))
+        {
+            K a = eval(BO->getOperand(0), depth + 1), b = eval(BO->getOperand(1), depth + 1);
+            uint32_t a0 = a.known & ~a.value, a1 = a.known & a.value, b0 = b.known & ~b.value, b1 = b.known & b.value;
+            switch (BO->getOpcode())
+            {
+            case Instruction::And: return {(a.known & b.known) | a0 | b0, a.value & b.value};
+            case Instruction::Or: return {(a.known & b.known) | a1 | b1, a.value | b.value};
+            case Instruction::Xor: return {a.known & b.known, a.value ^ b.value};
+            default: return {};
+            }
+        }
+        return {};
+    };
+    auto merge = [](K a, K b) {
+        uint32_t known = a.known & b.known & ~(a.value ^ b.value);
+        return K{known, a.value & known};
+    };
+    bool argMode = F.hasFnAttribute("zluda-fpmode-arg");
+    in[&F.getEntryBlock()] = argMode ? K{} : K{~0u, zludaInitialMode(F)};
+    SmallVector<BasicBlock *, 32> work{&F.getEntryBlock()};
+    SmallPtrSet<BasicBlock *, 32> queued{&F.getEntryBlock()};
+    unsigned steps = 0;
+    while (!work.empty())
+    {
+        BasicBlock *BB = work.pop_back_val();
+        queued.erase(BB);
+        // (a function whose flow does not settle quickly: every mode unknown; a bit can only go from known to
+        // unknown, so this is not reached in practice)
+        if (++steps > 64 * F.size() + 1024)
+            return {};
+        K st = in[BB];
+        for (Instruction &I : *BB)
+            if (auto *CI = dyn_cast<CallInst>(&I))
+            {
+                Function *Callee = CI->getCalledFunction();
+                if (Get && Callee == Get)
+                    gets[CI] = st;
+                else if (Set && Callee == Set)
+                    st = eval(CI->getArgOperand(0), 0);
+            }
+        for (BasicBlock *Succ : successors(BB))
+        {
+            auto it = in.find(Succ);
+            K merged = it == in.end() ? st : merge(it->second, st);
+            if (it == in.end() || it->second != merged)
+            {
+                in[Succ] = merged;
+                if (queued.insert(Succ).second)
+                    work.push_back(Succ);
+            }
+        }
+    }
+    for (BasicBlock &BB : F)
+    {
+        auto it = in.find(&BB);
+        if (it == in.end())
+            continue;
+        K st = it->second;
+        for (Instruction &I : BB)
+            if (auto *CI = dyn_cast<CallBase>(&I))
+            {
+                Function *Callee = CI->getCalledFunction();
+                if (Set && Callee == Set)
+                    st = eval(CI->getArgOperand(0), 0);
+                else if (Callee && !Callee->isDeclaration())
+                    out[CI] = st;
+            }
+    }
+    return out;
+}
+
+// Whether a call needs its callee to run in the caller's mode (inlined, or given the mode as an argument): not when
+// the mode reaching it is known to be the callee's own initial mode in every bit the callee's operations can see:
+// the rounding bits (0-3); the f16 flush bit (5) where it has f16 operations (half: itself or a function it calls);
+// the f32 flush bit (4) in strict mode, or where it sets the mode (setsMode, as above): outside strict mode the
+// hardware flushes f32 at round to nearest, and only the directed roundings' emulation reads that bit.
+static bool zludaCallNeedsMode(CallBase *CI, const DenseMap<CallBase *, ZludaKnownMode> &modes, bool strict, bool setsMode,
+                               bool half)
+{
+    auto it = modes.find(CI);
+    if (it == modes.end())
+        return true;
+    uint32_t relevant = 0xf | ((strict || setsMode) ? 0x10 : 0) | (half ? 0x20 : 0);
+    if ((it->second.known & relevant) != relevant)
+        return true;
+    return ((it->second.value ^ zludaInitialMode(*CI->getCalledFunction())) & relevant) != 0;
+}
+
+
 // ZLUDA_AGX target Air: the floating point mode of PTX's rounding modifiers
 // (__zluda_air.set.fpmode / __zluda_air.get.fpmode, as llvm.agx.set.fpmode for
 // the Agx target: f32 rounding in bits 0-1, f16/bf16/f64 in bits 2-3,
@@ -3650,6 +3781,128 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
     LLVMContext &Ctx = Mod->getContext();
     Function *Set = Mod->getFunction("__zluda_air.set.fpmode");
     Function *Get = Mod->getFunction("__zluda_air.get.fpmode");
+    static const bool debug = getenv("ZLUDA_AIR_MODE_DEBUG") != nullptr;
+    auto t0 = std::chrono::steady_clock::now();
+    auto note = [&](const char *what, size_t n) {
+        if (debug)
+            fprintf(stderr, "[zluda air mode] %s: %zu (%.2f s)\n", what, n,
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    };
+    // The functions that set the mode, themselves or in a function they call (zludaCallNeedsMode)
+    auto modeSetters = [&] {
+        SmallPtrSet<Function *, 32> setters;
+        if (!Set)
+            return setters;
+        // the sets that write a directed rounding (a rounding bit known without the mode read, other than round to
+        // nearest's: the denormal-only switches between .ftz and other operations keep the rounding they read), then up the
+        // call graph from them: each function once
+        std::function<ZludaKnownMode(Value *, unsigned)> written = [&](Value *V, unsigned depth) -> ZludaKnownMode {
+            if (auto *C = dyn_cast<ConstantInt>(V))
+                return {~0u, (uint32_t)C->getZExtValue()};
+            auto *BO = dyn_cast<BinaryOperator>(V);
+            if (!BO || depth > 8)
+                return {};
+            ZludaKnownMode a = written(BO->getOperand(0), depth + 1), b = written(BO->getOperand(1), depth + 1);
+            uint32_t a0 = a.known & ~a.value, a1 = a.known & a.value, b0 = b.known & ~b.value, b1 = b.known & b.value;
+            switch (BO->getOpcode())
+            {
+            case Instruction::And: return {(a.known & b.known) | a0 | b0, a.value & b.value};
+            case Instruction::Or: return {(a.known & b.known) | a1 | b1, a.value | b.value};
+            case Instruction::Xor: return {a.known & b.known, a.value ^ b.value};
+            default: return {};
+            }
+        };
+        SmallVector<Function *, 32> work;
+        for (User *U : Set->users())
+            if (auto *CI = dyn_cast<CallBase>(U); CI && CI->getCalledFunction() == Set)
+            {
+                ZludaKnownMode w = written(CI->getArgOperand(0), 0);
+                // (a rounding bit written, known, other than round to nearest's 0b0101)
+                bool directed = ((w.value ^ 5) & w.known & 0xf) != 0;
+                if (directed && setters.insert(CI->getFunction()).second)
+                    work.push_back(CI->getFunction());
+            }
+        while (!work.empty())
+        {
+            Function *F = work.pop_back_val();
+            for (User *U : F->users())
+                if (auto *CI = dyn_cast<CallBase>(U); CI && CI->getCalledFunction() == F)
+                    if (setters.insert(CI->getFunction()).second)
+                        work.push_back(CI->getFunction());
+        }
+        return setters;
+    };
+    // The functions with f16 operations, themselves or in a function they call (zludaCallNeedsMode)
+    auto halfUsers = [&] {
+        SmallPtrSet<Function *, 32> halves;
+        SmallVector<Function *, 32> work;
+        for (Function &F : *Mod)
+            if (!F.isDeclaration() && any_of(instructions(F), [](Instruction &I) {
+                    auto *C = dyn_cast<ConstrainedFPIntrinsic>(&I);
+                    return C && (C->getType()->getScalarType()->isHalfTy() ||
+                                 (C->arg_size() && C->getArgOperand(0)->getType()->getScalarType()->isHalfTy()));
+                }))
+                if (halves.insert(&F).second)
+                    work.push_back(&F);
+        while (!work.empty())
+        {
+            Function *F = work.pop_back_val();
+            for (User *U : F->users())
+                if (auto *CI = dyn_cast<CallBase>(U); CI && CI->getCalledFunction() == F)
+                    if (halves.insert(CI->getFunction()).second)
+                        work.push_back(CI->getFunction());
+        }
+        return halves;
+    };
+    auto halves = halfUsers();
+    auto setters = modeSetters();
+    // A call reached at round to nearest by denormal modes other than its callee's own: the call goes to a copy of
+    // the callee whose attributes start it in those modes (one per combination), instead of inlining it, which put
+    // Blender Cycles' call tree into its kernels (each .ftz switch changes the denormal bits). Returns whether the
+    // call was redirected.
+    DenseMap<std::pair<Function *, uint32_t>, Function *> modeClones;
+    size_t redirected = 0;
+    auto redirect = [&](CallBase *C, const DenseMap<CallBase *, ZludaKnownMode> &modes) {
+        auto it = modes.find(C);
+        Function *Callee = C->getCalledFunction();
+        if (it == modes.end() || !Callee || (it->second.known & 0x3f) != 0x3f || (it->second.value & 0xf) != 5 ||
+            Callee->hasFnAttribute("zluda-fpmode-arg"))
+            return false;
+        uint32_t bits = it->second.value & 0x30;
+        if ((zludaInitialMode(*Callee) & 0x30) == bits)
+            return false;
+        Function *Base = Callee;
+        if (auto *md = Callee->getMetadata("zluda.mode.clone.of"))
+            Base = cast<Function>(cast<ValueAsMetadata>(md->getOperand(0))->getValue());
+        Function *&Clone = modeClones[{Base, bits}];
+        if (!Clone)
+        {
+            if ((zludaInitialMode(*Base) & 0x30) == bits)
+                Clone = Base;
+            else
+            {
+                ValueToValueMapTy VMap;
+                Clone = CloneFunction(Base, VMap);
+                Clone->setName(Base->getName() + (bits & 0x10 ? ".ftz32" : ".ieee32") + (bits & 0x20 ? ".ftz16" : ".ieee16"));
+                Clone->setLinkage(GlobalValue::InternalLinkage);
+                Clone->setMetadata("zluda.mode.clone.of", MDNode::get(Ctx, ValueAsMetadata::get(Base)));
+                DenormalFPEnv env = Base->getDenormalFPEnv();
+                env.F32Mode = bits & 0x10 ? DenormalMode::getPreserveSign() : DenormalMode::getIEEE();
+                env.DefaultMode = bits & 0x20 ? DenormalMode::getPreserveSign() : DenormalMode::getIEEE();
+                Clone->removeFnAttr(Attribute::DenormalFPEnv);
+                Clone->addFnAttr(Attribute::get(Ctx, Attribute::DenormalFPEnv, env.toIntValue()));
+                if (setters.count(Base))
+                    setters.insert(Clone);
+                if (halves.count(Base))
+                    halves.insert(Clone);
+            }
+        }
+        if (Clone == Callee)
+            return false;
+        C->setCalledFunction(Clone);
+        redirected++;
+        return true;
+    };
     // Avoid call-graph work for the common case with no explicit mode changes.
     if (Set && !Set->use_empty()) {
         // Lowering a callee independently would restart its dynamic rounding at nearest.
@@ -3690,6 +3943,7 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
             return false;
         };
         DenseMap<Function *, bool> recursion;
+        setters = modeSetters();
         for (bool again = true; again;) {
             again = false;
             SmallVector<CallBase *, 32> calls;
@@ -3700,11 +3954,16 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
                 });
                 if (!changesMode)
                     continue;
+                // (only calls reached by a mode other than the callee's own: Blender Cycles' .ftz switches made this
+                // inline its whole call tree into its kernels, 0.48 -> 21 M instructions, over 10 minutes to compile)
+                auto modes = zludaModesAtCalls(F, Set, Get);
                 for (Instruction &I : instructions(F))
                     if (auto *C = dyn_cast<CallBase>(&I)) {
                         Function *Callee = C->getCalledFunction();
                         if (!Callee || !dependent.contains(Callee) || Callee->isDeclaration() ||
-                            Callee->hasFnAttribute(Attribute::NoInline) || Callee->hasFnAttribute("air-kernel"))
+                            Callee->hasFnAttribute(Attribute::NoInline) || Callee->hasFnAttribute("air-kernel") ||
+                            !zludaCallNeedsMode(C, modes, strict, setters.count(Callee), halves.count(Callee)) ||
+                            redirect(C, modes))
                             continue;
                         auto [It, Inserted] = recursion.try_emplace(Callee, false);
                         if (Inserted)
@@ -3712,6 +3971,25 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
                         if (!It->second)
                             calls.push_back(C);
                     }
+            }
+            note("pre-pass inlines", calls.size());
+            if (debug)
+            {
+                std::map<std::pair<uint32_t, uint32_t>, unsigned> why; // (unknown relevant bits, differing bits)
+                for (CallBase *C : calls)
+                {
+                    auto modes = zludaModesAtCalls(*C->getFunction(), Set, Get);
+                    Function *Callee = C->getCalledFunction();
+                    uint32_t relevant = 0xf | ((strict || setters.count(Callee)) ? 0x10 : 0) | (halves.count(Callee) ? 0x20 : 0);
+                    auto it = modes.find(C);
+                    uint32_t unknown = it == modes.end() ? 0xff : relevant & ~it->second.known;
+                    uint32_t differ = it == modes.end() ? 0 : relevant & it->second.known & (it->second.value ^ zludaInitialMode(*Callee));
+                    why[{unknown, differ}]++;
+                    if (why.size() > 40)
+                        break;
+                }
+                for (auto &[k, n] : why)
+                    fprintf(stderr, "[zluda air mode]   unknown %#x differ %#x: %u\n", k.first, k.second, n);
             }
             for (CallBase *C : calls) {
                 InlineFunctionInfo Info;
@@ -3754,15 +4032,30 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
                 }
             return false;
         };
+        // (only calls the mode reaching them can tell from the callee's own, zludaCallNeedsMode)
+        DenseMap<Function *, DenseMap<CallBase *, ZludaKnownMode>> modesIn;
+        auto needs = [&](CallInst *CI, const SmallPtrSet<Function *, 32> &setters) {
+            Function *Caller = CI->getFunction();
+            auto it = modesIn.find(Caller);
+            if (it == modesIn.end())
+                it = modesIn.try_emplace(Caller, zludaModesAtCalls(*Caller, Set, Get)).first;
+            return zludaCallNeedsMode(CI, it->second, strict, setters.count(CI->getCalledFunction()), halves.count(CI->getCalledFunction()));
+        };
         for (unsigned round = 0; round < 8; round++)
         {
             SmallVector<CallInst *, 16> calls;
+            setters = modeSetters();
+            modesIn.clear();
             for (Function &F : *Mod)
                 if (!F.isDeclaration() && !F.hasFnAttribute("air-kernel") &&
                     readsMode(F))
                     for (User *U : F.users())
-                        if (auto *CI = dyn_cast<CallInst>(U); CI && CI->getCalledFunction() == &F && CI->getFunction() != &F)
+                        if (auto *CI = dyn_cast<CallInst>(U); CI && CI->getCalledFunction() == &F && CI->getFunction() != &F &&
+                                                              needs(CI, setters))
                             calls.push_back(CI);
+            // (those that a copy in the reaching denormal modes serves instead)
+            calls.erase(llvm::remove_if(calls, [&](CallInst *CI) { return redirect(CI, modesIn[CI->getFunction()]); }), calls.end());
+            note("inlines of functions reading the mode", calls.size());
             if (calls.empty())
                 break;
             for (CallInst *CI : calls)
@@ -3778,14 +4071,19 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
         {
             again = false;
             SmallVector<Function *, 4> work;
+            setters = modeSetters();
+            modesIn.clear();
             for (Function &F : *Mod)
                 if (!F.isDeclaration() && !F.hasFnAttribute("air-kernel") && !F.hasFnAttribute("zluda-fpmode-arg") &&
                     readsMode(F) && !F.use_empty() &&
                     all_of(F.users(), [&](User *U) {
                         auto *CI = dyn_cast<CallInst>(U);
                         return CI && CI->getCalledFunction() == &F;
-                    }))
+                    }) &&
+                    any_of(F.users(), [&](User *U) { return needs(cast<CallInst>(U), setters); }))
                     work.push_back(&F);
+            note("calls to copies in other denormal modes", redirected);
+            note("functions given the mode as an argument", work.size());
             if (work.empty())
                 break;
             if (!Get)

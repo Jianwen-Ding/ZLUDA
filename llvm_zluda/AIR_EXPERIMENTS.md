@@ -70,6 +70,8 @@ What gained:
   callee-saved 16, scheduler target 48, 16 KB stack, blocks <= 192): 1054 / 1034 / 1036. Defaults now: the backend
   caps call trees (-agx-call-tree-max-gprs=72), zoc caps every kernel of a large module that defines functions
   (junkshop 321 -> 337), blocks up to 192 (+2.4%).
+- **Cap 64 against 72** (both the call trees and the module cap, with everything else at the new defaults): classroom
+  283 -> 287, junkshop 343 -> 330, monster 425 -> 431 (1051 -> 1048): no better, 72 stays.
 - **Refuted for leaf kernels**: the same cap on every kernel of llama.cpp: pp128 547 -> 309, tg64 122 -> 80. Leaf kernels
   declare what they use; a cap only spills there.
 

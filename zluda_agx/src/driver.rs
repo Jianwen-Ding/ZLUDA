@@ -82,6 +82,10 @@ pub(crate) struct Driver {
     /// state of each (module, kernel, scalar arguments, 8-byte argument equalities, block).
     spec_sources: HashMap<usize, std::sync::Arc<str>>,
     specs: HashMap<SpecKey, Spec>,
+    /// Constant-memory specialization (const_spec.rs), per module whose PTX has host-written `.const` variables;
+    /// and the module of each lazily compiled kernel's own module (whose global data it shares).
+    const_specs: HashMap<usize, crate::const_spec::ConstSpec>,
+    const_root: HashMap<usize, usize>,
     /// The device heap of `malloc` / `free`, made when the first module that uses it is loaded
     /// (CU_LIMIT_MALLOC_HEAP_SIZE bytes).
     heap: Option<agx_runtime::Bo>,
@@ -225,12 +229,12 @@ enum Spec {
 
 /// One of the background compilations that run at a time (half the CPUs: an application can have thousands of
 /// argument sets, ~0.1 s of compilation each), held while it runs.
-struct CompileSlot;
+pub(crate) struct CompileSlot;
 
 static COMPILE_SLOTS: (std::sync::Mutex<usize>, std::sync::Condvar) = (std::sync::Mutex::new(0), std::sync::Condvar::new());
 
 impl CompileSlot {
-    fn take() -> CompileSlot {
+    pub(crate) fn take() -> CompileSlot {
         let limit = std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1));
         let (running, freed) = &COMPILE_SLOTS;
         let mut n = running.lock().unwrap_or_else(|e| e.into_inner());
@@ -543,9 +547,12 @@ impl Driver {
         let capture = self.capture_before(m, &name, grid, block, shared, args)?;
         let g14x = self.ctx.device.g14x();
         // a captured launch runs the generic code it saved
-        let spec = if unchecked && capture.is_none() { self.specialized(m, &name, args, block) } else { None };
-        let Driver { ctx, default_waits, modules, streams, specs, batching, batch, .. } = self;
+        let root = self.const_root.get(&m).copied().unwrap_or(m);
+        let folded = unchecked && capture.is_none() && self.const_folded(root, &name, threads);
+        let spec = if unchecked && capture.is_none() && !folded { self.specialized(m, &name, args, block) } else { None };
+        let Driver { ctx, default_waits, modules, streams, specs, const_specs, batching, batch, .. } = self;
         let code = match spec.as_ref().map(|key| &specs[key]) {
+            _ if folded => const_specs.get_mut(&root).and_then(|c| c.ready(&name)).unwrap_or(&modules[&m]),
             Some(Spec::Ready(specialized)) => specialized,
             _ => &modules[&m],
         };
@@ -745,6 +752,18 @@ impl Driver {
     /// `agx_run`: the kernel's code, the launch's uniforms, and the current contents of the memory it can reach (the
     /// allocations its pointer arguments point into, the module's global data, parameter block and error record),
     /// with `replay.sh`. Memory is as the fault left it, not as the launch found it.
+    /// Whether module `root`'s kernel `name` has code with its host-written constants folded for their current
+    /// contents (`const_spec.rs`, then `ConstSpec::ready`); starts its compilation in the background if not.
+    fn const_folded(&mut self, root: usize, name: &str, threads: u64) -> bool {
+        let Driver { ctx, modules, const_specs, .. } = self;
+        let (Some(c), Some(generic)) = (const_specs.get_mut(&root), modules.get(&root)) else { return false };
+        c.code(name, generic.globals(), threads, |object, asm| {
+            let module = module::Module::load(object, asm).ok()?;
+            LoadedModule::new_sharing_globals(&mut ctx.vm, module, generic).ok()
+        })
+        .is_some()
+    }
+
     /// The specialization to launch for these arguments, once it is ready (see `Spec`); counts the launches and starts
     /// its compilation in the background.
     fn specialized(&mut self, m: usize, name: &str, args: &[&[u8]], block: [u32; 3]) -> Option<SpecKey> {
@@ -1047,7 +1066,8 @@ impl Driver {
     /// their barriers), instead of waiting for the GPU and copying on the CPU; false when it cannot be (no batch,
     /// a module's global data, which the CPU writes, or the copy kernels not compiling).
     fn copy_in_batch(&mut self, dst: u64, src: u64, n: u64, sh: usize) -> Result<bool, CUerror> {
-        if !self.batching {
+        // module global data is written on the CPU, after the work before (const_spec.rs reads it at each launch)
+        if !self.batching || self.module_global(dst, n).is_some() {
             return Ok(false);
         }
         self.copy_kernel(dst, src, n, sh)
@@ -1058,7 +1078,7 @@ impl Driver {
     /// every stream and copying on the CPU (cudaMemcpyAsync of the runtime, the libraries' copies). An idle stream
     /// copies on the CPU at once, as before (sooner than a launch). False when not done this way.
     fn copy_async(&mut self, dst: u64, src: u64, n: u64, sh: usize) -> Result<bool, CUerror> {
-        if !gpu_async_copies() || n == 0 || !self.is_device(dst) || !self.is_device(src) {
+        if !gpu_async_copies() || n == 0 || !self.is_device(dst) || !self.is_device(src) || self.module_global(dst, n).is_some() {
             return Ok(false);
         }
         let busy = {
@@ -1352,6 +1372,8 @@ fn new_driver() -> Result<Driver, CUerror> {
         libraries: HashMap::new(),
         functions: HashMap::new(),
         lazy_sources: HashMap::new(),
+        const_specs: HashMap::new(),
+        const_root: HashMap::new(),
         streams: HashMap::new(),
         copy_kernels: None,
         free_queues: Vec::new(),
@@ -2492,6 +2514,13 @@ unsafe fn load_module_data(d: &mut Driver, bytes: *const u8) -> Result<usize, CU
             loaded.uses_timer()
         );
     }
+    // constant-memory specialization (const_spec.rs), large modules included: one front end per set of contents
+    if ptx && !agx_checked() && !loaded.uses_heap() && !loaded.uses_timer() && !loaded.module.globals.is_empty() {
+        let text = lazy.as_ref().map(|(t, _)| t.clone()).or_else(|| std::str::from_utf8(image).ok().map(std::sync::Arc::from));
+        if let Some(c) = text.and_then(|t| crate::const_spec::ConstSpec::new(t, &loaded.module.global_symbols, portable.is_some(), d.ctx.props.llvm_cpu.clone())) {
+            d.const_specs.insert(h, c);
+        }
+    }
     if crate::log_enabled() {
         eprintln!("[zluda_agx] loaded module={h:#x}, kernels={}, globals={} bytes", loaded.module.kernels.len(), loaded.module.globals.len());
     }
@@ -2681,6 +2710,8 @@ pub(crate) unsafe fn cuModuleUnload(hmod: CUmodule) -> CUresult {
         d.functions.retain(|_, (m, _)| *m != h && !children.contains(m));
         d.spec_sources.remove(&h);
         d.specs.retain(|(m, ..), _| *m != h && !children.contains(m));
+        d.const_specs.remove(&h);
+        d.const_root.retain(|c, r| *r != h && *c != h);
         Ok(())
     })
 }
@@ -2746,6 +2777,7 @@ fn module_function(d: &mut Driver, parent: usize, name: &str) -> Result<usize, C
                 let can_specialize = specialize_enabled() && !agx_checked() && !loaded.uses_heap() && !loaded.uses_timer();
                 let child = d.handle();
                 d.modules.insert(child, loaded);
+                d.const_root.insert(child, parent);
                 if can_specialize {
                     d.spec_sources.insert(child, ptx);
                 }

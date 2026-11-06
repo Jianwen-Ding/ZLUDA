@@ -5,6 +5,8 @@
 //! and `mov.u32 %r, %ntid.{x,y,z}` becomes a `mov` of the block's size. Everything else, the other kernels
 //! and the parameter list included, stays as it is, so the specialized kernel takes the same arguments.
 
+use std::collections::HashMap;
+
 /// Canonical equality classes of 8-byte launch arguments, appended to the specialization key. Each duplicate is
 /// its argument index followed by the first equal earlier index. Values are omitted, so different pointers with
 /// the same equality pattern share one compiled kernel.
@@ -214,6 +216,165 @@ fn rewrite(line: &str, params: &[Option<(&str, &str)>], args: &[&[u8]], block: [
     Some(format!("{indent}mov.{ty} \t{dst}, {value};{newline}"))
 }
 
+/// The module-scope `.const` variables without an initializer, which only the host writes (through
+/// `cuModuleGetGlobal`'s address): name and size in bytes, in source order. Constant-memory specialization
+/// (`fold_const_loads`) folds their current contents into a copy of the module.
+pub fn host_written_consts(src: &str) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    for line in src.lines() {
+        let t = line.trim();
+        if depth == 0 && !t.contains('=') {
+            let t = t.strip_prefix(".visible ").unwrap_or(t);
+            if let Some(decl) = t.strip_prefix(".const ") {
+                if let Some(v) = const_decl(decl) {
+                    out.push(v);
+                }
+            }
+        }
+        depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+    }
+    out
+}
+
+/// `(name, bytes)` of a `.const` declaration's text after `.const`: `.align 16 .b8 name[4944];`, `.u64 name;`.
+fn const_decl(decl: &str) -> Option<(String, usize)> {
+    let words: Vec<&str> = decl.trim().strip_suffix(';')?.split_whitespace().collect();
+    let words: &[&str] = if words.first() == Some(&".align") { words.get(2..)? } else { &words };
+    let [ty, name] = words else { return None };
+    let elem = scalar_bytes(ty.strip_prefix('.')?)?;
+    let (name, count) = match name.split_once('[') {
+        Some((n, rest)) => (n, rest.strip_suffix(']')?.parse::<usize>().ok()?),
+        None => (*name, 1),
+    };
+    (!name.is_empty()).then(|| (name.to_string(), elem * count))
+}
+
+fn scalar_bytes(ty: &str) -> Option<usize> {
+    Some(match ty {
+        "b8" | "u8" | "s8" => 1,
+        "b16" | "u16" | "s16" | "f16" => 2,
+        "b32" | "u32" | "s32" | "f32" => 4,
+        "b64" | "u64" | "s64" | "f64" => 8,
+        _ => return None,
+    })
+}
+
+/// Constant-memory specialization: `src` with every `ld.const` of a variable in `values` (name, its current bytes)
+/// at a constant offset replaced by a `mov` of the value it reads, and the module-scope variables made `.visible`
+/// so that the copy lays out its global data as the module does (and keeps the variables, which loads at computed
+/// addresses still read). Valid while the variables hold these bytes: the driver compares them at every launch.
+/// Loads wider than `max_bytes` stay loads. Returns the text and the number of loads replaced.
+pub fn fold_const_loads(src: &str, values: &[(&str, &[u8])], max_bytes: usize) -> (String, usize) {
+    let mut out = String::with_capacity(src.len());
+    let mut regs: HashMap<String, String> = HashMap::new();
+    let mut folded = 0;
+    for line in src.split_inclusive('\n') {
+        let t = line.trim_start();
+        if t.starts_with(".reg ") {
+            // .reg .b32 %r<12>;  .reg .f32 %f<3>, %g;
+            let mut words = t[5..].trim_end().trim_end_matches(';').splitn(2, char::is_whitespace);
+            if let (Some(ty), Some(names)) = (words.next(), words.next()) {
+                for n in names.split(',') {
+                    let n = n.trim();
+                    let prefix = n.split('<').next().unwrap_or(n);
+                    regs.insert(prefix.to_string(), ty.trim_start_matches('.').to_string());
+                }
+            }
+        } else if t.contains(".entry") || t.contains(".func") {
+            regs.clear();
+        }
+        match t.contains("ld.const").then(|| fold_const_load(line, values, &regs, max_bytes)).flatten() {
+            Some(new) => {
+                out.push_str(&new);
+                folded += 1;
+            }
+            None => out.push_str(line),
+        }
+    }
+    (visible_globals(&out), folded)
+}
+
+/// The register type (`b32`, `f64`, ...) of a register by its declaration (`%r12` from `.reg .b32 %r<20>`).
+fn reg_type<'a>(reg: &str, regs: &'a HashMap<String, String>) -> Option<&'a str> {
+    regs.get(reg).or_else(|| regs.get(reg.trim_end_matches(|c: char| c.is_ascii_digit()))).map(|s| s.as_str())
+}
+
+fn fold_const_load(line: &str, values: &[(&str, &[u8])], regs: &HashMap<String, String>, max_bytes: usize) -> Option<String> {
+    let indent = &line[..line.len() - line.trim_start().len()];
+    let newline = if line.ends_with('\n') { "\n" } else { "" };
+    let mut text = line.trim();
+    let mut guard = "";
+    if text.starts_with('@') {
+        let sp = text.find(char::is_whitespace)?;
+        guard = &text[..sp];
+        text = text[sp..].trim_start();
+    }
+    let rest = text.strip_prefix("ld.const.")?;
+    let (ty, rest) = rest.split_at(rest.find(char::is_whitespace)?);
+    let (lanes, ty) = match ty.split_once('.') {
+        Some(("v2", t)) => (2, t),
+        Some(("v4", t)) => (4, t),
+        None => (1, ty),
+        _ => return None,
+    };
+    let size = scalar_bytes(ty).filter(|&n| n <= max_bytes)?;
+    let rest = rest.trim().strip_suffix(';')?;
+    let (dst, addr) = rest.rsplit_once(',')?;
+    let addr = addr.trim().strip_prefix('[')?.strip_suffix(']')?;
+    let (name, offset) = match addr.split_once('+') {
+        Some((n, o)) => (n.trim(), o.trim().parse::<usize>().ok()?),
+        None => (addr.trim(), 0),
+    };
+    let bytes = values.iter().find(|(n, _)| *n == name)?.1;
+    let dsts: Vec<&str> = match lanes {
+        1 => vec![dst.trim()],
+        _ => dst.trim().strip_prefix('{')?.strip_suffix('}')?.split(',').map(str::trim).collect(),
+    };
+    if dsts.len() != lanes || offset % size != 0 || offset + size * lanes > bytes.len() {
+        return None;
+    }
+    let mut new = String::new();
+    for (i, d) in dsts.iter().enumerate() {
+        if *d == "_" {
+            continue;
+        }
+        let at = offset + i * size;
+        let mut raw = [0u8; 8];
+        raw[..size].copy_from_slice(&bytes[at..at + size]);
+        let mut v = u64::from_le_bytes(raw);
+        if ty.starts_with('s') && size < 8 {
+            let shift = 64 - 8 * size as u32;
+            v = (((v << shift) as i64) >> shift) as u64;
+        }
+        let rty = reg_type(d, regs)?;
+        let value = match rty {
+            "f32" if matches!(ty, "f32" | "b32") => format!("mov.f32 \t{d}, 0f{:08X};", v as u32),
+            "f64" if matches!(ty, "f64" | "b64") => format!("mov.f64 \t{d}, 0d{v:016X};"),
+            "b16" | "u16" | "s16" | "b32" | "u32" | "s32" | "b64" | "u64" | "s64" => {
+                let width = scalar_bytes(rty)?;
+                let float = matches!(ty, "f32" | "f64");
+                if width < size || ty == "f16" || (float && width != size) {
+                    return None;
+                }
+                let v = if width < 8 { v & ((1u64 << (8 * width)) - 1) } else { v };
+                format!("mov.b{} \t{d}, 0x{v:0w$X};", 8 * width, w = 2 * width)
+            }
+            _ => return None,
+        };
+        if !new.is_empty() {
+            new.push_str(newline);
+            new.push_str(indent);
+        }
+        if !guard.is_empty() {
+            new.push_str(guard);
+            new.push(' ');
+        }
+        new.push_str(&value);
+    }
+    Some(format!("{indent}{new}{newline}"))
+}
+
 /// `dst, src;` of an instruction's operand text.
 fn operands(rest: &str) -> Option<(&str, &str)> {
     let rest = rest.trim().strip_suffix(';')?;
@@ -302,5 +463,46 @@ mod tests {
         assert!(same.contains("ld.param.u64 \t%rd2, [src];"));
         let (different, _) = specialize_ptx(ptx, "copy", &distinct, [64, 1, 1]).unwrap();
         assert!(different.contains("ld.param.u64 %rd2, [dst+0];"));
+    }
+
+    #[test]
+    fn host_written_constants_fold_into_moves() {
+        let ptx = ".version 7.0\n.target sm_75\n.address_size 64\n\
+            .const .align 16 .b8 params[24];\n\
+            .const .align 4 .b8 table[4] = {1, 2, 3, 4};\n\
+            .extern .const .align 4 .b8 other[8];\n\
+            .visible .entry k() {\n\
+            \t.reg .pred %p<2>;\n\
+            \t.reg .b16 %rs<2>;\n\
+            \t.reg .b32 %r<4>;\n\
+            \t.reg .f32 %f<2>;\n\
+            \t.reg .b64 %rd<4>;\n\
+            \tld.const.u64 %rd1, [params];\n\
+            \tld.const.s32 %rd2, [params+8];\n\
+            \tld.const.f32 %f1, [params+12];\n\
+            \tld.const.u8 %rs1, [params+16];\n\
+            \t@%p1 ld.const.v2.u32 {%r1, %r2}, [params+16];\n\
+            \tld.const.u32 %r3, [params+%rd1];\n\
+            \tld.const.u32 %r3, [table];\n\
+            \tret;\n}\n";
+        assert_eq!(host_written_consts(ptx), [("params".to_string(), 24)]);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        bytes.extend_from_slice(&(-2i32).to_le_bytes());
+        bytes.extend_from_slice(&1.5f32.to_le_bytes());
+        bytes.extend_from_slice(&[0xab, 0, 0, 0, 7, 0, 0, 0]);
+        let (out, n) = fold_const_loads(ptx, &[("params", &bytes)], 8);
+        assert_eq!(n, 5, "{out}");
+        let (narrow, n4) = fold_const_loads(ptx, &[("params", &bytes)], 4);
+        assert_eq!(n4, 4, "{narrow}");
+        assert!(narrow.contains("ld.const.u64 %rd1, [params];"));
+        assert!(out.contains("mov.b64 \t%rd1, 0x1122334455667788;"));
+        assert!(out.contains("mov.b64 \t%rd2, 0xFFFFFFFFFFFFFFFE;"), "sign-extended into the wider register");
+        assert!(out.contains("mov.f32 \t%f1, 0f3FC00000;"));
+        assert!(out.contains("mov.b16 \t%rs1, 0x00AB;"));
+        assert!(out.contains("@%p1 mov.b32 \t%r1, 0x000000AB;\n\t@%p1 mov.b32 \t%r2, 0x00000007;"));
+        assert!(out.contains("ld.const.u32 %r3, [params+%rd1];"), "computed addresses stay loads");
+        assert!(out.contains("ld.const.u32 %r3, [table];"), "initialized constants are not host written");
+        assert!(out.contains("\n.visible .const .align 16 .b8 params[24];"));
     }
 }

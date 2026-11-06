@@ -7,6 +7,7 @@
 //! Supported so far: one device and context, device memory, synchronous copies and fills, modules from PTX (or an
 //! AGX object), kernel launches with `kernelParams`, streams, events, device `printf` and `assert`.
 
+mod const_spec;
 mod contexts;
 mod dark;
 mod driver;

@@ -1753,6 +1753,11 @@ fn compile_or_cached(
     }
     options.push("air");
     // (a kernel alone: its object differs from the whole module's)
+    // (the module's portable AIR, kept in the cache beside its kernels' objects: a later run that needs another
+    // kernel makes it from the AIR without the front end again; its FILE.o3 flag as the entry's text)
+    let mut portable_options = options.clone();
+    portable_options.push("portable");
+    let portable_key = Key { source, chip: cpu, compiler: &compiler, options: &portable_options };
     let kernel_option = kernel.map(|(k, _)| format!("kernel={k}"));
     if let Some(k) = &kernel_option {
         options.push(k);
@@ -1793,6 +1798,16 @@ fn compile_or_cached(
         // A kernel alone: from the module's portable AIR when an earlier compilation kept it, else from the PTX,
         // keeping it (written aside and renamed, so that a compilation on another thread reads it whole or not at
         // all)
+        if let (Some((_, portable)), Some(cache)) = (kernel.filter(|(_, p)| !p.exists()), Cache::from_env()) {
+            if let Some((air, flag)) = cache.get(&portable_key) {
+                let (mut tmp, mut flag_path) = (portable.as_os_str().to_owned(), portable.as_os_str().to_owned());
+                tmp.push(format!(".cached.{}.{:?}", std::process::id(), std::thread::current().id()));
+                flag_path.push(".o3");
+                let _ = std::fs::write(&flag_path, flag)
+                    .and_then(|()| std::fs::write(&tmp, air))
+                    .and_then(|()| std::fs::rename(&tmp, portable));
+            }
+        }
         let from_portable = kernel.filter(|(_, p)| p.exists()).map(|(_, p)| p);
         let portable_out = kernel.filter(|_| from_portable.is_none()).map(|(_, p)| {
             let mut tmp = p.as_os_str().to_owned();
@@ -1846,6 +1861,11 @@ fn compile_or_cached(
             flag.push(".o3");
             // (the flag first: a reader that finds the AIR finds its flag)
             let _ = std::fs::rename(&flag_tmp, &flag).and_then(|()| std::fs::rename(out_path, portable));
+            if let (Some(cache), Ok(air), Ok(o3)) =
+                (Cache::from_env(), std::fs::read(portable), std::fs::read_to_string(&flag))
+            {
+                let _ = cache.put(&portable_key, &air, &o3);
+            }
         }
         let object_name = match from_portable {
             Some(p) => std::path::Path::new(p.file_name().unwrap_or_default()).with_extension("o"),

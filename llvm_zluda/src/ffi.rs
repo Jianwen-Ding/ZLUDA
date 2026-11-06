@@ -141,6 +141,12 @@ extern "C" {
     pub fn LLVMZludaAirCompareFloatBits(module: LLVMModuleRef, functions: i32) -> i32;
     pub fn LLVMZludaAirRangeReport(module: LLVMModuleRef) -> i32;
     pub fn LLVMZludaAirKernelModule(module: LLVMModuleRef, name: *const std::ffi::c_char) -> LLVMModuleRef;
+    pub fn LLVMZludaAirKernelSizes(
+        module: LLVMModuleRef,
+        names: *const *const std::ffi::c_char,
+        count: usize,
+        sizes: *mut u64,
+    );
     pub fn LLVMZludaPromoteDynamicPrivateLoads(module: LLVMModuleRef) -> i32;
     pub fn LLVMZludaAirSaltKernels(module: LLVMModuleRef, length: u64);
     pub fn LLVMZludaAirRemapAddressSpaces(module: LLVMModuleRef, error: *mut *mut std::ffi::c_char) -> i32;

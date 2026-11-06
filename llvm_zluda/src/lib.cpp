@@ -4726,6 +4726,68 @@ LLVMModuleRef LLVMZludaAirKernelModule(LLVMModuleRef M, const char *name)
     return wrap(New.release());
 }
 
+// ZLUDA_AGX target Air, AGX code a kernel at a time: the size of each kernel's compilation, to order the kernels
+// (the largest first) and to budget their memory. sizes[2 * i]: the instructions of the functions kernel names[i]
+// reaches (as LLVMZludaAirKernelModule's copy defines them); sizes[2 * i + 1]: its instructions with every call
+// inlined (as AGX code generation inlines them; a recursive call counts its callee once), saturating.
+void LLVMZludaAirKernelSizes(LLVMModuleRef M, const char *const *names, size_t count, uint64_t *sizes)
+{
+    Module *Mod = unwrap(M);
+    DenseMap<const Function *, uint64_t> Own, Inlined;
+    auto own = [&](const Function *F) -> uint64_t {
+        auto [It, New] = Own.try_emplace(F, 0);
+        if (New)
+            It->second = F->getInstructionCount();
+        return It->second;
+    };
+    SmallPtrSet<const Function *, 16> Active;
+    std::function<uint64_t(const Function *)> inlined = [&](const Function *F) -> uint64_t {
+        if (auto It = Inlined.find(F); It != Inlined.end())
+            return It->second;
+        if (!Active.insert(F).second)
+            return own(F);
+        uint64_t N = own(F);
+        for (const Instruction &I : instructions(*F))
+            if (auto *CB = dyn_cast<CallBase>(&I))
+                if (const Function *C = CB->getCalledFunction(); C && !C->isDeclaration())
+                    N = SaturatingAdd(N, inlined(C));
+        Active.erase(F);
+        Inlined[F] = N;
+        return N;
+    };
+    for (size_t i = 0; i < count; i++)
+    {
+        uint64_t Reached = 0, All = 0;
+        if (const Function *K = Mod->getFunction(names[i]); K && !K->isDeclaration())
+        {
+            SmallVector<const Value *, 64> Work{K};
+            SmallPtrSet<const Value *, 32> Seen;
+            while (!Work.empty())
+            {
+                const Value *V = Work.pop_back_val();
+                if (!Seen.insert(V).second)
+                    continue;
+                if (auto *F = dyn_cast<Function>(V))
+                {
+                    if (F->isDeclaration() || (F->hasFnAttribute("air-kernel") && F != K))
+                        continue;
+                    Reached += own(F);
+                    for (const Instruction &I : instructions(*F))
+                        for (const Value *Op : I.operands())
+                            if (isa<Constant>(Op))
+                                Work.push_back(Op);
+                }
+                else if (auto *C = dyn_cast<Constant>(V); C && !isa<GlobalVariable>(C))
+                    for (const Value *Op : C->operands())
+                        Work.push_back(Op);
+            }
+            All = inlined(K);
+        }
+        sizes[2 * i] = Reached;
+        sizes[2 * i + 1] = All;
+    }
+}
+
 LLVM_C_EXTERN_C_END
 
 LLVM_C_EXTERN_C_BEGIN

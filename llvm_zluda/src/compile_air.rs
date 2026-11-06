@@ -19,7 +19,7 @@ use crate::utils::{Context, Message, Module, PassBuilderOptions, TargetMachine};
 use crate::{
     LLVMZludaAgxKeepGlobals, LLVMZludaAgxLowerAddressSpaces, LLVMZludaAgxLowerClusters, LLVMZludaAgxSpillClusterShared,
     LLVMZludaAirFunctionPointers, LLVMZludaSetAirPrimitives, LLVMZludaAirGlobalsToBuffer, LLVMZludaAirInlineGlobalUsers,
-    LLVMZludaAirRemapAddressSpaces, LLVMZludaAirSharedLayout, LLVMZludaAirStaticRounding, LLVMZludaAirDropCompareFlushes, LLVMZludaAirDropMinMaxFixups, LLVMZludaAirExpandDivisions, LLVMZludaAirCanonicalNaNs, LLVMZludaAirTextureSampleHint, LLVMZludaAirCompareFloatBits, LLVMZludaAirRangeReport, LLVMZludaAirKernelModule, LLVMZludaPromoteDynamicPrivateLoads, LLVMZludaAirSaltKernels, LLVMZludaAgxCanonicalizeFoldedNaNs, LLVMZludaLinkUsedDefinitions,
+    LLVMZludaAirRemapAddressSpaces, LLVMZludaAirSharedLayout, LLVMZludaAirStaticRounding, LLVMZludaAirDropCompareFlushes, LLVMZludaAirDropMinMaxFixups, LLVMZludaAirExpandDivisions, LLVMZludaAirCanonicalNaNs, LLVMZludaAirTextureSampleHint, LLVMZludaAirCompareFloatBits, LLVMZludaAirRangeReport, LLVMZludaAirKernelModule, LLVMZludaAirKernelSizes, LLVMZludaPromoteDynamicPrivateLoads, LLVMZludaAirSaltKernels, LLVMZludaAgxCanonicalizeFoldedNaNs, LLVMZludaLinkUsedDefinitions,
     LLVMZludaUpgradeFunctionAttributes,
 };
 use llvm_sys::target_machine::{
@@ -388,6 +388,25 @@ pub fn compile_air(
                 // On ZLUDA_AGX_JOBS threads (default: every core the available memory allows, as each holds a
                 // kernel's compilation, up to about 1 GB for Cycles' largest with calls), each with its own context
                 // and target machine; the objects in the kernels' order.
+                // The kernels' sizes (with their calls inlined, as AGX code generation does), to compile the
+                // largest first (Cycles' largest takes minutes: started last, it alone made the end of the
+                // compilation) and to admit a kernel only while the estimates of the running ones and its own fit
+                // in the memory available (four of Cycles' largest at once took 14 GB)
+                let sizes = kernel_sizes(&linked, &kernels);
+                let mut order: Vec<usize> = (0..kernels.len()).collect();
+                order.sort_by_key(|&i| std::cmp::Reverse(sizes[i]));
+                let budget = available_memory().map_or(u64::MAX, |b| b / 4 * 3);
+                let estimate: Vec<u64> = sizes.iter().map(|&n| kernel_bytes(n).min(budget)).collect();
+                if timings {
+                    for &i in order.iter().take(8) {
+                        eprintln!(
+                            "[zluda air] kernel {}: {} instructions inlined, about {} MB",
+                            kernels[i].to_string_lossy(),
+                            sizes[i],
+                            estimate[i] >> 20
+                        );
+                    }
+                }
                 drop(linked);
                 drop(agx);
                 let jobs = THREAD_JOBS
@@ -401,7 +420,40 @@ pub fn compile_air(
                     .map(|v| v.split(',').map(str::to_string).collect())
                     .unwrap_or_default();
                 let want_asm = text_hook.is_some();
-                let next = std::sync::atomic::AtomicUsize::new(0);
+                // (started, bytes admitted, kernels running)
+                let admission = std::sync::Mutex::new((vec![false; kernels.len()], 0u64, 0usize));
+                let admitted = std::sync::Condvar::new();
+                // the next kernel to compile: the first in `order` not started whose estimate fits beside the
+                // running ones' (any when none runs); None when all have started
+                let take = || -> Option<usize> {
+                    let mut state = admission.lock().unwrap();
+                    loop {
+                        let (started, used, running) = &mut *state;
+                        let mut pending = false;
+                        for &i in &order {
+                            if started[i] {
+                                continue;
+                            }
+                            pending = true;
+                            if *running == 0 || used.saturating_add(estimate[i]) <= budget {
+                                started[i] = true;
+                                *used += estimate[i];
+                                *running += 1;
+                                return Some(i);
+                            }
+                        }
+                        if !pending {
+                            return None;
+                        }
+                        state = admitted.wait(state).unwrap();
+                    }
+                };
+                let done = |i: usize| {
+                    let mut state = admission.lock().unwrap();
+                    state.1 -= estimate[i];
+                    state.2 -= 1;
+                    admitted.notify_all();
+                };
                 let results: Vec<std::sync::Mutex<Option<Result<(Vec<u8>, Vec<u8>), String>>>> =
                     kernels.iter().map(|_| std::sync::Mutex::new(None)).collect();
                 std::thread::scope(|scope| {
@@ -410,17 +462,17 @@ pub fn compile_air(
                             let agx = match target_machine(AGX_TRIPLE, &cpu) {
                                 Ok(agx) => agx,
                                 Err(e) => {
-                                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    if let Some(r) = results.get(i) {
-                                        *r.lock().unwrap() = Some(Err(e));
+                                    if let Some(i) = take() {
+                                        *results[i].lock().unwrap() = Some(Err(e));
+                                        done(i);
                                     }
                                     return;
                                 }
                             };
                             unsafe { llvm_sys::target_machine::LLVMSetTargetMachineAsmVerbosity(agx.get(), 1) };
                             loop {
-                                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                let Some(name) = kernels.get(i) else { break };
+                                let Some(i) = take() else { break };
+                                let name = &kernels[i];
                                 let started = std::time::Instant::now();
                                 let one_kernel = || -> Result<(Vec<u8>, Vec<u8>), String> {
                                     let kctx = Context::new();
@@ -455,6 +507,7 @@ pub fn compile_air(
                                     eprintln!("[zluda air] AGX code of {}: {seconds:.3} s", name.to_string_lossy());
                                 }
                                 *results[i].lock().unwrap() = Some(result);
+                                done(i);
                             }
                         });
                     }
@@ -698,6 +751,33 @@ fn fast_cores() -> Option<usize> {
 }
 
 /// The names of the kernels (functions with the air-kernel attribute) of `module`.
+/// Each kernel's instructions with its calls inlined (LLVMZludaAirKernelSizes).
+fn kernel_sizes(module: &Module, kernels: &[CString]) -> Vec<u64> {
+    let names: Vec<*const std::ffi::c_char> = kernels.iter().map(|k| k.as_ptr()).collect();
+    let mut sizes = vec![0u64; 2 * kernels.len()];
+    unsafe { LLVMZludaAirKernelSizes(module.get(), names.as_ptr(), names.len(), sizes.as_mut_ptr()) };
+    sizes.chunks(2).map(|c| c[1]).collect()
+}
+
+/// The memory a kernel's AGX code generation may take, from its size with calls inlined (KERNEL_BYTES_PER_INSTRUCTION
+/// per instruction, at least KERNEL_MIN_BYTES).
+fn kernel_bytes(inlined: u64) -> u64 {
+    inlined.saturating_mul(KERNEL_BYTES_PER_INSTRUCTION).max(KERNEL_MIN_BYTES)
+}
+/// (Blender Cycles' intersect_mnee kernel, 1.25 M instructions inlined: 3.2 GB at its peak, in llc; its larger
+/// kernels take more per instruction: 3 KB let three of them together exceed 13.5 GB)
+const KERNEL_BYTES_PER_INSTRUCTION: u64 = 4096;
+const KERNEL_MIN_BYTES: u64 = 64 << 20;
+
+/// Linux's MemAvailable, in bytes.
+fn available_memory() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb = meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:")?.trim().strip_suffix("kB")?.trim().parse::<u64>().ok())?;
+    Some(kb * 1024)
+}
+
 fn kernel_names(module: &Module) -> Vec<CString> {
     let mut names = Vec::new();
     let key = "air-kernel";

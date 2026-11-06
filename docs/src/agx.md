@@ -1051,14 +1051,6 @@ an argument set already in the cache is used from its first launch. `ZLUDA_AGX_S
 `ZLUDA_AGX_LOG=1` prints each specialization when it is ready. `agx_specialize PTX KERNEL --block x,y,z ARG...` prints
 the PTX that a launch with these argument bytes (hex) would compile.
 
-For Geekbench 7's exact `gemm_block_size_bias` PTX template at a 32×4 block, specialization also transposes the B tile
-within its existing 8 KiB threadgroup allocation. Four scalar B reads in the inner loop become two 2-wide reads; the
-floating-point accumulation order is unchanged. The whole specialized PTX is fingerprinted after masking only its two
-size constants, so a changed kernel shape keeps the ordinary specialization. On an M2 Max, captured-output hashes were
-identical for the original and transposed code; one captured launch took 33.0 → 30.8 µs. Alternating warm driver runs
-of the dominant 2304×64×576 shape took 99.1 → 95.5 µs (-3.6%) with identical output hashes.
-`ZLUDA_AGX_GEMM_TILE=0` disables this layout experiment.
-
 ### Constant-memory specialization
 
 A PTX module whose `.const` variables have no initializer (CUDA's `__constant__` data, which the host writes
@@ -1068,7 +1060,10 @@ the value it reads, and what depends on it folds (feature flags, loop bounds, of
 arrays). Every launch compares the variables' bytes with those of the folded code (a few KB of `memcmp`), so folded
 code runs only while it computes what the generic code computes; until a kernel's folded code is compiled, in the
 background, and whenever the bytes differ, the generic code runs. A set of bytes is folded once it has been seen at
-two launches in a row, at most four per module. A large module gets one front end per set of bytes (portable AIR)
+two launches in a row, at most four per module. Only kernels that name one of the variables (with the functions
+kept beside them) are folded: the others keep the launch-time specialization of scalars and block size, which the
+folded copy would replace (a module of image kernels whose table only two of them read ran its others up to 1.7x
+slower). A large module gets one front end per set of bytes (portable AIR)
 and each kernel's code from it on first use; the folded code is in the compilation cache like any other, and
 device addresses are the same from run to run, so a later run of the same scene uses it from its first launches.
 Writes to module global data no longer go through GPU copy kernels, so the bytes read at a launch are those the

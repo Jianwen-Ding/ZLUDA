@@ -59,10 +59,6 @@ pub fn specialize_ptx(src: &str, kernel: &str, args: &[&[u8]], block: [u32; 3]) 
         return None;
     }
     let out = without_other_entries(&out, kernel);
-    // This exact Geekbench 7 tile shape has been checked against captured GPU data.
-    // Keep the optimization behind a complete PTX fingerprint until a general
-    // shared-memory layout pass can prove the same transformation for other code.
-    let out = crate::gemm_tile::transpose_b(&out, block).unwrap_or(out);
     Some((out, rewritten))
 }
 

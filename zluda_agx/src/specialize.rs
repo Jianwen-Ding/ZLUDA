@@ -216,6 +216,22 @@ fn rewrite(line: &str, params: &[Option<(&str, &str)>], args: &[&[u8]], block: [
     Some(format!("{indent}mov.{ty} \t{dst}, {value};{newline}"))
 }
 
+/// Whether kernel `kernel` of `src`, or a function kept beside it, names one of `vars` outside a module-scope
+/// declaration. A kernel that does not cannot gain from constant-memory specialization, and the folded copy would
+/// take the place of its launch-time specialization of scalars and block size (Geekbench's image kernels, whose
+/// module has a host-written table only its `_wide` kernels read, ran 1.7x slower that way).
+pub fn entry_names_any(src: &str, kernel: &str, vars: &[&str]) -> bool {
+    let text = without_other_entries(src, kernel);
+    let ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    text.lines().filter(|l| !l.trim_start().starts_with('.')).any(|line| {
+        vars.iter().any(|v| {
+            line.match_indices(v).any(|(i, _)| {
+                !line[..i].chars().next_back().is_some_and(ident) && !line[i + v.len()..].chars().next().is_some_and(ident)
+            })
+        })
+    })
+}
+
 /// The module-scope `.const` variables without an initializer, which only the host writes (through
 /// `cuModuleGetGlobal`'s address): name and size in bytes, in source order. Constant-memory specialization
 /// (`fold_const_loads`) folds their current contents into a copy of the module.
@@ -463,6 +479,20 @@ mod tests {
         assert!(same.contains("ld.param.u64 \t%rd2, [src];"));
         let (different, _) = specialize_ptx(ptx, "copy", &distinct, [64, 1, 1]).unwrap();
         assert!(different.contains("ld.param.u64 %rd2, [dst+0];"));
+    }
+
+    #[test]
+    fn host_written_constants_only_for_kernels_naming_them() {
+        let ptx = ".version 7.0\n.target sm_75\n.address_size 64\n\
+            .visible .const .align 4 .b8 table[64];\n\
+            .visible .entry plain(.param .u32 n) {\n\t.reg .b32 %r<2>;\n\tld.param.u32 %r1, [n];\n\tret;\n}\n\
+            .visible .entry wide() {\n\t.reg .b64 %rd<2>;\n\tmov.u64 %rd1, table;\n\tret;\n}\n\
+            .visible .entry direct() {\n\t.reg .f32 %f<2>;\n\tld.const.f32 %f1, [table+4];\n\tret;\n}\n\
+            .visible .entry other() {\n\t.reg .f32 %f<2>;\n\tld.const.f32 %f1, [table_b];\n\tret;\n}\n";
+        assert!(!entry_names_any(ptx, "plain", &["table"]));
+        assert!(entry_names_any(ptx, "wide", &["table"]));
+        assert!(entry_names_any(ptx, "direct", &["table"]));
+        assert!(!entry_names_any(ptx, "other", &["table"]));
     }
 
     #[test]

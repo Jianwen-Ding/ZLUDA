@@ -68,6 +68,9 @@ pub(crate) struct ConstSpec {
     variants: Vec<Variant>,
     current: Option<usize>,
     candidate: Option<(Vec<u8>, u32)>,
+    /// kernel -> whether it names one of the variables (`entry_names_any`; always for a large module, whose
+    /// kernels share its functions and have no scalar specialization to lose)
+    users: HashMap<String, bool>,
 }
 
 impl ConstSpec {
@@ -93,7 +96,7 @@ impl ConstSpec {
         if crate::log_enabled() {
             eprintln!("[zluda_agx] const specialization: {:?}", vars.iter().map(|(n, _, s)| (n, s)).collect::<Vec<_>>());
         }
-        Some(ConstSpec { ptx, vars, large, all, cpu, variants: Vec::new(), current: None, candidate: None })
+        Some(ConstSpec { ptx, vars, large, all, cpu, variants: Vec::new(), current: None, candidate: None, users: HashMap::new() })
     }
 
     fn matches(&self, v: usize, globals: &[u8]) -> bool {
@@ -109,6 +112,13 @@ impl ConstSpec {
     /// The folded code of `name` for the current contents of the variables (`globals`, the module's global data)
     /// if it is compiled and can run `threads` threads per threadgroup; starts its compilation otherwise.
     pub(crate) fn code(&mut self, name: &str, globals: &[u8], threads: u64, load: impl FnOnce(&[u8], &str) -> Option<LoadedModule>) -> Option<&LoadedModule> {
+        let (ptx, vars, large) = (&self.ptx, &self.vars, self.large);
+        let uses = *self.users.entry(name.to_string()).or_insert_with(|| {
+            large || crate::specialize::entry_names_any(ptx, name, &vars.iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>())
+        });
+        if !uses {
+            return None;
+        }
         let v = match self.current.filter(|&v| self.matches(v, globals)) {
             Some(v) => v,
             None => self.switch(globals)?,

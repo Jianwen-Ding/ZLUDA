@@ -3658,7 +3658,8 @@ struct ZludaKnownMode
     bool operator!=(const ZludaKnownMode &o) const { return !(*this == o); }
 };
 
-static DenseMap<CallBase *, ZludaKnownMode> zludaModesAtCalls(Function &F, Function *Set, Function *Get)
+static DenseMap<CallBase *, ZludaKnownMode> zludaModesAtCalls(Function &F, Function *Set, Function *Get,
+                                                              const ZludaKnownMode *entry = nullptr)
 {
     using K = ZludaKnownMode;
     DenseMap<CallBase *, K> out;
@@ -3695,7 +3696,7 @@ static DenseMap<CallBase *, ZludaKnownMode> zludaModesAtCalls(Function &F, Funct
         return K{known, a.value & known};
     };
     bool argMode = F.hasFnAttribute("zluda-fpmode-arg");
-    in[&F.getEntryBlock()] = argMode ? K{} : K{~0u, zludaInitialMode(F)};
+    in[&F.getEntryBlock()] = entry ? *entry : argMode ? K{} : K{~0u, zludaInitialMode(F)};
     SmallVector<BasicBlock *, 32> work{&F.getEntryBlock()};
     SmallPtrSet<BasicBlock *, 32> queued{&F.getEntryBlock()};
     unsigned steps = 0;
@@ -4123,6 +4124,58 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
             }
         }
     }
+    // The bits of the mode known on entry to the functions that take their caller's mode (the meet over their
+    // calls, from the kernels and the other functions' own initial modes, to a fixed point): their operations then
+    // know their rounding where every caller's is known, instead of being made in each rounding and selected
+    // (Blender Cycles: 40 000 directed-rounding emulations where every call runs at round to nearest).
+    DenseMap<Function *, ZludaKnownMode> entryKnown;
+    {
+        auto meet = [](ZludaKnownMode a, ZludaKnownMode b) {
+            uint32_t known = a.known & b.known & ~(a.value ^ b.value);
+            return ZludaKnownMode{known, a.value & known};
+        };
+        for (unsigned round = 0; round < 16; round++)
+        {
+            bool changed = false;
+            DenseMap<Function *, ZludaKnownMode> next;
+            for (Function &F : *Mod)
+            {
+                if (F.isDeclaration())
+                    continue;
+                bool arg = F.hasFnAttribute("zluda-fpmode-arg");
+                if (arg && !entryKnown.count(&F) && round > 0)
+                    continue; // (no caller seen yet)
+                ZludaKnownMode e = arg ? (entryKnown.count(&F) ? entryKnown[&F] : ZludaKnownMode{}) : ZludaKnownMode{~0u, zludaInitialMode(F)};
+                if (arg && round == 0)
+                    continue;
+                for (auto &[C, m] : zludaModesAtCalls(F, Set, Get, &e))
+                {
+                    Function *G = C->getCalledFunction();
+                    if (!G || !G->hasFnAttribute("zluda-fpmode-arg"))
+                        continue;
+                    auto it = next.find(G);
+                    next[G] = it == next.end() ? m : meet(it->second, m);
+                }
+            }
+            // functions also called from elsewhere than direct calls keep nothing known
+            for (auto &[G, m] : next)
+                if (!all_of(G->users(), [&](User *U) { auto *CI = dyn_cast<CallBase>(U); return CI && CI->getCalledFunction() == G; }))
+                    m = ZludaKnownMode{};
+            for (auto &[G, m] : next)
+            {
+                auto it = entryKnown.find(G);
+                if (it == entryKnown.end() || it->second != m)
+                    changed = true;
+            }
+            entryKnown = std::move(next);
+            if (!changed && round > 0)
+                break;
+        }
+        size_t known = 0;
+        for (auto &[G, m] : entryKnown)
+            known += (m.known & 0xf) == 0xf;
+        note("functions taking the mode with their rounding known on entry", known);
+    }
     for (Function &F : *Mod)
     {
         if (F.isDeclaration())
@@ -4156,10 +4209,16 @@ int LLVMZludaAirStaticRounding(LLVMModuleRef M, int strict)
         uint32_t initialMode = 1 | (1 << 2) | (flushes(APFloat::IEEEsingle()) ? 0x10 : 0) |
                                (flushes(APFloat::IEEEhalf()) ? 0x20 : 0);
         bool ftz32 = initialMode & 0x10, ftz16 = initialMode & 0x20;
-        Entry.CreateStore(F.hasFnAttribute("zluda-fpmode-arg")
-                              ? static_cast<Value *>(F.getArg(F.arg_size() - 1))
-                              : ConstantInt::get(I32, initialMode),
-                          mode);
+        Value *start = ConstantInt::get(I32, initialMode);
+        if (F.hasFnAttribute("zluda-fpmode-arg"))
+        {
+            // (the caller's mode, with the bits every caller is known to pass as constants)
+            start = F.getArg(F.arg_size() - 1);
+            if (auto it = entryKnown.find(&F); it != entryKnown.end() && it->second.known & 0x3f)
+                start = Entry.CreateOr(Entry.CreateAnd(start, ConstantInt::get(I32, ~it->second.known)),
+                                       ConstantInt::get(I32, it->second.value & it->second.known));
+        }
+        Entry.CreateStore(start, mode);
         F.removeFnAttr("zluda-fpmode-arg");
         for (CallInst *CI : sets)
         {

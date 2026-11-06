@@ -4726,6 +4726,18 @@ LLVMModuleRef LLVMZludaAirKernelModule(LLVMModuleRef M, const char *name)
     return wrap(New.release());
 }
 
+// Whether AGX code generation keeps calls (-agx-experimental-leaf-calls, which zluda_agx passes for a large
+// module) instead of inlining every function into every kernel.
+bool LLVMZludaAgxKeepsCalls()
+{
+    auto &Options = cl::getRegisteredOptions();
+    auto It = Options.find("agx-experimental-leaf-calls");
+    if (It == Options.end())
+        return false;
+    auto *Opt = static_cast<cl::opt<bool> *>(It->second);
+    return Opt->getValue();
+}
+
 // ZLUDA_AGX target Air, AGX code a kernel at a time: the size of each kernel's compilation, to order the kernels
 // (the largest first) and to budget their memory. sizes[2 * i]: the instructions of the functions kernel names[i]
 // reaches (as LLVMZludaAirKernelModule's copy defines them); sizes[2 * i + 1]: its instructions with every call

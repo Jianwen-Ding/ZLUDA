@@ -1624,11 +1624,10 @@ fn agx_fast_mma() -> bool {
     std::env::var("ZLUDA_AGX_FAST_MMA").is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
-/// The PTX size from which a module compiles a kernel at a time with real calls (`LARGE_MODULE_LLVM_ARGS`).
+/// The PTX size from which zoc compiles a module a kernel at a time with real calls (zoc decides that, and its
+/// options: compiler/src/main.rs, LARGE_MODULE_BYTES, the same size); here, such a module gets a zoc of its own (the
+/// options are LLVM's, for the whole process) and the stack retry below.
 const LARGE_MODULE_BYTES: usize = 4 << 20;
-/// The AGX backend's calls (experimental): called functions as calls, frames measured per call depth, and calls
-/// left to relocations, which the merger of the kernels' objects resolves to one copy of each function.
-const LARGE_MODULE_LLVM_ARGS: &str = "-agx-experimental-leaf-calls -agx-measured-call-frames -agx-call-relocations";
 /// The stack per thread a large module is first compiled with.
 const LARGE_MODULE_STACK_TRY: u32 = 12288;
 
@@ -1740,12 +1739,9 @@ fn compile_or_cached(sources: &[&[u8]], cpu: &str, cached_only: bool) -> Result<
         // the object alone: its .agx.kernels records describe the kernels, so no IR text or assembly
         let run = |stack_bytes: Option<u32>| -> Result<std::process::Output, String> {
             let mut command = std::process::Command::new(&zoc);
-            if large {
+            if let Some(b) = stack_bytes {
                 let llvm_args = std::env::var("ZLUDA_AGX_LLVM_ARGS").unwrap_or_default();
-                let stack = stack_bytes.map_or(String::new(), |b| format!(" -agx-measured-stack-bytes={b}"));
-                command
-                    .env("ZLUDA_AGX_LLVM_ARGS", format!("{LARGE_MODULE_LLVM_ARGS}{stack} {llvm_args}"))
-                    .env("ZLUDA_AGX_PER_KERNEL", "1");
+                command.env("ZLUDA_AGX_LLVM_ARGS", format!("-agx-measured-stack-bytes={b} {llvm_args}"));
             }
             command
                 .args(&args)

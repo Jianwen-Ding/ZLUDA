@@ -128,6 +128,9 @@ fn main_core() -> Result<(), CompilerError> {
         for path in &others {
             texts.push(String::from_utf8(fs::read(path)?).map_err(|e| e.utf8_error())?);
         }
+        if opts.arch.as_deref().is_some_and(|a| a.starts_with("agx")) {
+            large_module_defaults(texts.iter().map(|t| t.len()).sum());
+        }
         let object_only = opts.object_only;
         let sink = |bytes: &Vec<u8>, extension: String| {
             let output_path = output_path.with_extension(extension);
@@ -225,6 +228,30 @@ fn compile_amdgpu(
 /// `--target air`: PTX to portable AIR (NAME.portable.air), the AIR for Metal (NAME.air, with NAME.air.globals)
 /// and, with an AGX --arch, the AGX object compiled from the portable AIR (NAME.o, NAME.asm).
 #[cfg(feature = "agx")]
+/// The PTX size from which a module's AGX code is made a kernel at a time with real calls (LARGE_MODULE_LLVM_ARGS).
+/// zoc decides this for every caller (zluda_agx runs zoc and only reserves its stack): fully inlined, Blender Cycles'
+/// largest kernels (2 M instructions each) took 15 minutes and 6 GB each.
+const LARGE_MODULE_BYTES: usize = 4 << 20;
+/// The AGX backend's calls (experimental): called functions as calls, frames measured per call depth, and calls left
+/// to relocations, which the merger of the kernels' objects resolves to one copy of each function.
+const LARGE_MODULE_LLVM_ARGS: &str = "-agx-experimental-leaf-calls -agx-measured-call-frames -agx-call-relocations";
+
+/// A large module (over LARGE_MODULE_BYTES of PTX): its kernels one at a time (ZLUDA_AGX_PER_KERNEL=1) with
+/// LARGE_MODULE_LLVM_ARGS, before LLVM reads its options. ZLUDA_AGX_LARGE_MODULE=0 compiles it as a small one
+/// (every function inlined into every kernel); ZLUDA_AGX_PER_KERNEL and ZLUDA_AGX_LLVM_ARGS set by the caller stay.
+fn large_module_defaults(bytes: usize) {
+    if bytes <= LARGE_MODULE_BYTES || env::var("ZLUDA_AGX_LARGE_MODULE").is_ok_and(|v| v == "0") {
+        return;
+    }
+    if env::var_os("ZLUDA_AGX_PER_KERNEL").is_none() {
+        env::set_var("ZLUDA_AGX_PER_KERNEL", "1");
+    }
+    let args = env::var("ZLUDA_AGX_LLVM_ARGS").unwrap_or_default();
+    if !args.split_whitespace().any(|a| a == "-agx-experimental-leaf-calls") {
+        env::set_var("ZLUDA_AGX_LLVM_ARGS", format!("{LARGE_MODULE_LLVM_ARGS} {args}"));
+    }
+}
+
 fn compile_air(
     texts: &[String],
     sink: &dyn Fn(&Vec<u8>, String),

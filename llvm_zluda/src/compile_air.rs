@@ -19,7 +19,7 @@ use crate::utils::{Context, Message, Module, PassBuilderOptions, TargetMachine};
 use crate::{
     LLVMZludaAgxKeepGlobals, LLVMZludaAgxLowerAddressSpaces, LLVMZludaAgxLowerClusters, LLVMZludaAgxSpillClusterShared,
     LLVMZludaAirFunctionPointers, LLVMZludaSetAirPrimitives, LLVMZludaAirGlobalsToBuffer, LLVMZludaAirInlineGlobalUsers,
-    LLVMZludaAirRemapAddressSpaces, LLVMZludaAirSharedLayout, LLVMZludaAirStaticRounding, LLVMZludaAirDropCompareFlushes, LLVMZludaAirDropMinMaxFixups, LLVMZludaAirExpandDivisions, LLVMZludaAirCanonicalNaNs, LLVMZludaAirTextureSampleHint, LLVMZludaAirCompareFloatBits, LLVMZludaAirRangeReport, LLVMZludaAirKernelModule, LLVMZludaAirKernelSizes, LLVMZludaPromoteDynamicPrivateLoads, LLVMZludaAirSaltKernels, LLVMZludaAgxCanonicalizeFoldedNaNs, LLVMZludaLinkUsedDefinitions,
+    LLVMZludaAirRemapAddressSpaces, LLVMZludaAirSharedLayout, LLVMZludaAirStaticRounding, LLVMZludaAirDropCompareFlushes, LLVMZludaAirDropMinMaxFixups, LLVMZludaAirExpandDivisions, LLVMZludaAirCanonicalNaNs, LLVMZludaAirTextureSampleHint, LLVMZludaAirCompareFloatBits, LLVMZludaAirRangeReport, LLVMZludaAirKernelModule, LLVMZludaAirKernelSizes, LLVMZludaAgxKeepsCalls, LLVMZludaPromoteDynamicPrivateLoads, LLVMZludaAirSaltKernels, LLVMZludaAgxCanonicalizeFoldedNaNs, LLVMZludaLinkUsedDefinitions,
     LLVMZludaUpgradeFunctionAttributes,
 };
 use llvm_sys::target_machine::{
@@ -400,7 +400,7 @@ pub fn compile_air(
                 if timings {
                     for &i in order.iter().take(8) {
                         eprintln!(
-                            "[zluda air] kernel {}: {} instructions inlined, about {} MB",
+                            "[zluda air] kernel {}: {} instructions, about {} MB",
                             kernels[i].to_string_lossy(),
                             sizes[i],
                             estimate[i] >> 20
@@ -751,12 +751,15 @@ fn fast_cores() -> Option<usize> {
 }
 
 /// The names of the kernels (functions with the air-kernel attribute) of `module`.
-/// Each kernel's instructions with its calls inlined (LLVMZludaAirKernelSizes).
+/// Each kernel's instructions as AGX code generation compiles them (LLVMZludaAirKernelSizes): with its calls inlined,
+/// or, where the backend keeps calls (-agx-experimental-leaf-calls, as zluda_agx compiles a large module), those of
+/// the functions it reaches, each once.
 fn kernel_sizes(module: &Module, kernels: &[CString]) -> Vec<u64> {
     let names: Vec<*const std::ffi::c_char> = kernels.iter().map(|k| k.as_ptr()).collect();
     let mut sizes = vec![0u64; 2 * kernels.len()];
     unsafe { LLVMZludaAirKernelSizes(module.get(), names.as_ptr(), names.len(), sizes.as_mut_ptr()) };
-    sizes.chunks(2).map(|c| c[1]).collect()
+    let calls = unsafe { LLVMZludaAgxKeepsCalls() };
+    sizes.chunks(2).map(|c| if calls { c[0] } else { c[1] }).collect()
 }
 
 /// The memory a kernel's AGX code generation may take, from its size with calls inlined (KERNEL_BYTES_PER_INSTRUCTION

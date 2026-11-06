@@ -1059,6 +1059,31 @@ identical for the original and transposed code; one captured launch took 33.0 �
 of the dominant 2304×64×576 shape took 99.1 → 95.5 µs (-3.6%) with identical output hashes.
 `ZLUDA_AGX_GEMM_TILE=0` disables this layout experiment.
 
+### Constant-memory specialization
+
+A PTX module whose `.const` variables have no initializer (CUDA's `__constant__` data, which the host writes
+through `cuModuleGetGlobal`'s address) gets its kernels compiled once more with those variables' current contents
+folded in (`const_spec.rs`, `specialize::fold_const_loads`): an `ld.const` at a constant offset becomes a `mov` of
+the value it reads, and what depends on it folds (feature flags, loop bounds, offsets, the device addresses of
+arrays). Every launch compares the variables' bytes with those of the folded code (a few KB of `memcmp`), so folded
+code runs only while it computes what the generic code computes; until a kernel's folded code is compiled, in the
+background, and whenever the bytes differ, the generic code runs. A set of bytes is folded once it has been seen at
+two launches in a row, at most four per module. A large module gets one front end per set of bytes (portable AIR)
+and each kernel's code from it on first use; the folded code is in the compilation cache like any other, and
+device addresses are the same from run to run, so a later run of the same scene uses it from its first launches.
+Writes to module global data no longer go through GPU copy kernels, so the bytes read at a launch are those the
+launch sees.
+
+Blender Cycles keeps its scene settings (`KernelData`) and its arrays' addresses in `kernel_params`, 4944 bytes
+read 5059 times at constant offsets, as Metal's Cycles bakes them into its kernels (kernel specialization).
+M2 Max, classroom, samples per minute: 210 generic, 231 folded (+10%). Images against the generic code: monster
+bit-identical, classroom and junkshop within 0.0002 / 0.0007 mean (a few pixels, from constants folded into
+floating point expressions; the GPU against the CPU is 0.52).
+
+`ZLUDA_AGX_CONST_SPEC=0` turns it off, `scalars` folds values of up to 4 bytes only, `wait` (for checking the
+folded code) folds from the first launch and makes each launch wait for its kernel's folded code.
+`ZLUDA_AGX_LOG=1` prints the variables found, the loads folded and each kernel's folded code when it is ready.
+
 ### Streams, graphs and host costs
 
 Destroyed streams keep their queue (up to 32) for the next `cuStreamCreate`: creating a queue (a DRM queue, its

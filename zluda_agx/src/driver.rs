@@ -931,8 +931,18 @@ impl Driver {
         replay.add_textures(&self.ctx.vm);
         let mut regions = replay.regions.clone();
         // every allocation an 8-byte word of the arguments points into, or of the module's global data (Blender
-        // Cycles' kernel_params holds the addresses of its arrays)
-        let globals: Vec<u8> = m.globals_va().map(|_| m.globals().to_vec()).unwrap_or_default();
+        // Cycles' kernel_params holds the addresses of its arrays). A kernel compiled on request has a module of its
+        // own that shares the global data of the module it came from, whose contents are there: the replay maps
+        // them at the shared address (without them Cycles' captures read unmapped memory)
+        let root = self.const_root.get(&r.module).copied().unwrap_or(r.module);
+        let globals: Vec<u8> = match (m.globals_va(), self.modules.get(&root)) {
+            (Some(va), Some(owner)) if m.globals().is_empty() && !owner.globals().is_empty() => {
+                regions.retain(|(at, _)| *at != va);
+                regions.push((va, owner.globals().to_vec()));
+                owner.globals().to_vec()
+            }
+            _ => m.globals_va().map(|_| m.globals().to_vec()).unwrap_or_default(),
+        };
         let words = r
             .params
             .iter()

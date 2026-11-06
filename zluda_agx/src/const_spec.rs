@@ -21,14 +21,19 @@ const STABLE_AFTER: u32 = 2;
 const MAX_VARIANTS: usize = 4;
 
 /// `ZLUDA_AGX_CONST_SPEC`: `0` off; `scalars` folds values up to 4 bytes only (8-byte values are mostly device
-/// addresses, which differ between runs, so their code is not reused from the compilation cache); anything else,
-/// the default, folds all.
+/// addresses); `wait`, for checking the folded code, folds all from the first launch and makes each launch wait
+/// for its kernel's folded code; anything else, the default, folds all.
 pub(crate) fn mode() -> Option<bool> {
     match std::env::var("ZLUDA_AGX_CONST_SPEC").as_deref() {
         Ok("0") => None,
         Ok("scalars") => Some(false),
         _ => Some(true),
     }
+}
+
+fn wait() -> bool {
+    static WAIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WAIT.get_or_init(|| std::env::var("ZLUDA_AGX_CONST_SPEC").is_ok_and(|v| v == "wait"))
 }
 
 type Slot = Arc<Mutex<Option<Result<(Vec<u8>, String), String>>>>;
@@ -113,6 +118,11 @@ impl ConstSpec {
             KernelState::Pending(start(variant.folded.clone(), &self.ptx, &self.vars, &variant.bytes, self.all, name, self.large, &self.cpu))
         });
         if let KernelState::Pending(slot) = state {
+            if wait() {
+                while slot.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
             let done = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
             match done {
                 None => return None,
@@ -166,7 +176,7 @@ impl ConstSpec {
             Some((b, n)) if b == bytes => n + 1,
             _ => 1,
         };
-        if seen < STABLE_AFTER || self.variants.len() >= MAX_VARIANTS {
+        if (seen < STABLE_AFTER && !wait()) || self.variants.len() >= MAX_VARIANTS {
             self.candidate = Some((bytes, seen));
             return None;
         }

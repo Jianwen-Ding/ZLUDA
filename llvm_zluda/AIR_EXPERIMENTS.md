@@ -838,3 +838,29 @@ Over all 75 kernel modules (1,323 function instances): 34,730 spill stores, of w
 Load remat saves only the store, since each reload becomes a device load: about 3 of 49 cycles per pair on the schedule model (a model, not a measurement). No remat change has been built or tested.
 Order to try: lower callee-saved first, then ALU remat, then the kernel_params tiers. Scripts and data: /scratch/NOTES/spill-analysis (spillan.py). An early version dropped block labels with trailing comments and made mov_imm look like 621 removable stores: check a classifier against MIR.
 
+
+## Generic pointers: the memories they can name (llvm-project claude/perf-2026-11-07, 2026-11-07)
+
+**Inputs.** From 2026-11-07 on, code analysis uses only PTX from open-source compilers: Cycles built with clang
+(ptx/tools/cycles_clang, normalized: `sat.f32` -> `cvt.sat.f32.f32`, `tex.2d ... [t], {x, y}` -> `[t, {x, y}]`).
+The file named stock.ptx in earlier entries is the NVVM-generated PTX that Blender ships: never analyze it again;
+the shipped kernel is only run and timed.
+
+- **Why.** Clang reads Cycles' arrays through generic pointers loaded from `kernel_params` (.const). With real calls
+  AGXLowerGenericAddresses tag-tested every such access in called functions (if/else of device_load/stack_load, a
+  `wait 0` in each branch: no load overlapped another).
+- **Rule.** Each access gets the set {device, private, threadgroup} its pointer can name: casts name their space;
+  loads from constant memory / a kernel's argument block, kernel arguments and constants below 2^48 are device;
+  GEP/phi/select/int-pointer casts/element extraction and offsets bounded to 48 bits keep the set; arguments of
+  functions called only directly get what all callers pass (fixed point over the call graph). One memory: no test.
+- **Result.** Clang-built Cycles junkshop 152 -> 266 samples/min (intersect_closest 163 -> 61 ms per sample,
+  shade_surface 128 -> 93); its compile 62 s / 3.0 GB / 20.4 MB -> 46 s / 2.4 GB / 17.1 MB. Shipped kernel neutral
+  (343), images identical, PTX suite unchanged, llama and Geekbench unchanged.
+- **Failed first, do not repeat.** (1) Any 64-bit value as an "offset": PTX keeps pointers in integers, so a private
+  pointer argument plus an i64 read from constant memory passed as device; the render went black and ran "629
+  samples/min". (2) Constant 0 as a device base with `shl (zext hi), 32` as an offset: a 64-bit value rebuilt from
+  32-bit halves (isspacep-runtime.ptx faulted). Bound offsets by bit width. Always imgdiff before trusting a number.
+- **Not it.** Constant sinking (-agx-enable-sink-remat) and MachineLICM off: shade_surface spills 2829 -> 2799 / 2663,
+  no change worth having. Most "Folded Spill" stores there are callee-saved saves in prologues.
+- **Instruction fetch** (simulator agent, 2026-11-07): the clang shade_surface launch touches 10-17x the 12 KB
+  instruction cache; taken jumps to uncached lines cost 235-325 ns. Code size is performance for these kernels.

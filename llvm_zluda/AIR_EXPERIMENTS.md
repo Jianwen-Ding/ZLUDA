@@ -41,6 +41,43 @@ section. GPU times are from the M2 Max behind the AIR service; "suite" is PTX-fo
   is now the slow part. Not over-inlining: shade_surface_mnee packaged alone keeps 162 functions, and
   `-air-keep-function-cost` 20000 / 5000 / 2000 left it byte-identical (its large functions are kept already).
 
+## 2026-11-06: regressions on master, constant-memory specialization, occupancy defaults (M2 Max)
+
+Blender Open Data samples per minute, classroom / junkshop / monster (sum; Metal's median for this chip is 1777):
+2026-11-03 204 / 247 / 290 (741) -> 283 / 344 / 425 (1052) with the defaults of branch claude/perf-2026-11-06 and
+llvm-project claude/occupancy-default. Runs on an 18 W charger with the battery supplying the rest; configurations
+alternate, repeats within 0.3%. llama.cpp pp128 547-573, tg64 118-137, 4/4 exact throughout.
+
+What master did first (fixed, all generic):
+- **Cycles took over 20 minutes and 7 GB to compile** (2026-11-03: 23 s, 1.16 GB). 74334b13 inlined every
+  mode-dependent callee, transitively, into every function that sets the floating point mode; Cycles' PTX switches
+  between .ftz and other f32 operations everywhere (each switch is a set of the mode), so its whole call tree went into
+  its kernels: 0.48 M -> 21 M instructions after the first pipeline. Bisected with a worktree and the instruction count
+  of NAME.linked.ll (zoc without --object-only writes it). Now (LLVMZludaAirStaticRounding): the mode reaching each call
+  is known bit by bit; a call needs its caller's mode only where a bit its callee can see differs; calls at round to
+  nearest in other denormal modes go to a copy of the callee with those modes (at most four per function); functions
+  given the mode as an argument start in the bits every caller passes (without that, 40 000 directed-rounding
+  emulations where every call runs at round to nearest, and 223 s of AGX code). ~45 s, object 12.2 MB; PTX suite and
+  the FP-mode regressions identical to master in both modes.
+- **llama.cpp did not start**: zoc's air-verify (e082ab02) applied Metal's 31-buffer limit to portable AIR.
+- **Cycles ran at 15 samples per minute**: kernels loaded on request registered the whole 13 MB module for launch-time
+  specialization, rewritten and recompiled for every new set of scalar arguments.
+
+What gained:
+- **Constant-memory specialization** (docs/src/agx.md): `kernel_params` folded into the kernels, +10% (classroom
+  210 -> 231). Images within 0.0007 mean of the generic code.
+- **Register cap on call trees**: kernels with real calls declared 128. Cap 72 / 80 / 80 with callee-saved 8 (with
+  callee-saved 16, scheduler target 48, 16 KB stack, blocks <= 192): 1054 / 1034 / 1036. Defaults now: the backend
+  caps call trees (-agx-call-tree-max-gprs=72), zoc caps every kernel of a large module that defines functions
+  (junkshop 321 -> 337), blocks up to 192 (+2.4%).
+- **Refuted for leaf kernels**: the same cap on every kernel of llama.cpp: pp128 547 -> 309, tg64 122 -> 80. Leaf kernels
+  declare what they use; a cap only spills there.
+
+Open: Geekbench 25.85 -> 26.87 s of GPU time against 2026-11-03, mostly convolve_horizontal / vertical (+21%),
+blur_gray (+37%), depthwise_convolution_2d (+25%); not the block size (the same with ZLUDA_AGX_MAX_BLOCK=1024) and
+not the register cap (no calls there): something else changed since 2026-11-03 (other sessions' AGX backend commits
+are the first suspects). Compile time: the rounding stage 8.7 s (0.4 s on 2026-11-03), O3 13.8 s (6.9 s).
+
 ## Compile time, memory and host costs on Asahi (2026-11-01)
 
 No AIR service this session: GPU numbers are of the AGX code on the M2 Max through zluda_agx (Asahi DRM). Corpus:
@@ -697,7 +734,7 @@ samples/min. The opt-in ZLUDA_ROUNDING_STRICT_TEXTURES=f32 is no longer needed f
 Regenerating the texture block needs a clang: /scratch/clang-build (clang and NVPTX built from the tree); splice
 only that block (the other blocks keep clang 18's output) and drop repeated declarations.
 
-## Blender Cycles drops instanced geometry on the GPU, 2026-11-03 (open, investigation postponed)
+## Blender Cycles drops instanced geometry on the GPU, 2026-11-03 (solved: a miscompiled host, see above)
 
 - **Cycles renders run but are wrong.** 16-sample renders against the CPU in Blender 5.1.0: classroom loses its desks,
   chairs and ceiling lamps (mean difference 19.3 of 255), monster loses the monster and the child's face (13.1).

@@ -2743,7 +2743,14 @@ fn module_function(d: &mut Driver, parent: usize, name: &str) -> Result<usize, C
                 if !loaded.module.kernels.contains_key(&name) {
                     return Err(CUerror::NOT_FOUND);
                 }
-                let can_specialize = specialize_enabled() && !agx_checked() && !loaded.uses_heap() && !loaded.uses_timer();
+                // (not a kernel of a large module, as the module itself: each new set of scalar arguments would rewrite
+                // and hash all of its PTX at the launch, and compile the whole module's front end again; Blender
+                // Cycles' launches change them all the time: 3.7 s per sample instead of 0.3)
+                let can_specialize = specialize_enabled()
+                    && !agx_checked()
+                    && !loaded.uses_heap()
+                    && !loaded.uses_timer()
+                    && ptx.len() <= LARGE_MODULE_BYTES;
                 let child = d.handle();
                 d.modules.insert(child, loaded);
                 if can_specialize {

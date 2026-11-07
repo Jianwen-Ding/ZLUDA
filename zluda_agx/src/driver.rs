@@ -39,6 +39,15 @@ enum Op {
     Copy { dst: u64, src: u64, n: usize },
 }
 
+/// A stream's work held back behind a cuStreamWaitValue whose condition did not hold when it was called (see
+/// `Driver::poll_deferred`): replayed in order, each wait when its condition holds.
+enum Deferred {
+    Op(Op),
+    WaitValue { addr: u64, value: u64, flags: c_uint, width: usize },
+    WriteValue { addr: u64, bytes: Vec<u8> },
+    HostFunc { f: unsafe extern "system" fn(*mut c_void), data: usize },
+}
+
 pub(crate) struct Driver {
     default_waits: Vec<Fence>,
     pub(crate) modules: HashMap<usize, LoadedModule>,
@@ -61,6 +70,8 @@ pub(crate) struct Driver {
     limits: HashMap<u32, usize>,
     /// Streams being captured (0 is the default stream) and their operations so far.
     capturing: HashMap<usize, Vec<Op>>,
+    /// Streams waiting for a cuStreamWaitValue condition, and the work given to them since (`stream_key`).
+    deferred: HashMap<usize, std::collections::VecDeque<Deferred>>,
     /// Graphs and their instantiations: both are operation lists.
     graphs: HashMap<usize, Vec<Op>>,
     execs: HashMap<usize, Vec<Op>>,
@@ -499,13 +510,95 @@ fn stream_key(s: CUstream) -> usize {
 impl Driver {
     /// Records `op` if `stream` is being captured.
     fn captured(&mut self, stream: CUstream, op: impl FnOnce() -> Op) -> bool {
-        match self.capturing.get_mut(&stream_key(stream)) {
-            Some(ops) => {
-                ops.push(op());
-                true
-            }
-            None => false,
+        let k = stream_key(stream);
+        if let Some(ops) = self.capturing.get_mut(&k) {
+            ops.push(op());
+            return true;
         }
+        if let Some(q) = self.deferred.get_mut(&k) {
+            q.push_back(Deferred::Op(op()));
+            return true;
+        }
+        false
+    }
+
+    /// Whether a cuStreamWaitValue condition holds: CU_STREAM_WAIT_VALUE_GEQ ((signed)(*addr - value) >= 0, as the
+    /// hardware compares), EQ, AND, NOR.
+    fn value_holds(&mut self, addr: u64, value: u64, flags: c_uint, width: usize) -> Result<bool, CUerror> {
+        let mask = if width == 4 { u32::MAX as u64 } else { u64::MAX };
+        let mut b = [0u8; 8];
+        self.copy_dtoh(&mut b[..width], addr).map_err(from_io)?;
+        let v = u64::from_le_bytes(b) & mask;
+        let value = value & mask;
+        Ok(match flags & 0xf {
+            0 => (v.wrapping_sub(value) & mask) >> (width * 8 - 1) == 0,
+            1 => v == value,
+            2 => v & value != 0,
+            3 => !(v | value) & mask != 0,
+            _ => false,
+        })
+    }
+
+    /// The stream's earlier work finished.
+    fn sync_stream(&mut self, sh: usize) -> CUresult {
+        let q = self.queue(sh)?.0;
+        let last = q.last();
+        if let Err(e) = q.synchronize() {
+            return Err(self.failed(last.syncobj, e));
+        }
+        self.finished(last.syncobj, last.point);
+        Ok(())
+    }
+
+    /// A value written to memory in the stream's order: once its earlier work is done, by the CPU.
+    fn write_value_now(&mut self, sh: usize, addr: u64, bytes: &[u8]) -> CUresult {
+        self.sync_stream(sh)?;
+        self.copy_htod(addr, bytes).map_err(from_io)
+    }
+
+    /// Replays held-back stream work (see `Deferred`): each stream's in order up to a wait whose condition does not
+    /// hold yet, again while one stream's progress (a value it writes) may let another go on. Called at every driver
+    /// entry, so a value the host writes itself (tinygrad's CPU devices) is seen by the next call; synchronizing calls
+    /// poll until the work is gone. The host never waits for a condition: a wait issued before the work that
+    /// satisfies it (another stream's later write, in the same thread) would never end.
+    fn poll_deferred(&mut self) -> CUresult {
+        let mut progress = true;
+        while progress && !self.deferred.is_empty() {
+            progress = false;
+            let keys: Vec<usize> = self.deferred.keys().copied().collect();
+            for k in keys {
+                loop {
+                    let Some(front) = self.deferred.get_mut(&k).and_then(|q| q.pop_front()) else {
+                        self.deferred.remove(&k);
+                        break;
+                    };
+                    match front {
+                        Deferred::WaitValue { addr, value, flags, width } => {
+                            if !self.value_holds(addr, value, flags, width)? {
+                                let q = self.deferred.get_mut(&k).expect("deferred stream");
+                                q.push_front(Deferred::WaitValue { addr, value, flags, width });
+                                break;
+                            }
+                        }
+                        Deferred::Op(op) => {
+                            self.flush_batch()?;
+                            self.run(&op, k)?;
+                        }
+                        Deferred::WriteValue { addr, bytes } => self.write_value_now(k, addr, &bytes)?,
+                        Deferred::HostFunc { f, data } => {
+                            self.sync_stream(k)?;
+                            unsafe { f(data as *mut c_void) };
+                        }
+                    }
+                    progress = true;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn deferring(&self, stream: CUstream) -> bool {
+        self.deferred.contains_key(&stream_key(stream))
     }
 
     /// Submits the launches gathered so far (see `Batch`).
@@ -1392,6 +1485,7 @@ fn new_driver() -> Result<Driver, CUerror> {
         events: HashMap::new(),
         limits: HashMap::new(),
         capturing: HashMap::new(),
+        deferred: HashMap::new(),
         graphs: HashMap::new(),
         execs: HashMap::new(),
         host_allocs: HashMap::new(),
@@ -1482,6 +1576,7 @@ pub(crate) fn with_sticky<T>(f: impl FnOnce(&mut Driver) -> Result<T, CUerror>) 
         let h = c.current();
         let d = c.get_mut(h).ok_or(CUerror::INVALID_CONTEXT)?;
         d.flush_batch()?;
+        d.poll_deferred()?;
         f(d)
     })
 }
@@ -2347,6 +2442,7 @@ pub(crate) unsafe fn cuCtxGetDevice(device: *mut CUdevice) -> CUresult {
 }
 
 pub(crate) unsafe fn cuCtxSynchronize() -> CUresult {
+    drain_deferred(None)?;
     with(|d| d.sync_all())
 }
 
@@ -2986,6 +3082,7 @@ pub(crate) unsafe fn cuStreamDestroy_v2(s: CUstream) -> CUresult {
 }
 
 pub(crate) unsafe fn cuStreamSynchronize(s: CUstream) -> CUresult {
+    drain_deferred(Some(s))?;
     with(|d| {
         let q = d.queue(s.0 as usize)?.0;
         let last = q.last();
@@ -2997,46 +3094,58 @@ pub(crate) unsafe fn cuStreamSynchronize(s: CUstream) -> CUresult {
     })
 }
 
-// Stream memory operations (tinygrad's runtime signals with them) and host functions. The stream's earlier work
-// finishes first (the stream is synchronized), then the CPU does the operation, so the stream's later work, queued
-// after this returns, comes after it: the order the API promises, with the host thread waiting meanwhile.
-
-/// The stream's earlier work done, then `op` on the driver (not while capturing a graph: not recorded there).
-unsafe fn after_stream(s: CUstream, op: impl FnOnce(&mut Driver) -> CUresult) -> CUresult {
-    with(|d| if d.capturing.contains_key(&(s.0 as usize)) { Err(CUerror::NOT_SUPPORTED) } else { Ok(()) })?;
-    cuStreamSynchronize(s)?;
-    with(op)
-}
+// Stream memory operations (tinygrad's runtime signals with them) and host functions. A write or host function runs
+// on the CPU once the stream's earlier work is done; a wait whose condition does not hold yet holds the stream's later
+// work back on the host (Driver::deferred) instead of blocking the calling thread.
 
 unsafe fn stream_write_value(s: CUstream, addr: CUdeviceptr, value: &[u8]) -> CUresult {
-    after_stream(s, |d| d.copy_htod(addr.0 as u64, value).map_err(from_io))
+    with(|d| {
+        if d.capturing.contains_key(&stream_key(s)) {
+            return Err(CUerror::NOT_SUPPORTED);
+        }
+        if let Some(q) = d.deferred.get_mut(&stream_key(s)) {
+            q.push_back(Deferred::WriteValue { addr: addr.0 as u64, bytes: value.to_vec() });
+            return Ok(());
+        }
+        d.write_value_now(stream_key(s), addr.0 as u64, value)?;
+        // another stream may have been waiting for this value
+        d.poll_deferred()
+    })
 }
 
-/// CU_STREAM_WAIT_VALUE_GEQ (unsigned, wrapping as the hardware compares), EQ, AND, NOR.
 unsafe fn stream_wait_value(s: CUstream, addr: CUdeviceptr, value: u64, flags: c_uint, width: usize) -> CUresult {
-    let mask = if width == 4 { u32::MAX as u64 } else { u64::MAX };
-    let holds = |v: u64| match flags & 0xf {
-        0 => (v.wrapping_sub(value) & mask) >> (width * 8 - 1) == 0, // (signed)(*addr - value) >= 0
-        1 => v == value,
-        2 => v & value != 0,
-        3 => !(v | value) & mask != 0,
-        _ => false,
-    };
-    after_stream(s, |_| Ok(()))?;
+    with(|d| {
+        let k = stream_key(s);
+        if d.capturing.contains_key(&k) {
+            return Err(CUerror::NOT_SUPPORTED);
+        }
+        let wait = Deferred::WaitValue { addr: addr.0 as u64, value, flags, width };
+        if let Some(q) = d.deferred.get_mut(&k) {
+            q.push_back(wait);
+        } else if !d.value_holds(addr.0 as u64, value, flags, width)? {
+            d.deferred.insert(k, std::collections::VecDeque::from([wait]));
+        }
+        Ok(())
+    })
+}
+
+/// Waits (polling, without the driver's lock) until the streams' held-back work is gone: `None` for every stream.
+unsafe fn drain_deferred(s: Option<CUstream>) -> CUresult {
     let start = Instant::now();
     let mut warned = false;
     loop {
-        // read outside the driver lock between tries: another thread's CUDA call may be what writes the value
-        let mut b = [0u8; 8];
-        with(|d| d.copy_dtoh(&mut b[..width], addr.0 as u64).map_err(from_io))?;
-        if holds(u64::from_le_bytes(b) & mask) {
+        let pending = with_sticky(|d| Ok(match s {
+            Some(s) => d.deferring(s),
+            None => !d.deferred.is_empty(),
+        }))?;
+        if !pending {
             return Ok(());
         }
         if !warned && start.elapsed().as_secs() >= 10 {
             warned = true;
-            eprintln!("[zluda_agx] cuStreamWaitValue: 0x{:x} still not satisfied after 10 s (the host waits)", addr.0 as u64);
+            eprintln!("[zluda_agx] a stream has waited 10 s for a cuStreamWaitValue condition");
         }
-        std::thread::yield_now();
+        std::thread::sleep(std::time::Duration::from_micros(20));
     }
 }
 
@@ -3065,11 +3174,24 @@ pub(crate) unsafe fn cuStreamWaitValue64(s: CUstream, addr: CUdeviceptr, value: 
     cuStreamWaitValue64_v2(s, addr, value, flags)
 }
 
-/// The host function runs once the stream's earlier work is done, before its later work (on this thread).
+/// The host function runs once the stream's earlier work is done, before its later work (on the thread of the call
+/// that gets there).
 pub(crate) unsafe fn cuLaunchHostFunc(s: CUstream, f: CUhostFn, user_data: *mut c_void) -> CUresult {
     let f = f.ok_or(CUerror::INVALID_VALUE)?;
-    after_stream(s, |_| Ok(()))?;
-    f(user_data);
+    let run_now = with(|d| {
+        if d.capturing.contains_key(&stream_key(s)) {
+            return Err(CUerror::NOT_SUPPORTED);
+        }
+        if let Some(q) = d.deferred.get_mut(&stream_key(s)) {
+            q.push_back(Deferred::HostFunc { f, data: user_data as usize });
+            return Ok(false);
+        }
+        d.sync_stream(stream_key(s))?;
+        Ok(true)
+    })?;
+    if run_now {
+        f(user_data);
+    }
     Ok(())
 }
 
@@ -3097,6 +3219,8 @@ pub(crate) unsafe fn cuEventDestroy_v2(e: CUevent) -> CUresult {
 }
 
 pub(crate) unsafe fn cuEventRecord(e: CUevent, s: CUstream) -> CUresult {
+    // (an event after held-back work: recorded once that work is submitted)
+    drain_deferred(Some(s))?;
     with(|d| {
         let sh = if (s.0 as usize) <= 2 { 0 } else { s.0 as usize };
         let fence = d.queue(sh)?.0.last();
@@ -3472,6 +3596,9 @@ pub(crate) unsafe fn cuStreamDestroy(s: CUstream) -> CUresult {
 
 pub(crate) unsafe fn cuStreamQuery(s: CUstream) -> CUresult {
     with(|d| {
+        if d.deferring(s) {
+            return Err(CUerror::NOT_READY);
+        }
         let q = d.queue(s.0 as usize)?.0;
         let last = q.last();
         if q.is_done(last).map_err(from_io)? {

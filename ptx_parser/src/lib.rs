@@ -2595,8 +2595,15 @@ fn matrix_modifiers<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> Vec<&'inp
                 }
                 current = Some((span.start, span.end));
             }
-            // pieces of a modifier (`::`, digits), not the end of an instruction without operands
-            Some((start, end)) if span.start == end && !matches!(token, Token::Semicolon | Token::Comma) => {
+            // pieces of a modifier (`::`, digits), not the end of an instruction without operands nor the start of
+            // its first operand written without a space (`mma...f32{%r0, ...}`, as tinygrad's inline asm has it)
+            Some((start, end))
+                if span.start == end
+                    && !matches!(
+                        token,
+                        Token::Semicolon | Token::Comma | Token::LBrace | Token::LBracket | Token::LParen
+                    ) =>
+            {
                 current = Some((start, span.end))
             }
             _ => break,

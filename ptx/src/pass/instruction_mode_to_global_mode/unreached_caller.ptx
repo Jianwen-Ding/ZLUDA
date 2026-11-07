@@ -1,0 +1,48 @@
+.version 7.0
+.target sm_75
+.address_size 64
+
+.func (.param .b32 ret) g(.param .b32 x)
+{
+    .reg .b32 %r<2>;
+    ld.param.b32 %r0, [x];
+    st.param.b32 [ret], %r0;
+    ret;
+}
+
+// Nothing calls f: no kernel reaches its blocks, so their mode is the default (flush), while g, which k calls,
+// runs in k's mode (preserve)
+.visible .func (.param .b32 ret) f(.param .b32 x)
+{
+    .reg .b32 %r<3>;
+    ld.param.b32 %r0, [x];
+    {
+        .param .b32 p0;
+        .param .b32 r0;
+        st.param.b32 [p0], %r0;
+        call (r0), g, (p0);
+        ld.param.b32 %r1, [r0];
+    }
+    st.param.b32 [ret], %r1;
+    ret;
+}
+
+.visible .entry k(.param .u64 out)
+{
+    .reg .u64 %rd<2>;
+    .reg .f32 %f<3>;
+    .reg .b32 %r<2>;
+    ld.param.u64 %rd0, [out];
+    ld.global.f32 %f0, [%rd0];
+    add.f32 %f1, %f0, %f0;
+    mov.b32 %r0, %f1;
+    {
+        .param .b32 p0;
+        .param .b32 r0;
+        st.param.b32 [p0], %r0;
+        call (r0), g, (p0);
+        ld.param.b32 %r1, [r0];
+    }
+    st.global.b32 [%rd0], %r1;
+    ret;
+}

@@ -864,3 +864,19 @@ the shipped kernel is only run and timed.
   no change worth having. Most "Folded Spill" stores there are callee-saved saves in prologues.
 - **Instruction fetch** (simulator agent, 2026-11-07): the clang shade_surface launch touches 10-17x the 12 KB
   instruction cache; taken jumps to uncached lines cost 235-325 ns. Code size is performance for these kernels.
+
+## FP modes: jumps from code no kernel reaches (2026-11-07)
+
+- **Symptom**: Cycles' current kernel built with clang (ptx/tools/cycles_clang, 17.6 MB PTX) failed in
+  instruction_mode_to_global_mode with `TranslateError::Unreachable` (redirect_jump_impl: a jump whose mode differs
+  from its target's entry mode, but the target has no prologue).
+- **Cause**: clang keeps `.visible` functions nothing calls (kernel_image_interp_with_udim, volume_integrate_*).
+  No kernel reaches their blocks, so their modes resolve to the default (flush), while a block they jump or call
+  into, also reached from a kernel, resolves to that kernel's mode (preserve). The edge asks for no prologue (no
+  kernel takes it), and redirecting the jump found none. Reduced with ddmin over roots, stubbed bodies and
+  instructions (/scratch/perf/t/{ddmin,ddstub,ddlines}.py): no FP instruction is needed, only the call structure.
+- **Fix**: the blocks no kernel reaches through jumps, calls and returns are computed from the CFG, and their jumps
+  (and post-call branches) are left as they are: the code never runs, so the mode there does not matter. Executed
+  code is unchanged. Test: instruction_mode_to_global_mode/unreached_caller.ptx (fails before, passes after).
+- **Result**: the clang Cycles kernel compiles: 39.7 s wall, 78 s CPU, 2.07 GB peak, 17.4 MB object
+  (`zoc --arch=agx-g14c --agx-only --object-only`, whole module).

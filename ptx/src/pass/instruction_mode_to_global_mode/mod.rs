@@ -686,9 +686,10 @@ pub(crate) fn run<'input>(
     directives: Vec<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>,
 ) -> Result<Vec<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>, TranslateError> {
     let cfg = create_control_flow_graph(&directives)?;
+    let unreached = blocks_no_kernel_reaches(&cfg);
     let (denormal_f32, denormal_f16f64, rounding_f32, rounding_f16f64) =
         compute_minimal_mode_insertions(&cfg)?;
-    let temp = compute_full_mode_insertions(
+    let mut temp = compute_full_mode_insertions(
         flat_resolver,
         &directives,
         cfg,
@@ -697,7 +698,28 @@ pub(crate) fn run<'input>(
         rounding_f32,
         rounding_f16f64,
     )?;
+    temp.unreached = unreached;
     apply_global_mode_controls(directives, temp)
+}
+
+// The basic blocks that no kernel reaches through jumps, calls and returns: the bodies of functions nothing calls
+// (a .visible or .weak function the module only exports, as clang keeps them). Their modes resolve to the default
+// while a block they jump to may resolve to a kernel's mode, and that edge asks for no prologue (no kernel takes it),
+// so their jumps are left as they are: the code never runs, so the mode at those jumps does not matter.
+fn blocks_no_kernel_reaches(cfg: &ControlFlowGraph) -> FxHashSet<SpirvWord> {
+    let mut reached = vec![false; cfg.graph.node_count()];
+    let mut todo = cfg.entry_points.values().copied().collect::<Vec<_>>();
+    while let Some(n) = todo.pop() {
+        if std::mem::replace(&mut reached[n.index()], true) {
+            continue;
+        }
+        todo.extend(cfg.graph.neighbors_directed(n, Direction::Outgoing));
+    }
+    cfg.graph
+        .node_indices()
+        .filter(|n| !reached[n.index()])
+        .map(|n| cfg.graph[n].label)
+        .collect()
 }
 
 // For every basic block this pass computes:
@@ -969,12 +991,15 @@ fn join_modes(
     Ok(FullModeInsertion {
         basic_blocks,
         functions_exit_modes,
+        unreached: FxHashSet::default(),
     })
 }
 
 struct FullModeInsertion {
     basic_blocks: FxHashMap<SpirvWord, FullBasicBlockEntryState>,
     functions_exit_modes: FxHashMap<SpirvWord, ResolvedInstructionModes>,
+    // blocks_no_kernel_reaches
+    unreached: FxHashSet<SpirvWord>,
 }
 
 struct FullBasicBlockEntryState {
@@ -1043,6 +1068,7 @@ fn apply_global_mode_controls(
             let old_body = method.body.take().unwrap();
             let mut result = Vec::with_capacity(old_body.len());
             let mut bb_state = BasicBlockControlState::new(&global_modes, initial_mode);
+            bb_state.unreached = global_modes.unreached.contains(&method.name);
             let mut old_body = old_body.into_iter();
             while let Some(mut statement) = old_body.next() {
                 let mut call_target = None;
@@ -1109,11 +1135,13 @@ fn apply_global_mode_controls(
                             .functions_exit_modes
                             .get(&call_target)
                             .ok_or_else(error_unreachable)?;
-                        redirect_jump_impl(
-                            &bb_state.global_modes,
-                            node_exit_mode,
-                            post_call_label,
-                        )?;
+                        if !bb_state.unreached {
+                            redirect_jump_impl(
+                                &bb_state.global_modes,
+                                node_exit_mode,
+                                post_call_label,
+                            )?;
+                        }
                         result.push(post_call_bra);
                     } else {
                         return Err(error_unreachable());
@@ -1149,6 +1177,8 @@ fn check_function_prelude(
 
 struct BasicBlockControlState<'a> {
     global_modes: &'a FullModeInsertion,
+    // the current basic block is one no kernel reaches (blocks_no_kernel_reaches)
+    unreached: bool,
     denormal_f32: RegisterState<bool>,
     denormal_f16f64: RegisterState<bool>,
     rounding_f32: RegisterState<ast::RoundingMode>,
@@ -1183,6 +1213,7 @@ impl<'a> BasicBlockControlState<'a> {
         let rounding_f16f64 = RegisterState::new(initial_mode.rounding.twin_mode.f16f64);
         BasicBlockControlState {
             global_modes,
+            unreached: false,
             denormal_f32,
             denormal_f16f64,
             rounding_f32,
@@ -1200,6 +1231,7 @@ impl<'a> BasicBlockControlState<'a> {
             .basic_blocks
             .get(&basic_block)
             .ok_or_else(error_unreachable)?;
+        self.unreached = self.global_modes.unreached.contains(&basic_block);
 
         let denormal_f32 = RegisterState::new(bb_state.denormal.twin_mode.f32);
         let denormal_f16f64 = RegisterState::new(bb_state.denormal.twin_mode.f16f64);
@@ -1336,6 +1368,9 @@ impl<'a> BasicBlockControlState<'a> {
     }
 
     fn redirect_jump(&self, jump_target: &mut SpirvWord) -> Result<(), TranslateError> {
+        if self.unreached {
+            return Ok(());
+        }
         let current_mode = ResolvedInstructionModes {
             denormal_f32: self.denormal_f32.current_value,
             denormal_f16f64: self.denormal_f16f64.current_value,

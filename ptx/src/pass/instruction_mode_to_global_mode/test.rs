@@ -422,3 +422,23 @@ fn conditionals<const N: usize>(
         .try_into()
         .unwrap()
 }
+
+static UNREACHED_CALLER_PTX: &'static str = include_str!("unreached_caller.ptx");
+
+// A function no kernel reaches (f, exported and uncalled, as clang keeps .visible functions) calls one that a kernel
+// does (g). f's blocks resolve to the default mode (flush), g to the kernel's (preserve), and the call edge from f
+// asks for no prologue, since no kernel takes it: f's jumps stay as they are instead of failing (Unreachable).
+#[test]
+fn unreached_caller() {
+    let methods = compile_methods(UNREACHED_CALLER_PTX);
+    let kernel = methods.iter().find(|m| m.kernel_attributes.is_some()).unwrap();
+    let attrs = kernel.kernel_attributes.as_ref().unwrap();
+    assert_eq!(false, attrs.flush_to_zero_f32);
+    // the kernel's call to g needs no mode change (g has no prologue: functions never do)
+    assert!(!kernel
+        .body
+        .as_ref()
+        .unwrap()
+        .iter()
+        .any(|s| matches!(s, Statement::SetMode(..))));
+}

@@ -2876,17 +2876,54 @@ pub(crate) unsafe fn cuLaunchKernel(
     params: *mut *mut c_void,
     extra: *mut *mut c_void,
 ) -> CUresult {
-    if !extra.is_null() {
-        return Err(CUerror::NOT_SUPPORTED);
-    }
+    // `extra`: CU_LAUNCH_PARAM_BUFFER_POINTER (1) / _SIZE (2) / _END (0) pairs, the arguments packed in one buffer
+    let packed = if extra.is_null() {
+        None
+    } else {
+        let (mut buf, mut size) = (std::ptr::null::<u8>(), None);
+        let mut i = 0;
+        loop {
+            match *extra.add(i) as usize {
+                0 => break,
+                1 => buf = *extra.add(i + 1) as *const u8,
+                2 => size = Some(*(*extra.add(i + 1) as *const usize)),
+                _ => return Err(CUerror::INVALID_VALUE),
+            }
+            i += 2;
+        }
+        if buf.is_null() || !params.is_null() {
+            return Err(CUerror::INVALID_VALUE);
+        }
+        Some((buf, size))
+    };
     with_launch(|d| {
         let (m, name) = d.functions.get(&(f.0 as usize)).cloned().ok_or(CUerror::INVALID_HANDLE)?;
         let slots = d.modules[&m].module.kernels[&name].args.clone();
-        let args: Vec<&[u8]> = slots
-            .iter()
-            .enumerate()
-            .map(|(i, s)| std::slice::from_raw_parts(*params.add(i) as *const u8, s.bytes as usize))
-            .collect();
+        let args: Vec<&[u8]> = match packed {
+            None => slots
+                .iter()
+                .enumerate()
+                .map(|(i, s)| std::slice::from_raw_parts(*params.add(i) as *const u8, s.bytes as usize))
+                .collect(),
+            // Each argument at its alignment in the buffer, as CUDA lays parameters out. The alignment is taken
+            // from the size (the module keeps no .align): exact for scalars, pointers and vectors; a struct whose
+            // alignment is below the largest power of two dividing its size (a packed {char, int}) would be misread.
+            Some((buf, size)) => {
+                let mut off = 0usize;
+                let mut v = Vec::with_capacity(slots.len());
+                for s in &slots {
+                    let b = s.bytes as usize;
+                    let align = if b.is_power_of_two() && b <= 16 { b } else { (1usize << b.trailing_zeros()).min(8) };
+                    off = off.next_multiple_of(align.max(1));
+                    if size.is_some_and(|n| off + b > n) {
+                        return Err(CUerror::INVALID_VALUE);
+                    }
+                    v.push(std::slice::from_raw_parts(buf.add(off), b));
+                    off += b;
+                }
+                v
+            }
+        };
         let (grid, block) = ([gx, gy, gz], [bx, by, bz]);
         let op = || Op::Launch { f: f.0 as usize, grid, block, shared, params: args.iter().map(|a| a.to_vec()).collect() };
         if d.captured(stream, op) {
@@ -2941,6 +2978,82 @@ pub(crate) unsafe fn cuStreamSynchronize(s: CUstream) -> CUresult {
         d.finished(last.syncobj, last.point);
         d.after_sync()
     })
+}
+
+// Stream memory operations (tinygrad's runtime signals with them) and host functions. The stream's earlier work
+// finishes first (the stream is synchronized), then the CPU does the operation, so the stream's later work, queued
+// after this returns, comes after it: the order the API promises, with the host thread waiting meanwhile.
+
+/// The stream's earlier work done, then `op` on the driver (not while capturing a graph: not recorded there).
+unsafe fn after_stream(s: CUstream, op: impl FnOnce(&mut Driver) -> CUresult) -> CUresult {
+    with(|d| if d.capturing.contains_key(&(s.0 as usize)) { Err(CUerror::NOT_SUPPORTED) } else { Ok(()) })?;
+    cuStreamSynchronize(s)?;
+    with(op)
+}
+
+unsafe fn stream_write_value(s: CUstream, addr: CUdeviceptr, value: &[u8]) -> CUresult {
+    after_stream(s, |d| d.copy_htod(addr.0 as u64, value).map_err(from_io))
+}
+
+/// CU_STREAM_WAIT_VALUE_GEQ (unsigned, wrapping as the hardware compares), EQ, AND, NOR.
+unsafe fn stream_wait_value(s: CUstream, addr: CUdeviceptr, value: u64, flags: c_uint, width: usize) -> CUresult {
+    let mask = if width == 4 { u32::MAX as u64 } else { u64::MAX };
+    let holds = |v: u64| match flags & 0xf {
+        0 => (v.wrapping_sub(value) & mask) >> (width * 8 - 1) == 0, // (signed)(*addr - value) >= 0
+        1 => v == value,
+        2 => v & value != 0,
+        3 => !(v | value) & mask != 0,
+        _ => false,
+    };
+    after_stream(s, |_| Ok(()))?;
+    let start = Instant::now();
+    let mut warned = false;
+    loop {
+        // read outside the driver lock between tries: another thread's CUDA call may be what writes the value
+        let mut b = [0u8; 8];
+        with(|d| d.copy_dtoh(&mut b[..width], addr.0 as u64).map_err(from_io))?;
+        if holds(u64::from_le_bytes(b) & mask) {
+            return Ok(());
+        }
+        if !warned && start.elapsed().as_secs() >= 10 {
+            warned = true;
+            eprintln!("[zluda_agx] cuStreamWaitValue: 0x{:x} still not satisfied after 10 s (the host waits)", addr.0 as u64);
+        }
+        std::thread::yield_now();
+    }
+}
+
+pub(crate) unsafe fn cuStreamWriteValue32_v2(s: CUstream, addr: CUdeviceptr, value: cuuint32_t, _flags: c_uint) -> CUresult {
+    stream_write_value(s, addr, &value.to_le_bytes())
+}
+pub(crate) unsafe fn cuStreamWriteValue64_v2(s: CUstream, addr: CUdeviceptr, value: cuuint64_t, _flags: c_uint) -> CUresult {
+    stream_write_value(s, addr, &value.to_le_bytes())
+}
+pub(crate) unsafe fn cuStreamWaitValue32_v2(s: CUstream, addr: CUdeviceptr, value: cuuint32_t, flags: c_uint) -> CUresult {
+    stream_wait_value(s, addr, value as u64, flags, 4)
+}
+pub(crate) unsafe fn cuStreamWaitValue64_v2(s: CUstream, addr: CUdeviceptr, value: cuuint64_t, flags: c_uint) -> CUresult {
+    stream_wait_value(s, addr, value, flags, 8)
+}
+pub(crate) unsafe fn cuStreamWriteValue32(s: CUstream, addr: CUdeviceptr, value: cuuint32_t, flags: c_uint) -> CUresult {
+    cuStreamWriteValue32_v2(s, addr, value, flags)
+}
+pub(crate) unsafe fn cuStreamWriteValue64(s: CUstream, addr: CUdeviceptr, value: cuuint64_t, flags: c_uint) -> CUresult {
+    cuStreamWriteValue64_v2(s, addr, value, flags)
+}
+pub(crate) unsafe fn cuStreamWaitValue32(s: CUstream, addr: CUdeviceptr, value: cuuint32_t, flags: c_uint) -> CUresult {
+    cuStreamWaitValue32_v2(s, addr, value, flags)
+}
+pub(crate) unsafe fn cuStreamWaitValue64(s: CUstream, addr: CUdeviceptr, value: cuuint64_t, flags: c_uint) -> CUresult {
+    cuStreamWaitValue64_v2(s, addr, value, flags)
+}
+
+/// The host function runs once the stream's earlier work is done, before its later work (on this thread).
+pub(crate) unsafe fn cuLaunchHostFunc(s: CUstream, f: CUhostFn, user_data: *mut c_void) -> CUresult {
+    let f = f.ok_or(CUerror::INVALID_VALUE)?;
+    after_stream(s, |_| Ok(()))?;
+    f(user_data);
+    Ok(())
 }
 
 pub(crate) unsafe fn cuStreamWaitEvent(s: CUstream, e: CUevent, _flags: c_uint) -> CUresult {

@@ -227,6 +227,11 @@ libzcudart on the driver API, ptxas/fatbinary pass-through, gcc shims; outside Z
   back-to-back time (GPU clock not ramped up for bursty programs: lud_diagonal 128 vs 44 us); against warm times the
   model is within 20% on lud, normalize_weights, streamcluster, heartwall and off by -52..-79% on bfs, gaussian Fan1,
   sum_kernel (handed to the simulator accuracy work).
+- **Device code must be optimized by the front end**: zcc first passed a Makefile's missing -O to clang (device -O0:
+  a local depot per variable, 80-112 B of stack per thread in bfs; the simulator agent found the hardware charges
+  ~1.15 us per SIMD-group's first stack use, up to ~110 us a core). With device -O3 as nvcc does: GPU time bfs -71%,
+  gaussian -83%, pathfinder -67%, nw -49%, srad_v1 -42%, hybridsort -35%; results unchanged (bfs 0/1M mismatches,
+  lud -v, huffman PASS).
 - **Copies are not the bottleneck**: cuMemcpy HtoD/DtoH 28-40 GB/s = host memcpy on this machine at 64 KB-256 MB.
 
 ## What went wrong, 2026-11-03 (Blender Cycles session): read before repeating it

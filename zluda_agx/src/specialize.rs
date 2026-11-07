@@ -185,6 +185,25 @@ pub(crate) fn without_other_entries(src: &str, kernel: &str) -> String {
     out
 }
 
+/// Bytes of `src` outside its `.entry` declarations and bodies: what `without_other_entries` keeps of the module for
+/// any one kernel, besides the kernel itself.
+pub(crate) fn non_entry_bytes(src: &str) -> usize {
+    let mut entries = 0;
+    let mut at = 0;
+    while let Some(i) = src[at..].find(".entry") {
+        let entry = at + i;
+        let line = src[..entry].rfind('\n').map_or(0, |n| n + 1).max(at);
+        match src[entry..].find('{').map(|b| entry + b).and_then(|b| matching_brace(&src[b..]).map(|e| b + e)) {
+            Some(end) => {
+                entries += end - line;
+                at = end;
+            }
+            None => at = entry + ".entry".len(),
+        }
+    }
+    src.len() - entries
+}
+
 /// Kernel names in a PTX image, in source order. This is used to defer AGX
 /// code generation until a CUDA module asks for a particular kernel.
 pub(crate) fn entry_names(src: &str) -> Vec<String> {

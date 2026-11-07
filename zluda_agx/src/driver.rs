@@ -139,6 +139,9 @@ struct LazySource {
     compiled: HashMap<String, usize>,
     pending: HashMap<String, CompileResultSlot>,
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Bytes of the module's text outside its kernels (functions, globals: what every kernel's own text for
+    /// specialization keeps), measured once at the first kernel loaded on request
+    shared_bytes: Option<usize>,
 }
 
 /// Where a large lazily loaded module keeps its portable AIR, removed with the module.
@@ -2747,6 +2750,7 @@ unsafe fn load_module_data(d: &mut Driver, bytes: *const u8) -> Result<usize, CU
             compiled: HashMap::new(),
             pending,
             cancelled,
+            shared_bytes: None,
         });
     }
     Ok(h)
@@ -2990,8 +2994,15 @@ fn module_function(d: &mut Driver, parent: usize, name: &str) -> Result<usize, C
                 // attention modules are 10 MB of kernels, each a few tens of KB alone.
                 let can_specialize =
                     specialize_enabled() && !agx_checked() && !loaded.uses_heap() && !loaded.uses_timer();
-                let kernel_ptx = can_specialize
-                    .then(|| crate::specialize::without_other_entries(&ptx, &name))
+                // (measured once per module: when the functions alone are over the limit, no kernel's text is
+                // extracted; Blender Cycles' 17.6 MB module, 77 kernels on request, lost ~2.2 s a render to it)
+                let shared = can_specialize.then(|| {
+                    let source = d.lazy_sources.get_mut(&parent).unwrap();
+                    *source.shared_bytes.get_or_insert_with(|| crate::specialize::non_entry_bytes(&ptx))
+                });
+                let kernel_ptx = shared
+                    .filter(|&b| b <= SPEC_KERNEL_BYTES)
+                    .map(|_| crate::specialize::without_other_entries(&ptx, &name))
                     .filter(|text| text.len() <= SPEC_KERNEL_BYTES);
                 let child = d.handle();
                 d.modules.insert(child, loaded);

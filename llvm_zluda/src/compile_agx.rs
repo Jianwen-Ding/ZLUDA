@@ -130,6 +130,14 @@ pub(crate) fn init_globals() -> Result<(), String> {
             if std::env::var("ZLUDA_AGX_LAUNCH_DIVISORS").map_or(true, |v| v != "0") {
                 options.push(std::ffi::CString::new("-agx-launch-divisors").unwrap());
             }
+            // ZLUDA_AGX_LOOKUP_TABLES=0: no switch lookup tables in the AIR (-air-lookup-tables=false). They are
+            // constant arrays in the module's global data, where they move the device variables of a single-kernel
+            // recompilation, so launch-time specialization of such modules fails ("the modules lay out their global
+            // data differently"); without them it loads, but the selects are slower than the table loads
+            // (Rodinia hybridsort: GPU 449 -> 496 ms, mergeSortPass and bucketcount), so the tables stay.
+            if std::env::var("ZLUDA_AGX_LOOKUP_TABLES").is_ok_and(|v| v == "0") {
+                options.push(std::ffi::CString::new("-air-lookup-tables=false").unwrap());
+            }
             if let Ok(extra) = std::env::var("ZLUDA_AGX_LLVM_ARGS") {
                 options.extend(extra.split_whitespace().filter_map(|a| std::ffi::CString::new(a).ok()));
             }

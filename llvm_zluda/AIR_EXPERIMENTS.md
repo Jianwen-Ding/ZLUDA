@@ -217,7 +217,16 @@ libzcudart on the driver API, ptxas/fatbinary pass-through, gcc shims; outside Z
 - **Open, launch-time specialization of modules with device variables**: zoc's switch lookup tables
   (`.Lswitch.table.*`, private, in .agx.globals) of other kernels shift the named variables' offsets, so the
   specialized single-kernel module "lays out its global data differently" and is not loaded (hybridsort: 4 kernels
-  run unspecialized). Needs compiler-made constants outside the shared variables buffer.
+  run unspecialized). Needs compiler-made constants outside the shared variables buffer. **Refuted, no tables**
+  (`-air-lookup-tables=false`, ZLUDA_AGX_LOOKUP_TABLES=0): specialization then loads, but hybridsort's GPU time is
+  449 -> 496 ms (mergeSortPass 362 -> 390, bucketcount 72 -> 92 ms, 3 runs each): the select chains cost more than
+  the table loads plus the lost specialization. Cycles neutral (2671 -> 2663 ms).
+- **Halide apps** (Halide_TARGET=host-cuda, NVPTX from the fork's LLVM, Halide's runtime on libcuda): all 66 app
+  tests pass after the context-stack fix (exit-time cuCtxPushCurrent/PopCurrent panicked on destroyed TLS).
+- **Simulator on clang-built Rodinia captures** (/scratch/sim-captures/rodinia): in-run launches are 2-3x their warm
+  back-to-back time (GPU clock not ramped up for bursty programs: lud_diagonal 128 vs 44 us); against warm times the
+  model is within 20% on lud, normalize_weights, streamcluster, heartwall and off by -52..-79% on bfs, gaussian Fan1,
+  sum_kernel (handed to the simulator accuracy work).
 - **Copies are not the bottleneck**: cuMemcpy HtoD/DtoH 28-40 GB/s = host memcpy on this machine at 64 KB-256 MB.
 
 ## What went wrong, 2026-11-03 (Blender Cycles session): read before repeating it

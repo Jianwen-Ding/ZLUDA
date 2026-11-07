@@ -451,10 +451,11 @@ impl LaunchRecord {
 
 impl LaunchRecord {
     /// One JSON line of the `ZLUDA_AGX_PROFILE` file: the launch and its GPU time from the firmware timestamps.
-    fn profile_line(&self, ns: u64) -> String {
+    /// `start`: the command's firmware start timestamp in ns (the launches of a batch share it)
+    fn profile_line(&self, ns: u64, start: u64) -> String {
         let params: Vec<String> = self.params.iter().map(|p| format!("\"{}\"", p.iter().map(|b| format!("{b:02x}")).collect::<String>())).collect();
         format!(
-            "{{\"kernel\":\"{}\",\"module\":{},\"grid\":[{},{},{}],\"block\":[{},{},{}],\"shared\":{},\"stream\":{},\"command\":{},\"ns\":{},\"t\":{},\"params\":[{}]}}",
+            "{{\"kernel\":\"{}\",\"module\":{},\"grid\":[{},{},{}],\"block\":[{},{},{}],\"shared\":{},\"stream\":{},\"command\":{},\"ns\":{},\"start\":{},\"t\":{},\"params\":[{}]}}",
             self.kernel,
             self.module,
             self.grid[0],
@@ -467,6 +468,7 @@ impl LaunchRecord {
             self.stream,
             self.fence.point,
             ns,
+            start,
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis()),
             params.join(",")
         )
@@ -1152,7 +1154,8 @@ impl Driver {
                 for r in finished.clone() {
                     if let Some((start, end)) = q.timing(r.fence) {
                         let ns = end.saturating_sub(start) as u128 * 1_000_000_000 / freq / per_command[&r.fence.point];
-                        let _ = writeln!(out, "{}", r.profile_line(ns as u64));
+                        let at = start as u128 * 1_000_000_000 / freq;
+                        let _ = writeln!(out, "{}", r.profile_line(ns as u64, at as u64));
                     }
                 }
             }
@@ -4749,7 +4752,14 @@ pub(crate) unsafe fn cuGraphLaunch(exec: CUgraphExec, s: CUstream) -> CUresult {
         let mut r = Ok(());
         for op in &ops {
             let launch = matches!(op, Op::Launch { .. });
-            if !launch {
+            // a device-to-device copy joins the batch as a copy kernel (`run`, `copy_in_batch`; when it cannot, its
+            // `sync_all` submits the batch first): llama.cpp's graphs have one per layer, which split a token's
+            // ~250 launches into 13 commands (~15-20 us apart on the GPU, a submit each)
+            let batchable = match op {
+                Op::Copy { dst, src, .. } => d.is_device(*dst) && d.is_device(*src),
+                _ => false,
+            };
+            if !launch && !batchable {
                 let at = std::time::Instant::now();
                 r = d.flush_batch();
                 t[2] += at.elapsed();

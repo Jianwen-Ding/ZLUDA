@@ -934,3 +934,19 @@ the shipped kernel is only run and timed.
   code is unchanged. Test: instruction_mode_to_global_mode/unreached_caller.ptx (fails before, passes after).
 - **Result**: the clang Cycles kernel compiles: 39.7 s wall, 78 s CPU, 2.07 GB peak, 17.4 MB object
   (`zoc --arch=agx-g14c --agx-only --object-only`, whole module).
+
+### llama.cpp (clang-built ggml-cuda) correct on ZLUDA (2026-11-07)
+- Garbage text was caused by zcc passing `-fcuda-flush-denormals-to-zero` for nvcc's `-ftz=true`/`--use_fast_math`:
+  clang's NVPTX backend then emits `.ftz` on f16 ops too (`mul.ftz.f16`), whereas nvcc flushes only f32. ggml's
+  `__hmul2(dm5, ds8)` (Q5_1 block scale products) is routinely f16-subnormal and became 0. Fixed in
+  /scratch/cuda-clang-helpers/bin/zcc (flag dropped; ZLUDA's default FP mode flushes f32 in hardware anyway).
+  Found with a standalone ggml MUL_MAT CUDA-vs-CPU harness on the real weights (/scratch/perf/wt): test-backend-ops
+  passed because its random weights rarely give subnormal half products.
+- Other fixes on the way: AGX abs(neg x) source-modifier fold (llvm 465c53bd), `__byte_perm` selector mask,
+  `.maxntid` recompilation for blocks above the threadgroup limit (SOFT_MAX), cublasDestroy on destroyed streams.
+- CUDA graphs enabled (helpers runtime forwards capture/instantiate/update/launch to the driver): output identical.
+- `llama-completion` output is byte-identical to the CPU backend. llama-bench, qwen2.5-0.5b Q5_K_M, M2 Max:
+  fa=0: pp128 254, pp512 339, tg128 122 t/s; fa=1: pp128 263, pp512 330, tg128 71 t/s.
+- Next: flash_attn_ext_f16 decode kernel (ncols=1) is ~205 us/launch vs ~14 us for the others (43% of tg GPU time
+  with fa=1); quantize_q8_1/mul_mat_vec_q/rms_norm each ~14 us (launch-floor-bound; ~13 us appears to be a
+  per-kernel minimum, so fusion/graph batching would matter).

@@ -961,3 +961,16 @@ the shipped kernel is only run and timed.
   agent, noisy): none pp128 246 / tg128 94; 96: 273 / 94; 80: 263 / 66; 64: 249 / 59. Occupancy alone does not fix
   MMVQ; 96 may help prompt processing (re-measure on a quiet GPU). Next: MMVQ load vectorization / issuing the next
   block's loads before the ALU work (software pipelining), a native-ish dp4a sequence.
+- Why MMVQ is slow (2026-11-07, later): it is per-launch latency, not bandwidth. Q5_1 896x896 takes ~20 us back to
+  back with 1, 4 or 32 workgroups (23-29 us at its 224): k = 896 is one loop iteration, a straight pass of ~845
+  instructions per SIMD group over 110 distinct 64-byte code lines, cold-fetched at every command (~104 ns per line,
+  playground 2026-11-01-code-fetch) = ~11 us. Shrinking the executed code is the lever.
+- `-agx-signed-bytes-alu=0` (dp4a bytes sign-extended by two shifts instead of and/xor/sub; fewer instructions):
+  tg128 106/110 vs default 109/113 t/s. No gain; default kept.
+- Launch-time specialization extended (zluda_agx specialize.rs): struct fields and null pointers become constants,
+  kernels of large lazily-compiled modules are specialized from their own extracted PTX, and a specialized module
+  whose globals are a prefix of the original's shares them. The fusion branches of MMVQ fold away. llama-bench
+  qwen2.5-0.5b Q5_K_M: fa=0 pp128 251-261, pp512 327-347, tg128 140-142 (was ~110); fa=1 pp128 262-266, pp512
+  340-344, tg128 76-80 (was ~71). Output identical to the CPU backend.
+- Next: flash_attn_ext_f16 decode (1392 B stack per thread, ~205 us/launch) and code size of the MMVQ dequant
+  (q5 qh merging: and/or/shift chains the bfi combine does not catch).

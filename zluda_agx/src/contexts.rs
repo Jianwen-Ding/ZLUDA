@@ -81,17 +81,25 @@ pub(crate) fn top() -> Option<usize> {
     STACK.try_with(|s| s.borrow().last().copied()).ok().flatten()
 }
 
+// After the thread's stack is destroyed (exit-time destructors: Halide's halide_cuda_device_release pushes and pops
+// its context from one), push / set / forget do nothing and pop finds nothing; calls use the primary context then.
+
+/// Whether this thread's context stack still exists (false in exit-time destructors that run after it).
+pub(crate) fn alive() -> bool {
+    STACK.try_with(|_| ()).is_ok()
+}
+
 pub(crate) fn push(h: usize) {
-    STACK.with(|s| s.borrow_mut().push(h));
+    let _ = STACK.try_with(|s| s.borrow_mut().push(h));
 }
 
 pub(crate) fn pop() -> Option<usize> {
-    STACK.with(|s| s.borrow_mut().pop())
+    STACK.try_with(|s| s.borrow_mut().pop()).ok().flatten()
 }
 
 /// cuCtxSetCurrent: replaces the top of the stack (pushes onto an empty one); `None` pops it.
 pub(crate) fn set(h: Option<usize>) {
-    STACK.with(|s| {
+    let _ = STACK.try_with(|s| {
         let mut s = s.borrow_mut();
         match h {
             Some(h) => match s.last_mut() {
@@ -102,12 +110,12 @@ pub(crate) fn set(h: Option<usize>) {
                 s.pop();
             }
         }
-    })
+    });
 }
 
 /// Drops a destroyed context from this thread's stack.
 pub(crate) fn forget(h: usize) {
-    STACK.with(|s| s.borrow_mut().retain(|&x| x != h));
+    let _ = STACK.try_with(|s| s.borrow_mut().retain(|&x| x != h));
 }
 
 #[cfg(test)]

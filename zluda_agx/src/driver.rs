@@ -3347,7 +3347,12 @@ pub(crate) unsafe fn cuCtxPushCurrent_v2(ctx: CUcontext) -> CUresult {
 
 pub(crate) unsafe fn cuCtxPopCurrent_v2(pctx: *mut CUcontext) -> CUresult {
     with_contexts(|_| Ok(()))?;
-    let h = contexts::pop().ok_or(CUerror::INVALID_CONTEXT)?;
+    let h = match contexts::pop() {
+        Some(h) => h,
+        // exit-time destructors after this thread's stack is gone: the context their calls used, the primary one
+        None if !contexts::alive() => with_contexts(|c| Ok(c.current()))?,
+        None => return Err(CUerror::INVALID_CONTEXT),
+    };
     if pctx.is_null() {
         return Ok(());
     }

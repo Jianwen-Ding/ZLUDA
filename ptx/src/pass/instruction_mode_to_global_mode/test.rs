@@ -442,3 +442,13 @@ fn unreached_caller() {
         .iter()
         .any(|s| matches!(s, Statement::SetMode(..))));
 }
+
+static UNOBSERVED_MODE_JOIN_PTX: &'static str = include_str!("unobserved_mode_join.ptx");
+
+// The cleanup block (only ret) is entered with different f16/f64 denormal modes and observes none: it has no
+// prologue, and the jumps into it stay as they are instead of failing (Unreachable).
+#[test]
+fn unobserved_mode_join() {
+    let methods = compile_methods(UNOBSERVED_MODE_JOIN_PTX);
+    assert!(methods.iter().any(|m| m.kernel_attributes.is_some()));
+}

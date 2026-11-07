@@ -975,7 +975,9 @@ fn join_modes(
                 kernel_attributes: None,
                 ..
             }) => {
-                let ret_bb = cfg.functions_rets.get(name).unwrap();
+                // a function that never returns (only trap / exit / endless loops: clang's PTX for ggml's
+                // no-device-code stubs) has no exit modes; the code after a call to it is unreachable
+                let ret_bb = cfg.functions_rets.get(name)?;
                 let weights = cfg.graph.node_weight(*ret_bb).unwrap();
                 let modes = ResolvedInstructionModes {
                     denormal_f32: weights.denormal_f32.exit.map(DenormalMode::to_ftz),
@@ -1131,11 +1133,9 @@ fn apply_global_mode_controls(
                             },
                     }) = post_call_bra
                     {
-                        let node_exit_mode = global_modes
-                            .functions_exit_modes
-                            .get(&call_target)
-                            .ok_or_else(error_unreachable)?;
-                        if !bb_state.unreached {
+                        // (a callee that never returns has no exit modes: what follows the call is never run)
+                        let node_exit_mode = global_modes.functions_exit_modes.get(&call_target);
+                        if let (false, Some(node_exit_mode)) = (bb_state.unreached, node_exit_mode) {
                             redirect_jump_impl(
                                 &bb_state.global_modes,
                                 node_exit_mode,
@@ -1402,6 +1402,12 @@ fn redirect_jump_impl(
         || current_mode
             .rounding_f16f64
             .mode_change(target.rounding.twin_mode.f16f64.map(RoundingMode::to_ast));
+    // A block gets a prologue for a mode only where it, or code after it, observes that mode
+    // (compute_minimal_mode_insertions). A different mode on the way into a block without one is not observed: such as
+    // a block that only returns, entered from blocks that left the f16/f64 mode differently (clang's PTX for ggml's
+    // xielu: setp.ftz.f16 then cvt.rn.f16.f32 before the cleanup block). The jump then stays as it is.
+    let jump_to_denormal_prelude = jump_to_denormal_prelude && target.denormal.prologue.is_some();
+    let jump_to_rounding_prelude = jump_to_rounding_prelude && target.rounding.prologue.is_some();
     match (jump_to_denormal_prelude, jump_to_rounding_prelude) {
         (true, false) => {
             *jump_target = target.denormal.prologue.ok_or_else(error_unreachable)?;

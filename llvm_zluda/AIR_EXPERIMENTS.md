@@ -953,8 +953,9 @@ the shipped kernel is only run and timed.
 - Token generation is GPU-bound (~79% busy, ~510 launches/token in 2 graphs): host graph launch ~1 ms/token, other
   host work ~0.2 ms (LD_PRELOAD timer /scratch/perf/apitime/t.so, reads zluda_agx_gpu_busy_ns). Batched profile
   lines split a command's time evenly, so per-kernel ns inside graphs are not per-kernel times.
-- Warm isolated hw times (agx_run_hw --back-to-back, /scratch/sim-captures/llama-tg): mul_mat_vec_q Q5_1 896x896
-  35 us (~17 GB/s), Q8_0 896x128 23.5 us, Q5_K 38.5 us, Q6_K 4864x896 45 us (~78 GB/s): the MMVQ kernels are the
+- Warm isolated hw times (agx_run_hw --back-to-back 300 while other GPU jobs ran: up to 1.9x too high; idle GPU,
+  b2b 1000 x5: Q5_1 19.0 us, Q8_0 17.2 us, /scratch/agx-r4/hw/llama-tg-b2b1000-r5.txt): mul_mat_vec_q Q5_1 896x896
+  35 us, Q8_0 896x128 23.5 us, Q5_K 38.5 us, Q6_K 4864x896 45 us (~78 GB/s): the MMVQ kernels are the
   bottleneck. They use 134-190 register halves (16-21 SIMD groups per core); the inner loop is scalar i32 loads,
   `wait 0`, then the dp4a emulation (bfeil/imadd).
 - Global register cap (-agx-default-max-gprs, all kernels), llama-bench fa=0 r=3 (GPU shared with simulator

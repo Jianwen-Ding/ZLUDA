@@ -2235,6 +2235,9 @@ pub(crate) unsafe fn cuDeviceGetAttribute(pi: *mut c_int, attrib: CUdevice_attri
             A::CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY | A::CU_DEVICE_ATTRIBUTE_CAN_MAP_HOST_MEMORY => 1,
             A::CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS | A::CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS => 0,
             A::CU_DEVICE_ATTRIBUTE_CONCURRENT_KERNELS => 1,
+            // every stream has its own queue: a copy on one overlaps kernels on another (programs check this
+            // before using streams for overlap, Rodinia's huffman returns early without it)
+            A::CU_DEVICE_ATTRIBUTE_GPU_OVERLAP | A::CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT => 1,
             // grids up to the co-resident limit (B5); thread block clusters as compiled (B28)
             A::CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH | A::CU_DEVICE_ATTRIBUTE_CLUSTER_LAUNCH => 1,
             // no run time limit on kernels (ptx-re-blockers B6)

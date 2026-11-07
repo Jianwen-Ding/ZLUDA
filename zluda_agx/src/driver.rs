@@ -2559,7 +2559,21 @@ unsafe fn load_module_data(d: &mut Driver, bytes: *const u8) -> Result<usize, CU
     }
     d.modules.insert(h, loaded);
     if let Some((ptx, names)) = lazy {
-        let workers = std::env::var("ZLUDA_AGX_PARALLEL_KERNELS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(16);
+        // A large module's other kernels (made from its portable AIR, a kernel's AGX code each) compile on 4 workers
+        // by default: Blender Cycles' 78 kernels, cold, 89.6 -> 39.7 s with 1.8 GB of zoc memory at the peak (one
+        // worker: 1.0 GB); 8 workers are no faster, the slowest kernel (17 s) being the rest of the time. Smaller
+        // lazily loaded modules (ZLUDA_AGX_LAZY_KERNELS=1) keep compiling on request. ZLUDA_AGX_PARALLEL_KERNELS=N
+        // (0 to 16) overrides.
+        let default_workers = if portable.is_some() {
+            std::thread::available_parallelism().map_or(1, |n| n.get() / 3).clamp(1, 4)
+        } else {
+            0
+        };
+        let workers = std::env::var("ZLUDA_AGX_PARALLEL_KERNELS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(default_workers)
+            .min(16);
         let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pending = if workers > 0 {
             precompile_kernels(ptx.clone(), portable.clone(), &names[1..], cpu, workers, cancelled.clone())

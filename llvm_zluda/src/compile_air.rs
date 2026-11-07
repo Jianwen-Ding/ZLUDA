@@ -593,6 +593,12 @@ fn per_kernel_object(
                         if let Some(pipeline) = per_kernel_pipeline {
                             run(&one, pipeline, &agx, &PassBuilderOptions::new())?;
                         }
+                        // ZLUDA_AIR_DUMP_KERNEL=DIR: each kernel's module as the AGX backend gets it, DIR/NAME.bc (to
+                        // time the backend's passes with llc -time-passes)
+                        if let Some(dir) = std::env::var_os("ZLUDA_AIR_DUMP_KERNEL") {
+                            let path = std::path::Path::new(&dir).join(format!("{}.bc", name.to_string_lossy()));
+                            std::fs::write(path, bitcode(&one)).map_err(|e| e.to_string())?;
+                        }
                         let mut asm = Vec::new();
                         if want_asm {
                             asm = agx

@@ -9635,8 +9635,13 @@ impl<'a> MethodEmitContext<'a> {
     }
 
     fn emit_exit(&mut self) -> Result<(), TranslateError> {
+        // `exit` in a function (not a kernel) is what LLVM's NVPTX backend writes for `unreachable` (inline asm
+        // `exit;` in blocks such as a covered switch's %default.unreachable, as a hint to ptxas): clang-built PTX
+        // has it, NVVM's does not. It is emitted as `unreachable`, which is what the source said; a thread that
+        // really executed it would have to end in every caller, which the AGX code has no instruction for.
         if !self.is_kernel {
-            return Err(error_todo());
+            unsafe { LLVMBuildUnreachable(self.builder) };
+            return Ok(());
         }
         unsafe {
             LLVMBuildRetVoid(self.builder);

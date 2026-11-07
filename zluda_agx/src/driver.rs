@@ -95,6 +95,8 @@ pub(crate) struct Driver {
     /// Launch-time specialization (specialize.rs): the PTX of the modules whose kernels may be specialized, and the
     /// state of each (module, kernel, scalar arguments, 8-byte argument equalities, block).
     spec_sources: HashMap<usize, std::sync::Arc<str>>,
+    /// Per (module, kernel): the struct fields and 8-byte parameters its specialization reads (`param_reads`)
+    spec_reads: HashMap<(usize, String), Vec<crate::specialize::ParamRead>>,
     specs: HashMap<SpecKey, Spec>,
     /// Constant-memory specialization (const_spec.rs), per module whose PTX has host-written `.const` variables;
     /// and the module of each lazily compiled kernel's own module (whose global data it shares).
@@ -919,6 +921,16 @@ impl Driver {
         // rewritten as a read of its equal predecessor, so this pattern must be in the key.
         scalars.push(0);
         scalars.extend(crate::specialize::equal_eight_byte_args(args));
+        // struct fields' values and 8-byte reads' null-ness, as `specialize_ptx` rewrites them
+        let reads = match self.spec_reads.get(&(m, name.to_string())) {
+            Some(r) => r,
+            None => {
+                let r = crate::specialize::param_reads(&self.spec_sources[&m], name);
+                self.spec_reads.entry((m, name.to_string())).or_insert(r)
+            }
+        };
+        scalars.push(0xfe);
+        scalars.extend(crate::specialize::read_key(reads, args));
         let key: SpecKey = (m, name.to_string(), scalars, block);
         // arguments that change at every launch (a step counter) would never be specialized: stop counting new ones
         if self.specs.len() >= MAX_SPECS && !self.specs.contains_key(&key) {
@@ -1542,6 +1554,7 @@ fn new_driver() -> Result<Driver, CUerror> {
         checked_launches: Default::default(),
         captured_launches: Default::default(),
         spec_sources: Default::default(),
+        spec_reads: Default::default(),
         specs: Default::default(),
         heap: None,
         timer: None,
@@ -1831,6 +1844,10 @@ fn agx_fast_mma() -> bool {
 /// options: compiler/src/main.rs, LARGE_MODULE_BYTES, the same size); here, such a module gets a zoc of its own (the
 /// options are LLVM's, for the whole process) and the stack retry below.
 const LARGE_MODULE_BYTES: usize = 4 << 20;
+
+/// A kernel of a large module is specialized at launch (`specialized`) when its own PTX, with the module's functions
+/// and globals, is at most this size.
+const SPEC_KERNEL_BYTES: usize = 1 << 20;
 /// The stack per thread a large module is first compiled with.
 const LARGE_MODULE_STACK_TRY: u32 = 16384;
 
@@ -2900,6 +2917,7 @@ pub(crate) unsafe fn cuModuleUnload(hmod: CUmodule) -> CUresult {
         d.functions.retain(|_, (m, _)| *m != h && !children.contains(m));
         d.spec_sources.remove(&h);
         d.specs.retain(|(m, ..), _| *m != h && !children.contains(m));
+        d.spec_reads.retain(|(m, _), _| *m != h && !children.contains(m));
         d.const_specs.remove(&h);
         d.const_root.retain(|c, r| *r != h && *c != h);
         Ok(())
@@ -2964,19 +2982,22 @@ fn module_function(d: &mut Driver, parent: usize, name: &str) -> Result<usize, C
                 if !loaded.module.kernels.contains_key(&name) {
                     return Err(CUerror::NOT_FOUND);
                 }
-                // (not a kernel of a large module, as the module itself: each new set of scalar arguments would rewrite
-                // and hash all of its PTX at the launch, and compile the whole module's front end again; Blender
-                // Cycles' launches change them all the time: 3.7 s per sample instead of 0.3)
-                let can_specialize = specialize_enabled()
-                    && !agx_checked()
-                    && !loaded.uses_heap()
-                    && !loaded.uses_timer()
-                    && ptx.len() <= LARGE_MODULE_BYTES;
+                // The kernel's own PTX (the kernel, the module's functions and globals) for launch-time
+                // specialization, extracted once here: specializing the whole module's text would rewrite and hash
+                // all of it at each new set of scalar arguments (Blender Cycles' launches change them all the time:
+                // 3.7 s per sample instead of 0.3). A kernel whose text is still large (Cycles: mostly functions,
+                // each recompiled for a specialized copy) is not specialized. llama.cpp's MMVQ / MMQ / flash
+                // attention modules are 10 MB of kernels, each a few tens of KB alone.
+                let can_specialize =
+                    specialize_enabled() && !agx_checked() && !loaded.uses_heap() && !loaded.uses_timer();
+                let kernel_ptx = can_specialize
+                    .then(|| crate::specialize::without_other_entries(&ptx, &name))
+                    .filter(|text| text.len() <= SPEC_KERNEL_BYTES);
                 let child = d.handle();
                 d.modules.insert(child, loaded);
                 d.const_root.insert(child, parent);
-                if can_specialize {
-                    d.spec_sources.insert(child, ptx);
+                if let Some(text) = kernel_ptx {
+                    d.spec_sources.insert(child, std::sync::Arc::from(text));
                 }
                 d.lazy_sources.get_mut(&parent).unwrap().compiled.insert(name.clone(), child);
                 if crate::log_enabled() {

@@ -2,8 +2,13 @@
 //! compiled once more with them as constants (ZLUDA_AGX_SPECIALIZE, see the AGX docs). The PTX of the kernel is
 //! rewritten: `ld.param` of a 4-byte scalar parameter (`.u32`, `.s32`, `.b32`, `.f32`) becomes a `mov` of the
 //! argument's value; an 8-byte parameter equal to an earlier parameter of the same type reads that earlier parameter;
-//! and `mov.u32 %r, %ntid.{x,y,z}` becomes a `mov` of the block's size. Everything else, the other kernels
-//! and the parameter list included, stays as it is, so the specialized kernel takes the same arguments.
+//! and `mov.u32 %r, %ntid.{x,y,z}` becomes a `mov` of the block's size. Fields of a struct parameter (`.b8
+//! name[N]`) read as 4-byte values (`ld.param.b32 %r, [name+8]`, vector loads too) become `mov`s of their values, and
+//! an 8-byte read (a pointer, top-level or a struct field) whose value is zero becomes `mov ..., 0`: ggml passes its
+//! fusion options as a struct whose null pointers are the flags, and the branches on them fold away. Which fields a
+//! kernel reads (`param_reads`) decides the key: their 4-byte values and the 8-byte ones' null-ness (`read_key`).
+//! Everything else, the other kernels and the parameter list included, stays as it is, so the specialized kernel
+//! takes the same arguments.
 
 use std::collections::HashMap;
 
@@ -24,29 +29,117 @@ pub fn equal_eight_byte_args(args: &[&[u8]]) -> Vec<u8> {
     pairs
 }
 
-/// The module with `kernel` specialized for `args` (the launch's parameter bytes) and `block`, and the number of
-/// instructions rewritten; `None` if the kernel is not found or nothing in it depends on them.
-pub fn specialize_ptx(src: &str, kernel: &str, args: &[&[u8]], block: [u32; 3]) -> Option<(String, usize)> {
+/// The kernel's parameters by index: `Some((type, name))` of a scalar (`u32`, ..., `b64`) or of a struct (`agg`,
+/// `.b8 name[N]`), `None` otherwise. (Pointer parameters are declared `.param .u64 .ptr .align 1 name`.)
+fn kernel_params(src: &str, kernel: &str) -> Option<(Vec<Option<(&'static str, String)>>, usize)> {
     let entry = find_entry(src, kernel)?;
     let open = entry + src[entry..].find('(')?;
-    let close = open + src[open..].find(')')?;
-    // index -> (type, name) of scalar parameters we can specialize
-    let mut params: Vec<Option<(&str, &str)>> = Vec::new();
+    let close = open + matching_paren(&src[open..])? - 1;
+    let mut params = Vec::new();
     for p in src[open + 1..close].split(',') {
         let words: Vec<&str> = p.split_whitespace().collect();
-        params.push(match words.as_slice() {
-            [".param", ty @ (".u32" | ".s32" | ".b32" | ".f32" | ".u64" | ".s64" | ".b64"), name]
-                if !name.contains('[') => Some((&ty[1..], *name)),
+        let Some(name) = words.last() else {
+            params.push(None);
+            continue;
+        };
+        let ty = words.iter().find_map(|w| {
+            Some(match *w {
+                ".u32" => "u32",
+                ".s32" => "s32",
+                ".b32" => "b32",
+                ".f32" => "f32",
+                ".u64" => "u64",
+                ".s64" => "s64",
+                ".b64" => "b64",
+                ".b8" => "agg",
+                _ => return None,
+            })
+        });
+        params.push(match (ty, name.split_once('[')) {
+            (Some("agg"), Some((n, _))) => Some(("agg", n.to_string())),
+            (Some(t), None) if t != "agg" && words.first() == Some(&".param") => Some((t, name.to_string())),
             _ => None,
         });
     }
+    Some((params, close))
+}
+
+/// A read of a launch argument that specialization may rewrite: (parameter index, byte offset, width), width 4 a
+/// value inside a struct parameter, 8 an 8-byte read (its null-ness matters).
+pub type ParamRead = (u32, u32, u8);
+
+/// The reads of `kernel`'s struct fields and 8-byte parameters that `specialize_ptx` would rewrite, in order, without
+/// duplicates (computed once per kernel: the key of each launch is built from them, `read_key`).
+pub fn param_reads(src: &str, kernel: &str) -> Vec<ParamRead> {
+    let Some((params, close)) = kernel_params(src, kernel) else { return Vec::new() };
+    let Some(body_start) = src[close..].find('{').map(|b| close + b) else { return Vec::new() };
+    let Some(body_end) = matching_brace(&src[body_start..]).map(|e| body_start + e) else { return Vec::new() };
+    let mut reads = Vec::new();
+    for line in src[body_start..body_end].lines() {
+        if let Some((index, offset, width, lanes)) = param_load(line.trim(), &params) {
+            for lane in 0..lanes {
+                let r = (index as u32, offset + lane * width as u32, width);
+                if !reads.contains(&r) {
+                    reads.push(r);
+                }
+            }
+        }
+    }
+    reads
+}
+
+/// The part of the specialization key from `reads`: each 4-byte value, and one byte per 8-byte read (zero or not).
+pub fn read_key(reads: &[ParamRead], args: &[&[u8]]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(reads.len() * 4);
+    for &(index, offset, width) in reads {
+        let bytes = args.get(index as usize).and_then(|a| a.get(offset as usize..offset as usize + width as usize));
+        match (bytes, width) {
+            (Some(b), 4) => key.extend_from_slice(b),
+            (Some(b), _) => key.push(b.iter().all(|x| *x == 0) as u8),
+            (None, _) => key.push(0xff),
+        }
+    }
+    key
+}
+
+/// A parameter load this pass rewrites: (parameter index, offset, width, vector lanes) of `ld.param[.v2|.v4].<ty>
+/// dst, [name(+off)]` where the parameter is a struct and `ty` is 32-bit, or `ty` is a 64-bit integer.
+fn param_load(text: &str, params: &[Option<(&'static str, String)>]) -> Option<(usize, u32, u8, u32)> {
+    let rest = text.strip_prefix("ld.param.")?;
+    let (lanes, rest) = match rest {
+        r if r.starts_with("v2.") => (2, &r[3..]),
+        r if r.starts_with("v4.") => (4, &r[3..]),
+        r => (1, r),
+    };
+    let (ty, rest) = rest.split_at(rest.find(|c: char| c.is_whitespace())?);
+    let addr = rest.trim().strip_suffix(';')?.rsplit_once(',')?.1.trim();
+    let inner = addr.strip_prefix('[')?.strip_suffix(']')?.trim();
+    let (name, offset) = match inner.split_once('+') {
+        Some((n, o)) => (n.trim(), o.trim().parse::<u32>().ok()?),
+        None => (inner, 0),
+    };
+    let index = params.iter().position(|p| p.as_ref().is_some_and(|(_, n)| n == name))?;
+    let (pty, _) = params[index].as_ref()?;
+    let width = match ty {
+        "b32" | "u32" | "s32" | "f32" if *pty == "agg" => 4,
+        "b64" | "u64" | "s64" if lanes == 1 && (*pty == "agg" || pty.ends_with("64")) => 8,
+        _ => return None,
+    };
+    Some((index, offset, width, lanes))
+}
+
+/// The module with `kernel` specialized for `args` (the launch's parameter bytes) and `block`, and the number of
+/// instructions rewritten; `None` if the kernel is not found or nothing in it depends on them.
+pub fn specialize_ptx(src: &str, kernel: &str, args: &[&[u8]], block: [u32; 3]) -> Option<(String, usize)> {
+    let (owned, close) = kernel_params(src, kernel)?;
+    let params: Vec<Option<(&str, &str)>> = owned.iter().map(|p| p.as_ref().map(|(t, n)| (*t, n.as_str()))).collect();
     let body_start = close + src[close..].find('{')?;
     let body_end = body_start + matching_brace(&src[body_start..])?;
     let mut out = String::with_capacity(src.len());
     out.push_str(&src[..body_start]);
     let mut rewritten = 0;
     for line in src[body_start..body_end].split_inclusive('\n') {
-        match rewrite(line, &params, args, block) {
+        match rewrite(line, &params, &owned, args, block) {
             Some(new) => {
                 out.push_str(&new);
                 rewritten += 1;
@@ -162,7 +255,13 @@ fn matching_brace(s: &str) -> Option<usize> {
 }
 
 /// The replacement of one line of the kernel body, if it reads a specialized value.
-fn rewrite(line: &str, params: &[Option<(&str, &str)>], args: &[&[u8]], block: [u32; 3]) -> Option<String> {
+fn rewrite(
+    line: &str,
+    params: &[Option<(&str, &str)>],
+    owned: &[Option<(&'static str, String)>],
+    args: &[&[u8]],
+    block: [u32; 3],
+) -> Option<String> {
     let indent = &line[..line.len() - line.trim_start().len()];
     let text = line.trim();
     let newline = if line.ends_with('\n') { "\n" } else { "" };
@@ -176,6 +275,44 @@ fn rewrite(line: &str, params: &[Option<(&str, &str)>], args: &[&[u8]], block: [
             _ => return None,
         };
         return Some(format!("{indent}mov.u32 \t{dst}, {};{newline}", block[dim]));
+    }
+    // struct fields (4 bytes, vector loads too) and null 8-byte reads
+    if let Some((index, offset, width, lanes)) = param_load(text, owned) {
+        let rest = text.strip_prefix("ld.param.")?;
+        let rest = rest.strip_prefix("v2.").or_else(|| rest.strip_prefix("v4.")).unwrap_or(rest);
+        let (ty, rest) = rest.split_at(rest.find(|c: char| c.is_whitespace())?);
+        let dst = rest.trim().rsplit_once(',')?.0.trim();
+        let dsts: Vec<&str> = if lanes == 1 {
+            vec![dst]
+        } else {
+            dst.strip_prefix('{')?.strip_suffix('}')?.split(',').map(str::trim).collect()
+        };
+        let arg = args.get(index)?;
+        let mut out = String::new();
+        for (lane, d) in dsts.iter().enumerate() {
+            let at = offset as usize + lane * width as usize;
+            let bytes = arg.get(at..at + width as usize)?;
+            if width == 8 {
+                if bytes.iter().any(|b| *b != 0) {
+                    break;
+                }
+                out.push_str(&format!("{indent}mov.{ty} \t{d}, 0;{newline}"));
+                continue;
+            }
+            let v = u32::from_le_bytes(bytes.try_into().ok()?);
+            let value = match ty {
+                "f32" => format!("0f{v:08X}"),
+                "s32" => format!("{}", v as i32),
+                _ => format!("{v}"),
+            };
+            out.push_str(&format!("{indent}mov.{ty} \t{d}, {value};{newline}"));
+        }
+        if !out.is_empty() {
+            return Some(out);
+        }
+        if params[index].is_some_and(|(t, _)| t == "agg") {
+            return None;
+        }
     }
     // ld.param.<ty> %r, [name] / [name+0]
     let rest = text.strip_prefix("ld.param.")?;
@@ -424,6 +561,44 @@ mod tests {
 	ret;
 }
 ";
+
+    #[test]
+    fn struct_fields_and_null_pointers_become_constants() {
+        let ptx = ".version 7.0
+.target sm_75
+.address_size 64
+.visible .entry k(
+	.param .u64 .ptr .align 1 k_param_0,
+	.param .align 8 .b8 k_param_1[24],
+	.param .u64 .ptr .align 1 k_param_2
+)
+{
+	ld.param.b64 	%rd1, [k_param_0];
+	ld.param.b64 	%rd2, [k_param_1+8];
+	ld.param.b64 	%rd3, [k_param_1];
+	ld.param.v2.b32 	{%r1, %r2}, [k_param_1+16];
+	ld.param.b64 	%rd4, [k_param_2];
+	ret;
+}
+";
+        let p0 = 0x1234u64.to_le_bytes();
+        let mut s = [0u8; 24];
+        s[0..8].copy_from_slice(&0x5678u64.to_le_bytes());
+        s[16..20].copy_from_slice(&7u32.to_le_bytes());
+        s[20..24].copy_from_slice(&(-2i32).to_le_bytes());
+        let p2 = 0u64.to_le_bytes();
+        let args: Vec<&[u8]> = vec![&p0, &s, &p2];
+        let reads = param_reads(ptx, "k");
+        assert_eq!(reads, vec![(0, 0, 8), (1, 8, 8), (1, 0, 8), (1, 16, 4), (1, 20, 4), (2, 0, 8)]);
+        assert_eq!(read_key(&reads, &args), vec![0, 1, 0, 7, 0, 0, 0, 0xfe, 0xff, 0xff, 0xff, 1]);
+        let (out, n) = specialize_ptx(ptx, "k", &args, [32, 1, 1]).unwrap();
+        assert_eq!(n, 3, "{out}");
+        assert!(out.contains("ld.param.b64 \t%rd1, [k_param_0];"));
+        assert!(out.contains("mov.b64 \t%rd2, 0;"));
+        assert!(out.contains("ld.param.b64 \t%rd3, [k_param_1];"));
+        assert!(out.contains("mov.b32 \t%r1, 7;") && out.contains("mov.b32 \t%r2, 4294967294;"));
+        assert!(out.contains("mov.b64 \t%rd4, 0;"));
+    }
 
     #[test]
     fn scalars_and_block_become_constants() {

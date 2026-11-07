@@ -232,6 +232,13 @@ libzcudart on the driver API, ptxas/fatbinary pass-through, gcc shims; outside Z
   ~1.15 us per SIMD-group's first stack use, up to ~110 us a core). With device -O3 as nvcc does: GPU time bfs -71%,
   gaussian -83%, pathfinder -67%, nw -49%, srad_v1 -42%, hybridsort -35%; results unchanged (bfs 0/1M mismatches,
   lud -v, huffman PASS).
+- **tinygrad (DEV=CUDA)**: needs stream waits that do not block the host (a wait comes before the write that
+  satisfies it, same thread: now deferred on the host, 23f2b276), NVRTC's cuda_fp16.h / cuda_bf16.h, and mma with its
+  first operand glued to the type (`.f32{`). Matmul: f32 2048^2 1.75 TFLOPS, f16 through mma.sync (the SIMD-group
+  matrix emulation) 2048^2 1.14 / 4096^2 2.10 TFLOPS, all correct. Far from the M2 Max's ~13.6 TFLOPS f32: tinygrad's
+  CUDA kernels are shaped for NVIDIA (open: what the mma m16n8k16 emulation and its fragment shuffles cost).
+- **Refuted, queue priority**: DRM_ASAHI_PRIORITY_LOW vs MEDIUM no different on lud (13.3 ms GPU each); HIGH and
+  REALTIME are rejected by the kernel.
 - **Copies are not the bottleneck**: cuMemcpy HtoD/DtoH 28-40 GB/s = host memcpy on this machine at 64 KB-256 MB.
 
 ## What went wrong, 2026-11-03 (Blender Cycles session): read before repeating it

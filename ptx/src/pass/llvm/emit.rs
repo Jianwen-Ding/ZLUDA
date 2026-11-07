@@ -937,6 +937,28 @@ fn get_input_argument_type(
     }
 }
 
+/// The type of .texref / .surfref / .samplerref variables (get_type's ast::Type::Texref).
+fn is_texref_type(t: LLVMTypeRef) -> bool {
+    unsafe {
+        LLVMGetTypeKind(t) == LLVMTypeKind::LLVMStructTypeKind
+            && !LLVMGetStructName(t).is_null()
+            && CStr::from_ptr(LLVMGetStructName(t)) == c"struct.texture"
+    }
+}
+
+/// The .texref variable `v` is, or whose address (ptrtoint, as the implicit conversion to a u64 register makes it)
+/// it is.
+fn texref_global(v: LLVMValueRef) -> Option<LLVMValueRef> {
+    unsafe {
+        let g = if !LLVMIsAConstantExpr(v).is_null() && LLVMGetConstOpcode(v) == LLVMOpcode::LLVMPtrToInt {
+            LLVMGetOperand(v, 0)
+        } else {
+            v
+        };
+        (!LLVMIsAGlobalVariable(g).is_null() && is_texref_type(LLVMGlobalGetValueType(g))).then_some(g)
+    }
+}
+
 struct MethodEmitContext<'a> {
     context: LLVMContextRef,
     module: LLVMModuleRef,
@@ -2035,8 +2057,19 @@ impl<'a> MethodEmitContext<'a> {
     }
 
     fn emit_mov(&mut self, arguments: ast::MovArgs<SpirvWord>) -> Result<(), TranslateError> {
-        self.resolver
-            .register(arguments.dst, self.resolver.value(arguments.src)?);
+        let src = self.resolver.value(arguments.src)?;
+        // `mov.u64 %rd, tex` of a .texref / .surfref / .samplerref variable is the opaque handle (unified texture
+        // mode), not the variable's address: the driver keeps the handle in the variable's first 8 bytes. clang
+        // makes every texture<> fetch this way (mov, then tex with the register).
+        if let Some(var) = texref_global(src) {
+            let i64_type = unsafe { LLVMInt64TypeInContext(self.context) };
+            let builder = self.builder;
+            self.resolver.with_result(arguments.dst, |dst| unsafe {
+                LLVMBuildLoad2(builder, i64_type, var, dst)
+            });
+            return Ok(());
+        }
+        self.resolver.register(arguments.dst, src);
         Ok(())
     }
 
@@ -9602,8 +9635,13 @@ impl<'a> MethodEmitContext<'a> {
     }
 
     fn emit_exit(&mut self) -> Result<(), TranslateError> {
+        // `exit` in a function (not a kernel) is what LLVM's NVPTX backend writes for `unreachable` (inline asm
+        // `exit;` in blocks such as a covered switch's %default.unreachable, as a hint to ptxas): clang-built PTX
+        // has it, NVVM's does not. It is emitted as `unreachable`, which is what the source said; a thread that
+        // really executed it would have to end in every caller, which the AGX code has no instruction for.
         if !self.is_kernel {
-            return Err(error_todo());
+            unsafe { LLVMBuildUnreachable(self.builder) };
+            return Ok(());
         }
         unsafe {
             LLVMBuildRetVoid(self.builder);
@@ -9921,6 +9959,12 @@ fn get_type(context: LLVMContextRef, type_: &ast::Type) -> Result<LLVMTypeRef, T
                 })
         }
         ast::Type::Texref => {
+            // One type for every .texref / .surfref / .samplerref variable of the context (a second
+            // LLVMStructCreateNamed would make "struct.texture.2", which is_texref_type would not know)
+            let existing = unsafe { LLVMGetTypeByName2(context, c"struct.texture".as_ptr()) };
+            if !existing.is_null() {
+                return Ok(existing);
+            }
             // Definitions taken from ROCm LLVM output
             let format_desc =
                 unsafe { LLVMStructCreateNamed(context, c"struct.hipChannelFormatDesc".as_ptr()) };

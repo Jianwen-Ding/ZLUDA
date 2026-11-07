@@ -39,6 +39,15 @@ enum Op {
     Copy { dst: u64, src: u64, n: usize },
 }
 
+/// A stream's work held back behind a cuStreamWaitValue whose condition did not hold when it was called (see
+/// `Driver::poll_deferred`): replayed in order, each wait when its condition holds.
+enum Deferred {
+    Op(Op),
+    WaitValue { addr: u64, value: u64, flags: c_uint, width: usize },
+    WriteValue { addr: u64, bytes: Vec<u8> },
+    HostFunc { f: unsafe extern "system" fn(*mut c_void), data: usize },
+}
+
 pub(crate) struct Driver {
     default_waits: Vec<Fence>,
     pub(crate) modules: HashMap<usize, LoadedModule>,
@@ -61,6 +70,11 @@ pub(crate) struct Driver {
     limits: HashMap<u32, usize>,
     /// Streams being captured (0 is the default stream) and their operations so far.
     capturing: HashMap<usize, Vec<Op>>,
+    /// Kernels recompiled with `.maxntid` for a block their registers did not leave room for (module, kernel,
+    /// threads): see `Driver::fit_block`.
+    fitted: HashMap<(usize, String, u64), LoadedModule>,
+    /// Streams waiting for a cuStreamWaitValue condition, and the work given to them since (`stream_key`).
+    deferred: HashMap<usize, std::collections::VecDeque<Deferred>>,
     /// Graphs and their instantiations: both are operation lists.
     graphs: HashMap<usize, Vec<Op>>,
     execs: HashMap<usize, Vec<Op>>,
@@ -81,6 +95,8 @@ pub(crate) struct Driver {
     /// Launch-time specialization (specialize.rs): the PTX of the modules whose kernels may be specialized, and the
     /// state of each (module, kernel, scalar arguments, 8-byte argument equalities, block).
     spec_sources: HashMap<usize, std::sync::Arc<str>>,
+    /// Per (module, kernel): the struct fields and 8-byte parameters its specialization reads (`param_reads`)
+    spec_reads: HashMap<(usize, String), Vec<crate::specialize::ParamRead>>,
     specs: HashMap<SpecKey, Spec>,
     /// Constant-memory specialization (const_spec.rs), per module whose PTX has host-written `.const` variables;
     /// and the module of each lazily compiled kernel's own module (whose global data it shares).
@@ -123,6 +139,9 @@ struct LazySource {
     compiled: HashMap<String, usize>,
     pending: HashMap<String, CompileResultSlot>,
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Bytes of the module's text outside its kernels (functions, globals: what every kernel's own text for
+    /// specialization keeps), measured once at the first kernel loaded on request
+    shared_bytes: Option<usize>,
 }
 
 /// Where a large lazily loaded module keeps its portable AIR, removed with the module.
@@ -437,10 +456,11 @@ impl LaunchRecord {
 
 impl LaunchRecord {
     /// One JSON line of the `ZLUDA_AGX_PROFILE` file: the launch and its GPU time from the firmware timestamps.
-    fn profile_line(&self, ns: u64) -> String {
+    /// `start`: the command's firmware start timestamp in ns (the launches of a batch share it)
+    fn profile_line(&self, ns: u64, start: u64) -> String {
         let params: Vec<String> = self.params.iter().map(|p| format!("\"{}\"", p.iter().map(|b| format!("{b:02x}")).collect::<String>())).collect();
         format!(
-            "{{\"kernel\":\"{}\",\"module\":{},\"grid\":[{},{},{}],\"block\":[{},{},{}],\"shared\":{},\"stream\":{},\"command\":{},\"ns\":{},\"t\":{},\"params\":[{}]}}",
+            "{{\"kernel\":\"{}\",\"module\":{},\"grid\":[{},{},{}],\"block\":[{},{},{}],\"shared\":{},\"stream\":{},\"command\":{},\"ns\":{},\"start\":{},\"t\":{},\"params\":[{}]}}",
             self.kernel,
             self.module,
             self.grid[0],
@@ -453,6 +473,7 @@ impl LaunchRecord {
             self.stream,
             self.fence.point,
             ns,
+            start,
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis()),
             params.join(",")
         )
@@ -499,13 +520,95 @@ fn stream_key(s: CUstream) -> usize {
 impl Driver {
     /// Records `op` if `stream` is being captured.
     fn captured(&mut self, stream: CUstream, op: impl FnOnce() -> Op) -> bool {
-        match self.capturing.get_mut(&stream_key(stream)) {
-            Some(ops) => {
-                ops.push(op());
-                true
-            }
-            None => false,
+        let k = stream_key(stream);
+        if let Some(ops) = self.capturing.get_mut(&k) {
+            ops.push(op());
+            return true;
         }
+        if let Some(q) = self.deferred.get_mut(&k) {
+            q.push_back(Deferred::Op(op()));
+            return true;
+        }
+        false
+    }
+
+    /// Whether a cuStreamWaitValue condition holds: CU_STREAM_WAIT_VALUE_GEQ ((signed)(*addr - value) >= 0, as the
+    /// hardware compares), EQ, AND, NOR.
+    fn value_holds(&mut self, addr: u64, value: u64, flags: c_uint, width: usize) -> Result<bool, CUerror> {
+        let mask = if width == 4 { u32::MAX as u64 } else { u64::MAX };
+        let mut b = [0u8; 8];
+        self.copy_dtoh(&mut b[..width], addr).map_err(from_io)?;
+        let v = u64::from_le_bytes(b) & mask;
+        let value = value & mask;
+        Ok(match flags & 0xf {
+            0 => (v.wrapping_sub(value) & mask) >> (width * 8 - 1) == 0,
+            1 => v == value,
+            2 => v & value != 0,
+            3 => !(v | value) & mask != 0,
+            _ => false,
+        })
+    }
+
+    /// The stream's earlier work finished.
+    fn sync_stream(&mut self, sh: usize) -> CUresult {
+        let q = self.queue(sh)?.0;
+        let last = q.last();
+        if let Err(e) = q.synchronize() {
+            return Err(self.failed(last.syncobj, e));
+        }
+        self.finished(last.syncobj, last.point);
+        Ok(())
+    }
+
+    /// A value written to memory in the stream's order: once its earlier work is done, by the CPU.
+    fn write_value_now(&mut self, sh: usize, addr: u64, bytes: &[u8]) -> CUresult {
+        self.sync_stream(sh)?;
+        self.copy_htod(addr, bytes).map_err(from_io)
+    }
+
+    /// Replays held-back stream work (see `Deferred`): each stream's in order up to a wait whose condition does not
+    /// hold yet, again while one stream's progress (a value it writes) may let another go on. Called at every driver
+    /// entry, so a value the host writes itself (tinygrad's CPU devices) is seen by the next call; synchronizing calls
+    /// poll until the work is gone. The host never waits for a condition: a wait issued before the work that
+    /// satisfies it (another stream's later write, in the same thread) would never end.
+    fn poll_deferred(&mut self) -> CUresult {
+        let mut progress = true;
+        while progress && !self.deferred.is_empty() {
+            progress = false;
+            let keys: Vec<usize> = self.deferred.keys().copied().collect();
+            for k in keys {
+                loop {
+                    let Some(front) = self.deferred.get_mut(&k).and_then(|q| q.pop_front()) else {
+                        self.deferred.remove(&k);
+                        break;
+                    };
+                    match front {
+                        Deferred::WaitValue { addr, value, flags, width } => {
+                            if !self.value_holds(addr, value, flags, width)? {
+                                let q = self.deferred.get_mut(&k).expect("deferred stream");
+                                q.push_front(Deferred::WaitValue { addr, value, flags, width });
+                                break;
+                            }
+                        }
+                        Deferred::Op(op) => {
+                            self.flush_batch()?;
+                            self.run(&op, k)?;
+                        }
+                        Deferred::WriteValue { addr, bytes } => self.write_value_now(k, addr, &bytes)?,
+                        Deferred::HostFunc { f, data } => {
+                            self.sync_stream(k)?;
+                            unsafe { f(data as *mut c_void) };
+                        }
+                    }
+                    progress = true;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn deferring(&self, stream: CUstream) -> bool {
+        self.deferred.contains_key(&stream_key(stream))
     }
 
     /// Submits the launches gathered so far (see `Batch`).
@@ -526,11 +629,12 @@ impl Driver {
         if threads == 0 || grid.contains(&0) || threads > p.max_threads_per_block as u64 || too_large {
             return Err(CUerror::INVALID_VALUE);
         }
-        let k = &self.modules[&m].module.kernels[&name];
-        // the kernel's registers do not leave room for this many threads on a core
-        if threads > k.max_threads_per_threadgroup() as u64 {
-            return Err(CUerror::LAUNCH_OUT_OF_RESOURCES);
+        // the kernel's registers do not leave room for this many threads on a core: a copy compiled for this block
+        let fits = threads <= self.modules[&m].module.kernels[&name].max_threads_per_threadgroup() as u64;
+        if !fits {
+            self.fit_block(m, &name, block, threads)?;
         }
+        let k = &self.modules[&m].module.kernels[&name];
         // a cluster kernel's grid is a multiple of its cluster
         if (0..3).any(|i| grid[i] % k.cluster[i] != 0) {
             return Err(CUerror::INVALID_CLUSTER_SIZE);
@@ -548,10 +652,12 @@ impl Driver {
         let g14x = self.ctx.device.g14x();
         // a captured launch runs the generic code it saved
         let root = self.const_root.get(&m).copied().unwrap_or(m);
-        let folded = unchecked && capture.is_none() && self.const_folded(root, &name, threads);
-        let spec = if unchecked && capture.is_none() && !folded { self.specialized(m, &name, args, block) } else { None };
-        let Driver { ctx, default_waits, modules, streams, specs, const_specs, batching, batch, .. } = self;
+        let folded = fits && unchecked && capture.is_none() && self.const_folded(root, &name, threads);
+        let spec =
+            if fits && unchecked && capture.is_none() && !folded { self.specialized(m, &name, args, block) } else { None };
+        let Driver { ctx, default_waits, modules, streams, specs, const_specs, batching, batch, fitted, .. } = self;
         let code = match spec.as_ref().map(|key| &specs[key]) {
+            _ if !fits => &fitted[&(m, name.clone(), threads)],
             _ if folded => const_specs.get_mut(&root).and_then(|c| c.ready(&name)).unwrap_or(&modules[&m]),
             Some(Spec::Ready(specialized)) => specialized,
             _ => &modules[&m],
@@ -752,6 +858,43 @@ impl Driver {
     /// `agx_run`: the kernel's code, the launch's uniforms, and the current contents of the memory it can reach (the
     /// allocations its pointer arguments point into, the module's global data, parameter block and error record),
     /// with `replay.sh`. Memory is as the fault left it, not as the launch found it.
+    /// A copy of module `m`'s kernel `name` for blocks of `threads` threads, which its registers do not leave room
+    /// for (CUDA kernels without __launch_bounds__ launched with 1024 threads, as ggml's soft_max: a CUDA SM has
+    /// more registers than an AGX core): the module's PTX with `.maxntid` on the kernel, so that the backend
+    /// allocates fewer registers (spilling if it must), compiled once (and cached), sharing the module's global data.
+    /// LAUNCH_OUT_OF_RESOURCES if there is no PTX to recompile or the copy still does not fit.
+    fn fit_block(&mut self, m: usize, name: &str, block: [u32; 3], threads: u64) -> CUresult {
+        let key = (m, name.to_string(), threads);
+        if self.fitted.contains_key(&key) {
+            return Ok(());
+        }
+        let Some(src) = self.spec_sources.get(&m).cloned() else { return Err(CUerror::LAUNCH_OUT_OF_RESOURCES) };
+        let text = crate::specialize::with_maxntid(&src, name, block).ok_or(CUerror::LAUNCH_OUT_OF_RESOURCES)?;
+        let started = Instant::now();
+        let (object, asm) = compile_ptx(text.as_bytes(), &self.ctx.props.llvm_cpu).map_err(|e| {
+            eprintln!("zluda_agx: {name} for {threads} threads: {e}");
+            CUerror::LAUNCH_OUT_OF_RESOURCES
+        })?;
+        let module = module::Module::load(&object, &asm).map_err(|_| CUerror::LAUNCH_OUT_OF_RESOURCES)?;
+        let loaded = LoadedModule::new_sharing_globals(&mut self.ctx.vm, module, &self.modules[&m]).map_err(|e| {
+            eprintln!("zluda_agx: {name} for {threads} threads: {e}");
+            CUerror::LAUNCH_OUT_OF_RESOURCES
+        })?;
+        let fits = loaded.module.kernels.get(name).is_some_and(|k| threads <= k.max_threads_per_threadgroup() as u64);
+        if crate::log_enabled() {
+            eprintln!(
+                "[zluda_agx] {name} recompiled for blocks of {threads} threads in {:.3} s: {}",
+                started.elapsed().as_secs_f64(),
+                if fits { "fits" } else { "still too many registers" }
+            );
+        }
+        if !fits {
+            return Err(CUerror::LAUNCH_OUT_OF_RESOURCES);
+        }
+        self.fitted.insert(key, loaded);
+        Ok(())
+    }
+
     /// Whether module `root`'s kernel `name` has code with its host-written constants folded for their current
     /// contents (`const_spec.rs`, then `ConstSpec::ready`); starts its compilation in the background if not.
     fn const_folded(&mut self, root: usize, name: &str, threads: u64) -> bool {
@@ -781,6 +924,16 @@ impl Driver {
         // rewritten as a read of its equal predecessor, so this pattern must be in the key.
         scalars.push(0);
         scalars.extend(crate::specialize::equal_eight_byte_args(args));
+        // struct fields' values and 8-byte reads' null-ness, as `specialize_ptx` rewrites them
+        let reads = match self.spec_reads.get(&(m, name.to_string())) {
+            Some(r) => r,
+            None => {
+                let r = crate::specialize::param_reads(&self.spec_sources[&m], name);
+                self.spec_reads.entry((m, name.to_string())).or_insert(r)
+            }
+        };
+        scalars.push(0xfe);
+        scalars.extend(crate::specialize::read_key(reads, args));
         let key: SpecKey = (m, name.to_string(), scalars, block);
         // arguments that change at every launch (a step counter) would never be specialized: stop counting new ones
         if self.specs.len() >= MAX_SPECS && !self.specs.contains_key(&key) {
@@ -1016,7 +1169,8 @@ impl Driver {
                 for r in finished.clone() {
                     if let Some((start, end)) = q.timing(r.fence) {
                         let ns = end.saturating_sub(start) as u128 * 1_000_000_000 / freq / per_command[&r.fence.point];
-                        let _ = writeln!(out, "{}", r.profile_line(ns as u64));
+                        let at = start as u128 * 1_000_000_000 / freq;
+                        let _ = writeln!(out, "{}", r.profile_line(ns as u64, at as u64));
                     }
                 }
             }
@@ -1392,6 +1546,8 @@ fn new_driver() -> Result<Driver, CUerror> {
         events: HashMap::new(),
         limits: HashMap::new(),
         capturing: HashMap::new(),
+        deferred: HashMap::new(),
+        fitted: HashMap::new(),
         graphs: HashMap::new(),
         execs: HashMap::new(),
         host_allocs: HashMap::new(),
@@ -1401,6 +1557,7 @@ fn new_driver() -> Result<Driver, CUerror> {
         checked_launches: Default::default(),
         captured_launches: Default::default(),
         spec_sources: Default::default(),
+        spec_reads: Default::default(),
         specs: Default::default(),
         heap: None,
         timer: None,
@@ -1482,6 +1639,7 @@ pub(crate) fn with_sticky<T>(f: impl FnOnce(&mut Driver) -> Result<T, CUerror>) 
         let h = c.current();
         let d = c.get_mut(h).ok_or(CUerror::INVALID_CONTEXT)?;
         d.flush_batch()?;
+        d.poll_deferred()?;
         f(d)
     })
 }
@@ -1689,6 +1847,10 @@ fn agx_fast_mma() -> bool {
 /// options: compiler/src/main.rs, LARGE_MODULE_BYTES, the same size); here, such a module gets a zoc of its own (the
 /// options are LLVM's, for the whole process) and the stack retry below.
 const LARGE_MODULE_BYTES: usize = 4 << 20;
+
+/// A kernel of a large module is specialized at launch (`specialized`) when its own PTX, with the module's functions
+/// and globals, is at most this size.
+const SPEC_KERNEL_BYTES: usize = 1 << 20;
 /// The stack per thread a large module is first compiled with.
 const LARGE_MODULE_STACK_TRY: u32 = 16384;
 
@@ -2235,6 +2397,9 @@ pub(crate) unsafe fn cuDeviceGetAttribute(pi: *mut c_int, attrib: CUdevice_attri
             A::CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY | A::CU_DEVICE_ATTRIBUTE_CAN_MAP_HOST_MEMORY => 1,
             A::CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS | A::CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS => 0,
             A::CU_DEVICE_ATTRIBUTE_CONCURRENT_KERNELS => 1,
+            // every stream has its own queue: a copy on one overlaps kernels on another (programs check this
+            // before using streams for overlap, Rodinia's huffman returns early without it)
+            A::CU_DEVICE_ATTRIBUTE_GPU_OVERLAP | A::CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT => 1,
             // grids up to the co-resident limit (B5); thread block clusters as compiled (B28)
             A::CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH | A::CU_DEVICE_ATTRIBUTE_CLUSTER_LAUNCH => 1,
             // no run time limit on kernels (ptx-re-blockers B6)
@@ -2344,6 +2509,7 @@ pub(crate) unsafe fn cuCtxGetDevice(device: *mut CUdevice) -> CUresult {
 }
 
 pub(crate) unsafe fn cuCtxSynchronize() -> CUresult {
+    drain_deferred(None)?;
     with(|d| d.sync_all())
 }
 
@@ -2556,7 +2722,21 @@ unsafe fn load_module_data(d: &mut Driver, bytes: *const u8) -> Result<usize, CU
     }
     d.modules.insert(h, loaded);
     if let Some((ptx, names)) = lazy {
-        let workers = std::env::var("ZLUDA_AGX_PARALLEL_KERNELS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(16);
+        // A large module's other kernels (made from its portable AIR, a kernel's AGX code each) compile on 4 workers
+        // by default: Blender Cycles' 78 kernels, cold, 89.6 -> 39.7 s with 1.8 GB of zoc memory at the peak (one
+        // worker: 1.0 GB); 8 workers are no faster, the slowest kernel (17 s) being the rest of the time. Smaller
+        // lazily loaded modules (ZLUDA_AGX_LAZY_KERNELS=1) keep compiling on request. ZLUDA_AGX_PARALLEL_KERNELS=N
+        // (0 to 16) overrides.
+        let default_workers = if portable.is_some() {
+            std::thread::available_parallelism().map_or(1, |n| n.get() / 3).clamp(1, 4)
+        } else {
+            0
+        };
+        let workers = std::env::var("ZLUDA_AGX_PARALLEL_KERNELS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(default_workers)
+            .min(16);
         let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pending = if workers > 0 {
             precompile_kernels(ptx.clone(), portable.clone(), &names[1..], cpu, workers, cancelled.clone())
@@ -2570,6 +2750,7 @@ unsafe fn load_module_data(d: &mut Driver, bytes: *const u8) -> Result<usize, CU
             compiled: HashMap::new(),
             pending,
             cancelled,
+            shared_bytes: None,
         });
     }
     Ok(h)
@@ -2740,6 +2921,7 @@ pub(crate) unsafe fn cuModuleUnload(hmod: CUmodule) -> CUresult {
         d.functions.retain(|_, (m, _)| *m != h && !children.contains(m));
         d.spec_sources.remove(&h);
         d.specs.retain(|(m, ..), _| *m != h && !children.contains(m));
+        d.spec_reads.retain(|(m, _), _| *m != h && !children.contains(m));
         d.const_specs.remove(&h);
         d.const_root.retain(|c, r| *r != h && *c != h);
         Ok(())
@@ -2804,19 +2986,29 @@ fn module_function(d: &mut Driver, parent: usize, name: &str) -> Result<usize, C
                 if !loaded.module.kernels.contains_key(&name) {
                     return Err(CUerror::NOT_FOUND);
                 }
-                // (not a kernel of a large module, as the module itself: each new set of scalar arguments would rewrite
-                // and hash all of its PTX at the launch, and compile the whole module's front end again; Blender
-                // Cycles' launches change them all the time: 3.7 s per sample instead of 0.3)
-                let can_specialize = specialize_enabled()
-                    && !agx_checked()
-                    && !loaded.uses_heap()
-                    && !loaded.uses_timer()
-                    && ptx.len() <= LARGE_MODULE_BYTES;
+                // The kernel's own PTX (the kernel, the module's functions and globals) for launch-time
+                // specialization, extracted once here: specializing the whole module's text would rewrite and hash
+                // all of it at each new set of scalar arguments (Blender Cycles' launches change them all the time:
+                // 3.7 s per sample instead of 0.3). A kernel whose text is still large (Cycles: mostly functions,
+                // each recompiled for a specialized copy) is not specialized. llama.cpp's MMVQ / MMQ / flash
+                // attention modules are 10 MB of kernels, each a few tens of KB alone.
+                let can_specialize =
+                    specialize_enabled() && !agx_checked() && !loaded.uses_heap() && !loaded.uses_timer();
+                // (measured once per module: when the functions alone are over the limit, no kernel's text is
+                // extracted; Blender Cycles' 17.6 MB module, 77 kernels on request, lost ~2.2 s a render to it)
+                let shared = can_specialize.then(|| {
+                    let source = d.lazy_sources.get_mut(&parent).unwrap();
+                    *source.shared_bytes.get_or_insert_with(|| crate::specialize::non_entry_bytes(&ptx))
+                });
+                let kernel_ptx = shared
+                    .filter(|&b| b <= SPEC_KERNEL_BYTES)
+                    .map(|_| crate::specialize::without_other_entries(&ptx, &name))
+                    .filter(|text| text.len() <= SPEC_KERNEL_BYTES);
                 let child = d.handle();
                 d.modules.insert(child, loaded);
                 d.const_root.insert(child, parent);
-                if can_specialize {
-                    d.spec_sources.insert(child, ptx);
+                if let Some(text) = kernel_ptx {
+                    d.spec_sources.insert(child, std::sync::Arc::from(text));
                 }
                 d.lazy_sources.get_mut(&parent).unwrap().compiled.insert(name.clone(), child);
                 if crate::log_enabled() {
@@ -2876,17 +3068,54 @@ pub(crate) unsafe fn cuLaunchKernel(
     params: *mut *mut c_void,
     extra: *mut *mut c_void,
 ) -> CUresult {
-    if !extra.is_null() {
-        return Err(CUerror::NOT_SUPPORTED);
-    }
+    // `extra`: CU_LAUNCH_PARAM_BUFFER_POINTER (1) / _SIZE (2) / _END (0) pairs, the arguments packed in one buffer
+    let packed = if extra.is_null() {
+        None
+    } else {
+        let (mut buf, mut size) = (std::ptr::null::<u8>(), None);
+        let mut i = 0;
+        loop {
+            match *extra.add(i) as usize {
+                0 => break,
+                1 => buf = *extra.add(i + 1) as *const u8,
+                2 => size = Some(*(*extra.add(i + 1) as *const usize)),
+                _ => return Err(CUerror::INVALID_VALUE),
+            }
+            i += 2;
+        }
+        if buf.is_null() || !params.is_null() {
+            return Err(CUerror::INVALID_VALUE);
+        }
+        Some((buf, size))
+    };
     with_launch(|d| {
         let (m, name) = d.functions.get(&(f.0 as usize)).cloned().ok_or(CUerror::INVALID_HANDLE)?;
         let slots = d.modules[&m].module.kernels[&name].args.clone();
-        let args: Vec<&[u8]> = slots
-            .iter()
-            .enumerate()
-            .map(|(i, s)| std::slice::from_raw_parts(*params.add(i) as *const u8, s.bytes as usize))
-            .collect();
+        let args: Vec<&[u8]> = match packed {
+            None => slots
+                .iter()
+                .enumerate()
+                .map(|(i, s)| std::slice::from_raw_parts(*params.add(i) as *const u8, s.bytes as usize))
+                .collect(),
+            // Each argument at its alignment in the buffer, as CUDA lays parameters out. The alignment is taken
+            // from the size (the module keeps no .align): exact for scalars, pointers and vectors; a struct whose
+            // alignment is below the largest power of two dividing its size (a packed {char, int}) would be misread.
+            Some((buf, size)) => {
+                let mut off = 0usize;
+                let mut v = Vec::with_capacity(slots.len());
+                for s in &slots {
+                    let b = s.bytes as usize;
+                    let align = if b.is_power_of_two() && b <= 16 { b } else { (1usize << b.trailing_zeros()).min(8) };
+                    off = off.next_multiple_of(align.max(1));
+                    if size.is_some_and(|n| off + b > n) {
+                        return Err(CUerror::INVALID_VALUE);
+                    }
+                    v.push(std::slice::from_raw_parts(buf.add(off), b));
+                    off += b;
+                }
+                v
+            }
+        };
         let (grid, block) = ([gx, gy, gz], [bx, by, bz]);
         let op = || Op::Launch { f: f.0 as usize, grid, block, shared, params: args.iter().map(|a| a.to_vec()).collect() };
         if d.captured(stream, op) {
@@ -2932,6 +3161,7 @@ pub(crate) unsafe fn cuStreamDestroy_v2(s: CUstream) -> CUresult {
 }
 
 pub(crate) unsafe fn cuStreamSynchronize(s: CUstream) -> CUresult {
+    drain_deferred(Some(s))?;
     with(|d| {
         let q = d.queue(s.0 as usize)?.0;
         let last = q.last();
@@ -2941,6 +3171,107 @@ pub(crate) unsafe fn cuStreamSynchronize(s: CUstream) -> CUresult {
         d.finished(last.syncobj, last.point);
         d.after_sync()
     })
+}
+
+// Stream memory operations (tinygrad's runtime signals with them) and host functions. A write or host function runs
+// on the CPU once the stream's earlier work is done; a wait whose condition does not hold yet holds the stream's later
+// work back on the host (Driver::deferred) instead of blocking the calling thread.
+
+unsafe fn stream_write_value(s: CUstream, addr: CUdeviceptr, value: &[u8]) -> CUresult {
+    with(|d| {
+        if d.capturing.contains_key(&stream_key(s)) {
+            return Err(CUerror::NOT_SUPPORTED);
+        }
+        if let Some(q) = d.deferred.get_mut(&stream_key(s)) {
+            q.push_back(Deferred::WriteValue { addr: addr.0 as u64, bytes: value.to_vec() });
+            return Ok(());
+        }
+        d.write_value_now(stream_key(s), addr.0 as u64, value)?;
+        // another stream may have been waiting for this value
+        d.poll_deferred()
+    })
+}
+
+unsafe fn stream_wait_value(s: CUstream, addr: CUdeviceptr, value: u64, flags: c_uint, width: usize) -> CUresult {
+    with(|d| {
+        let k = stream_key(s);
+        if d.capturing.contains_key(&k) {
+            return Err(CUerror::NOT_SUPPORTED);
+        }
+        let wait = Deferred::WaitValue { addr: addr.0 as u64, value, flags, width };
+        if let Some(q) = d.deferred.get_mut(&k) {
+            q.push_back(wait);
+        } else if !d.value_holds(addr.0 as u64, value, flags, width)? {
+            d.deferred.insert(k, std::collections::VecDeque::from([wait]));
+        }
+        Ok(())
+    })
+}
+
+/// Waits (polling, without the driver's lock) until the streams' held-back work is gone: `None` for every stream.
+unsafe fn drain_deferred(s: Option<CUstream>) -> CUresult {
+    let start = Instant::now();
+    let mut warned = false;
+    loop {
+        let pending = with_sticky(|d| Ok(match s {
+            Some(s) => d.deferring(s),
+            None => !d.deferred.is_empty(),
+        }))?;
+        if !pending {
+            return Ok(());
+        }
+        if !warned && start.elapsed().as_secs() >= 10 {
+            warned = true;
+            eprintln!("[zluda_agx] a stream has waited 10 s for a cuStreamWaitValue condition");
+        }
+        std::thread::sleep(std::time::Duration::from_micros(20));
+    }
+}
+
+pub(crate) unsafe fn cuStreamWriteValue32_v2(s: CUstream, addr: CUdeviceptr, value: cuuint32_t, _flags: c_uint) -> CUresult {
+    stream_write_value(s, addr, &value.to_le_bytes())
+}
+pub(crate) unsafe fn cuStreamWriteValue64_v2(s: CUstream, addr: CUdeviceptr, value: cuuint64_t, _flags: c_uint) -> CUresult {
+    stream_write_value(s, addr, &value.to_le_bytes())
+}
+pub(crate) unsafe fn cuStreamWaitValue32_v2(s: CUstream, addr: CUdeviceptr, value: cuuint32_t, flags: c_uint) -> CUresult {
+    stream_wait_value(s, addr, value as u64, flags, 4)
+}
+pub(crate) unsafe fn cuStreamWaitValue64_v2(s: CUstream, addr: CUdeviceptr, value: cuuint64_t, flags: c_uint) -> CUresult {
+    stream_wait_value(s, addr, value, flags, 8)
+}
+pub(crate) unsafe fn cuStreamWriteValue32(s: CUstream, addr: CUdeviceptr, value: cuuint32_t, flags: c_uint) -> CUresult {
+    cuStreamWriteValue32_v2(s, addr, value, flags)
+}
+pub(crate) unsafe fn cuStreamWriteValue64(s: CUstream, addr: CUdeviceptr, value: cuuint64_t, flags: c_uint) -> CUresult {
+    cuStreamWriteValue64_v2(s, addr, value, flags)
+}
+pub(crate) unsafe fn cuStreamWaitValue32(s: CUstream, addr: CUdeviceptr, value: cuuint32_t, flags: c_uint) -> CUresult {
+    cuStreamWaitValue32_v2(s, addr, value, flags)
+}
+pub(crate) unsafe fn cuStreamWaitValue64(s: CUstream, addr: CUdeviceptr, value: cuuint64_t, flags: c_uint) -> CUresult {
+    cuStreamWaitValue64_v2(s, addr, value, flags)
+}
+
+/// The host function runs once the stream's earlier work is done, before its later work (on the thread of the call
+/// that gets there).
+pub(crate) unsafe fn cuLaunchHostFunc(s: CUstream, f: CUhostFn, user_data: *mut c_void) -> CUresult {
+    let f = f.ok_or(CUerror::INVALID_VALUE)?;
+    let run_now = with(|d| {
+        if d.capturing.contains_key(&stream_key(s)) {
+            return Err(CUerror::NOT_SUPPORTED);
+        }
+        if let Some(q) = d.deferred.get_mut(&stream_key(s)) {
+            q.push_back(Deferred::HostFunc { f, data: user_data as usize });
+            return Ok(false);
+        }
+        d.sync_stream(stream_key(s))?;
+        Ok(true)
+    })?;
+    if run_now {
+        f(user_data);
+    }
+    Ok(())
 }
 
 pub(crate) unsafe fn cuStreamWaitEvent(s: CUstream, e: CUevent, _flags: c_uint) -> CUresult {
@@ -2967,6 +3298,8 @@ pub(crate) unsafe fn cuEventDestroy_v2(e: CUevent) -> CUresult {
 }
 
 pub(crate) unsafe fn cuEventRecord(e: CUevent, s: CUstream) -> CUresult {
+    // (an event after held-back work: recorded once that work is submitted)
+    drain_deferred(Some(s))?;
     with(|d| {
         let sh = if (s.0 as usize) <= 2 { 0 } else { s.0 as usize };
         let fence = d.queue(sh)?.0.last();
@@ -3217,7 +3550,12 @@ pub(crate) unsafe fn cuCtxPushCurrent_v2(ctx: CUcontext) -> CUresult {
 
 pub(crate) unsafe fn cuCtxPopCurrent_v2(pctx: *mut CUcontext) -> CUresult {
     with_contexts(|_| Ok(()))?;
-    let h = contexts::pop().ok_or(CUerror::INVALID_CONTEXT)?;
+    let h = match contexts::pop() {
+        Some(h) => h,
+        // exit-time destructors after this thread's stack is gone: the context their calls used, the primary one
+        None if !contexts::alive() => with_contexts(|c| Ok(c.current()))?,
+        None => return Err(CUerror::INVALID_CONTEXT),
+    };
     if pctx.is_null() {
         return Ok(());
     }
@@ -3337,6 +3675,9 @@ pub(crate) unsafe fn cuStreamDestroy(s: CUstream) -> CUresult {
 
 pub(crate) unsafe fn cuStreamQuery(s: CUstream) -> CUresult {
     with(|d| {
+        if d.deferring(s) {
+            return Err(CUerror::NOT_READY);
+        }
         let q = d.queue(s.0 as usize)?.0;
         let last = q.last();
         if q.is_done(last).map_err(from_io)? {
@@ -4443,7 +4784,14 @@ pub(crate) unsafe fn cuGraphLaunch(exec: CUgraphExec, s: CUstream) -> CUresult {
         let mut r = Ok(());
         for op in &ops {
             let launch = matches!(op, Op::Launch { .. });
-            if !launch {
+            // a device-to-device copy joins the batch as a copy kernel (`run`, `copy_in_batch`; when it cannot, its
+            // `sync_all` submits the batch first): llama.cpp's graphs have one per layer, which split a token's
+            // ~250 launches into 13 commands (~15-20 us apart on the GPU, a submit each)
+            let batchable = match op {
+                Op::Copy { dst, src, .. } => d.is_device(*dst) && d.is_device(*src),
+                _ => false,
+            };
+            if !launch && !batchable {
                 let at = std::time::Instant::now();
                 r = d.flush_batch();
                 t[2] += at.elapsed();

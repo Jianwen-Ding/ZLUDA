@@ -349,8 +349,9 @@ mod imp {
         }
         let h = Box::from_raw(h.0 as *mut Handle);
         engine::free(h.ws).map_err(status)?;
+        // No stream sync: the handle's stream may already be destroyed (ggml destroys its streams first), and
+        // freeing device memory waits for the work in flight, as cuMemFree does.
         if !h.scratch.is_null() {
-            engine::synchronize(h.scratch_stream).map_err(status)?;
             engine::free(h.scratch).map_err(status)?;
         }
         Ok(())

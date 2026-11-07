@@ -58,6 +58,23 @@ template<> __ZINL float4 tex2D<float4>(unsigned long long t, float x, float y) {
 }
 template<> __ZINL float tex2D<float>(unsigned long long t, float x, float y) { return tex2D<float4>(t, x, y).x; }
 
+// Surface reads and writes (Cycles 5.2+: denoiser and pass outputs): PTX suld / sust, x in bytes, out of range traps
+__ZINL void surf2Dwrite(float4 v, unsigned long long s, int x, int y) {
+  __asm__ volatile("sust.b.2d.v4.b32.trap [%0, {%1, %2}], {%3, %4, %5, %6};"
+                   :: "l"(s), "r"(x), "r"(y), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w) : "memory");
+}
+__ZINL void surf2Dwrite(float2 v, unsigned long long s, int x, int y) {
+  __asm__ volatile("sust.b.2d.v2.b32.trap [%0, {%1, %2}], {%3, %4};"
+                   :: "l"(s), "r"(x), "r"(y), "f"(v.x), "f"(v.y) : "memory");
+}
+__ZINL void surf2Dwrite(float v, unsigned long long s, int x, int y) {
+  __asm__ volatile("sust.b.2d.b32.trap [%0, {%1, %2}], {%3};" :: "l"(s), "r"(x), "r"(y), "f"(v) : "memory");
+}
+__ZINL void surf2Dread(float4 *v, unsigned long long s, int x, int y) {
+  __asm__ volatile("suld.b.2d.v4.b32.trap {%0, %1, %2, %3}, [%4, {%5, %6}];"
+                   : "=f"(v->x), "=f"(v->y), "=f"(v->z), "=f"(v->w) : "l"(s), "r"(x), "r"(y) : "memory");
+}
+
 // Math. These are what --use_fast_math style kernels ask for: the hardware approximations where PTX has them.
 __ZINL float __fabsf_(float x) { return __builtin_fabsf(x); }
 __ZINL float fabsf(float x) { return __builtin_fabsf(x); }
@@ -98,6 +115,7 @@ __ZINL float __logf(float x) { return __zlg2(x) * 0.693147180559945f; }
 __ZINL float __expf(float x) { return __zex2(x * 1.44269504088896f); }
 __ZINL float __powf(float x, float y) { return __zex2(y * __zlg2(x)); }
 __ZINL float log2f(float x) { return __zlg2(x); }
+__ZINL float log2(float x) { return __zlg2(x); }
 __ZINL float log10f(float x) { return __zlg2(x) * 0.301029995663981f; }
 __ZINL float exp2f(float x) { return __zex2(x); }
 __ZINL float fmodf(float a, float b) {

@@ -10,7 +10,8 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 /// Bumped when the entry layout changes.
-const FORMAT: &str = "agx-cache-1";
+// agx-cache-2: the source is hashed with source_hash (agx-cache-1 fed it byte by byte to the 128-bit FNV-1a)
+const FORMAT: &str = "agx-cache-2";
 
 pub struct Cache {
     dir: PathBuf,
@@ -40,9 +41,44 @@ impl Key<'_> {
         for o in self.options {
             feed(o.as_bytes());
         }
-        feed(self.source);
+        feed(&source_hash(self.source).to_le_bytes());
         format!("{h:032x}")
     }
+}
+
+/// A 128-bit hash of `data` for cache keys, ~10x faster than feeding it to the byte-wise FNV-1a above: four lanes of
+/// 64 x 64 -> 128-bit multiplications folded to 64 bits (wyhash's mum), 8 bytes per multiplication, the length mixed in. A cache
+/// key is looked up for every kernel loaded on request (Blender Cycles: 78 kernels of one 17.6 MB PTX module, each
+/// lookup 56 ms of hashing with FNV-1a: 4.4 s of the start-up of a render). Not cryptographic: inputs are the
+/// program's own PTX, not adversarial.
+pub fn source_hash(data: &[u8]) -> u128 {
+    const P: [u64; 4] = [0xa0761d6478bd642f, 0xe7037ed1a0b428db, 0x8ebc6af09c88c6e3, 0x589965cc75374cc3];
+    #[inline(always)]
+    fn mum(a: u64, b: u64) -> u64 {
+        let m = (a as u128) * (b as u128);
+        (m as u64) ^ ((m >> 64) as u64)
+    }
+    #[inline(always)]
+    fn word(b: &[u8], i: usize) -> u64 {
+        u64::from_le_bytes(b[i..i + 8].try_into().unwrap())
+    }
+    let mut s = [P[0] ^ data.len() as u64, P[1], P[2], P[3]];
+    // each lane chains its words (one multiplication per 8 bytes); the four lanes are independent, so they overlap
+    let mut chunks = data.chunks_exact(32);
+    for c in &mut chunks {
+        for l in 0..4 {
+            s[l] = mum(s[l] ^ word(c, 8 * l), P[l]);
+        }
+    }
+    let rest = chunks.remainder();
+    let mut tail = [0u8; 32];
+    tail[..rest.len()].copy_from_slice(rest);
+    for l in 0..4 {
+        s[l] = mum(s[l] ^ word(&tail, 8 * l), P[l] ^ rest.len() as u64);
+    }
+    let lo = mum(s[0] ^ P[1], s[1] ^ P[2]) ^ mum(s[2] ^ P[3], s[3] ^ P[0]);
+    let hi = mum(s[0] ^ P[3], s[2] ^ P[1]) ^ mum(s[1] ^ P[0], s[3] ^ P[2] ^ lo);
+    ((hi as u128) << 64) | lo as u128
 }
 
 impl Cache {
@@ -164,6 +200,24 @@ mod tests {
         let a = Key { source: b"", chip: "ab", compiler: "c", options: &[] };
         let b = Key { source: b"", chip: "a", compiler: "bc", options: &[] };
         assert_ne!(a.digest(), b.digest());
+    }
+
+    #[test]
+    fn source_hash_distinguishes() {
+        let mut seen = std::collections::HashSet::new();
+        // every length up to 200 of zeros, and single-bit changes at every position of a 1 KB buffer
+        for n in 0..200 {
+            assert!(seen.insert(source_hash(&vec![0u8; n])));
+        }
+        let base = vec![0x5au8; 1024];
+        assert!(seen.insert(source_hash(&base)));
+        for i in 0..base.len() {
+            for bit in [0u8, 3, 7] {
+                let mut b = base.clone();
+                b[i] ^= 1 << bit;
+                assert!(seen.insert(source_hash(&b)), "collision at byte {i} bit {bit}");
+            }
+        }
     }
 
     #[test]

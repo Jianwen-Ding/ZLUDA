@@ -48,6 +48,8 @@ pub const ARCHS: [c_int; 14] = [50, 52, 53, 60, 61, 62, 70, 72, 75, 80, 86, 87, 
 const PRELUDE: &str = include_str!("include/agx_nvrtc_prelude.h");
 const MATH: &str = include_str!("include/agx_nvrtc_math.h");
 const SM70_RT: &str = include_str!("include/crt/sm_70_rt.hpp");
+const CUDA_FP16: &str = include_str!("include/cuda_fp16.h");
+const CUDA_BF16: &str = include_str!("include/cuda_bf16.h");
 
 /// A program: its source and headers, then the result of compiling it.
 pub struct Program {
@@ -193,6 +195,8 @@ fn compile(p: &mut Program, opts: &[String]) -> Result<CString, String> {
         write(&dir.join("agx_nvrtc_prelude.h"), PRELUDE)?;
         write(&dir.join("agx_nvrtc_math.h"), MATH)?;
         write(&dir.join("crt/sm_70_rt.hpp"), SM70_RT)?;
+        write(&dir.join("cuda_fp16.h"), CUDA_FP16)?;
+        write(&dir.join("cuda_bf16.h"), CUDA_BF16)?;
         let headers = dir.join("headers");
         for (name, text) in &p.headers {
             write(&headers.join(name), text)?;

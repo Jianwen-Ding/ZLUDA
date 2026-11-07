@@ -1773,7 +1773,10 @@ impl LoadedModule {
     /// global data out alike, every symbol at the same offset with the same size. The buffer stays `other`'s, which
     /// must outlive this module; this module's own accessors of global data (`globals`, `write_global`, ...) see none.
     pub fn new_sharing_globals(vm: &mut Vm, module: module::Module, other: &LoadedModule) -> io::Result<LoadedModule> {
-        let alike = module.globals.len() == other.module.globals.len()
+        // (a smaller module whose symbols all sit where `other`'s do is a prefix of its layout: a single specialized
+        // kernel without `printf`, whose module drops the buffer that the module's printf-using kernels added at
+        // the end; its code never reaches past its own size)
+        let alike = module.globals.len() <= other.module.globals.len()
             && module.global_symbols.iter().all(|(name, at)| other.module.global_symbols.get(name) == Some(at));
         // compiler-made constant tables only (LLVM's switch lookup tables, string and aggregate constants): no
         // device variable to share; a recompilation's may differ, and it keeps its own

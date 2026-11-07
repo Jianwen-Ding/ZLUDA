@@ -187,6 +187,60 @@ wall time, peak RSS, object md5).
   99 -> 82 us (`zluda_blas_agx/tools/gemmbench.c`). Skinny n <= 8 products stay slow (0.2-0.3 TFLOPS: the dot kernel
   reads A once per column), but ggml uses its own kernels there.
 
+## Clang-built benchmarks without the CUDA toolkit (2026-11-07, branch claude/clang-bench-2026-11-07)
+
+Toolchain: the fork's clang 24 (/scratch/clang-build) and /scratch/cuda-clang-helpers (our own runtime headers,
+libzcudart on the driver API, ptxas/fatbinary pass-through, gcc shims; outside ZLUDA by design). Benchmarks:
+/scratch/benchmarks (Cycles standalone, Halide apps, tinygrad), /scratch/Rodinia (3.1, all 23 CUDA programs build).
+
+- **What clang-built PTX needed from ZLUDA** (each a general fix): FP-mode pass with uncalled `.visible` functions
+  (5318efc4); `exit` inside a function = `unreachable` (NVPTX writes it into unreachable blocks); `mov` of a `.texref`
+  loads its handle and every texref shares one LLVM struct type (texture<> reads returned 0; the second texref of a
+  module got `struct.texture.2`); deviceOverlap / asyncEngineCount = 1 (huffman skipped its GPU work);
+  cuStreamWrite/WaitValue, cuLaunchHostFunc, packed `extra` launch arguments (tinygrad).
+- **Start-up**: cache keys hashed the module source byte-wise (128-bit FNV-1a): 56 ms per on-request kernel of
+  Cycles' 17.6 MB module, 4.4 s per render start. Word-wise hash: 2 ms; 1-sample render 3.5 -> 1.43 s. Large modules'
+  other kernels now compile on 4 workers by default: cold start 89.6 -> 40 s, peak zoc RSS 1.8 GB (the old 20 GiB
+  warning was for fully inlined kernels). What is left cold: the front end 20.8 s (first pipeline 6.7 s, O3 in AIR
+  spaces 8.7 s) + the slowest kernel (intersect_mnee, 177k instructions, 17 s: greedy RA 30%, ISel 22%). Each kernel
+  compiles its own copy of the shared functions (bsdf, svm, light tree): compiling them once per module is the open
+  compile-time item.
+- **Refuted**: ZLUDA_AIR_AS_PIPELINE=light+ for Cycles: cold start unchanged (critical path is front end + slowest
+  kernel), GPU time +10% (2671 -> 2951 ms per 256 samples).
+- **Cycles (clang kernel)**: scene_monkey 640x360 GPU image vs CPU: mean abs diff 0.000, max 3/255. 1280x720x512
+  spp: 7.6 s wall vs 23.2 s on 12 CPU cores; per 256 spp GPU 2.67 s (shade_surface 42%, intersect_closest 35%).
+- **Rodinia correctness** (vs OpenMP / CPU references, /scratch/rodinia-verify/NOTES.md): 18 programs correct; kmeans
+  wrong as shipped (cudaMemcpyToSymbol with a string, invalid since CUDA 5); **myocyte needs denormals**: default mode
+  (f32 denormals flushed, as the ALU does) makes its Fehlberg step control fail at t=15; with ZLUDA_ROUNDING_STRICT=1
+  it matches the CPU-float build to 1e-7 (72 s vs 21 s). The device math functions are not the cause: expf 1.0,
+  logf 1.8, powf 0.5, exp/log/pow (f64) 1.0/1.1/2.2 ulp max over 1M random inputs.
+- **Open, launch-time specialization of modules with device variables**: zoc's switch lookup tables
+  (`.Lswitch.table.*`, private, in .agx.globals) of other kernels shift the named variables' offsets, so the
+  specialized single-kernel module "lays out its global data differently" and is not loaded (hybridsort: 4 kernels
+  run unspecialized). Needs compiler-made constants outside the shared variables buffer. **Refuted, no tables**
+  (`-air-lookup-tables=false`, ZLUDA_AGX_LOOKUP_TABLES=0): specialization then loads, but hybridsort's GPU time is
+  449 -> 496 ms (mergeSortPass 362 -> 390, bucketcount 72 -> 92 ms, 3 runs each): the select chains cost more than
+  the table loads plus the lost specialization. Cycles neutral (2671 -> 2663 ms).
+- **Halide apps** (Halide_TARGET=host-cuda, NVPTX from the fork's LLVM, Halide's runtime on libcuda): all 66 app
+  tests pass after the context-stack fix (exit-time cuCtxPushCurrent/PopCurrent panicked on destroyed TLS).
+- **Simulator on clang-built Rodinia captures** (/scratch/sim-captures/rodinia): in-run launches are 2-3x their warm
+  back-to-back time (GPU clock not ramped up for bursty programs: lud_diagonal 128 vs 44 us); against warm times the
+  model is within 20% on lud, normalize_weights, streamcluster, heartwall and off by -52..-79% on bfs, gaussian Fan1,
+  sum_kernel (handed to the simulator accuracy work).
+- **Device code must be optimized by the front end**: zcc first passed a Makefile's missing -O to clang (device -O0:
+  a local depot per variable, 80-112 B of stack per thread in bfs; the simulator agent found the hardware charges
+  ~1.15 us per SIMD-group's first stack use, up to ~110 us a core). With device -O3 as nvcc does: GPU time bfs -71%,
+  gaussian -83%, pathfinder -67%, nw -49%, srad_v1 -42%, hybridsort -35%; results unchanged (bfs 0/1M mismatches,
+  lud -v, huffman PASS).
+- **tinygrad (DEV=CUDA)**: needs stream waits that do not block the host (a wait comes before the write that
+  satisfies it, same thread: now deferred on the host, 23f2b276), NVRTC's cuda_fp16.h / cuda_bf16.h, and mma with its
+  first operand glued to the type (`.f32{`). Matmul: f32 2048^2 1.75 TFLOPS, f16 through mma.sync (the SIMD-group
+  matrix emulation) 2048^2 1.14 / 4096^2 2.10 TFLOPS, all correct. Far from the M2 Max's ~13.6 TFLOPS f32: tinygrad's
+  CUDA kernels are shaped for NVIDIA (open: what the mma m16n8k16 emulation and its fragment shuffles cost).
+- **Refuted, queue priority**: DRM_ASAHI_PRIORITY_LOW vs MEDIUM no different on lud (13.3 ms GPU each); HIGH and
+  REALTIME are rejected by the kernel.
+- **Copies are not the bottleneck**: cuMemcpy HtoD/DtoH 28-40 GB/s = host memcpy on this machine at 64 KB-256 MB.
+
 ## What went wrong, 2026-11-03 (Blender Cycles session): read before repeating it
 
 Policy, from the user: running nvcc-generated PTX through ZLUDA is fine; decompiling or reverse engineering it, or
@@ -864,3 +918,60 @@ the shipped kernel is only run and timed.
   no change worth having. Most "Folded Spill" stores there are callee-saved saves in prologues.
 - **Instruction fetch** (simulator agent, 2026-11-07): the clang shade_surface launch touches 10-17x the 12 KB
   instruction cache; taken jumps to uncached lines cost 235-325 ns. Code size is performance for these kernels.
+
+## FP modes: jumps from code no kernel reaches (2026-11-07)
+
+- **Symptom**: Cycles' current kernel built with clang (ptx/tools/cycles_clang, 17.6 MB PTX) failed in
+  instruction_mode_to_global_mode with `TranslateError::Unreachable` (redirect_jump_impl: a jump whose mode differs
+  from its target's entry mode, but the target has no prologue).
+- **Cause**: clang keeps `.visible` functions nothing calls (kernel_image_interp_with_udim, volume_integrate_*).
+  No kernel reaches their blocks, so their modes resolve to the default (flush), while a block they jump or call
+  into, also reached from a kernel, resolves to that kernel's mode (preserve). The edge asks for no prologue (no
+  kernel takes it), and redirecting the jump found none. Reduced with ddmin over roots, stubbed bodies and
+  instructions (/scratch/perf/t/{ddmin,ddstub,ddlines}.py): no FP instruction is needed, only the call structure.
+- **Fix**: the blocks no kernel reaches through jumps, calls and returns are computed from the CFG, and their jumps
+  (and post-call branches) are left as they are: the code never runs, so the mode there does not matter. Executed
+  code is unchanged. Test: instruction_mode_to_global_mode/unreached_caller.ptx (fails before, passes after).
+- **Result**: the clang Cycles kernel compiles: 39.7 s wall, 78 s CPU, 2.07 GB peak, 17.4 MB object
+  (`zoc --arch=agx-g14c --agx-only --object-only`, whole module).
+
+### llama.cpp (clang-built ggml-cuda) correct on ZLUDA (2026-11-07)
+- Garbage text was caused by zcc passing `-fcuda-flush-denormals-to-zero` for nvcc's `-ftz=true`/`--use_fast_math`:
+  clang's NVPTX backend then emits `.ftz` on f16 ops too (`mul.ftz.f16`), whereas nvcc flushes only f32. ggml's
+  `__hmul2(dm5, ds8)` (Q5_1 block scale products) is routinely f16-subnormal and became 0. Fixed in
+  /scratch/cuda-clang-helpers/bin/zcc (flag dropped; ZLUDA's default FP mode flushes f32 in hardware anyway).
+  Found with a standalone ggml MUL_MAT CUDA-vs-CPU harness on the real weights (/scratch/perf/wt): test-backend-ops
+  passed because its random weights rarely give subnormal half products.
+- Other fixes on the way: AGX abs(neg x) source-modifier fold (llvm 465c53bd), `__byte_perm` selector mask,
+  `.maxntid` recompilation for blocks above the threadgroup limit (SOFT_MAX), cublasDestroy on destroyed streams.
+- CUDA graphs enabled (helpers runtime forwards capture/instantiate/update/launch to the driver): output identical.
+- `llama-completion` output is byte-identical to the CPU backend. llama-bench, qwen2.5-0.5b Q5_K_M, M2 Max:
+  fa=0: pp128 254, pp512 339, tg128 122 t/s; fa=1: pp128 263, pp512 330, tg128 71 t/s.
+- Next: flash_attn_ext_f16 decode kernel (ncols=1) is ~205 us/launch vs ~14 us for the others (43% of tg GPU time
+  with fa=1); quantize_q8_1/mul_mat_vec_q/rms_norm each ~14 us (launch-floor-bound; ~13 us appears to be a
+  per-kernel minimum, so fusion/graph batching would matter).
+- Token generation is GPU-bound (~79% busy, ~510 launches/token in 2 graphs): host graph launch ~1 ms/token, other
+  host work ~0.2 ms (LD_PRELOAD timer /scratch/perf/apitime/t.so, reads zluda_agx_gpu_busy_ns). Batched profile
+  lines split a command's time evenly, so per-kernel ns inside graphs are not per-kernel times.
+- Warm isolated hw times (agx_run_hw --back-to-back 300 while other GPU jobs ran: up to 1.9x too high; idle GPU,
+  b2b 1000 x5: Q5_1 19.0 us, Q8_0 17.2 us, /scratch/agx-r4/hw/llama-tg-b2b1000-r5.txt): mul_mat_vec_q Q5_1 896x896
+  35 us, Q8_0 896x128 23.5 us, Q5_K 38.5 us, Q6_K 4864x896 45 us (~78 GB/s): the MMVQ kernels are the
+  bottleneck. They use 134-190 register halves (16-21 SIMD groups per core); the inner loop is scalar i32 loads,
+  `wait 0`, then the dp4a emulation (bfeil/imadd).
+- Global register cap (-agx-default-max-gprs, all kernels), llama-bench fa=0 r=3 (GPU shared with simulator
+  agent, noisy): none pp128 246 / tg128 94; 96: 273 / 94; 80: 263 / 66; 64: 249 / 59. Occupancy alone does not fix
+  MMVQ; 96 may help prompt processing (re-measure on a quiet GPU). Next: MMVQ load vectorization / issuing the next
+  block's loads before the ALU work (software pipelining), a native-ish dp4a sequence.
+- Why MMVQ is slow (2026-11-07, later): it is per-launch latency, not bandwidth. Q5_1 896x896 takes ~20 us back to
+  back with 1, 4 or 32 workgroups (23-29 us at its 224): k = 896 is one loop iteration, a straight pass of ~845
+  instructions per SIMD group over 110 distinct 64-byte code lines, cold-fetched at every command (~104 ns per line,
+  playground 2026-11-01-code-fetch) = ~11 us. Shrinking the executed code is the lever.
+- `-agx-signed-bytes-alu=0` (dp4a bytes sign-extended by two shifts instead of and/xor/sub; fewer instructions):
+  tg128 106/110 vs default 109/113 t/s. No gain; default kept.
+- Launch-time specialization extended (zluda_agx specialize.rs): struct fields and null pointers become constants,
+  kernels of large lazily-compiled modules are specialized from their own extracted PTX, and a specialized module
+  whose globals are a prefix of the original's shares them. The fusion branches of MMVQ fold away. llama-bench
+  qwen2.5-0.5b Q5_K_M: fa=0 pp128 251-261, pp512 327-347, tg128 140-142 (was ~110); fa=1 pp128 262-266, pp512
+  340-344, tg128 76-80 (was ~71). Output identical to the CPU backend.
+- Next: flash_attn_ext_f16 decode (1392 B stack per thread, ~205 us/launch) and code size of the MMVQ dequant
+  (q5 qh merging: and/or/shift chains the bfi combine does not catch).

@@ -1,0 +1,31 @@
+// Reduced from clang's PTX for llama.cpp's xielu kernel (half): the cleanup block (only ret) is entered from the
+// entry block and from a block that left the f16/f64 denormal mode as cvt.rn.f16.f32 has it; nothing observes the
+// mode there, so it has no prologue and the jumps into it stay as they are.
+.version 7.8
+.target sm_80
+.address_size 64
+.visible .entry unobserved_mode_join(.param .u64 out, .param .u32 n)
+{
+	.reg .pred %p<4>;
+	.reg .b16 %rs<5>;
+	.reg .b32 %r<8>;
+	.reg .b64 %rd<3>;
+	ld.param.u32 %r1, [n];
+	setp.ge.s32 %p1, %r1, 1;
+	@%p1 bra $L__BB_9;
+	cvt.ftz.f32.f16 %r2, %rs1;
+	setp.ge.ftz.f32 %p2, %r2, 0f3EB33333;
+	@%p2 bra $L__BB_3;
+	bra.uni $L__BB_8;
+$L__BB_3:
+	setp.le.ftz.f32 %p3, %r2, 0f42B00000;
+	@%p3 bra $L__BB_8;
+$L__BB_8:
+	setp.gt.ftz.f16 %p3, %rs1, %rs2;
+	fma.rn.ftz.f32 %r3, %r2, %r2, %r2;
+	cvt.rn.f16.f32 %rs4, %r3;
+	ld.param.u64 %rd1, [out];
+	st.global.b16 [%rd1], %rs4;
+$L__BB_9:
+	ret;
+}

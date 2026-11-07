@@ -187,6 +187,39 @@ wall time, peak RSS, object md5).
   99 -> 82 us (`zluda_blas_agx/tools/gemmbench.c`). Skinny n <= 8 products stay slow (0.2-0.3 TFLOPS: the dot kernel
   reads A once per column), but ggml uses its own kernels there.
 
+## Clang-built benchmarks without the CUDA toolkit (2026-11-07, branch claude/clang-bench-2026-11-07)
+
+Toolchain: the fork's clang 24 (/scratch/clang-build) and /scratch/cuda-clang-helpers (our own runtime headers,
+libzcudart on the driver API, ptxas/fatbinary pass-through, gcc shims; outside ZLUDA by design). Benchmarks:
+/scratch/benchmarks (Cycles standalone, Halide apps, tinygrad), /scratch/Rodinia (3.1, all 23 CUDA programs build).
+
+- **What clang-built PTX needed from ZLUDA** (each a general fix): FP-mode pass with uncalled `.visible` functions
+  (5318efc4); `exit` inside a function = `unreachable` (NVPTX writes it into unreachable blocks); `mov` of a `.texref`
+  loads its handle and every texref shares one LLVM struct type (texture<> reads returned 0; the second texref of a
+  module got `struct.texture.2`); deviceOverlap / asyncEngineCount = 1 (huffman skipped its GPU work);
+  cuStreamWrite/WaitValue, cuLaunchHostFunc, packed `extra` launch arguments (tinygrad).
+- **Start-up**: cache keys hashed the module source byte-wise (128-bit FNV-1a): 56 ms per on-request kernel of
+  Cycles' 17.6 MB module, 4.4 s per render start. Word-wise hash: 2 ms; 1-sample render 3.5 -> 1.43 s. Large modules'
+  other kernels now compile on 4 workers by default: cold start 89.6 -> 40 s, peak zoc RSS 1.8 GB (the old 20 GiB
+  warning was for fully inlined kernels). What is left cold: the front end 20.8 s (first pipeline 6.7 s, O3 in AIR
+  spaces 8.7 s) + the slowest kernel (intersect_mnee, 177k instructions, 17 s: greedy RA 30%, ISel 22%). Each kernel
+  compiles its own copy of the shared functions (bsdf, svm, light tree): compiling them once per module is the open
+  compile-time item.
+- **Refuted**: ZLUDA_AIR_AS_PIPELINE=light+ for Cycles: cold start unchanged (critical path is front end + slowest
+  kernel), GPU time +10% (2671 -> 2951 ms per 256 samples).
+- **Cycles (clang kernel)**: scene_monkey 640x360 GPU image vs CPU: mean abs diff 0.000, max 3/255. 1280x720x512
+  spp: 7.6 s wall vs 23.2 s on 12 CPU cores; per 256 spp GPU 2.67 s (shade_surface 42%, intersect_closest 35%).
+- **Rodinia correctness** (vs OpenMP / CPU references, /scratch/rodinia-verify/NOTES.md): 18 programs correct; kmeans
+  wrong as shipped (cudaMemcpyToSymbol with a string, invalid since CUDA 5); **myocyte needs denormals**: default mode
+  (f32 denormals flushed, as the ALU does) makes its Fehlberg step control fail at t=15; with ZLUDA_ROUNDING_STRICT=1
+  it matches the CPU-float build to 1e-7 (72 s vs 21 s). The device math functions are not the cause: expf 1.0,
+  logf 1.8, powf 0.5, exp/log/pow (f64) 1.0/1.1/2.2 ulp max over 1M random inputs.
+- **Open, launch-time specialization of modules with device variables**: zoc's switch lookup tables
+  (`.Lswitch.table.*`, private, in .agx.globals) of other kernels shift the named variables' offsets, so the
+  specialized single-kernel module "lays out its global data differently" and is not loaded (hybridsort: 4 kernels
+  run unspecialized). Needs compiler-made constants outside the shared variables buffer.
+- **Copies are not the bottleneck**: cuMemcpy HtoD/DtoH 28-40 GB/s = host memcpy on this machine at 64 KB-256 MB.
+
 ## What went wrong, 2026-11-03 (Blender Cycles session): read before repeating it
 
 Policy, from the user: running nvcc-generated PTX through ZLUDA is fine; decompiling or reverse engineering it, or

@@ -197,7 +197,9 @@ AGX_NV int __nv_mul24(int x, int y) { return ((x << 8) >> 8) * ((y << 8) >> 8); 
 AGX_NV unsigned __nv_umul24(unsigned x, unsigned y) { return (x & 0xffffff) * (y & 0xffffff); }
 AGX_NV int __nv_sad(int x, int y, int z) { return z + (x > y ? x - y : y - x); }
 AGX_NV unsigned __nv_usad(unsigned x, unsigned y, unsigned z) { return z + (x > y ? x - y : y - x); }
-AGX_NV int __nv_byte_perm(int x, int y, int s) { return (int)__nvvm_prmt(x, y, s); }
+// __byte_perm selects with the low 3 bits of each selector nibble (CUDA math API); PTX prmt's bit 3 would replicate the
+// sign instead, so it is masked off (ggml's 4-bit table lookups depend on it being ignored).
+AGX_NV int __nv_byte_perm(int x, int y, int s) { return (int)__nvvm_prmt(x, y, s & 0x7777); }
 AGX_NV int __nv_hadd(int x, int y) { return (int)(((long long)x + y) >> 1); }
 AGX_NV int __nv_rhadd(int x, int y) { return (int)(((long long)x + y + 1) >> 1); }
 AGX_NV int __nv_uhadd(unsigned x, unsigned y) { return (unsigned)(((unsigned long long)x + y) >> 1); }

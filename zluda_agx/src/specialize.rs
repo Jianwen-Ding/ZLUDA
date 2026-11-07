@@ -532,3 +532,41 @@ mod tests {
         assert!(out.contains("\n.visible .const .align 16 .b8 params[24];"));
     }
 }
+
+/// `src` with `.maxntid x, y, z` on kernel `kernel` (if it has no `.maxntid` / `.reqntid` yet): the backend then
+/// allocates registers so that a threadgroup of that many threads fits (launch-time fitting of a block that the
+/// kernel's registers do not leave room for). Everything else stays as it is, so the global data layout is the
+/// module's.
+pub fn with_maxntid(src: &str, kernel: &str, block: [u32; 3]) -> Option<String> {
+    let at = find_entry(src, kernel)?;
+    let params = at + src[at..].find('(')?;
+    let close = params + matching_paren(&src[params..])?;
+    let body = close + src[close..].find('{')?;
+    let directives = &src[close..body];
+    if directives.contains(".maxntid") || directives.contains(".reqntid") {
+        return None;
+    }
+    let mut out = String::with_capacity(src.len() + 48);
+    out.push_str(&src[..close]);
+    out.push_str(&format!("\n.maxntid {}, {}, {}\n", block[0], block[1], block[2]));
+    out.push_str(&src[close..]);
+    Some(out)
+}
+
+/// The offset just past the `)` that closes the `(` at offset 0.
+fn matching_paren(s: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}

@@ -70,6 +70,9 @@ pub(crate) struct Driver {
     limits: HashMap<u32, usize>,
     /// Streams being captured (0 is the default stream) and their operations so far.
     capturing: HashMap<usize, Vec<Op>>,
+    /// Kernels recompiled with `.maxntid` for a block their registers did not leave room for (module, kernel,
+    /// threads): see `Driver::fit_block`.
+    fitted: HashMap<(usize, String, u64), LoadedModule>,
     /// Streams waiting for a cuStreamWaitValue condition, and the work given to them since (`stream_key`).
     deferred: HashMap<usize, std::collections::VecDeque<Deferred>>,
     /// Graphs and their instantiations: both are operation lists.
@@ -619,11 +622,12 @@ impl Driver {
         if threads == 0 || grid.contains(&0) || threads > p.max_threads_per_block as u64 || too_large {
             return Err(CUerror::INVALID_VALUE);
         }
-        let k = &self.modules[&m].module.kernels[&name];
-        // the kernel's registers do not leave room for this many threads on a core
-        if threads > k.max_threads_per_threadgroup() as u64 {
-            return Err(CUerror::LAUNCH_OUT_OF_RESOURCES);
+        // the kernel's registers do not leave room for this many threads on a core: a copy compiled for this block
+        let fits = threads <= self.modules[&m].module.kernels[&name].max_threads_per_threadgroup() as u64;
+        if !fits {
+            self.fit_block(m, &name, block, threads)?;
         }
+        let k = &self.modules[&m].module.kernels[&name];
         // a cluster kernel's grid is a multiple of its cluster
         if (0..3).any(|i| grid[i] % k.cluster[i] != 0) {
             return Err(CUerror::INVALID_CLUSTER_SIZE);
@@ -641,10 +645,12 @@ impl Driver {
         let g14x = self.ctx.device.g14x();
         // a captured launch runs the generic code it saved
         let root = self.const_root.get(&m).copied().unwrap_or(m);
-        let folded = unchecked && capture.is_none() && self.const_folded(root, &name, threads);
-        let spec = if unchecked && capture.is_none() && !folded { self.specialized(m, &name, args, block) } else { None };
-        let Driver { ctx, default_waits, modules, streams, specs, const_specs, batching, batch, .. } = self;
+        let folded = fits && unchecked && capture.is_none() && self.const_folded(root, &name, threads);
+        let spec =
+            if fits && unchecked && capture.is_none() && !folded { self.specialized(m, &name, args, block) } else { None };
+        let Driver { ctx, default_waits, modules, streams, specs, const_specs, batching, batch, fitted, .. } = self;
         let code = match spec.as_ref().map(|key| &specs[key]) {
+            _ if !fits => &fitted[&(m, name.clone(), threads)],
             _ if folded => const_specs.get_mut(&root).and_then(|c| c.ready(&name)).unwrap_or(&modules[&m]),
             Some(Spec::Ready(specialized)) => specialized,
             _ => &modules[&m],
@@ -845,6 +851,43 @@ impl Driver {
     /// `agx_run`: the kernel's code, the launch's uniforms, and the current contents of the memory it can reach (the
     /// allocations its pointer arguments point into, the module's global data, parameter block and error record),
     /// with `replay.sh`. Memory is as the fault left it, not as the launch found it.
+    /// A copy of module `m`'s kernel `name` for blocks of `threads` threads, which its registers do not leave room
+    /// for (CUDA kernels without __launch_bounds__ launched with 1024 threads, as ggml's soft_max: a CUDA SM has
+    /// more registers than an AGX core): the module's PTX with `.maxntid` on the kernel, so that the backend
+    /// allocates fewer registers (spilling if it must), compiled once (and cached), sharing the module's global data.
+    /// LAUNCH_OUT_OF_RESOURCES if there is no PTX to recompile or the copy still does not fit.
+    fn fit_block(&mut self, m: usize, name: &str, block: [u32; 3], threads: u64) -> CUresult {
+        let key = (m, name.to_string(), threads);
+        if self.fitted.contains_key(&key) {
+            return Ok(());
+        }
+        let Some(src) = self.spec_sources.get(&m).cloned() else { return Err(CUerror::LAUNCH_OUT_OF_RESOURCES) };
+        let text = crate::specialize::with_maxntid(&src, name, block).ok_or(CUerror::LAUNCH_OUT_OF_RESOURCES)?;
+        let started = Instant::now();
+        let (object, asm) = compile_ptx(text.as_bytes(), &self.ctx.props.llvm_cpu).map_err(|e| {
+            eprintln!("zluda_agx: {name} for {threads} threads: {e}");
+            CUerror::LAUNCH_OUT_OF_RESOURCES
+        })?;
+        let module = module::Module::load(&object, &asm).map_err(|_| CUerror::LAUNCH_OUT_OF_RESOURCES)?;
+        let loaded = LoadedModule::new_sharing_globals(&mut self.ctx.vm, module, &self.modules[&m]).map_err(|e| {
+            eprintln!("zluda_agx: {name} for {threads} threads: {e}");
+            CUerror::LAUNCH_OUT_OF_RESOURCES
+        })?;
+        let fits = loaded.module.kernels.get(name).is_some_and(|k| threads <= k.max_threads_per_threadgroup() as u64);
+        if crate::log_enabled() {
+            eprintln!(
+                "[zluda_agx] {name} recompiled for blocks of {threads} threads in {:.3} s: {}",
+                started.elapsed().as_secs_f64(),
+                if fits { "fits" } else { "still too many registers" }
+            );
+        }
+        if !fits {
+            return Err(CUerror::LAUNCH_OUT_OF_RESOURCES);
+        }
+        self.fitted.insert(key, loaded);
+        Ok(())
+    }
+
     /// Whether module `root`'s kernel `name` has code with its host-written constants folded for their current
     /// contents (`const_spec.rs`, then `ConstSpec::ready`); starts its compilation in the background if not.
     fn const_folded(&mut self, root: usize, name: &str, threads: u64) -> bool {
@@ -1486,6 +1529,7 @@ fn new_driver() -> Result<Driver, CUerror> {
         limits: HashMap::new(),
         capturing: HashMap::new(),
         deferred: HashMap::new(),
+        fitted: HashMap::new(),
         graphs: HashMap::new(),
         execs: HashMap::new(),
         host_allocs: HashMap::new(),

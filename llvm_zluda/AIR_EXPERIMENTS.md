@@ -41,6 +41,52 @@ section. GPU times are from the M2 Max behind the AIR service; "suite" is PTX-fo
   is now the slow part. Not over-inlining: shade_surface_mnee packaged alone keeps 162 functions, and
   `-air-keep-function-cost` 20000 / 5000 / 2000 left it byte-identical (its large functions are kept already).
 
+## 2026-11-08: mma and ldmatrix as bit exchanges, closures in registers (branch claude/mma-bitmove-2026-11-08)
+
+All inputs are built with clang (zcc, ptx/tools/cycles_clang); the baseline is origin/master zoc with
+`-agx-fold-lane-identities=0 -agx-quad-uniform-shuffles=0` (/scratch/mma-chain/basezoc).
+
+- **The AGX shuffle model was misread before.** One `simd_shuffle` makes thread r read quad `idx(r) >> 2` at the OR
+  of the low index bits of *that quad's own threads* (measured, every lane predicted: playground
+  novel-results/2026-11-08-shuffle-source-quad). Low bits that are uniform in each *reading* quad are not enough: a
+  first version that skipped the 4-way split for them was wrong in loops (mma chained 37 times), right for one mma.
+  The backend now evaluates indices that are functions of the thread index in all 32 threads, and keeps one shuffle
+  only when each source quad holds the position it is read at (`readsNamedThreads`). No mma index qualifies: one
+  shuffle delivers at most one value per source quad.
+- **mma fragments are bit permutations; moves are shuffle_xor exchanges** (agx_matrix.rs `bit_labels`, `bit_move`).
+  Exchanging two lane bits costs one constant-mask `simd_shuffle_xor` (exact) and a select per register, against
+  about 11 instructions per register for a 4-way split. Swapping the unit tile's row bits 0 and 1 (`unit_row`, exact)
+  makes A, C and D one exchange each. The m16n8k16 loop went from 345 to 100 instructions. Clang-built loop
+  (/scratch/mma-chain/mmatest.cu), Gmma/s: f16 0.70 -> 2.28, bf16 0.71 -> 2.41, f16 k8 0.84 -> 4.24, tf32 0.84 -> 3.82,
+  f16 accumulate 0.75 -> 1.46, s8 2.90 -> 3.38. Outputs bit-identical to before, with exact and full-mantissa inputs.
+- **D -> C moves of chained mmas cancel** (llvm-project `foldLaneIdentities`). It traces each value through shuffles,
+  selects and element moves in all 32 lanes. It must run before `lowerMatrixFMA`, whose i64 operands it cannot see
+  through (the first version folded nothing there). It costs no measurable compile time.
+- **ldmatrix m8n8 (not .trans)**: the row addresses are rotated by two lane bits with exchanges, then read with
+  constant-position `quad_shuffle`s: 16 shuffles + 12 selects + 16 ops -> 4 + 4 + 4 per x4. .trans is left as it was:
+  known bits already halve its split, and a butterfly scheme would save about 1% of code.
+- **llama.cpp flash attention was mostly generic-address tests, not mma.** Its tg kernel was 139k instructions, with
+  20k jmp_exec_none, 19k wait, 14k stack_load and 4631 3-way address tests. Clang keeps the calls to
+  `ggml_cuda_unroll<N>` with the tile-loading lambdas. Their closures (captured references) sit in the local depot,
+  addressed by integers (inttoptr(zext(trunc(ptrtoint(depot)) + off))), so neither SROA nor address inference saw
+  them. Fixes: `LLVMZludaAgxRewritePrivateAddresses` (raw private offsets as GEPs on the depot, then SROA) and
+  `LLVMZludaAirInlineLocalAddressCalls` (inline callees that load pointers through a local address argument).
+  Result: kernel 23k instructions, 96 tests; module object 10.7 -> 4.2 MB, peak compile memory 3.4 -> 1.6 GB.
+  qwen2.5-0.5b fa=1 tg128 84 -> 120 t/s, pp512 390 -> 431 t/s.
+- **Failed first, do not repeat.** (1) Rewriting raw *threadgroup* offsets too broke tcg2-0/2/cp (outputs 0). The
+  shared array is a noalias base, and tcgen05 reads it through descriptor integers, which alias analysis then
+  treated as not aliasing the GEP stores. Private only. (2) Inlining every callee given a local address doubled
+  Blender Cycles' compile (37.6 -> 73 s): its ShaderData is passed to many large functions, and interprocedural
+  provenance already resolves those. Only callees that *load addresses* through the argument are inlined.
+  (3) Folding the raw rewrites into LLVMZludaAgxLowerAddressSpaces made its heavy rerun pipeline run twice
+  (+8 s for Cycles); it is its own pass with an SROA cleanup now. (4) After inlining, the FA module's whole-module
+  O3 took 22.5 s, because `independent_kernels` counted ZLUDA's own `__zluda*` primitives as shared functions. Not
+  counting them gives O3 per kernel in parallel, 51 -> 38 s.
+- Cycles (clang kernel): compile 37.6 -> 37.8 s, object 17.4 -> 16.8 MB, warm 1280x720x256 render 4.1 s both,
+  image vs CPU unchanged. PTX-formalization on the simulator: all 413 files as before (365 pass, 1790 checks).
+- **PTX-formalization ldm-0..7 fail only on hardware (agx_run_hw), and are not a ZLUDA bug.** After `stmatrix .x1`,
+  threads 8-31 read shared memory that no thread wrote. The K model and the simulator zero it; the GPU does not.
+
 ## 2026-11-06: regressions on master, constant-memory specialization, occupancy defaults (M2 Max)
 
 Blender Open Data samples per minute, classroom / junkshop / monster (sum; Metal's median for this chip is 1777):

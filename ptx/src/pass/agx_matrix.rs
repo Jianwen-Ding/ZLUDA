@@ -74,10 +74,11 @@ fn is_fast(d: &ast::MmaDetails) -> bool {
 /// Integer mma (8- and 4-bit A and B, s32 C and D) on the matrix unit: the
 /// elements are exact in f32, and so are their products and every partial sum
 /// (at most k 255^2 < 2^24), whatever the order; C is added in integers.
-/// (Measured: k = 16 without .satfinite is cheaper exactly.)
+/// (k = 16 without .satfinite was cheaper exactly while the operands were gathered with per-thread shuffle indices;
+/// with `bit_move` the unit is faster: m16n8k16 s8 2.50 -> 6.00 Gmma/s, AIR_EXPERIMENTS 2026-11-08.)
 fn is_fast_int(d: &ast::MmaDetails) -> bool {
     use ast::MmaType::*;
-    (d.k >= 32 || d.satfinite)
+    (d.k >= 16 || d.satfinite)
         && matches!(d.atype, S8 | U8 | S4 | U4)
         && matches!(d.btype, S8 | U8 | S4 | U4)
         && d.atype.bits() == d.btype.bits()

@@ -878,12 +878,34 @@ fn ldmatrix(
 ) -> Result<Vec<String>, TranslateError> {
     let base = pointer_bits(ir, p, ptr_type);
     let (g, t) = (&lane.g.clone(), &lane.t.clone());
+    // m8n8: thread (g, t) needs the address of row g of each matrix i, which thread 8i + g holds. The addresses
+    // are rotated by two lane bits (thread 4r + i then holds row r of matrix i: `bit_move`, constant-mask
+    // shuffles), and each quad reads matrix i from its position i (a quad shuffle of a constant position): exact
+    // single instructions, where shuffles of thread 8i + g are split into four by AGX's quad merge.
+    let rotated = if d.shape == ast::MatrixShape::M8n8 && !d.transpose {
+        let lane_id = ir.linear(4, g, 1, t, 0);
+        let lo = ir.cast("trunc", "i64", &base, "i32");
+        let hi = ir.op("lshr", "i64", &base, "32");
+        let hi = ir.cast("trunc", "i64", &hi, "i32");
+        let from: [Label; 6] = [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (2, 0)];
+        let to: [Label; 6] = [(1, 0), (1, 1), (0, 0), (0, 1), (0, 2), (2, 0)];
+        let words = bit_move(ir, &lane_id, &[lo, hi], 32, &from, &to)?;
+        Some(words)
+    } else {
+        None
+    };
     let mut regs = Vec::new();
     for i in 0..d.number.get() as u32 {
         match d.shape {
             ast::MatrixShape::M8n8 if !d.transpose => {
-                let l = ir.linear(1, g, 0, t, 8 * i);
-                let row = row_address(ir, &base, &l);
+                let words = rotated.as_ref().ok_or_else(|| todo("ldmatrix"))?;
+                let read = |ir: &mut Ir, w: &str| ir.def(&format!("call i32 @llvm.agx.quad.shuffle.i32(i32 {w}, i32 {i})"));
+                let lo = read(ir, &words[0]);
+                let hi = read(ir, &words[1]);
+                let lo = ir.cast("zext", "i32", &lo, "i64");
+                let hi = ir.cast("zext", "i32", &hi, "i64");
+                let hi = ir.op("shl", "i64", &hi, "32");
+                let row = ir.op("or", "i64", &lo, &hi);
                 let off = ir.op("mul", "i32", t, "4");
                 let off = ir.cast("zext", "i32", &off, "i64");
                 let a = ir.address(&row, &off, ptr_type);

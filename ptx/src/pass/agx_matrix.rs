@@ -1233,6 +1233,193 @@ fn unit_holder(row: u32, col: u32) -> (u32, u32) {
     (16 * (row / 4) + 2 * (row % 4) + 8 * (col / 4) + (col / 2) % 2, col % 2)
 }
 
+// The row m of A, C and D that row `row` of an 8x8 tile of the matrix unit
+// computes: bits 0 and 1 swapped (an involution). The unit's lanes then hold
+// the rows and columns of the PTX fragments of A, C and D with only lane bits
+// 1 and 3 exchanged (one shuffle_xor and a select per register, see
+// `bit_move`); unpermuted, the move is a 3-cycle of lane bits. The products
+// are the same, only which lane computes them changes.
+fn unit_row(row: u32) -> u32 {
+    (row & !3) | ((row & 1) << 1) | ((row >> 1) & 1)
+}
+
+/// A coordinate bit of a matrix: (0 for the row, 1 for the column; bit).
+type Label = (u8, u32);
+
+/// The bits of a fragment layout: `f(lane, i)` is the (row, column) of
+/// element i of thread `lane`, for i < 2^local_bits. Storage bit j (lanes
+/// 0-4, then the bits of i) is the coordinate bit returned at j, when every
+/// storage bit is one coordinate bit (a bijection onto rows x columns), or
+/// None.
+fn bit_labels(local_bits: u32, f: &dyn Fn(u32, u32) -> Option<(u32, u32)>) -> Option<Vec<Label>> {
+    let n = 5 + local_bits;
+    let mut labels = Vec::new();
+    let (r0, c0) = f(0, 0)?;
+    if (r0, c0) != (0, 0) {
+        return None;
+    }
+    for j in 0..n {
+        let x = 1u32 << j;
+        let (r, c) = f(x & 31, x >> 5)?;
+        let label = match (r, c) {
+            (r, 0) if r.is_power_of_two() => (0, r.trailing_zeros()),
+            (0, c) if c.is_power_of_two() => (1, c.trailing_zeros()),
+            _ => return None,
+        };
+        if labels.contains(&label) {
+            return None;
+        }
+        labels.push(label);
+    }
+    // linear in the bits: every element is the OR of its bits' coordinates
+    for x in 0..1u32 << n {
+        let (mut r, mut c) = (0, 0);
+        for (j, &(kind, bit)) in labels.iter().enumerate() {
+            if (x >> j) & 1 == 1 {
+                if kind == 0 {
+                    r |= 1 << bit;
+                } else {
+                    c |= 1 << bit;
+                }
+            }
+        }
+        if f(x & 31, x >> 5)? != (r, c) {
+            return None;
+        }
+    }
+    Some(labels)
+}
+
+/// Moves the elements of a fragment between two layouts of the same matrix
+/// with SIMD-group shuffles of constant masks (exact single instructions on
+/// AGX, unlike shuffles of per-thread indices, which AGX merges per quad).
+/// `words`: the 32-bit registers of the source, `elem_bits` bits per
+/// element; `from`: its storage bits (lanes 0-4, element-in-word bits, word
+/// bits); `to`: the storage bits of the destination (lanes 0-4, then the
+/// bits of its element index). Every exchange of two storage bits is one
+/// shuffle_xor and a select or two per register. Returns the elements of
+/// this thread in the destination, zero-extended to i32, by index.
+fn bit_move(
+    ir: &mut Ir,
+    lane: &str,
+    words: &[String],
+    elem_bits: u32,
+    from: &[Label],
+    to: &[Label],
+) -> Result<Vec<String>, TranslateError> {
+    let fail = || todo("bit move");
+    let per = 32 / elem_bits;
+    let sub_bits = per.trailing_zeros();
+    if !words.len().is_power_of_two() || from.len() != 5 + sub_bits as usize + words.len().trailing_zeros() as usize
+        || from.len() != to.len()
+        || to.iter().any(|l| !from.contains(l))
+    {
+        return Err(fail());
+    }
+    ir.declarations.insert("declare i32 @llvm.agx.simd.shuffle.xor.i32(i32, i32)".to_string());
+    let mut words = words.to_vec();
+    let mut lab = from.to_vec();
+    let mut bit_cache: HashMap<u32, String> = HashMap::new();
+    let mut lane_bit = |ir: &mut Ir, b: u32| -> String {
+        bit_cache
+            .entry(b)
+            .or_insert_with(|| {
+                let x = ir.op("lshr", "i32", lane, &b.to_string());
+                ir.op("and", "i32", &x, "1")
+            })
+            .clone()
+    };
+    let xor = |ir: &mut Ir, v: &str, mask: u32| {
+        ir.def(&format!("call i32 @llvm.agx.simd.shuffle.xor.i32(i32 {v}, i32 {mask})"))
+    };
+    for j in 0..5usize {
+        let want = to[j];
+        if lab[j] == want {
+            continue;
+        }
+        let at = lab.iter().position(|l| *l == want).ok_or_else(fail)?;
+        let bj = lane_bit(ir, j as u32);
+        if at < 5 {
+            // two lane bits: threads whose bits differ trade with lane ^ (2^j + 2^at)
+            let ba = lane_bit(ir, at as u32);
+            let d = ir.op("xor", "i32", &bj, &ba);
+            let differ = ir.icmp("ne", "i32", &d, "0");
+            for w in words.iter_mut() {
+                let t = xor(ir, w, (1 << j) | (1 << at));
+                *w = ir.select(&differ, "i32", &t, w);
+            }
+        } else if at < 5 + sub_bits as usize {
+            // a lane bit and the elements of a word: halves (quarters) traded with lane ^ 2^j
+            let q = (at - 5) as u32;
+            let shift = elem_bits << q;
+            // the elements whose bit q is 0
+            let mut low = 0u32;
+            for e in 0..per {
+                if (e >> q) & 1 == 0 {
+                    low |= (((1u64 << elem_bits) - 1) as u32) << (e * elem_bits);
+                }
+            }
+            let one = ir.icmp("ne", "i32", &bj, "0");
+            for w in words.iter_mut() {
+                let t = xor(ir, w, 1 << j);
+                // bit j = 0 keeps its elements with bit q = 0 and takes the partner's (as bit q = 1)
+                let keep0 = ir.op("and", "i32", w, &(low as i32).to_string());
+                let t0 = ir.op("shl", "i32", &t, &shift.to_string());
+                let t0 = ir.op("and", "i32", &t0, &(!low as i32).to_string());
+                let lo = ir.op("or", "i32", &keep0, &t0);
+                let keep1 = ir.op("and", "i32", w, &(!low as i32).to_string());
+                let t1 = ir.op("lshr", "i32", &t, &shift.to_string());
+                let t1 = ir.op("and", "i32", &t1, &(low as i32).to_string());
+                let hi = ir.op("or", "i32", &keep1, &t1);
+                *w = ir.select(&one, "i32", &hi, &lo);
+            }
+        } else {
+            // a lane bit and a word bit: pairs of words traded with lane ^ 2^j
+            let k = at - 5 - sub_bits as usize;
+            let one = ir.icmp("ne", "i32", &bj, "0");
+            for x in 0..words.len() {
+                if (x >> k) & 1 == 1 {
+                    continue;
+                }
+                let y = x | (1 << k);
+                let (wx, wy) = (words[x].clone(), words[y].clone());
+                let send = ir.select(&one, "i32", &wx, &wy);
+                let t = xor(ir, &send, 1 << j);
+                words[x] = ir.select(&one, "i32", &t, &wx);
+                words[y] = ir.select(&one, "i32", &wy, &t);
+            }
+        }
+        lab.swap(j, at);
+    }
+    // the destination's elements: their bits are now element-in-word and word bits
+    let local = &to[5..];
+    let mut out = Vec::new();
+    for d in 0..1u32 << local.len() {
+        let (mut sub, mut word) = (0u32, 0usize);
+        for (b, l) in local.iter().enumerate() {
+            if (d >> b) & 1 == 0 {
+                continue;
+            }
+            let at = lab.iter().position(|x| x == l).ok_or_else(fail)?;
+            if at < 5 {
+                return Err(fail());
+            } else if at < 5 + sub_bits as usize {
+                sub |= 1 << (at - 5);
+            } else {
+                word |= 1 << (at - 5 - sub_bits as usize);
+            }
+        }
+        let w = &words[word];
+        out.push(if per == 1 {
+            w.clone()
+        } else {
+            let x = ir.op("lshr", "i32", w, &(sub * elem_bits).to_string());
+            ir.op("and", "i32", &x, &((1u64 << elem_bits) - 1).to_string())
+        });
+    }
+    Ok(out)
+}
+
 // `Options::fast_mma`: an mma tile of f16, bf16 or tf32 A and B as 8x8x8
 // llvm.agx.simdgroup.matrix.fma products in f32 (the G14 matrix unit, or the
 // same chain of fused multiply-adds in k order with shuffles elsewhere):
@@ -1320,6 +1507,8 @@ fn fast_tile(
      -> Result<String, TranslateError> {
         let at = |t: u32| {
             let (r, col) = unit_position(t, s);
+            // (the rows of A and C are m; those of B are k)
+            let r = if which == 1 { r } else { unit_row(r) };
             owners.get(&(row0 + r, col0 + col)).copied().filter(|_| col0 + col < cols)
         };
         let valid = |t: u32| Some(at(t).is_some() as u32);
@@ -1361,8 +1550,45 @@ fn fast_tile(
         "declare <2 x float> @llvm.agx.simdgroup.matrix.fma.v2f32(<2 x float>, <2 x float>, <2 x float>)".to_string(),
     );
     let steps = k.div_ceil(8);
+    // The operands in the unit's layout by bit moves (`bit_move`) where both
+    // layouts are bit permutations of the same elements: element 2 tile + s
+    // of thread t is slot s of the tile. Otherwise (k < 8) per-element gathers.
+    let moved = |ir: &mut Ir,
+                 matrix: MmaMatrix,
+                 regs: &[String],
+                 type_: ast::MmaType,
+                 tile_rc: &dyn Fn(u32) -> (u32, u32, bool)|
+     -> Option<Vec<String>> {
+        let bits = type_.bits();
+        let count = match matrix {
+            MmaMatrix::A => m * k,
+            MmaMatrix::B => k * 8,
+            _ => m * 8,
+        } / 32;
+        if bits > 32 || count * bits % 32 != 0 || regs.len() as u32 != count * bits / 32 || !count.is_power_of_two() {
+            return None;
+        }
+        let from = bit_labels(count.trailing_zeros(), &|t, i| {
+            if i < count { position(matrix, m, k, bits, t, i) } else { None }
+        })?;
+        let to = bit_labels(count.trailing_zeros(), &|t, e| {
+            let (row0, col0, permute) = tile_rc(e / 2);
+            let (r, c) = unit_position(t, e % 2);
+            Some((row0 + if permute { unit_row(r) } else { r }, col0 + c))
+        })?;
+        let elements = bit_move(ir, &l, regs, bits, &from, &to).ok()?;
+        Some(elements.iter().map(|x| element_f32(ir, x, type_)).collect())
+    };
+    let ht = m / 8;
+    let b_moved = moved(ir, MmaMatrix::B, b, d.btype, &|tile| (8 * tile, 0, false));
+    let a_moved = moved(ir, MmaMatrix::A, a, d.atype, &|tile| (8 * (tile % ht), 8 * (tile / ht), true));
+    let c_moved = if int { None } else { moved(ir, MmaMatrix::C, c, d.ctype, &|tile| (8 * tile, 0, true)) };
     let mut b_tiles = Vec::new();
     for kt in 0..steps {
+        if let Some(e) = &b_moved {
+            b_tiles.push(vector(ir, &e[2 * kt as usize], &e[2 * kt as usize + 1]));
+            continue;
+        }
         let x = gather(ir, 1, b, d.btype, &b_owners, (8 * kt, 0, 8), 0)?;
         // (the rows of B past k have no element, and are zero)
         let y = gather(ir, 1, b, d.btype, &b_owners, (8 * kt, 0, 8), 1)?;
@@ -1373,6 +1599,8 @@ fn fast_tile(
         // (integers: the products' sum from zero, C added in integers below)
         let (x, y) = if int {
             ("0".to_string(), "0".to_string())
+        } else if let Some(e) = &c_moved {
+            (e[2 * h as usize].clone(), e[2 * h as usize + 1].clone())
         } else {
             (
                 gather(ir, 2, c, d.ctype, &c_owners, (8 * h, 0, 8), 0)?,
@@ -1382,9 +1610,14 @@ fn fast_tile(
         let mut acc = vector(ir, &x, &y);
         for (kt, bt) in b_tiles.iter().enumerate() {
             let kt = kt as u32;
-            let x = gather(ir, 0, a, d.atype, &a_owners, (8 * h, 8 * kt, k), 0)?;
-            let y = gather(ir, 0, a, d.atype, &a_owners, (8 * h, 8 * kt, k), 1)?;
-            let at = vector(ir, &x, &y);
+            let at = if let Some(e) = &a_moved {
+                let tile = (h + ht * kt) as usize;
+                vector(ir, &e[2 * tile], &e[2 * tile + 1])
+            } else {
+                let x = gather(ir, 0, a, d.atype, &a_owners, (8 * h, 8 * kt, k), 0)?;
+                let y = gather(ir, 0, a, d.atype, &a_owners, (8 * h, 8 * kt, k), 1)?;
+                vector(ir, &x, &y)
+            };
             acc = ir.def(&format!(
                 "call <2 x float> @llvm.agx.simdgroup.matrix.fma.v2f32(<2 x float> {at}, <2 x float> {bt}, <2 x float> {acc})"
             ));
@@ -1398,11 +1631,27 @@ fn fast_tile(
         tiles.push(slots);
     }
     // the elements of D in the PTX layout (that of C)
+    let unit_words = tiles.iter().flatten().cloned().collect::<Vec<_>>();
+    let d_moved = (|| {
+        let count = m * 8 / 32;
+        let from = bit_labels(count.trailing_zeros(), &|t, e| {
+            let (r, c) = unit_position(t, e % 2);
+            Some((8 * (e / 2) + unit_row(r), c))
+        })?;
+        let to = bit_labels(count.trailing_zeros(), &|t, j| {
+            if j < count { position(MmaMatrix::C, m, k, 32, t, j) } else { None }
+        })?;
+        bit_move(ir, &l, &unit_words, 32, &from, &to).ok()
+    })();
     let mut elements = Vec::new();
     for j in 0..m * 8 / 32 {
+        if let Some(e) = &d_moved {
+            elements.push(finish_d(ir, d, int, c, j, &e[j as usize])?);
+            continue;
+        }
         let at = |t: u32| -> (u32, u32, u32) {
             let (r, col) = position(MmaMatrix::C, m, k, d.ctype.bits(), t, j).unwrap_or((0, 0));
-            let (holder, slot) = unit_holder(r % 8, col);
+            let (holder, slot) = unit_holder(unit_row(r % 8), col);
             (r / 8, holder, slot)
         };
         let tile = lane_function(ir, &mut functions, &l, &|t| Some(at(t).0))?;
@@ -1422,31 +1671,65 @@ fn fast_tile(
                 value = ir.select(&is, "i32", &v, &value);
             }
         }
-        elements.push(if d.dtype == ast::MmaType::F16 {
-            let f = ir.cast("bitcast", "i32", &value, "float");
-            let h = ir.cast("fptrunc", "float", &f, "half");
-            let h = ir.cast("bitcast", "half", &h, "i16");
-            ir.cast("zext", "i16", &h, "i32")
-        } else if int {
-            // C + the sum (exact in f32), wrapping, or clamped to s32 with .satfinite
-            let f = ir.cast("bitcast", "i32", &value, "float");
-            let v = ir.cast("fptosi", "float", &f, "i32");
-            let cj = c.get(j as usize).ok_or_else(|| todo("mma fragment size"))?;
-            if d.satfinite {
-                let v64 = ir.cast("sext", "i32", &v, "i64");
-                let c64 = ir.cast("sext", "i32", cj, "i64");
-                let sum = ir.op("add", "i64", &c64, &v64);
-                let low = ir.intrinsic("smax", "i64", &[&sum, "-2147483648"]);
-                let sum = ir.intrinsic("smin", "i64", &[&low, "2147483647"]);
-                ir.cast("trunc", "i64", &sum, "i32")
-            } else {
-                ir.op("add", "i32", cj, &v)
-            }
-        } else {
-            value
-        });
+        elements.push(finish_d(ir, d, int, c, j, &value)?);
     }
     Ok(pack_d(ir, d, &elements))
+}
+
+// Element j of D from its f32 bits `value` (the unit's sum): rounded to
+// f16, or for integers C + the sum (exact in f32), wrapping, or clamped to
+// s32 with .satfinite.
+fn finish_d(ir: &mut Ir, d: &ast::MmaDetails, int: bool, c: &[String], j: u32, value: &str) -> Result<String, TranslateError> {
+    Ok(if d.dtype == ast::MmaType::F16 {
+        let f = ir.cast("bitcast", "i32", value, "float");
+        let h = ir.cast("fptrunc", "float", &f, "half");
+        let h = ir.cast("bitcast", "half", &h, "i16");
+        ir.cast("zext", "i16", &h, "i32")
+    } else if int {
+        let f = ir.cast("bitcast", "i32", value, "float");
+        let v = ir.cast("fptosi", "float", &f, "i32");
+        let cj = c.get(j as usize).ok_or_else(|| todo("mma fragment size"))?;
+        if d.satfinite {
+            let v64 = ir.cast("sext", "i32", &v, "i64");
+            let c64 = ir.cast("sext", "i32", cj, "i64");
+            let sum = ir.op("add", "i64", &c64, &v64);
+            let low = ir.intrinsic("smax", "i64", &[&sum, "-2147483648"]);
+            let sum = ir.intrinsic("smin", "i64", &[&low, "2147483647"]);
+            ir.cast("trunc", "i64", &sum, "i32")
+        } else {
+            ir.op("add", "i32", cj, &v)
+        }
+    } else {
+        value.to_string()
+    })
+}
+
+// f32 bits of an element (zero-extended in an i32) of an mma operand.
+fn element_f32(ir: &mut Ir, x: &str, type_: ast::MmaType) -> String {
+    let bits = type_.bits();
+    match type_ {
+        ast::MmaType::F16 => {
+            let h = ir.cast("trunc", "i32", x, "i16");
+            let h = ir.cast("bitcast", "i16", &h, "half");
+            let f = ir.cast("fpext", "half", &h, "float");
+            ir.cast("bitcast", "float", &f, "i32")
+        }
+        ast::MmaType::Bf16 => ir.op("shl", "i32", x, "16"),
+        ast::MmaType::Tf32 => ir.op("and", "i32", x, "-8192"),
+        ast::MmaType::S8 | ast::MmaType::S4 => {
+            let sh = (32 - bits).to_string();
+            let x = ir.op("shl", "i32", x, &sh);
+            let x = ir.op("ashr", "i32", &x, &sh);
+            let f = ir.cast("sitofp", "i32", &x, "float");
+            ir.cast("bitcast", "float", &f, "i32")
+        }
+        ast::MmaType::U8 | ast::MmaType::U4 => {
+            let x = ir.op("and", "i32", x, &((1u32 << bits) - 1).to_string());
+            let f = ir.cast("uitofp", "i32", &x, "float");
+            ir.cast("bitcast", "float", &f, "i32")
+        }
+        _ => x.to_string(),
+    }
 }
 
 // mma.m8n8k4 with .f16 A and B: four independent 8x8x4 products, product q

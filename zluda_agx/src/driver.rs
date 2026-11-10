@@ -2672,7 +2672,24 @@ unsafe fn load_module_data(d: &mut Driver, bytes: *const u8) -> Result<usize, CU
         None
     };
     // (a large module's kernels from its portable AIR, the front end once: compile_ptx_kernel)
-    let portable = lazy.as_ref().filter(|_| image.len() > LARGE_MODULE_BYTES).and_then(|_| PortableAir::new()).map(std::sync::Arc::new);
+    // Only where the kernels share functions (Blender Cycles): each kernel from its own PTX would run the front end
+    // over all of them again. A module of independent kernels (llama.cpp's: 5-10 MB, 64-185 kernels, a few used)
+    // compiles each kernel from its own PTX instead, the whole module's front end (about 25 s each) off the path of
+    // the first launch: cold llama-bench pp512 168-174 s, 1 GB -> 99 s, 232 MB; warm 10.5 -> 1.8 s, the same pp512.
+    // ZLUDA_AGX_PORTABLE=0 / 1: never / always for a large module.
+    let portable_env = std::env::var("ZLUDA_AGX_PORTABLE").ok();
+    let portable = lazy
+        .as_ref()
+        .filter(|(text, _)| {
+            image.len() > LARGE_MODULE_BYTES
+                && match portable_env.as_deref() {
+                    Some("0") => false,
+                    Some("1") => true,
+                    _ => crate::specialize::defines_shared_functions(text),
+                }
+        })
+        .and_then(|_| PortableAir::new())
+        .map(std::sync::Arc::new);
     let initial_ptx = lazy
         .as_ref()
         .filter(|_| portable.is_none())

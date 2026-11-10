@@ -935,7 +935,9 @@ mod parts {
         }
     }
 
-    /// Whether `src` defines functions other than kernels (`.func` with a body, not `.extern`).
+    /// Whether `src` defines functions other than kernels (`.func` with a body, not `.extern`) that kernels can share
+    /// as calls: not `.noreturn` ones, the error paths that clang emits into modules of independent kernels
+    /// (ggml's no_device_code: a printf and a trap), which never make a kernel a call tree.
     pub fn defines_functions(src: &str) -> bool {
         let mut depth = 0i32;
         let mut line_start = 0;
@@ -945,18 +947,25 @@ mod parts {
                 b'{' => depth += 1,
                 b'}' => depth -= 1,
                 b'\n' => line_start = i + 1,
-                b'.' if depth == 0 => {
-                    let rest = &src[i..];
-                    if rest.starts_with(".func") && rest[5..].starts_with(|c: char| c.is_whitespace())
-                        && !src[line_start..i].contains(".extern")
-                    {
-                        return true;
-                    }
-                }
+                b'.' if depth == 0 && shared_function_at(src, line_start, i) => return true,
                 _ => {}
             }
         }
         false
+    }
+
+    /// Whether the text at `i` (top level, on the line from `line_start`) defines a function other than a kernel that
+    /// kernels can share: a `.func` with a body, not `.extern` and not `.noreturn` (see defines_functions).
+    fn shared_function_at(src: &str, line_start: usize, i: usize) -> bool {
+        let rest = &src[i..];
+        if !rest.starts_with(".func") || !rest[5..].starts_with(|c: char| c.is_whitespace())
+            || src[line_start..i].contains(".extern")
+        {
+            return false;
+        }
+        // (the directives between the signature and the body, or the `;` of a declaration)
+        let head = &rest[..rest.find(['{', ';']).unwrap_or(rest.len())];
+        !head.contains(".noreturn") && !rest[head.len()..].starts_with(';')
     }
 
     /// `src` in up to `n` parts of about the same size (whole kernels, in source order within each), or None: fewer
@@ -977,7 +986,9 @@ mod parts {
                     let rest = &src[i..];
                     let word = |w: &str| rest.starts_with(w) && rest[w.len()..].starts_with(|c: char| c.is_whitespace());
                     if word(".func") {
-                        // a function declared .extern has no body: only definitions count
+                        // a function declared .extern has no body: only definitions count (a module with only a
+                        // .noreturn error path too: compiled whole, its kernels stay lazy, which measured faster for
+                        // llama.cpp's MMQ module than parts: cold llama-bench 183 s, 544 MB against 226 s, 1057 MB)
                         if !src[line_start..i].contains(".extern") {
                             return None;
                         }
@@ -1037,5 +1048,18 @@ mod parts {
             part.push_str(&src[at..]);
         }
         Some(parts)
+    }
+}
+
+#[cfg(all(test, feature = "agx"))]
+mod parts_tests {
+    #[test]
+    fn noreturn_functions_are_not_shared_functions() {
+        let error_path = ".func _Z5abortv\n()\n.noreturn\n;\n.func _Z5abortv()\n.noreturn\n{\n\ttrap; exit;\n}\n\
+                          .visible .entry k()\n{\n\tret;\n}\n";
+        assert!(!super::parts::defines_functions(error_path));
+        let shared = ".func  (.param .b32 r) _Z1fi(\n\t.param .b32 a\n)\n{\n\tret;\n}\n";
+        assert!(super::parts::defines_functions(shared));
+        assert!(!super::parts::defines_functions(".extern .func _Z1gv\n()\n;\n"));
     }
 }

@@ -136,4 +136,96 @@ gpu.module @agx_blas_epilogue {
     }
     gpu.return
   }
+
+  // Split-K GEMM (engine::gemm): C[r, c] = alpha * sum_s W[s * slice + r * N + c] + beta * C[r, c] for row-major
+  // M x N C (ld ldc) of f32, the S slices of W (f32) the tile kernel wrote for S chunks of K. Summed in slice order
+  // (deterministic); C is not read when beta is 0. Launch x over N, y over M (16 x 16 threads per threadgroup).
+  gpu.func @agx_splitk_reduce_f32(%w0: memref<1xf32, 1>, %c0: memref<1xf32, 1>,
+                            %M: index, %N: index, %ldc: index, %S: index, %slice: index,
+                            %alpha: f32, %beta: f32) kernel {
+    %i0 = arith.constant 0 : index
+    %i1 = arith.constant 1 : index
+    %big = arith.constant 4611686018427387904 : index
+    %W = memref.reinterpret_cast %w0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %C = memref.reinterpret_cast %c0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %c = gpu.global_id x
+    %r = gpu.global_id y
+    %in_n = arith.cmpi ult, %c, %N : index
+    %in_m = arith.cmpi ult, %r, %M : index
+    %in = arith.andi %in_m, %in_n : i1
+    scf.if %in {
+      %rn = arith.muli %r, %N : index
+      %e = arith.addi %rn, %c : index
+      %f0 = arith.constant 0.0 : f32
+      %sum = scf.for %s = %i0 to %S step %i1 iter_args(%acc = %f0) -> (f32) {
+        %o = arith.muli %s, %slice : index
+        %q = arith.addi %o, %e : index
+        %x = memref.load %W[%q] : memref<?xf32, strided<[1]>, 1>
+        %a = arith.addf %acc, %x : f32
+        scf.yield %a : f32
+      }
+      %rl = arith.muli %r, %ldc : index
+      %p = arith.addi %rl, %c : index
+      %scaled = arith.mulf %sum, %alpha : f32
+      %has_beta = arith.cmpf une, %beta, %f0 : f32
+      %v = scf.if %has_beta -> f32 {
+        %old = memref.load %C[%p] : memref<?xf32, strided<[1]>, 1>
+        %t = math.fma %old, %beta, %scaled : f32
+        scf.yield %t : f32
+      } else {
+        scf.yield %scaled : f32
+      }
+      memref.store %v, %C[%p] : memref<?xf32, strided<[1]>, 1>
+    }
+    gpu.return
+  }
+
+  // Split-K GEMM (engine::gemm): C[r, c] = alpha * sum_s W[s * slice + r * N + c] + beta * C[r, c] for row-major
+  // M x N C (ld ldc) of f16, the S slices of W (f32) the tile kernel wrote for S chunks of K. Summed in slice order
+  // (deterministic); C is not read when beta is 0. Launch x over N, y over M (16 x 16 threads per threadgroup).
+  gpu.func @agx_splitk_reduce_f16(%w0: memref<1xf32, 1>, %c0: memref<1xf16, 1>,
+                            %M: index, %N: index, %ldc: index, %S: index, %slice: index,
+                            %alpha: f32, %beta: f32) kernel {
+    %i0 = arith.constant 0 : index
+    %i1 = arith.constant 1 : index
+    %big = arith.constant 4611686018427387904 : index
+    %W = memref.reinterpret_cast %w0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf32, 1> to memref<?xf32, strided<[1]>, 1>
+    %C = memref.reinterpret_cast %c0 to offset: [0], sizes: [%big], strides: [1]
+        : memref<1xf16, 1> to memref<?xf16, strided<[1]>, 1>
+    %c = gpu.global_id x
+    %r = gpu.global_id y
+    %in_n = arith.cmpi ult, %c, %N : index
+    %in_m = arith.cmpi ult, %r, %M : index
+    %in = arith.andi %in_m, %in_n : i1
+    scf.if %in {
+      %rn = arith.muli %r, %N : index
+      %e = arith.addi %rn, %c : index
+      %f0 = arith.constant 0.0 : f32
+      %sum = scf.for %s = %i0 to %S step %i1 iter_args(%acc = %f0) -> (f32) {
+        %o = arith.muli %s, %slice : index
+        %q = arith.addi %o, %e : index
+        %x = memref.load %W[%q] : memref<?xf32, strided<[1]>, 1>
+        %a = arith.addf %acc, %x : f32
+        scf.yield %a : f32
+      }
+      %rl = arith.muli %r, %ldc : index
+      %p = arith.addi %rl, %c : index
+      %scaled = arith.mulf %sum, %alpha : f32
+      %has_beta = arith.cmpf une, %beta, %f0 : f32
+      %v = scf.if %has_beta -> f32 {
+        %old = memref.load %C[%p] : memref<?xf16, strided<[1]>, 1>
+        %oldf = arith.extf %old : f16 to f32
+        %t = math.fma %oldf, %beta, %scaled : f32
+        scf.yield %t : f32
+      } else {
+        scf.yield %scaled : f32
+      }
+      %vs = arith.truncf %v : f32 to f16
+      memref.store %vs, %C[%p] : memref<?xf16, strided<[1]>, 1>
+    }
+    gpu.return
+  }
 }

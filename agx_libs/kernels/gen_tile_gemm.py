@@ -20,7 +20,7 @@ KERNELS = {  # file: [(name, A and B type, C type)]
 VARIANTS = [("", False, False), ("_ta", True, False), ("_tb", False, True), ("_tatb", True, True)]
 # `_u` kernels make no alignment assumption (odd leading dimensions or strides, matrices not 8-byte aligned)
 ALIGNMENTS = [("", True), ("_u", False)]
-# f16 kernels: the next step's fragments loaded while the current step's products run (see kernel())
+# The next step's fragments loaded while the current step's products run (see kernel()), f16 and f32 kernels
 PREFETCH = True
 
 
@@ -95,7 +95,7 @@ def kernel(name, ab, c, ta, tb, aligned=True):
     w("      gpu.barrier memfence []")
     w("      %kk_end0 = arith.addi %kk, %i128 : index")
     w("      %kk_end = arith.minui %kk_end0, %K : index")
-    prefetch = PREFETCH and ab == "f16"
+    prefetch = PREFETCH
     if prefetch:
         # Software pipelining: the fragments of step k + 8 are loaded while step k's products run (carried by the
         # loop); the last step loads its own again (clamped) instead of branching.

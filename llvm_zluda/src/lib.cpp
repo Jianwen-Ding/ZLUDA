@@ -5752,27 +5752,43 @@ int LLVMZludaPromoteDynamicPrivateLoads(LLVMModuleRef M)
 // moves (about 23 shuffles and selects) of each iteration. A d_ptx whose remaining uses are after the loop moves to
 // the loop's exit (an mma.sync.aligned in the loop: the warp leaves it together). Then every marker is inlined.
 
+// The f32 markers c_unit / d_ptx pair by their tile shape ("m16k16"); the f16 markers c16_unit / d16_ptx by
+// "16:" and the shape (Shape points into a string of the function's own name, kept alive by the module).
 static bool zludaMmaMarker(const Function *F, bool &ToUnit, StringRef &Shape)
 {
     if (!F)
         return false;
     StringRef N = F->getName();
-    if (N.consume_front("__zluda_ptx_impl_agx_mma_c_unit_"))
+    if (!N.consume_front("__zluda_ptx_impl_agx_mma_"))
+        return false;
+    bool F16 = N.starts_with("c16_") || N.starts_with("d16_");
+    if (N.consume_front("c_unit_") || N.consume_front("c16_unit_"))
         ToUnit = true;
-    else if (N.consume_front("__zluda_ptx_impl_agx_mma_d_ptx_"))
+    else if (N.consume_front("d_ptx_") || N.consume_front("d16_ptx_"))
         ToUnit = false;
     else
         return false;
+    // (the f16 shape keeps its "16_" prefix from the name: "unit_m16k16" / "ptx_m16k16" differ, so compare
+    // the part after the last '_')
     Shape = N;
+    (void)F16;
     return true;
 }
 
-static CallInst *zludaMmaMarkerCall(Value *V, bool ToUnit, StringRef Shape)
+static bool zludaMmaMarkerF16(const Function *F)
+{
+    return F && (F->getName().starts_with("__zluda_ptx_impl_agx_mma_c16_") ||
+                 F->getName().starts_with("__zluda_ptx_impl_agx_mma_d16_"));
+}
+
+static CallInst *zludaMmaMarkerCall(Value *V, bool ToUnit, StringRef Shape, bool F16)
 {
     auto *C = dyn_cast<CallInst>(V);
     bool U;
     StringRef S;
-    if (C && zludaMmaMarker(C->getCalledFunction(), U, S) && U == ToUnit && S == Shape)
+    // (IPO may have dropped the argument of a marker that was always called with undef: such a call is left alone)
+    if (C && C->arg_size() == 1 && zludaMmaMarker(C->getCalledFunction(), U, S) && U == ToUnit && S == Shape &&
+        zludaMmaMarkerF16(C->getCalledFunction()) == F16)
         return C;
     return nullptr;
 }
@@ -5783,9 +5799,28 @@ namespace
     struct ZludaUnitResolver
     {
         StringRef Shape;
-        FixedVectorType *VT;
+        FixedVectorType *VT; // the unit's words
+        unsigned PtxN;       // the words of C in the PTX layout
+        bool F16;            // c16_unit / d16_ptx: x rounded to f16 and back where they cancel
         DenseMap<Value *, PHINode *> Made; // (by the first scalar phi, or the vector phi)
         SmallVector<PHINode *, 8> Created;
+        DenseMap<Value *, Value *> Rounded;
+
+        // the unit's words of d_ptx's operand X as c_unit would make them from d_ptx(X)
+        Value *unitOf(CallInst *D)
+        {
+            Value *X = D->getArgOperand(0);
+            if (!F16)
+                return X;
+            if (Value *R = Rounded.lookup(D))
+                return R;
+            IRBuilder<> B(D->getNextNode());
+            auto *FT = FixedVectorType::get(B.getFloatTy(), VT->getNumElements());
+            auto *HT = FixedVectorType::get(B.getHalfTy(), VT->getNumElements());
+            Value *R = B.CreateBitCast(B.CreateFPExt(B.CreateFPTrunc(B.CreateBitCast(X, FT), HT), FT), VT);
+            Rounded[D] = R;
+            return R;
+        }
 
         Value *strip(Value *V)
         {
@@ -5810,10 +5845,10 @@ namespace
         {
             V = strip(V);
             auto *T = dyn_cast<FixedVectorType>(V->getType());
-            if (!T || T->getNumElements() != VT->getNumElements())
+            if (!T || T->getNumElements() != PtxN)
                 return nullptr;
-            if (CallInst *C = zludaMmaMarkerCall(V, false, Shape))
-                return C->getArgOperand(0);
+            if (CallInst *C = zludaMmaMarkerCall(V, false, Shape, F16))
+                return unitOf(C);
             if (isZero(V))
                 return Constant::getNullValue(VT);
             if (auto *P = dyn_cast<PHINode>(V))
@@ -5833,7 +5868,7 @@ namespace
                 return Q;
             }
             // a vector made of its elements
-            unsigned N = VT->getNumElements();
+            unsigned N = PtxN;
             SmallVector<Value *, 8> S(N, nullptr);
             Value *Cur = V;
             while (auto *IE = dyn_cast<InsertElementInst>(Cur))
@@ -5907,8 +5942,12 @@ namespace
                 Q->replaceAllUsesWith(PoisonValue::get(Q->getType()));
             for (PHINode *Q : Created)
                 Q->eraseFromParent();
+            for (auto &[D, R] : Rounded)
+                if (auto *I = dyn_cast<Instruction>(R); I && I->use_empty())
+                    RecursivelyDeleteTriviallyDeadInstructions(I);
             Created.clear();
             Made.clear();
+            Rounded.clear();
         }
     };
 }
@@ -6012,7 +6051,7 @@ int LLVMZludaAgxCancelMmaLayouts(LLVMModuleRef MRef)
             {
                 bool U;
                 StringRef S;
-                if (zludaMmaMarker(C->getCalledFunction(), U, S) && U)
+                if (C->arg_size() == 1 && zludaMmaMarker(C->getCalledFunction(), U, S) && U)
                     ToUnit.push_back(C);
             }
         bool Changed = false;
@@ -6024,7 +6063,10 @@ int LLVMZludaAgxCancelMmaLayouts(LLVMModuleRef MRef)
             auto *VT = dyn_cast<FixedVectorType>(C->getType());
             if (!VT)
                 continue;
-            ZludaUnitResolver R{S, VT};
+            auto *PT = dyn_cast<FixedVectorType>(C->getArgOperand(0)->getType());
+            if (!PT)
+                continue;
+            ZludaUnitResolver R{S, VT, PT->getNumElements(), zludaMmaMarkerF16(C->getCalledFunction())};
             Value *V = R.vector(C->getArgOperand(0));
             if (!V)
             {
@@ -6074,7 +6116,7 @@ int LLVMZludaAgxCancelMmaLayouts(LLVMModuleRef MRef)
             {
                 bool U;
                 StringRef S;
-                if (zludaMmaMarker(C->getCalledFunction(), U, S) && !U)
+                if (C->arg_size() == 1 && zludaMmaMarker(C->getCalledFunction(), U, S) && !U)
                     ToPtx.push_back(C);
             }
         bool Sunk = false;

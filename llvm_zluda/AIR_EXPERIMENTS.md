@@ -1054,3 +1054,13 @@ agent: absolute numbers drift by ~5% between hours).
 - Cycles compile time: each of its 394 shared functions is compiled 3.9x on average (once per calling kernel:
   1.90 M IR instructions through the backend for 486 k unique); compiling functions once is a compile-unit design
   change, not started.
+- **Prompt processing through cuBLAS.** llama.cpp configured with -DGGML_CUDA_FORCE_CUBLAS=ON (same clang/zcc
+  toolchain) dequantizes to f16 and calls cublasGemmEx: ZLUDA's MLIR hgemm (simdgroup matrices in the unit's layout)
+  instead of MMQ's emulated int8 mma. pp512 fa0 ~1100 -> ~2590, fa1 ~1110 -> ~3290, pp128 fa1 ~745 -> ~1950; tg the
+  same; fa=1 completion identical to the CPU backend. Then **split-K (d136aa34)** for tile GEMMs of few threadgroups
+  (2-8 chunks of K into a per-stream f32 workspace, agx_splitk_reduce): 896x512x4864 1444 -> 978 us, 128x512x896
+  139 -> 56 us; pp512 fa1 ~3290 -> ~3740, fa0 ~2590 -> ~3280, pp128 fa1 ~1950 -> ~2590. Large tile GEMMs peak at
+  ~5.6 TFLOPS (608+ tiles): the hgemm kernel itself is the next lever, then flash_attn_ext_f16 prefill (~27%).
+- **f16 accumulators through the markers (b22e7804):** c16_unit(d16_ptx(x)) = round-to-f16-and-back of x in the
+  unit layout. mmatest f16 chain +13%, flash-attn prefill shuffles -12% but no measurable pp change. Markers whose
+  argument IPO dropped (always-undef C) are left alone (an assertion in isa-mma-k8.ptx otherwise).

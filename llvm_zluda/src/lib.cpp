@@ -443,23 +443,53 @@ static Value *zludaAgxLocalBase(Value *V)
     return Cast->getPointerOperand();
 }
 
-// Splits an integer into such an address plus offsets
-static Value *zludaAgxSplitLocalAddress(Value *V, SmallVectorImpl<Value *> &Offsets, unsigned Depth = 0)
+// Splits an integer into such an address plus offsets: a generic address of threadgroup or private memory, or
+// (`Raw`) the integer of a private pointer itself, its 32-bit offset in that memory (ZLUDA's front end
+// writes `ld.local [%SPL + 96]` as inttoptr(ptrtoint(depot) + 96)). Only raw offsets are followed through 32-bit
+// truncations and extensions (they are 32-bit; a generic address loses its tag bits there).
+static Value *zludaAgxSplitLocalAddress(Value *V, SmallVectorImpl<Value *> &Offsets, bool *Raw = nullptr,
+                                        unsigned Depth = 0, bool Resized = false)
 {
     if (Value *Base = zludaAgxLocalBase(V))
+    {
+        if (Resized)
+            return nullptr;
+        if (Raw)
+            *Raw = false;
         return Base;
+    }
+    if (auto *P2I = dyn_cast<PtrToIntOperator>(V))
+    {
+        Value *P = P2I->getPointerOperand();
+        unsigned AS = P->getType()->getPointerAddressSpace();
+        // (private memory only: threadgroup memory is also reached through integers of other origins, such as
+        // tcgen05's shared memory descriptors, which alias analysis would no longer see aliasing a pointer of its own;
+        // a private depot's address is only ever ptrtoint(depot))
+        if (!Raw || AS != 5)
+            return nullptr;
+        *Raw = true;
+        return P;
+    }
+    if (Depth > 8)
+        return nullptr;
+    if (auto *C = dyn_cast<CastInst>(V))
+    {
+        if (Raw && (isa<ZExtInst>(C) || isa<SExtInst>(C) || isa<TruncInst>(C)) &&
+            C->getType()->getIntegerBitWidth() >= 32 && C->getOperand(0)->getType()->getIntegerBitWidth() >= 32)
+            return zludaAgxSplitLocalAddress(C->getOperand(0), Offsets, Raw, Depth + 1, true);
+        return nullptr;
+    }
     auto *Add = dyn_cast<BinaryOperator>(V);
-    if (!Add || Add->getOpcode() != Instruction::Add || Depth > 8)
+    if (!Add || Add->getOpcode() != Instruction::Add)
         return nullptr;
     for (unsigned i = 0; i < 2; i++)
-        if (Value *Base = zludaAgxSplitLocalAddress(Add->getOperand(i), Offsets, Depth + 1))
+        if (Value *Base = zludaAgxSplitLocalAddress(Add->getOperand(i), Offsets, Raw, Depth + 1, Resized))
         {
             Offsets.push_back(Add->getOperand(1 - i));
             return Base;
         }
     return nullptr;
 }
-
 // Whether an address converted to an integer is never used as an address
 // again: it only flows into comparisons and into operations whose results
 // are no addresses (masks of low bits, shifts, ...)
@@ -520,24 +550,30 @@ static bool zludaAgxStaysInteger(Value *V, SmallPtrSetImpl<Value *> &Visited)
 // arithmetic on the original pointer (which address space inference then
 // follows), and those only used as integers (compared, masked) become
 // their 32-bit offsets.
-static bool zludaAgxRewriteLocalAddress(Instruction *I)
+static bool zludaAgxRewriteLocalAddress(Instruction *I, bool raw_private = false)
 {
     if (auto *I2P = dyn_cast<IntToPtrInst>(I))
     {
         SmallVector<Value *, 4> Offsets;
-        Value *Base = zludaAgxSplitLocalAddress(I2P->getOperand(0), Offsets);
+        bool Raw = false;
+        Value *Base = zludaAgxSplitLocalAddress(I2P->getOperand(0), Offsets, raw_private ? &Raw : nullptr);
+        if (raw_private && !Raw)
+            return false;
         if (!Base)
+            return false;
+        // (a raw offset is that memory's address only as a pointer of its own address space)
+        if (Raw && I2P->getType()->getPointerAddressSpace() != Base->getType()->getPointerAddressSpace())
             return false;
         IRBuilder<> Builder(I2P);
         Value *Ptr = Base;
         for (Value *Offset : Offsets)
-            Ptr = Builder.CreateGEP(Builder.getInt8Ty(), Ptr, Builder.CreateTrunc(Offset, Builder.getInt32Ty()));
+            Ptr = Builder.CreateGEP(Builder.getInt8Ty(), Ptr, Builder.CreateSExtOrTrunc(Offset, Builder.getInt32Ty()));
         I2P->replaceAllUsesWith(Builder.CreateAddrSpaceCast(Ptr, I2P->getType()));
         I2P->eraseFromParent();
         return true;
     }
     auto *P2I = dyn_cast<PtrToIntInst>(I);
-    if (!P2I)
+    if (!P2I || raw_private)
         return false;
     Value *Base = zludaAgxLocalBase(P2I);
     if (!Base)
@@ -561,6 +597,23 @@ static bool zludaAgxRewriteLocalAddress(Instruction *I)
 // those memories that went through integer arithmetic (see
 // zludaAgxRewriteLocalAddress), which keeps them out of the tagged form.
 // Returns whether anything changed.
+// Accesses of private memory at integer addresses, inttoptr(ptrtoint(depot) + offsets) as ZLUDA's front end writes
+// `ld.local [%SPL + 96]` and cvta.local, as GEPs on the depot: SROA then keeps what it can of the depot in registers
+// (a lambda's closure, the pointers it holds), and address space inference follows the generic pointers made from
+// it. (Its own pass with a light cleanup: in LLVMZludaAgxLowerAddressSpaces they made the heavy pipeline that follows
+// generic casts run twice for Blender Cycles, +8 s.) Returns whether anything changed.
+bool LLVMZludaAgxRewritePrivateAddresses(LLVMModuleRef M)
+{
+    Module *Mod = unwrap(M);
+    bool found = false;
+    for (Function &F : *Mod)
+        for (BasicBlock &BB : F)
+            for (Instruction &I : make_early_inc_range(BB))
+                if (zludaAgxRewriteLocalAddress(&I, true))
+                    found = true;
+    return found;
+}
+
 bool LLVMZludaAgxLowerAddressSpaces(LLVMModuleRef M)
 {
     struct Space
@@ -5318,6 +5371,194 @@ int LLVMZludaAirRangeReport(LLVMModuleRef M)
 LLVM_C_EXTERN_C_END
 
 LLVM_C_EXTERN_C_BEGIN
+
+// Whether V is an address of private or threadgroup memory (an alloca, a local depot, a shared array), as a pointer or
+// converted to an integer, plus offsets: through integer and address space casts, GEPs, adds and ors.
+static bool zludaIsLocalAddress(Value *V)
+{
+    for (unsigned depth = 0; depth < 32; depth++)
+    {
+        if (isa<AllocaInst>(V))
+            return true;
+        if (V->getType()->isPointerTy())
+        {
+            unsigned AS = V->getType()->getPointerAddressSpace();
+            if (AS == 3 || AS == 5)
+                return true;
+        }
+        auto *Op = dyn_cast<Operator>(V);
+        if (!Op)
+            return false;
+        switch (Op->getOpcode())
+        {
+        case Instruction::PtrToInt:
+        case Instruction::IntToPtr:
+        case Instruction::AddrSpaceCast:
+        case Instruction::BitCast:
+        case Instruction::ZExt:
+        case Instruction::SExt:
+        case Instruction::Trunc:
+        case Instruction::GetElementPtr:
+            V = Op->getOperand(0);
+            continue;
+        case Instruction::Add:
+        case Instruction::Or:
+            // (the base is either operand of an add; an offset is never itself an address of local memory)
+            if (zludaIsLocalAddress(Op->getOperand(1)))
+                return true;
+            V = Op->getOperand(0);
+            continue;
+        default:
+            return false;
+        }
+    }
+    return false;
+}
+
+// Whether V (derived from argument A of a callee, an address of the caller's private or threadgroup memory) reaches a
+// load whose result is then used as an address: a pointer kept in that memory, such as a reference a lambda captured
+// in its closure. Only such loads need the caller's view of that memory (store-to-load forwarding after inlining);
+// accesses of the memory itself are resolved without inlining (interprocedural provenance in the AGX backend).
+static bool zludaLoadsAddressThrough(Value *V, unsigned Depth, SmallPtrSetImpl<Value *> &Visited)
+{
+    if (Depth > 12 || !Visited.insert(V).second)
+        return false;
+    // whether the value loaded is used as an address (through integer arithmetic and casts)
+    std::function<bool(Value *, unsigned)> usedAsAddress = [&](Value *X, unsigned D) -> bool {
+        if (D > 8)
+            return false;
+        for (User *U : X->users())
+        {
+            if (isa<IntToPtrInst>(U) || isa<GetElementPtrInst>(U))
+                return true;
+            if (auto *L = dyn_cast<LoadInst>(U); L && L->getPointerOperand() == X)
+                return true;
+            if (auto *St = dyn_cast<StoreInst>(U); St && St->getPointerOperand() == X)
+                return true;
+            if (isa<CastInst>(U) || (isa<BinaryOperator>(U) && (cast<Instruction>(U)->getOpcode() == Instruction::Add ||
+                                                                 cast<Instruction>(U)->getOpcode() == Instruction::Or)))
+                if (usedAsAddress(U, D + 1))
+                    return true;
+        }
+        return false;
+    };
+    for (User *U : V->users())
+    {
+        if (auto *L = dyn_cast<LoadInst>(U))
+        {
+            if (L->getPointerOperand() == V && usedAsAddress(L, 0))
+                return true;
+            continue;
+        }
+        if (isa<CastInst>(U) || isa<GetElementPtrInst>(U) ||
+            (isa<BinaryOperator>(U) && (cast<Instruction>(U)->getOpcode() == Instruction::Add ||
+                                        cast<Instruction>(U)->getOpcode() == Instruction::Or)))
+            if (zludaLoadsAddressThrough(U, Depth + 1, Visited))
+                return true;
+        // (passed on to another call: its own call site is considered after this one is inlined)
+        if (auto *CB = dyn_cast<CallBase>(U); CB && CB->getCalledFunction() && !CB->getCalledFunction()->isDeclaration())
+            for (unsigned i = 0; i < CB->arg_size(); i++)
+                if (CB->getArgOperand(i) == V && i < CB->getCalledFunction()->arg_size())
+                {
+                    SmallPtrSet<Value *, 16> Inner;
+                    if (zludaLoadsAddressThrough(CB->getCalledFunction()->getArg(i), Depth + 1, Inner))
+                        return true;
+                }
+    }
+    return false;
+}
+
+// Inlines the calls that pass the callee an address of the caller's private or threadgroup memory, for callees of at
+// most `max_callee` instructions, while the module grows by at most `max_growth` instructions (0: its own size, at
+// least 64k). AGX has no generic
+// addressing of that memory: in the callee, such an address is an integer whose origin is unknown, and every access
+// through it (and through the pointers it loads, such as the references a C++ lambda captures in its closure) tests
+// the address's memory at run time (a device, stack or threadgroup access in three branches each). Inlined, the
+// accesses are GEPs on the caller's memory (LLVMZludaAgxLowerAddressSpaces), and SROA keeps closures in registers.
+// Only callees that load addresses kept in that memory (zludaLoadsAddressThrough): Blender Cycles passes its private
+// ShaderData to many large functions, which interprocedural provenance resolves without inlining (inlining them all
+// doubled its compile time). The AGX backend inlines most calls anyway, after these passes; llama.cpp's flash attention
+// passes its tile-loading lambdas' closures this way (clang keeps ggml_cuda_unroll's calls). Returns the calls inlined.
+int LLVMZludaAirInlineLocalAddressCalls(LLVMModuleRef M, unsigned max_callee, uint64_t max_growth)
+{
+    Module *Mod = unwrap(M);
+    int inlined = 0;
+    uint64_t grown = 0;
+    if (max_growth == 0)
+    {
+        // (the module's own size, at least 64k instructions)
+        for (Function &F : *Mod)
+            max_growth += F.getInstructionCount();
+        max_growth = std::max<uint64_t>(max_growth, 1 << 16);
+    }
+    // (callee, argument) -> whether the callee loads addresses through that argument
+    std::map<std::pair<Function *, unsigned>, bool> loads_addresses;
+    SmallSetVector<Function *, 16> callees;
+    for (unsigned round = 0; round < 8; round++)
+    {
+        SmallVector<CallBase *, 16> calls;
+        for (Function &F : *Mod)
+        {
+            if (F.isDeclaration())
+                continue;
+            for (Instruction &I : instructions(F))
+            {
+                auto *CB = dyn_cast<CallBase>(&I);
+                if (!CB)
+                    continue;
+                Function *Callee = CB->getCalledFunction();
+                if (!Callee || Callee->isDeclaration() || Callee == &F || Callee->isVarArg() ||
+                    Callee->hasFnAttribute(Attribute::NoInline) || Callee->getInstructionCount() > max_callee)
+                    continue;
+                for (unsigned i = 0; i < CB->arg_size() && i < Callee->arg_size(); i++)
+                {
+                    if (!zludaIsLocalAddress(CB->getArgOperand(i)))
+                        continue;
+                    auto key = std::make_pair(Callee, i);
+                    auto it = loads_addresses.find(key);
+                    if (it == loads_addresses.end())
+                    {
+                        SmallPtrSet<Value *, 16> Visited;
+                        it = loads_addresses.insert({key, zludaLoadsAddressThrough(Callee->getArg(i), 0, Visited)}).first;
+                    }
+                    if (it->second)
+                    {
+                        calls.push_back(CB);
+                        break;
+                    }
+                }
+            }
+        }
+        bool changed = false;
+        for (CallBase *CB : calls)
+        {
+            Function *Callee = CB->getCalledFunction();
+            uint64_t size = Callee->getInstructionCount();
+            if (grown + size > max_growth)
+                continue;
+            InlineFunctionInfo IFI;
+            if (InlineFunction(*CB, IFI).isSuccess())
+            {
+                grown += size;
+                inlined++;
+                changed = true;
+                callees.insert(Callee);
+            }
+        }
+        if (!changed)
+            break;
+    }
+    // Callees left without calls are deleted (the module is linked; PTX looks up only kernels by name): a module whose
+    // kernels then share no function is optimized a kernel at a time, in parallel (independent_kernels in
+    // compile_air.rs; llama.cpp's flash attention module: O3 of the whole module 22.5 s otherwise).
+    for (Function *F : callees)
+        if (F->use_empty())
+        {
+            loads_addresses.erase(loads_addresses.lower_bound({F, 0}), loads_addresses.upper_bound({F, ~0u}));
+            F->eraseFromParent();
+        }
+    return inlined;
+}
 
 // Loads from a small private array at a run-time offset, `inttoptr(ptrtoint(array) + offset)` as ZLUDA's front end
 // writes PTX's `ld.local [%depot + %r]`, as a select over the loads at each element's constant offset, and stores at

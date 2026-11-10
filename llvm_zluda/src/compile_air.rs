@@ -17,8 +17,8 @@ use crate::compile_agx::{
 };
 use crate::utils::{Context, Message, Module, PassBuilderOptions, TargetMachine};
 use crate::{
-    LLVMZludaAgxKeepGlobals, LLVMZludaAgxLowerAddressSpaces, LLVMZludaAgxLowerClusters, LLVMZludaAgxSpillClusterShared,
-    LLVMZludaAirFunctionPointers, LLVMZludaSetAirPrimitives, LLVMZludaAirGlobalsToBuffer, LLVMZludaAirInlineGlobalUsers,
+    LLVMZludaAgxKeepGlobals, LLVMZludaAgxLowerAddressSpaces, LLVMZludaAgxRewritePrivateAddresses, LLVMZludaAgxLowerClusters, LLVMZludaAgxSpillClusterShared,
+    LLVMZludaAirFunctionPointers, LLVMZludaAirInlineLocalAddressCalls, LLVMZludaSetAirPrimitives, LLVMZludaAirGlobalsToBuffer, LLVMZludaAirInlineGlobalUsers,
     LLVMZludaAirRemapAddressSpaces, LLVMZludaAirSharedLayout, LLVMZludaAirStaticRounding, LLVMZludaAirDropCompareFlushes, LLVMZludaAirDropMinMaxFixups, LLVMZludaAirExpandDivisions, LLVMZludaAirCanonicalNaNs, LLVMZludaAirTextureSampleHint, LLVMZludaAirCompareFloatBits, LLVMZludaAirRangeReport, LLVMZludaAirKernelModule, LLVMZludaAirKernelSizes, LLVMZludaAgxKeepsCalls, LLVMZludaPromoteDynamicPrivateLoads, LLVMZludaAirSaltKernels, LLVMZludaAgxCanonicalizeFoldedNaNs, LLVMZludaLinkUsedDefinitions,
     LLVMZludaUpgradeFunctionAttributes,
 };
@@ -196,6 +196,21 @@ pub fn compile_air(
     let lowered = (|| -> Result<(), String> {
         run(&linked, first_pipeline, &air, &options)?;
         stage("first pipeline");
+        // calls given addresses of the caller's private or threadgroup memory inlined before the address spaces are
+        // lowered (LLVMZludaAirInlineLocalAddressCalls): callees of at most ZLUDA_AIR_INLINE_LOCAL_CALLS
+        // instructions (default 8192; 0: none), the module growing by at most its own size (at least 64k)
+        let max_callee = std::env::var("ZLUDA_AIR_INLINE_LOCAL_CALLS").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(8192);
+        if max_callee > 0 {
+            let inlined = unsafe { LLVMZludaAirInlineLocalAddressCalls(linked.get(), max_callee, 0) };
+            if inlined > 0 {
+                stage("calls given local addresses inlined");
+            }
+        }
+        // private memory at integer addresses as GEPs on its depot (LLVMZludaAgxRewritePrivateAddresses), then SROA
+        if unsafe { LLVMZludaAgxRewritePrivateAddresses(linked.get()) } {
+            run(&linked, c"function(sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg)", &air, &options)?;
+            stage("private addresses as GEPs, SROA");
+        }
         // small private arrays read at run-time offsets kept in registers (LLVMZludaPromoteDynamicPrivateLoads):
         // SROA again for them. ZLUDA_AIR_PROMOTE_PRIVATE=0 keeps them in memory.
         if std::env::var("ZLUDA_AIR_PROMOTE_PRIVATE").map_or(true, |v| v != "0")
@@ -798,7 +813,13 @@ fn independent_kernels(module: &Module) -> bool {
         let mut f = llvm_sys::core::LLVMGetFirstFunction(module.get());
         while !f.is_null() {
             let kernel = !llvm_sys::core::LLVMGetStringAttributeAtIndex(f, llvm_sys::LLVMAttributeFunctionIndex, c"air-kernel".as_ptr(), 10).is_null();
-            if llvm_sys::core::LLVMIsDeclaration(f) == 0 && !kernel {
+            // (not ZLUDA's own primitives, __zluda_air.* and the like: small, and inlined into every kernel; counted,
+            // they kept llama.cpp's flash attention module, 32 of them beside its kernels, on the O3 of the whole
+            // module: 22.5 s of its 51 s)
+            let mut len = 0;
+            let name = llvm_sys::core::LLVMGetValueName2(f, &mut len);
+            let primitive = std::slice::from_raw_parts(name as *const u8, len).starts_with(b"__zluda");
+            if llvm_sys::core::LLVMIsDeclaration(f) == 0 && !kernel && !primitive {
                 others += 1;
             }
             f = llvm_sys::core::LLVMGetNextFunction(f);

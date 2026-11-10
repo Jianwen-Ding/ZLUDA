@@ -117,6 +117,7 @@ extern "C" {
     pub fn LLVMZludaUpgradeFunctionAttributes(module: LLVMModuleRef);
 
     pub fn LLVMZludaAgxLowerAddressSpaces(module: LLVMModuleRef) -> bool;
+    pub fn LLVMZludaAgxRewritePrivateAddresses(module: LLVMModuleRef) -> bool;
 
     pub fn LLVMZludaAgxCanonicalizeFoldedNaNs(module: LLVMModuleRef);
 
@@ -149,6 +150,7 @@ extern "C" {
         sizes: *mut u64,
     );
     pub fn LLVMZludaPromoteDynamicPrivateLoads(module: LLVMModuleRef) -> i32;
+    pub fn LLVMZludaAirInlineLocalAddressCalls(module: LLVMModuleRef, max_callee: u32, max_growth: u64) -> i32;
     pub fn LLVMZludaAirSaltKernels(module: LLVMModuleRef, length: u64);
     pub fn LLVMZludaAirRemapAddressSpaces(module: LLVMModuleRef, error: *mut *mut std::ffi::c_char) -> i32;
     pub fn LLVMZludaAirFunctionPointers(module: LLVMModuleRef, error: *mut *mut std::ffi::c_char) -> i32;

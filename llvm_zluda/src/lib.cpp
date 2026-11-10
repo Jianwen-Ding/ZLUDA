@@ -5744,4 +5744,360 @@ int LLVMZludaPromoteDynamicPrivateLoads(LLVMModuleRef M)
     return rewritten;
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// mma layout markers (ptx/src/pass/agx_matrix.rs layout_marker): __zluda_ptx_impl_agx_mma_c_unit_<shape> moves the f32
+// C words of an mma from the PTX layout to the matrix unit's, ..._d_ptx_<shape> the D words back; both noinline
+// until here. c_unit(d_ptx(x)) is x, and so is c_unit of phis whose incoming values are d_ptx results or zeros: an
+// accumulator that a loop carries (C = D of the previous iteration) stays in the unit's layout, without the two
+// moves (about 23 shuffles and selects) of each iteration. A d_ptx whose remaining uses are after the loop moves to
+// the loop's exit (an mma.sync.aligned in the loop: the warp leaves it together). Then every marker is inlined.
+
+static bool zludaMmaMarker(const Function *F, bool &ToUnit, StringRef &Shape)
+{
+    if (!F)
+        return false;
+    StringRef N = F->getName();
+    if (N.consume_front("__zluda_ptx_impl_agx_mma_c_unit_"))
+        ToUnit = true;
+    else if (N.consume_front("__zluda_ptx_impl_agx_mma_d_ptx_"))
+        ToUnit = false;
+    else
+        return false;
+    Shape = N;
+    return true;
+}
+
+static CallInst *zludaMmaMarkerCall(Value *V, bool ToUnit, StringRef Shape)
+{
+    auto *C = dyn_cast<CallInst>(V);
+    bool U;
+    StringRef S;
+    if (C && zludaMmaMarker(C->getCalledFunction(), U, S) && U == ToUnit && S == Shape)
+        return C;
+    return nullptr;
+}
+
+namespace
+{
+    // The unit-layout words (<N x i32>) of a value in the PTX layout, or null.
+    struct ZludaUnitResolver
+    {
+        StringRef Shape;
+        FixedVectorType *VT;
+        DenseMap<Value *, PHINode *> Made; // (by the first scalar phi, or the vector phi)
+        SmallVector<PHINode *, 8> Created;
+
+        Value *strip(Value *V)
+        {
+            while (auto *B = dyn_cast<BitCastInst>(V))
+            {
+                Type *From = B->getSrcTy(), *To = B->getDestTy();
+                auto *FV = dyn_cast<FixedVectorType>(From), *TV = dyn_cast<FixedVectorType>(To);
+                bool Same = (FV && TV && FV->getNumElements() == TV->getNumElements()) ||
+                            (!FV && !TV && From->getPrimitiveSizeInBits() == 32 && To->getPrimitiveSizeInBits() == 32);
+                if (!Same)
+                    break;
+                V = B->getOperand(0);
+            }
+            return V;
+        }
+        bool isZero(Value *V)
+        {
+            auto *C = dyn_cast<Constant>(strip(V));
+            return C && C->isNullValue();
+        }
+        Value *vector(Value *V)
+        {
+            V = strip(V);
+            auto *T = dyn_cast<FixedVectorType>(V->getType());
+            if (!T || T->getNumElements() != VT->getNumElements())
+                return nullptr;
+            if (CallInst *C = zludaMmaMarkerCall(V, false, Shape))
+                return C->getArgOperand(0);
+            if (isZero(V))
+                return Constant::getNullValue(VT);
+            if (auto *P = dyn_cast<PHINode>(V))
+            {
+                if (PHINode *Q = Made.lookup(P))
+                    return Q;
+                PHINode *Q = PHINode::Create(VT, P->getNumIncomingValues(), "", P->getParent()->begin());
+                Made[P] = Q;
+                Created.push_back(Q);
+                for (unsigned k = 0; k < P->getNumIncomingValues(); k++)
+                {
+                    Value *R = vector(P->getIncomingValue(k));
+                    if (!R)
+                        return nullptr;
+                    Q->addIncoming(R, P->getIncomingBlock(k));
+                }
+                return Q;
+            }
+            // a vector made of its elements
+            unsigned N = VT->getNumElements();
+            SmallVector<Value *, 8> S(N, nullptr);
+            Value *Cur = V;
+            while (auto *IE = dyn_cast<InsertElementInst>(Cur))
+            {
+                auto *I = dyn_cast<ConstantInt>(IE->getOperand(2));
+                if (!I || I->getZExtValue() >= N)
+                    return nullptr;
+                if (!S[I->getZExtValue()])
+                    S[I->getZExtValue()] = IE->getOperand(1);
+                Cur = IE->getOperand(0);
+            }
+            for (unsigned i = 0; i < N; i++)
+                if (!S[i])
+                    return nullptr;
+            return scalars(S);
+        }
+        Value *scalars(ArrayRef<Value *> S)
+        {
+            unsigned N = S.size();
+            // element i of one vector each
+            Value *X = nullptr;
+            bool Extracts = true;
+            for (unsigned i = 0; i < N && Extracts; i++)
+            {
+                auto *E = dyn_cast<ExtractElementInst>(strip(S[i]));
+                auto *I = E ? dyn_cast<ConstantInt>(E->getIndexOperand()) : nullptr;
+                Extracts = I && I->getZExtValue() == i && (!X || X == E->getVectorOperand());
+                if (Extracts)
+                    X = E->getVectorOperand();
+            }
+            if (Extracts)
+                return vector(X);
+            if (all_of(S, [&](Value *V) { return isZero(V); }))
+                return Constant::getNullValue(VT);
+            // phis of one block with the same predecessors
+            SmallVector<PHINode *, 8> P;
+            for (Value *V : S)
+            {
+                auto *Q = dyn_cast<PHINode>(strip(V));
+                if (!Q || (!P.empty() && (Q->getParent() != P[0]->getParent() ||
+                                          Q->getNumIncomingValues() != P[0]->getNumIncomingValues())))
+                    return nullptr;
+                P.push_back(Q);
+            }
+            if (PHINode *Q = Made.lookup(P[0]))
+                return Q;
+            PHINode *Q = PHINode::Create(VT, P[0]->getNumIncomingValues(), "", P[0]->getParent()->begin());
+            Made[P[0]] = Q;
+            Created.push_back(Q);
+            for (unsigned k = 0; k < P[0]->getNumIncomingValues(); k++)
+            {
+                BasicBlock *B = P[0]->getIncomingBlock(k);
+                SmallVector<Value *, 8> In;
+                for (PHINode *Pi : P)
+                {
+                    int At = Pi->getBasicBlockIndex(B);
+                    if (At < 0)
+                        return nullptr;
+                    In.push_back(Pi->getIncomingValue(At));
+                }
+                Value *R = scalars(In);
+                if (!R)
+                    return nullptr;
+                Q->addIncoming(R, B);
+            }
+            return Q;
+        }
+        void discard()
+        {
+            for (PHINode *Q : Created)
+                Q->replaceAllUsesWith(PoisonValue::get(Q->getType()));
+            for (PHINode *Q : Created)
+                Q->eraseFromParent();
+            Created.clear();
+            Made.clear();
+        }
+    };
+}
+
+// The values a d_ptx result reaches through extractelement and bitcast (projections), and their other users.
+static bool zludaProjections(Instruction *X, SmallVectorImpl<Instruction *> &Proj, SmallVectorImpl<Use *> &Ends)
+{
+    SmallVector<Instruction *, 8> Work{X};
+    while (!Work.empty())
+    {
+        Instruction *I = Work.pop_back_val();
+        Proj.push_back(I);
+        for (Use &U : I->uses())
+        {
+            auto *W = cast<Instruction>(U.getUser());
+            if (isa<ExtractElementInst>(W) || isa<BitCastInst>(W))
+                Work.push_back(W);
+            else
+                Ends.push_back(&U);
+        }
+    }
+    return true;
+}
+
+// A d_ptx call used only after its loop: to the loop's exit.
+static bool zludaSinkMmaMarker(CallInst *X, LoopInfo &LI, DominatorTree &DT)
+{
+    Loop *L = LI.getLoopFor(X->getParent());
+    if (!L)
+        return false;
+    BasicBlock *Exit = L->getExitBlock(), *Exiting = L->getExitingBlock();
+    if (!Exit || !Exiting || Exit->getSinglePredecessor() != Exiting || !DT.dominates(X->getParent(), Exiting))
+        return false;
+    SmallVector<Instruction *, 8> Proj;
+    SmallVector<Use *, 8> Ends;
+    zludaProjections(X, Proj, Ends);
+    if (Ends.empty())
+        return false;
+    for (Use *U : Ends)
+    {
+        auto *W = cast<Instruction>(U->getUser());
+        if (auto *P = dyn_cast<PHINode>(W); P && P->getParent() == Exit)
+        {
+            if (P->getNumIncomingValues() != 1)
+                return false;
+            continue;
+        }
+        if (L->contains(W) || !DT.dominates(Exit, W->getParent()))
+            return false;
+    }
+    // the copies, in the order of Proj (each after its operand)
+    DenseMap<Instruction *, Instruction *> Copy;
+    Instruction *At = &*Exit->getFirstInsertionPt();
+    for (Instruction *I : Proj)
+    {
+        Instruction *C = I->clone();
+        C->insertBefore(At->getIterator());
+        if (I != X)
+            C->setOperand(0, Copy[cast<Instruction>(I->getOperand(0))]);
+        Copy[I] = C;
+    }
+    for (Use *U : Ends)
+    {
+        auto *W = cast<Instruction>(U->getUser());
+        Instruction *C = Copy[cast<Instruction>(U->get())];
+        if (auto *P = dyn_cast<PHINode>(W); P && P->getParent() == Exit)
+        {
+            P->replaceAllUsesWith(C);
+            P->eraseFromParent();
+        }
+        else
+            U->set(C);
+    }
+    for (Instruction *I : reverse(Proj))
+        if (I->use_empty())
+            I->eraseFromParent();
+    return true;
+}
+
+int LLVMZludaAgxCancelMmaLayouts(LLVMModuleRef MRef)
+{
+    Module *M = unwrap(MRef);
+    int cancelled = 0;
+    SmallVector<Function *, 8> Markers;
+    for (Function &F : *M)
+    {
+        bool U;
+        StringRef S;
+        if (zludaMmaMarker(&F, U, S))
+            Markers.push_back(&F);
+    }
+    if (Markers.empty())
+        return 0;
+    for (Function &F : *M)
+    {
+        if (F.isDeclaration())
+            continue;
+        SmallVector<CallInst *, 16> ToUnit;
+        for (Instruction &I : instructions(F))
+            if (auto *C = dyn_cast<CallInst>(&I))
+            {
+                bool U;
+                StringRef S;
+                if (zludaMmaMarker(C->getCalledFunction(), U, S) && U)
+                    ToUnit.push_back(C);
+            }
+        bool Changed = false;
+        for (CallInst *C : ToUnit)
+        {
+            bool U;
+            StringRef S;
+            zludaMmaMarker(C->getCalledFunction(), U, S);
+            auto *VT = dyn_cast<FixedVectorType>(C->getType());
+            if (!VT)
+                continue;
+            ZludaUnitResolver R{S, VT};
+            Value *V = R.vector(C->getArgOperand(0));
+            if (!V)
+            {
+                R.discard();
+                continue;
+            }
+            C->replaceAllUsesWith(V);
+            C->eraseFromParent();
+            cancelled++;
+            Changed = true;
+        }
+        if (!Changed)
+            continue;
+        // what the cancelled moves used: phis of the PTX layout, extracts, d_ptx calls
+        bool Deleted = true;
+        while (Deleted)
+        {
+            Deleted = false;
+            for (Instruction &I : make_early_inc_range(instructions(F)))
+                if (I.use_empty() && (isa<PHINode>(I) || isa<InsertElementInst>(I) || isa<ExtractElementInst>(I) ||
+                                      isa<BitCastInst>(I) ||
+                                      [&] {
+                                          auto *Ci = dyn_cast<CallInst>(&I);
+                                          bool U2;
+                                          StringRef S2;
+                                          return Ci && zludaMmaMarker(Ci->getCalledFunction(), U2, S2);
+                                      }()))
+                {
+                    I.eraseFromParent();
+                    Deleted = true;
+                }
+            // phis that only feed each other
+            for (BasicBlock &B : F)
+                for (PHINode &P : make_early_inc_range(B.phis()))
+                    if (all_of(P.users(), [&](User *W) { return W == &P; }))
+                    {
+                        P.replaceAllUsesWith(PoisonValue::get(P.getType()));
+                        P.eraseFromParent();
+                        Deleted = true;
+                    }
+        }
+        DominatorTree DT(F);
+        LoopInfo LI(DT);
+        SmallVector<CallInst *, 16> ToPtx;
+        for (Instruction &I : instructions(F))
+            if (auto *C = dyn_cast<CallInst>(&I))
+            {
+                bool U;
+                StringRef S;
+                if (zludaMmaMarker(C->getCalledFunction(), U, S) && !U)
+                    ToPtx.push_back(C);
+            }
+        bool Sunk = false;
+        for (CallInst *C : ToPtx)
+            Sunk |= zludaSinkMmaMarker(C, LI, DT);
+        (void)Sunk;
+    }
+    // every marker inlined (the backend has no calls for them)
+    for (Function *F : Markers)
+    {
+        SmallVector<CallBase *, 16> Calls;
+        for (User *U : F->users())
+            if (auto *C = dyn_cast<CallBase>(U))
+                Calls.push_back(C);
+        for (CallBase *C : Calls)
+        {
+            InlineFunctionInfo IFI;
+            (void)InlineFunction(*C, IFI);
+        }
+        if (F->use_empty())
+            F->eraseFromParent();
+    }
+    return cancelled;
+}
+
 LLVM_C_EXTERN_C_END

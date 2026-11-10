@@ -133,6 +133,8 @@ extern "C" {
     pub fn LLVMZludaAirAddress32Offsets(module: LLVMModuleRef) -> i32;
     pub fn LLVMZludaAirTablesInGlobals(module: LLVMModuleRef, error: *mut *mut std::ffi::c_char) -> i32;
     pub fn LLVMZludaSetAirPrimitives(air: i32);
+    /// The mma layout markers of agx_matrix.rs cancelled (loop-carried accumulators), then inlined: the count.
+    pub fn LLVMZludaAgxCancelMmaLayouts(module: LLVMModuleRef) -> i32;
     pub fn LLVMZludaAirStaticRounding(module: LLVMModuleRef, strict: i32) -> i32;
     pub fn LLVMZludaAirDropCompareFlushes(module: LLVMModuleRef) -> i32;
     pub fn LLVMZludaAirDropMinMaxFixups(module: LLVMModuleRef, compares_flush: i32) -> i32;

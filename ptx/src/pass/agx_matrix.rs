@@ -511,6 +511,7 @@ declare i32 @llvm.agx.simd.shuffle.i32(i32, i32)
 declare i32 @llvm.agx.quad.shuffle.i32(i32, i32)
 declare i64 @__zluda_ptx_impl_agx_round_pack(i1, i64, i1, i32, i32, i32)
 attributes #0 = { alwaysinline convergent nounwind }
+attributes #1 = { noinline convergent nounwind willreturn memory(none) }
 "#;
 
 fn define(
@@ -1605,7 +1606,18 @@ fn fast_tile(
     let ht = m / 8;
     let b_moved = moved(ir, MmaMatrix::B, b, d.btype, &|tile| (8 * tile, 0, false));
     let a_moved = moved(ir, MmaMatrix::A, a, d.atype, &|tile| (8 * (tile % ht), 8 * (tile / ht), true));
-    let c_moved = if int { None } else { moved(ir, MmaMatrix::C, c, d.ctype, &|tile| (8 * tile, 0, true)) };
+    // f32 C and D through the layout markers (layout_marker), which a loop-carried accumulator cancels across
+    let markers = !int
+        && d.ctype == ast::MmaType::F32
+        && d.dtype == ast::MmaType::F32
+        && std::env::var("ZLUDA_AGX_MMA_LAYOUT_MARKERS").as_deref() != Ok("0");
+    let c_moved = if int {
+        None
+    } else if let Some(e) = markers.then(|| layout_marker(ir, LayoutMarker::ToUnit, m, k, c)).flatten() {
+        Some(e)
+    } else {
+        moved(ir, MmaMatrix::C, c, d.ctype, &|tile| (8 * tile, 0, true))
+    };
     let mut b_tiles = Vec::new();
     for kt in 0..steps {
         if let Some(e) = &b_moved {
@@ -1655,7 +1667,7 @@ fn fast_tile(
     }
     // the elements of D in the PTX layout (that of C)
     let unit_words = tiles.iter().flatten().cloned().collect::<Vec<_>>();
-    let d_moved = (|| {
+    let d_moved = markers.then(|| layout_marker(ir, LayoutMarker::ToPtx, m, k, &unit_words)).flatten().or_else(|| (|| {
         let count = m * 8 / 32;
         let from = bit_labels(count.trailing_zeros(), &|t, e| {
             let (r, c) = unit_position(t, e % 2);
@@ -1665,7 +1677,7 @@ fn fast_tile(
             if j < count { position(MmaMatrix::C, m, k, 32, t, j) } else { None }
         })?;
         bit_move(ir, &l, &unit_words, 32, &from, &to).ok()
-    })();
+    })());
     let mut elements = Vec::new();
     for j in 0..m * 8 / 32 {
         if let Some(e) = &d_moved {
@@ -1697,6 +1709,59 @@ fn fast_tile(
         elements.push(finish_d(ir, d, int, c, j, &value)?);
     }
     Ok(pack_d(ir, d, &elements))
+}
+
+#[derive(Copy, Clone, PartialEq)]
+enum LayoutMarker {
+    ToUnit,
+    ToPtx,
+}
+
+/// The f32 C (`ToUnit`) or D (`ToPtx`) words of an m x 8 tile moved between the PTX layout and the matrix unit's, as a
+/// call to a function of their own, `__zluda_ptx_impl_agx_mma_c_unit_mMkK` / `..._d_ptx_mMkK`, noinline until
+/// LLVMZludaAgxCancelMmaLayouts: there `c_unit(d_ptx(x))` is x, through the phis of an accumulator that a loop carries
+/// (tinygrad's and CUTLASS-like GEMMs: C = D of the previous iteration), and a d_ptx used only after a loop moves to
+/// its exit; then the calls are inlined. None where the layouts are not bit permutations of each other.
+fn layout_marker(ir: &mut Ir, kind: LayoutMarker, m: u32, k: u32, words: &[String]) -> Option<Vec<String>> {
+    use ast::MmaMatrix;
+    let count = m * 8 / 32;
+    if words.len() as u32 != count || !count.is_power_of_two() {
+        return None;
+    }
+    let ptx = |t: u32, j: u32| if j < count { position(MmaMatrix::C, m, k, 32, t, j) } else { None };
+    let unit = |t: u32, e: u32| {
+        let (r, c) = unit_position(t, e % 2);
+        Some((8 * (e / 2) + unit_row(r), c))
+    };
+    let bits = count.trailing_zeros();
+    let (from, to) = match kind {
+        LayoutMarker::ToUnit => (bit_labels(bits, &ptx)?, bit_labels(bits, &unit)?),
+        LayoutMarker::ToPtx => (bit_labels(bits, &unit)?, bit_labels(bits, &ptx)?),
+    };
+    let name = format!(
+        "__zluda_ptx_impl_agx_mma_{}_m{m}k{k}",
+        if kind == LayoutMarker::ToUnit { "c_unit" } else { "d_ptx" }
+    );
+    let vec = format!("<{count} x i32>");
+    // the function: the words moved by bit exchanges
+    let mut body = Ir::default();
+    let lane = body.def("call i32 @llvm.agx.thread.index.in.simdgroup()");
+    let input = (0..count).map(|i| body.def(&format!("extractelement {vec} %x, i32 {i}"))).collect::<Vec<_>>();
+    let moved = bit_move(&mut body, &lane, &input, 32, &from, &to).ok()?;
+    let mut v = "poison".to_string();
+    for (i, w) in moved.iter().enumerate() {
+        v = body.def(&format!("insertelement {vec} {v}, i32 {w}, i32 {i}"));
+    }
+    body.stmt(&format!("ret {vec} {v}"));
+    ir.declarations.extend(body.declarations);
+    ir.declarations.insert(format!("define internal {vec} @{name}({vec} %x) #1 {{\n{}}}", body.out));
+    // the call
+    let mut x = "poison".to_string();
+    for (i, w) in words.iter().enumerate() {
+        x = ir.def(&format!("insertelement {vec} {x}, i32 {w}, i32 {i}"));
+    }
+    let y = ir.def(&format!("call {vec} @{name}({vec} {x})"));
+    Some((0..count).map(|i| ir.def(&format!("extractelement {vec} {y}, i32 {i}"))).collect())
 }
 
 // Element j of D from its f32 bits `value` (the unit's sum): rounded to

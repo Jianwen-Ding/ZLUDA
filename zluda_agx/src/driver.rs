@@ -138,6 +138,9 @@ struct LazySource {
     kernels: std::collections::HashSet<String>,
     compiled: HashMap<String, usize>,
     pending: HashMap<String, CompileResultSlot>,
+    /// The kernels the precompile workers have not started (precompile_kernels): one asked for first leaves the
+    /// queue and compiles on the asking thread
+    queue: PrecompileQueue,
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Bytes of the module's text outside its kernels (functions, globals: what every kernel's own text for
     /// specialization keeps), measured once at the first kernel loaded on request
@@ -184,6 +187,26 @@ type CompileResultSlot = std::sync::Arc<(
     std::sync::Condvar,
 )>;
 
+thread_local! {
+    /// A thread compiling kernels ahead of their use (precompile_kernels): its zoc runs at a low CPU priority (the
+    /// thread's nice value, which a child inherits), and not through the shared zoc server, so that the compilations
+    /// a launch waits for get the cores first. llama.cpp loads five 5-10 MB modules of 64-185 kernels and uses a few of
+    /// each. Cold llama-bench (M2 Max): 184 s when a kernel asked for waited for the workers to reach it in their
+    /// queue, 168-174 s now that it leaves the queue (LazySource::queue), 163 s with no precompilation; Blender Cycles,
+    /// which uses them all: cold 1-sample render 40.7 s (90.2 s without precompilation, warm 1.3 s).
+    static BACKGROUND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The calling thread's nice value raised to 10 (Linux: setpriority of PRIO_PROCESS 0 is the calling thread's).
+fn lower_this_thread_priority() {
+    extern "C" {
+        fn setpriority(which: i32, who: u32, prio: i32) -> i32;
+    }
+    unsafe { setpriority(0, 0, 10) };
+}
+
+type PrecompileQueue = std::sync::Arc<Mutex<std::collections::VecDeque<String>>>;
+
 fn precompile_kernels(
     ptx: std::sync::Arc<str>,
     portable: Option<std::sync::Arc<PortableAir>>,
@@ -191,7 +214,7 @@ fn precompile_kernels(
     cpu: String,
     workers: usize,
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> HashMap<String, CompileResultSlot> {
+) -> (HashMap<String, CompileResultSlot>, PrecompileQueue) {
     let pending: HashMap<_, _> = names
         .iter()
         .map(|name| {
@@ -213,6 +236,9 @@ fn precompile_kernels(
             cancelled.clone(),
         );
         std::thread::spawn(move || loop {
+            if !BACKGROUND.with(|b| b.replace(true)) {
+                lower_this_thread_priority();
+            }
             if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
@@ -225,7 +251,7 @@ fn precompile_kernels(
             ready.notify_all();
         });
     }
-    pending
+    (pending, queue)
 }
 
 /// (module, kernel, the bytes of its scalar arguments with their sizes and the equality classes of 8-byte
@@ -1962,7 +1988,7 @@ fn compile_or_cached(
     let compile = || -> Result<(Vec<u8>, String), String> {
         compiled.set(true);
         if crate::log_enabled() {
-            eprintln!("[zluda_agx] invoking zoc: PTX modules={}, bytes={}, target={cpu}, ", sources.len(), sources.iter().map(|s| s.len()).sum::<usize>());
+            eprintln!("[zluda_agx] invoking zoc: PTX modules={}, bytes={}, target={cpu}, kernel={}", sources.len(), sources.iter().map(|s| s.len()).sum::<usize>(), kernel.map_or("-", |(k, _)| k));
         }
         // (the AGX object alone: no AIR for Metal, which nothing on Asahi reads)
         let mut args: Vec<String> = ["--target", "air", "--arch", cpu, "--object-only", "--agx-only"].iter().map(|a| a.to_string()).collect();
@@ -2047,7 +2073,7 @@ fn compile_or_cached(
             out = run(None)?;
         }
         if crate::log_enabled() {
-            eprintln!("[zluda_agx] zoc finished: {}, elapsed={:.3}s", out.status, started.elapsed().as_secs_f64());
+            eprintln!("[zluda_agx] zoc finished: {}, elapsed={:.3}s, bytes={}, kernel={}", out.status, started.elapsed().as_secs_f64(), sources.iter().map(|s| s.len()).sum::<usize>(), kernel.map_or("-", |(k, _)| k));
         }
         if let (Some(out_path), Some((_, portable)), true) = (&portable_out, kernel, out.status.success()) {
             let (mut flag_tmp, mut flag) = (out_path.as_os_str().to_owned(), portable.as_os_str().to_owned());
@@ -2110,7 +2136,7 @@ mod zoc_server {
 
     /// The object and the assembly from the server, or None when the caller should run zoc itself.
     pub(super) fn compile(zoc: &Path, args: &[String], sources: &[&[u8]]) -> Option<Result<(Vec<u8>, String), String>> {
-        if std::env::var("ZLUDA_AGX_ZOC_SERVER").as_deref() == Ok("0") {
+        if std::env::var("ZLUDA_AGX_ZOC_SERVER").as_deref() == Ok("0") || super::BACKGROUND.with(|b| b.get()) {
             return None;
         }
         let mut guard = SERVER.try_lock().ok()?;
@@ -2738,10 +2764,10 @@ unsafe fn load_module_data(d: &mut Driver, bytes: *const u8) -> Result<usize, CU
             .unwrap_or(default_workers)
             .min(16);
         let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let pending = if workers > 0 {
+        let (pending, queue) = if workers > 0 {
             precompile_kernels(ptx.clone(), portable.clone(), &names[1..], cpu, workers, cancelled.clone())
         } else {
-            HashMap::new()
+            (HashMap::new(), Default::default())
         };
         d.lazy_sources.insert(h, LazySource {
             ptx,
@@ -2749,6 +2775,7 @@ unsafe fn load_module_data(d: &mut Driver, bytes: *const u8) -> Result<usize, CU
             kernels: names.into_iter().collect(),
             compiled: HashMap::new(),
             pending,
+            queue,
             cancelled,
             shared_bytes: None,
         });
@@ -2958,7 +2985,12 @@ fn module_function(d: &mut Driver, parent: usize, name: &str) -> Result<usize, C
                 let start = Instant::now();
                 let ptx = source.ptx.clone();
                 let portable = source.portable.clone();
-                let pending = source.pending.get(&name).cloned();
+                // (a kernel that no precompile worker has started: out of their queue, compiled here)
+                let unstarted = {
+                    let mut queue = source.queue.lock().unwrap_or_else(|e| e.into_inner());
+                    queue.iter().position(|k| *k == name).and_then(|i| queue.remove(i)).is_some()
+                };
+                let pending = source.pending.get(&name).cloned().filter(|_| !unstarted);
                 let module = if let Some(slot) = pending {
                     let (lock, ready) = &*slot;
                     let mut result = lock.lock().unwrap_or_else(|e| e.into_inner());

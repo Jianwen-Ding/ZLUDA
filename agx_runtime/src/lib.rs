@@ -829,9 +829,58 @@ pub fn cdm_dispatch_with(
     c
 }
 
+/// Whether a control stream word is the barrier `cdm_dispatch_ordered` puts between dispatches.
+pub fn is_order_barrier(w: &[u8]) -> bool {
+    w == order_barrier_word()
+}
+
+/// `cdm_dispatch_with`, its barrier `CDM_ORDER_BARRIER` when `ordering_only`.
+pub fn cdm_dispatch_ordered(
+    pipeline_words: u32,
+    uniform_halves: u32,
+    g14x: bool,
+    global: [u32; 3],
+    local: [u32; 3],
+    barrier: bool,
+    ordering_only: bool,
+) -> Vec<u8> {
+    let mut c = cdm_dispatch_with(pipeline_words, uniform_halves, g14x, global, local, barrier);
+    if barrier && ordering_only {
+        let at = c.len() - 12;
+        c[at..at + 4].copy_from_slice(&order_barrier_word());
+    }
+    c
+}
+
 /// The CDM barrier word (Mesa's unk0..19, the USC cache invalidate included) that orders the dispatches of one
 /// command, as a standalone word of a control stream.
 pub const CDM_BARRIER: [u8; 4] = (3u32 << 29 | 0xfffff).to_le_bytes();
+
+/// The barrier between two dispatches of one command: `CDM_BARRIER` without bit 11 (Mesa's genxml `Unk 11`, which
+/// libagx_dgc.h leaves out of its base set too). The dispatches stay ordered and see each other's stores (ping-pong
+/// test of 64 dispatches reading values other cores wrote, /scratch/mmq/launch/lbc.c: exact; 0x7f, 0xfff00 wrong), and
+/// the instruction cache keeps the code of the earlier dispatches: with bit 11 (and bits 0-9), every dispatch fetched
+/// all its code from memory again: a 7 KB straight-line kernel repeated cost 16.3 us per dispatch, 7.0 without it (an
+/// empty kernel 2.3-3 either way; two such kernels alternating 16 us either way: together beyond the 12 KB cache).
+pub const CDM_ORDER_BARRIER: [u8; 4] = (3u32 << 29 | (0xfffff & !(1 << 11))).to_le_bytes();
+
+/// ZLUDA_AGX_ORDER_BARRIER_BITS=HEX (experiment): bits 0-26 of `CDM_ORDER_BARRIER` in its place.
+fn order_barrier_word() -> [u8; 4] {
+    static W: std::sync::OnceLock<[u8; 4]> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("ZLUDA_AGX_ORDER_BARRIER_BITS")
+            .ok()
+            .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+            .map_or(CDM_ORDER_BARRIER, |b| (3u32 << 29 | (b & 0x7ff_ffff)).to_le_bytes())
+    })
+}
+
+/// Whether the barriers between the dispatches of one command are `CDM_ORDER_BARRIER` when no code was loaded since
+/// the queue's last dispatch; `ZLUDA_AGX_ORDER_BARRIER=0`: the full `CDM_BARRIER` everywhere.
+pub fn order_barriers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ZLUDA_AGX_ORDER_BARRIER").map_or(true, |v| v != "0"))
+}
 
 /// Firmware timestamps of one compute command, in `command_timestamp_frequency_hz` units.
 #[derive(Clone, Copy, Debug)]
@@ -1309,6 +1358,24 @@ mod tests {
         assert!(words(&with).contains(&(3 << 29 | 0xfffff)));
         assert!(!words(&without).contains(&(3 << 29 | 0xfffff)));
         assert_eq!(words(&without)[words(&without).len() - 2..], [2 << 29, 0], "still terminated");
+    }
+
+    #[test]
+    fn the_ordering_barrier_is_the_full_one_without_bit_11() {
+        let words = |c: &[u8]| c.chunks(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect::<Vec<_>>();
+        assert_eq!(u32::from_le_bytes(CDM_BARRIER) ^ u32::from_le_bytes(CDM_ORDER_BARRIER), 1 << 11);
+        let full = cdm_dispatch_with(0x1000, 16, false, [32, 1, 1], [32, 1, 1], true);
+        let ordered = cdm_dispatch_ordered(0x1000, 16, false, [32, 1, 1], [32, 1, 1], true, true);
+        let (f, o) = (words(&full), words(&ordered));
+        assert_eq!(f.len(), o.len());
+        let n = f.len();
+        assert_eq!(f[..n - 3], o[..n - 3], "the same launch");
+        assert_eq!(o[n - 3..], [u32::from_le_bytes(CDM_ORDER_BARRIER), 2 << 29, 0]);
+        assert_eq!(cdm_dispatch_ordered(0x1000, 16, false, [32, 1, 1], [32, 1, 1], true, false), full);
+        assert_eq!(
+            cdm_dispatch_ordered(0x1000, 16, false, [32, 1, 1], [32, 1, 1], false, true),
+            cdm_dispatch_with(0x1000, 16, false, [32, 1, 1], [32, 1, 1], false)
+        );
     }
 
     #[test]
@@ -2164,12 +2231,21 @@ impl LoadedModule {
             // Separate queue commands are ordered by firmware. Dispatches
             // within one command need the CDM barrier even when their code
             // is cached, or dependent kernels can overlap and read stale data.
-            let barrier = (batched && queue.trailing_barrier.get())
-                || queue.usc_seen.get() != vm.usc_generation
-                || always_usc_barrier();
+            let invalidate = queue.usc_seen.get() != vm.usc_generation || always_usc_barrier();
+            let barrier = (batched && queue.trailing_barrier.get()) || invalidate;
             queue.usc_seen.set(vm.usc_generation);
-            let stream =
-                cdm_dispatch_with((pw - vm.usc_base) as u32, pipeline.uniform_halves(), g14x, global, local, barrier);
+            // (a barrier between dispatches of one command only orders them: the code they run was loaded before the
+            // command, and its pipeline words are in USC ring slots no earlier dispatch of the command used)
+            let ordering_only = batched && !invalidate && order_barriers();
+            let stream = cdm_dispatch_ordered(
+                (pw - vm.usc_base) as u32,
+                pipeline.uniform_halves(),
+                g14x,
+                global,
+                local,
+                barrier,
+                ordering_only,
+            );
             if let Some(words) = words_only {
                 // the launch and its barrier, without the stream terminate, for a stream of several dispatches
                 words.extend_from_slice(&stream[..stream.len() - 8]);

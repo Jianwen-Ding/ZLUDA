@@ -314,6 +314,10 @@ fn submit_batch(queue: &mut Queue, mut b: Batch) -> Result<(), CUerror> {
         // (with ZLUDA_AGX_HAZARD_BARRIERS the last dispatch has no barrier of its own)
         if hazard_barriers() {
             b.words.extend_from_slice(&agx_runtime::CDM_BARRIER);
+        } else if b.words.len() >= 4 && agx_runtime::is_order_barrier(&b.words[b.words.len() - 4..]) {
+            // the command's last barrier stays the full one (what a command of one dispatch has)
+            let at = b.words.len() - 4;
+            b.words[at..].copy_from_slice(&agx_runtime::CDM_BARRIER);
         }
         queue.submit_words(&b.words, None, None, &b.waits).map_err(from_io)?;
     }

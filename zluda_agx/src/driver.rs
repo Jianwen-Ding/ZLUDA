@@ -2685,7 +2685,14 @@ unsafe fn load_module_data(d: &mut Driver, bytes: *const u8) -> Result<usize, CU
                 && match portable_env.as_deref() {
                     Some("0") => false,
                     Some("1") => true,
-                    _ => crate::specialize::defines_shared_functions(text),
+                    // (and only where those functions are too large to compile again with each kernel: the
+                    // limit of a kernel's own PTX for launch-time specialization, SPEC_KERNEL_BYTES. llama.cpp's
+                    // flash attention modules, 8.7 and 12.2 MB with 457 KB of functions, compiled their first
+                    // kernels in 43 and 53 s through the portable AIR)
+                    _ => {
+                        crate::specialize::defines_shared_functions(text)
+                            && crate::specialize::non_entry_bytes(text) > SPEC_KERNEL_BYTES
+                    }
                 }
         })
         .and_then(|_| PortableAir::new())

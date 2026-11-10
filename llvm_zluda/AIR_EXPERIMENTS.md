@@ -1021,3 +1021,36 @@ the shipped kernel is only run and timed.
   340-344, tg128 76-80 (was ~71). Output identical to the CPU backend.
 - Next: flash_attn_ext_f16 decode (1392 B stack per thread, ~205 us/launch) and code size of the MMVQ dequant
   (q5 qh merging: and/or/shift chains the bfi combine does not catch).
+
+## 2026-11-10: register caps, cold start, MMQ spills, loop-carried mma accumulators (branch claude/mmq-regs-2026-11-10)
+
+M2 Max, qwen2.5-0.5b Q5_K_M, kernels built with clang only; A/B runs alternate (the GPU is shared with the simulator
+agent: absolute numbers drift by ~5% between hours).
+
+- **.noreturn functions do not cap a module (aa8b6ed3).** llama.cpp's modules got -agx-default-max-gprs=72 only
+  because clang emits ggml's `.noreturn` no_device_code `.func`. Uncapped: pp512 982/978 -> 1134/1137 (+16%).
+  Compiling such a module in parallel parts (parts::split) was tried and rejected: cold llama-bench 226 s, 1057 MB
+  against 183 s, 544 MB compiled whole with lazy kernels.
+- **Cold start (7b3f2783, 01de4da5).** A large module's first kernel ran the front end over the whole module (~25 s
+  for each of llama's five 5-10 MB modules, 17 s of it the first pipeline: InstCombine 6.5 s, SROA 5.4 s) so that its
+  64-185 kernels could skip it later; llama uses a few. The portable AIR is now made only where kernels share
+  functions (Cycles); other large modules compile each kernel from its own PTX on request. A kernel asked for leaves
+  the precompile queue (it waited for the workers to reach it in source order), and precompiles run at nice 10.
+  Cold llama-bench 184 s / ~1 GB -> 86-99 s / 230 MB, warm 10.5 -> 1.8 s, same pp/tg, identical completion; Cycles
+  cold 41 s, warm 1.3 s, unchanged.
+- **MMQ spills: cause found, fix not worth it.** The Q5_1 J=128 kernel (61% of pp512 GPU time) uses 128 registers
+  and spills 6.5k times. clang's NVPTX output orders all 128 mma (+cvt) of a block before the float accumulations
+  (ptxas reorders on NVIDIA); the matrix operands themselves are converted next to their use. An IR pass that moves
+  pure instructions up to the operands they are the last user of (/scratch/mmq/patches/agx-shorten-live-ranges.patch)
+  interleaves them, but the machine scheduler re-hoists the mmas; with -enable-misched=false spills 6531 -> 5434 and
+  mma-result spills 980 -> 1, yet pp512 is the same (1169-1176 vs 1144-1178), and the pass alone is 9% slower. What
+  is left is ggml's sum[64] + A tiles + scales, >128 live by design. A larger reported SM count (more stream-k
+  blocks) gives +17% (38 -> 114 "SMs"): a device-model decision left to the user (not committed).
+- **Loop-carried mma accumulators (bd9df1d2).** tinygrad's TC GEMM carries C = D in place across its k-loop, so
+  every iteration moved each accumulator unit -> PTX -> unit (~23 shuffles/selects per mma). The f32 C/D moves are
+  now noinline marker functions that LLVMZludaAgxCancelMmaLayouts cancels through phis (and sinks to the loop exit)
+  before inlining them. f16 GEMM 2048^3: 1.9-2.0 -> 2.55-2.8 TFLOPS; mmatest bit-identical; mma PTX-formalization
+  tests unchanged; llama fa=1 identical.
+- Cycles compile time: each of its 394 shared functions is compiled 3.9x on average (once per calling kernel:
+  1.90 M IR instructions through the backend for 486 k unique); compiling functions once is a compile-unit design
+  change, not started.

@@ -1064,3 +1064,9 @@ agent: absolute numbers drift by ~5% between hours).
 - **f16 accumulators through the markers (b22e7804):** c16_unit(d16_ptx(x)) = round-to-f16-and-back of x in the
   unit layout. mmatest f16 chain +13%, flash-attn prefill shuffles -12% but no measurable pp change. Markers whose
   argument IPO dropped (always-undef C) are left alone (an assertion in isa-mma-k8.ptx otherwise).
+- **Software-pipelined tile GEMMs (4b25b80d, 88f9e398):** the next K step's fragments are loaded during the current
+  step's products; f16 4096^3 5.6 -> 6.3 TFLOPS, llama shapes -4..-18% (f32 -10..-20% on the large ones).
+- **Portable AIR only for > 1 MB of shared functions (add97ed9):** llama's flash-attention modules (457 KB of
+  functions in 12 MB) now compile per kernel from their own PTX: cold llama-bench (fa1, pp+tg) cuBLAS build 142 -> 60
+  s, 938 -> 225 MB; and the FA kernels run faster than through the portable path (calls and the 72-register cap
+  there): ZLUDA_AGX_PORTABLE=1 vs default, alternating, pp512 3861-3967 vs 4426-4445, pp2048 2870-2896 vs 3680-3683.

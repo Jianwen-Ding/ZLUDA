@@ -20,6 +20,9 @@ pub struct Cache {
 /// The parts of a compilation that determine its output.
 pub struct Key<'a> {
     pub source: &'a [u8],
+    /// `source_hash(source)` when the caller has it already (a large module whose kernels are looked up one at a
+    /// time: Blender Cycles hashed its 17.6 MB of PTX again for each of its 77 kernels, 1.8 ms each)
+    pub source_hash: Option<u128>,
     pub chip: &'a str,
     pub compiler: &'a str,
     pub options: &'a [&'a str],
@@ -41,7 +44,7 @@ impl Key<'_> {
         for o in self.options {
             feed(o.as_bytes());
         }
-        feed(&source_hash(self.source).to_le_bytes());
+        feed(&self.source_hash.unwrap_or_else(|| source_hash(self.source)).to_le_bytes());
         format!("{h:032x}")
     }
 }
@@ -185,7 +188,7 @@ mod tests {
     use super::*;
 
     fn key<'a>(source: &'a [u8], chip: &'a str) -> Key<'a> {
-        Key { source, chip, compiler: "llvm-agx test", options: &["-O3"] }
+        Key { source, source_hash: None, chip, compiler: "llvm-agx test", options: &["-O3"] }
     }
 
     #[test]
@@ -194,11 +197,11 @@ mod tests {
         assert_eq!(base, key(b"ptx", "agx-g14c").digest());
         assert_ne!(base, key(b"ptx2", "agx-g14c").digest());
         assert_ne!(base, key(b"ptx", "agx-g13g").digest());
-        let other = Key { source: b"ptx", chip: "agx-g14c", compiler: "llvm-agx test", options: &["-O2"] };
+        let other = Key { source_hash: None, source: b"ptx", chip: "agx-g14c", compiler: "llvm-agx test", options: &["-O2"] };
         assert_ne!(base, other.digest());
         // Length prefixes keep field boundaries apart.
-        let a = Key { source: b"", chip: "ab", compiler: "c", options: &[] };
-        let b = Key { source: b"", chip: "a", compiler: "bc", options: &[] };
+        let a = Key { source_hash: None, source: b"", chip: "ab", compiler: "c", options: &[] };
+        let b = Key { source_hash: None, source: b"", chip: "a", compiler: "bc", options: &[] };
         assert_ne!(a.digest(), b.digest());
     }
 

@@ -238,7 +238,7 @@ fn start(folded: Arc<Folded>, ptx: &Arc<str>, vars: &[(String, usize, usize)], b
                         drop(first);
                     }
                     let _slot = CompileSlot::take();
-                    compile_ptx_kernel(text.as_bytes(), &name, &path, &cpu)
+                    compile_ptx_kernel(text.as_bytes(), &name, &path, &cpu, None)
                 }
                 None if large => Err("no directory for the portable AIR".into()),
                 None => {

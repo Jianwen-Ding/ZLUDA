@@ -1507,8 +1507,14 @@ fn fast_tile(
             }
             ast::MmaType::Bf16 => ir.op("shl", "i32", &x, "16"),
             ast::MmaType::Tf32 => ir.op("and", "i32", &x, "-8192"),
-            // integers as their (exact) floats
-            ast::MmaType::S8 | ast::MmaType::S4 => {
+            // integers as their (exact) floats; a byte as an i8, which the AGX convert reads from either half of
+            // a register (s8_to_f), where shl/ashr cost two shared-unit shifts more for bytes 1 and 2
+            ast::MmaType::S8 => {
+                let b = ir.cast("trunc", "i32", &x, "i8");
+                let f = ir.cast("sitofp", "i8", &b, "float");
+                ir.cast("bitcast", "float", &f, "i32")
+            }
+            ast::MmaType::S4 => {
                 let sh = (32 - bits).to_string();
                 let x = ir.op("shl", "i32", &x, &sh);
                 let x = ir.op("ashr", "i32", &x, &sh);
@@ -1887,7 +1893,12 @@ fn element_f32(ir: &mut Ir, x: &str, type_: ast::MmaType) -> String {
         }
         ast::MmaType::Bf16 => ir.op("shl", "i32", x, "16"),
         ast::MmaType::Tf32 => ir.op("and", "i32", x, "-8192"),
-        ast::MmaType::S8 | ast::MmaType::S4 => {
+        ast::MmaType::S8 => {
+            let b = ir.cast("trunc", "i32", x, "i8");
+            let f = ir.cast("sitofp", "i8", &b, "float");
+            ir.cast("bitcast", "float", &f, "i32")
+        }
+        ast::MmaType::S4 => {
             let sh = (32 - bits).to_string();
             let x = ir.op("shl", "i32", x, &sh);
             let x = ir.op("ashr", "i32", &x, &sh);

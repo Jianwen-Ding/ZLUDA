@@ -204,6 +204,35 @@ pub(crate) fn non_entry_bytes(src: &str) -> usize {
     src.len() - entries
 }
 
+/// Whether `src` defines a function that its kernels can share as calls: a top-level `.func` with a body, neither
+/// `.extern` nor `.noreturn` (clang's error paths, such as ggml's no_device_code: a printf and a trap). The same test
+/// as zoc's parts::defines_functions, which makes such a module's kernels call trees.
+pub(crate) fn defines_shared_functions(src: &str) -> bool {
+    let bytes = src.as_bytes();
+    let (mut depth, mut line_start) = (0i32, 0usize);
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            b'\n' => line_start = i + 1,
+            b'.' if depth == 0 => {
+                let rest = &src[i..];
+                if !rest.starts_with(".func") || !rest[5..].starts_with(|c: char| c.is_whitespace())
+                    || src[line_start..i].contains(".extern")
+                {
+                    continue;
+                }
+                let head = &rest[..rest.find(['{', ';']).unwrap_or(rest.len())];
+                if !head.contains(".noreturn") && !rest[head.len()..].starts_with(';') {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Kernel names in a PTX image, in source order. This is used to defer AGX
 /// code generation until a CUDA module asks for a particular kernel.
 pub(crate) fn entry_names(src: &str) -> Vec<String> {
@@ -553,6 +582,15 @@ fn operands(rest: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_functions_are_not_noreturn_error_paths() {
+        let error_path = ".func _Z5abortv\n()\n.noreturn\n;\n.func _Z5abortv()\n.noreturn\n{\n\ttrap; exit;\n}\n\
+                          .visible .entry k()\n{\n\tret;\n}\n";
+        assert!(!defines_shared_functions(error_path));
+        assert!(defines_shared_functions(".func  (.param .b32 r) _Z1fi(\n\t.param .b32 a\n)\n{\n\tret;\n}\n"));
+        assert!(!defines_shared_functions(".extern .func _Z1gv\n()\n;\n"));
+    }
 
     const PTX: &str = ".version 7.0
 .target sm_75

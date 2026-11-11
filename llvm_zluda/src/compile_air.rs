@@ -20,7 +20,7 @@ use crate::{
     LLVMZludaAgxKeepGlobals, LLVMZludaAgxLowerAddressSpaces, LLVMZludaAgxRewritePrivateAddresses, LLVMZludaAgxLowerClusters, LLVMZludaAgxSpillClusterShared,
     LLVMZludaAirFunctionPointers, LLVMZludaAirInlineLocalAddressCalls, LLVMZludaSetAirPrimitives, LLVMZludaAirGlobalsToBuffer, LLVMZludaAirInlineGlobalUsers,
     LLVMZludaAirRemapAddressSpaces, LLVMZludaAirSharedLayout, LLVMZludaAirStaticRounding, LLVMZludaAirDropCompareFlushes, LLVMZludaAirDropMinMaxFixups, LLVMZludaAirExpandDivisions, LLVMZludaAirCanonicalNaNs, LLVMZludaAirTextureSampleHint, LLVMZludaAirCompareFloatBits, LLVMZludaAirRangeReport, LLVMZludaAirKernelModule, LLVMZludaAirKernelSizes, LLVMZludaAgxKeepsCalls, LLVMZludaPromoteDynamicPrivateLoads, LLVMZludaAirSaltKernels, LLVMZludaAgxCanonicalizeFoldedNaNs, LLVMZludaLinkUsedDefinitions,
-    LLVMZludaUpgradeFunctionAttributes,
+    LLVMZludaUpgradeFunctionAttributes, LLVMZludaAgxCancelMmaLayouts,
 };
 use llvm_sys::target_machine::{
     LLVMCodeGenFileType, LLVMCodeGenOptLevel, LLVMCodeModel, LLVMGetTargetFromTriple, LLVMRelocMode,
@@ -196,6 +196,11 @@ pub fn compile_air(
     let lowered = (|| -> Result<(), String> {
         run(&linked, first_pipeline, &air, &options)?;
         stage("first pipeline");
+        // (before the lowerings below: the mma layout markers, noinline until here, cancelled and inlined)
+        let cancelled = unsafe { LLVMZludaAgxCancelMmaLayouts(linked.get()) };
+        if timings && cancelled > 0 {
+            eprintln!("[zluda air] mma layout moves cancelled: {cancelled}");
+        }
         // calls given addresses of the caller's private or threadgroup memory inlined before the address spaces are
         // lowered (LLVMZludaAirInlineLocalAddressCalls): callees of at most ZLUDA_AIR_INLINE_LOCAL_CALLS
         // instructions (default 8192; 0: none), the module growing by at most its own size (at least 64k)

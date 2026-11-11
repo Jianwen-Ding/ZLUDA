@@ -511,6 +511,12 @@ declare i32 @llvm.agx.simd.shuffle.i32(i32, i32)
 declare i32 @llvm.agx.quad.shuffle.i32(i32, i32)
 declare i64 @__zluda_ptx_impl_agx_round_pack(i1, i64, i1, i32, i32, i32)
 attributes #0 = { alwaysinline convergent nounwind }
+attributes #1 = { noinline convergent nounwind willreturn memory(none) }
+attributes #2 = { noinline nounwind willreturn memory(none) }
+define internal i32 @__zluda_ptx_impl_agx_exact_fptosi(float %x) #2 {
+  %r = fptosi float %x to i32
+  ret i32 %r
+}
 "#;
 
 fn define(
@@ -1501,8 +1507,14 @@ fn fast_tile(
             }
             ast::MmaType::Bf16 => ir.op("shl", "i32", &x, "16"),
             ast::MmaType::Tf32 => ir.op("and", "i32", &x, "-8192"),
-            // integers as their (exact) floats
-            ast::MmaType::S8 | ast::MmaType::S4 => {
+            // integers as their (exact) floats; a byte as an i8, which the AGX convert reads from either half of
+            // a register (s8_to_f), where shl/ashr cost two shared-unit shifts more for bytes 1 and 2
+            ast::MmaType::S8 => {
+                let b = ir.cast("trunc", "i32", &x, "i8");
+                let f = ir.cast("sitofp", "i8", &b, "float");
+                ir.cast("bitcast", "float", &f, "i32")
+            }
+            ast::MmaType::S4 => {
                 let sh = (32 - bits).to_string();
                 let x = ir.op("shl", "i32", &x, &sh);
                 let x = ir.op("ashr", "i32", &x, &sh);
@@ -1605,7 +1617,26 @@ fn fast_tile(
     let ht = m / 8;
     let b_moved = moved(ir, MmaMatrix::B, b, d.btype, &|tile| (8 * tile, 0, false));
     let a_moved = moved(ir, MmaMatrix::A, a, d.atype, &|tile| (8 * (tile % ht), 8 * (tile / ht), true));
-    let c_moved = if int { None } else { moved(ir, MmaMatrix::C, c, d.ctype, &|tile| (8 * tile, 0, true)) };
+    // f32 C and D through the layout markers (layout_marker), which a loop-carried accumulator cancels across
+    let markers = !int
+        && d.ctype == ast::MmaType::F32
+        && d.dtype == ast::MmaType::F32
+        && std::env::var("ZLUDA_AGX_MMA_LAYOUT_MARKERS").as_deref() != Ok("0");
+    // f16 C and D likewise (layout_marker16): a chain of f16-accumulating mmas rounds D to f16 between them, which
+    // is the same element by element in either layout
+    let markers16 = !int
+        && d.ctype == ast::MmaType::F16
+        && d.dtype == ast::MmaType::F16
+        && std::env::var("ZLUDA_AGX_MMA_LAYOUT_MARKERS").as_deref() != Ok("0");
+    let c_moved = if int {
+        None
+    } else if let Some(e) = markers.then(|| layout_marker(ir, LayoutMarker::ToUnit, m, k, c)).flatten() {
+        Some(e)
+    } else if let Some(e) = markers16.then(|| layout_marker16(ir, d, LayoutMarker::ToUnit, m, k, c)).flatten() {
+        Some(e)
+    } else {
+        moved(ir, MmaMatrix::C, c, d.ctype, &|tile| (8 * tile, 0, true))
+    };
     let mut b_tiles = Vec::new();
     for kt in 0..steps {
         if let Some(e) = &b_moved {
@@ -1655,7 +1686,10 @@ fn fast_tile(
     }
     // the elements of D in the PTX layout (that of C)
     let unit_words = tiles.iter().flatten().cloned().collect::<Vec<_>>();
-    let d_moved = (|| {
+    if let Some(regs) = markers16.then(|| layout_marker16(ir, d, LayoutMarker::ToPtx, m, k, &unit_words)).flatten() {
+        return Ok(regs);
+    }
+    let d_moved = markers.then(|| layout_marker(ir, LayoutMarker::ToPtx, m, k, &unit_words)).flatten().or_else(|| (|| {
         let count = m * 8 / 32;
         let from = bit_labels(count.trailing_zeros(), &|t, e| {
             let (r, c) = unit_position(t, e % 2);
@@ -1665,7 +1699,7 @@ fn fast_tile(
             if j < count { position(MmaMatrix::C, m, k, 32, t, j) } else { None }
         })?;
         bit_move(ir, &l, &unit_words, 32, &from, &to).ok()
-    })();
+    })());
     let mut elements = Vec::new();
     for j in 0..m * 8 / 32 {
         if let Some(e) = &d_moved {
@@ -1699,6 +1733,124 @@ fn fast_tile(
     Ok(pack_d(ir, d, &elements))
 }
 
+#[derive(Copy, Clone, PartialEq)]
+enum LayoutMarker {
+    ToUnit,
+    ToPtx,
+}
+
+/// The f32 C (`ToUnit`) or D (`ToPtx`) words of an m x 8 tile moved between the PTX layout and the matrix unit's, as a
+/// call to a function of their own, `__zluda_ptx_impl_agx_mma_c_unit_mMkK` / `..._d_ptx_mMkK`, noinline until
+/// LLVMZludaAgxCancelMmaLayouts: there `c_unit(d_ptx(x))` is x, through the phis of an accumulator that a loop carries
+/// (tinygrad's and CUTLASS-like GEMMs: C = D of the previous iteration), and a d_ptx used only after a loop moves to
+/// its exit; then the calls are inlined. None where the layouts are not bit permutations of each other.
+fn layout_marker(ir: &mut Ir, kind: LayoutMarker, m: u32, k: u32, words: &[String]) -> Option<Vec<String>> {
+    use ast::MmaMatrix;
+    let count = m * 8 / 32;
+    if words.len() as u32 != count || !count.is_power_of_two() {
+        return None;
+    }
+    let ptx = |t: u32, j: u32| if j < count { position(MmaMatrix::C, m, k, 32, t, j) } else { None };
+    let unit = |t: u32, e: u32| {
+        let (r, c) = unit_position(t, e % 2);
+        Some((8 * (e / 2) + unit_row(r), c))
+    };
+    let bits = count.trailing_zeros();
+    let (from, to) = match kind {
+        LayoutMarker::ToUnit => (bit_labels(bits, &ptx)?, bit_labels(bits, &unit)?),
+        LayoutMarker::ToPtx => (bit_labels(bits, &unit)?, bit_labels(bits, &ptx)?),
+    };
+    let name = format!(
+        "__zluda_ptx_impl_agx_mma_{}_m{m}k{k}",
+        if kind == LayoutMarker::ToUnit { "c_unit" } else { "d_ptx" }
+    );
+    let vec = format!("<{count} x i32>");
+    // the function: the words moved by bit exchanges
+    let mut body = Ir::default();
+    let lane = body.def("call i32 @llvm.agx.thread.index.in.simdgroup()");
+    let input = (0..count).map(|i| body.def(&format!("extractelement {vec} %x, i32 {i}"))).collect::<Vec<_>>();
+    let moved = bit_move(&mut body, &lane, &input, 32, &from, &to).ok()?;
+    let mut v = "poison".to_string();
+    for (i, w) in moved.iter().enumerate() {
+        v = body.def(&format!("insertelement {vec} {v}, i32 {w}, i32 {i}"));
+    }
+    body.stmt(&format!("ret {vec} {v}"));
+    ir.declarations.extend(body.declarations);
+    ir.declarations.insert(format!("define internal {vec} @{name}({vec} %x) #1 {{\n{}}}", body.out));
+    // the call
+    let mut x = "poison".to_string();
+    for (i, w) in words.iter().enumerate() {
+        x = ir.def(&format!("insertelement {vec} {x}, i32 {w}, i32 {i}"));
+    }
+    let y = ir.def(&format!("call {vec} @{name}({vec} {x})"));
+    Some((0..count).map(|i| ir.def(&format!("extractelement {vec} {y}, i32 {i}"))).collect())
+}
+
+/// layout_marker for f16 C and D (`__zluda_ptx_impl_agx_mma_c16_unit_mMkK`, `..._d16_ptx_mMkK`): C's packed f16
+/// words to the unit's f32 words (moved, then widened exactly), and the unit's f32 words to D's packed f16 words
+/// (moved, rounded to f16 by finish_d, packed by pack_d, as fast_tile does). LLVMZludaAgxCancelMmaLayouts takes
+/// c16_unit(d16_ptx(x)) as x rounded to f16 and widened again, element by element.
+fn layout_marker16(ir: &mut Ir, d: &ast::MmaDetails, kind: LayoutMarker, m: u32, k: u32, words: &[String]) -> Option<Vec<String>> {
+    use ast::MmaMatrix;
+    let count = m * 8 / 32;
+    let packed = count / 2;
+    if !count.is_power_of_two() || packed == 0 {
+        return None;
+    }
+    let (inputs, outputs) = match kind {
+        LayoutMarker::ToUnit => (packed, count),
+        LayoutMarker::ToPtx => (count, packed),
+    };
+    if words.len() as u32 != inputs {
+        return None;
+    }
+    let unit = |t: u32, e: u32| {
+        let (r, c) = unit_position(t, e % 2);
+        Some((8 * (e / 2) + unit_row(r), c))
+    };
+    let bits = count.trailing_zeros();
+    let (vin, vout) = (format!("<{inputs} x i32>"), format!("<{outputs} x i32>"));
+    let mut body = Ir::default();
+    let lane = body.def("call i32 @llvm.agx.thread.index.in.simdgroup()");
+    let input = (0..inputs).map(|i| body.def(&format!("extractelement {vin} %x, i32 {i}"))).collect::<Vec<_>>();
+    let result = match kind {
+        LayoutMarker::ToUnit => {
+            let from = bit_labels(bits, &|t, i| if i < count { position(MmaMatrix::C, m, k, 16, t, i) } else { None })?;
+            let to = bit_labels(bits, &unit)?;
+            let elements = bit_move(&mut body, &lane, &input, 16, &from, &to).ok()?;
+            elements.iter().map(|x| element_f32(&mut body, x, ast::MmaType::F16)).collect::<Vec<_>>()
+        }
+        LayoutMarker::ToPtx => {
+            let from = bit_labels(bits, &unit)?;
+            let to = bit_labels(bits, &|t, j| if j < count { position(MmaMatrix::C, m, k, 32, t, j) } else { None })?;
+            let moved = bit_move(&mut body, &lane, &input, 32, &from, &to).ok()?;
+            let elements =
+                (0..count).map(|j| finish_d(&mut body, d, false, &[], j, &moved[j as usize])).collect::<Result<Vec<_>, _>>().ok()?;
+            pack_d(&mut body, d, &elements)
+        }
+    };
+    if result.len() as u32 != outputs {
+        return None;
+    }
+    let mut v = "poison".to_string();
+    for (i, w) in result.iter().enumerate() {
+        v = body.def(&format!("insertelement {vout} {v}, i32 {w}, i32 {i}"));
+    }
+    body.stmt(&format!("ret {vout} {v}"));
+    let name = format!(
+        "__zluda_ptx_impl_agx_mma_{}_m{m}k{k}",
+        if kind == LayoutMarker::ToUnit { "c16_unit" } else { "d16_ptx" }
+    );
+    ir.declarations.extend(body.declarations);
+    ir.declarations.insert(format!("define internal {vout} @{name}({vin} %x) #1 {{\n{}}}", body.out));
+    let mut x = "poison".to_string();
+    for (i, w) in words.iter().enumerate() {
+        x = ir.def(&format!("insertelement {vin} {x}, i32 {w}, i32 {i}"));
+    }
+    let y = ir.def(&format!("call {vout} @{name}({vin} {x})"));
+    Some((0..outputs).map(|i| ir.def(&format!("extractelement {vout} {y}, i32 {i}"))).collect())
+}
+
 // Element j of D from its f32 bits `value` (the unit's sum): rounded to
 // f16, or for integers C + the sum (exact in f32), wrapping, or clamped to
 // s32 with .satfinite.
@@ -1710,7 +1862,9 @@ fn finish_d(ir: &mut Ir, d: &ast::MmaDetails, int: bool, c: &[String], j: u32, v
         ir.cast("zext", "i16", &h, "i32")
     } else if int {
         let f = ir.cast("bitcast", "i32", value, "float");
-        let v = ir.cast("fptosi", "float", &f, "i32");
+        // the unit's sum is an exact integer (is_fast_int): LLVMZludaAgxCancelMmaLayouts takes sitofp of this
+        // conversion as the float itself (ggml's MMQ converts each D with C = 0 back to float)
+        let v = ir.def(&format!("call i32 @__zluda_ptx_impl_agx_exact_fptosi(float {f})"));
         let cj = c.get(j as usize).ok_or_else(|| todo("mma fragment size"))?;
         if d.satfinite {
             let v64 = ir.cast("sext", "i32", &v, "i64");
@@ -1739,7 +1893,12 @@ fn element_f32(ir: &mut Ir, x: &str, type_: ast::MmaType) -> String {
         }
         ast::MmaType::Bf16 => ir.op("shl", "i32", x, "16"),
         ast::MmaType::Tf32 => ir.op("and", "i32", x, "-8192"),
-        ast::MmaType::S8 | ast::MmaType::S4 => {
+        ast::MmaType::S8 => {
+            let b = ir.cast("trunc", "i32", x, "i8");
+            let f = ir.cast("sitofp", "i8", &b, "float");
+            ir.cast("bitcast", "float", &f, "i32")
+        }
+        ast::MmaType::S4 => {
             let sh = (32 - bits).to_string();
             let x = ir.op("shl", "i32", x, &sh);
             let x = ir.op("ashr", "i32", &x, &sh);

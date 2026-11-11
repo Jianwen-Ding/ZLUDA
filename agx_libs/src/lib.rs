@@ -334,6 +334,8 @@ pub mod engine {
         dotrows: [CUfunction; 4],
         /// f32 and f16 D.
         epilogue: [CUfunction; 2],
+        /// The split-K sums (agx_splitk_reduce_*): f32 and f16 C.
+        splitk: [CUfunction; 2],
     }
     unsafe impl Send for Kernels {}
 
@@ -389,6 +391,7 @@ pub mod engine {
                 get(sm, b"agx_dgemm_dotrows\0")?,
             ],
             epilogue: [get(em, b"agx_epilogue_f32\0")?, get(em, b"agx_epilogue_f16\0")?],
+            splitk: [get(em, b"agx_splitk_reduce_f32\0")?, get(em, b"agx_splitk_reduce_f16\0")?],
         };
         loaded.push(k);
         Ok(k)
@@ -503,6 +506,47 @@ pub mod engine {
     /// Batch entries per launch: the kernels take the batch index from grid y (z for the generic kernel).
     const BATCH_PER_LAUNCH: u64 = 65535;
 
+    /// Chunks of K for a tile product of `groups` threadgroups (M2 Max, 38 cores: below a few hundred threadgroups
+    /// the cores hold too few to hide memory latency): each chunk a batch entry of the f32 tile kernel into a
+    /// workspace, then agx_splitk_reduce adds them up with alpha and beta. f16 GEMMs of llama.cpp's prompt (N = 512):
+    /// 896 x 512 x 4864 1443 -> ~930 us, 896 x 512 x 896 ~260 -> ~210 us, 128 x 512 x 896 139 -> ~57 us (the tile work
+    /// of 4 chunks measured as one GEMM of 4x the rows, plus the sum). 1: no split. ZLUDA_AGX_GEMM_SPLITK=0: never.
+    fn splitk_chunks(groups: u32, k: u64) -> u64 {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("ZLUDA_AGX_GEMM_SPLITK").map_or(true, |v| v != "0")) {
+            return 1;
+        }
+        let mut s = 1u64;
+        // chunks of at least 128 steps of K, a multiple of 8 each, up to 8 of them, until ~256 threadgroups
+        while s < 8 && (groups as u64) * s < 256 && k % (16 * s) == 0 && k / (2 * s) >= 128 {
+            s *= 2;
+        }
+        s
+    }
+
+    /// The split-K workspace of (context, stream): f32 slices, grown (never freed: work queued on the stream may
+    /// still use an older one) and kept per stream so that GEMMs on other streams cannot overlap in it.
+    unsafe fn splitk_workspace(stream: CUstream, bytes: usize) -> Result<*mut c_void, Error> {
+        static SPACES: Mutex<Vec<((usize, usize), usize, usize)>> = Mutex::new(Vec::new());
+        let d = driver()?;
+        let mut ctx = CUcontext(std::ptr::null_mut());
+        (d.current)(&mut ctx).map_err(|_| Error::NotInitialized)?;
+        let key = (ctx.0 as usize, stream.0 as usize);
+        let mut spaces = SPACES.lock().unwrap();
+        if let Some(e) = spaces.iter_mut().find(|e| e.0 == key) {
+            if e.2 >= bytes {
+                return Ok(e.1 as *mut c_void);
+            }
+            let p = alloc(bytes.max(e.2 * 2))?;
+            *e = (key, p as usize, bytes.max(e.2 * 2));
+            return Ok(p);
+        }
+        let size = bytes.max(8 << 20);
+        let p = alloc(size)?;
+        spaces.push((key, p as usize, size));
+        Ok(p)
+    }
+
     pub unsafe fn gemm(g: &Gemm, stream: CUstream) -> Result<(), Error> {
         if g.m == 0 || g.n == 0 || g.batch == 0 {
             return Ok(());
@@ -525,6 +569,48 @@ pub mod engine {
                 c.byte_offset((first * g.stride_c as isize + oc) * cb),
             );
             let (mut sa, mut sb, sc) = (g.stride_a, g.stride_b, g.stride_c);
+            // a lone tile product with few threadgroups along a long K: split-K (splitk_chunks)
+            if let (Plan::Tile { swap, trans, aligned, dims, groups }, 1, false, true) =
+                (&part.plan, g.batch, part.accumulate, types != Types::D)
+            {
+                let chunks = splitk_chunks(*groups, dims[2]);
+                if chunks > 1 {
+                    if *swap {
+                        std::mem::swap(&mut pa, &mut pb);
+                    }
+                    let [mm, nn, kk, lda, ldb, ldc] = *dims;
+                    let kc = kk / chunks;
+                    let slice = mm * nn;
+                    let w = splitk_workspace(stream, (chunks * slice * 4) as usize)?;
+                    // chunk s of K: A'[r, s kc + l] and B'[s kc + l, c], as batch entries of the f32 tile kernel
+                    let step_a = if trans[0] { kc * lda } else { kc };
+                    let step_b = if trans[1] { kc } else { kc * ldb };
+                    let tile_f32 = if types == Types::S { 0 } else { 2 };
+                    let f = kernels.tile[tile_f32][*aligned as usize][trans[0] as usize][trans[1] as usize];
+                    let mut pw = w;
+                    let mut dims = vec![mm, nn, kc, lda, ldb, nn, step_a, step_b, slice];
+                    let (mut one, mut zero) = (1.0f32, 0.0f32);
+                    let mut params: Vec<*mut c_void> = vec![
+                        &mut pa as *mut _ as *mut c_void,
+                        &mut pb as *mut _ as *mut c_void,
+                        &mut pw as *mut _ as *mut c_void,
+                    ];
+                    params.extend(dims.iter_mut().map(|v| v as *mut u64 as *mut c_void));
+                    params.push(&mut one as *mut f32 as *mut c_void);
+                    params.push(&mut zero as *mut f32 as *mut c_void);
+                    launch3(d, f, [*groups, chunks as u32, 1], [128, 1], &mut params, stream)?;
+                    let f = kernels.splitk[(types == Types::H) as usize];
+                    let (mut alpha, mut beta) = (g.alpha as f32, g.beta as f32);
+                    let mut rdims = [mm, nn, ldc, chunks, slice];
+                    let mut params: Vec<*mut c_void> =
+                        vec![&mut pw as *mut _ as *mut c_void, &mut pc as *mut _ as *mut c_void];
+                    params.extend(rdims.iter_mut().map(|v| v as *mut u64 as *mut c_void));
+                    params.push(&mut alpha as *mut f32 as *mut c_void);
+                    params.push(&mut beta as *mut f32 as *mut c_void);
+                    launch3(d, f, [nn.div_ceil(16) as u32, mm.div_ceil(16) as u32, 1], [16, 16], &mut params, stream)?;
+                    continue;
+                }
+            }
             let (f, dims, grid, block): (CUfunction, &[u64], [u32; 3], [u32; 2]) = match &part.plan {
                 Plan::Tile { swap, trans, aligned, dims, groups } => {
                     if *swap {

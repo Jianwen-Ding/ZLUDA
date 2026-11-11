@@ -354,9 +354,10 @@ struct Scratch {
     helper: Bo,
     buffer: Bo,
     layout: scratch::Layout,
-    /// Smaller buffers that commands in flight may still use; freed with the address space.
-    #[allow(dead_code)]
-    retired: Vec<Bo>,
+    /// SIMD-groups per core with an allocation (`scratch::Buffer::subgroups`).
+    subgroups: u32,
+    /// Smaller buffers that commands in flight may still use, with their layouts; freed with the address space.
+    retired: Vec<(Bo, scratch::Layout, u32)>,
 }
 
 pub const USC_HEAP_SIZE: u64 = 1 << 32;
@@ -462,30 +463,35 @@ impl Vm {
         self.textures.as_ref().filter(|t| !t.sampler_slots.is_empty()).map(|t| (t.samplers.va, t.sampler_slots.len() as u32))
     }
 
-    /// The helper program of a command whose shader uses `dwords` 32-bit words of stack per thread: its tagged USC
-    /// address and the address of the scratch buffer's header (`drm_asahi_helper_program`). The buffer grows to the
-    /// largest size asked for and is shared by every command of the address space.
-    pub fn scratch(&mut self, dwords: u32) -> io::Result<(u32, u64)> {
+    /// The helper program of a command whose shader uses `dwords` 32-bit words of stack per thread and of which a
+    /// core holds `groups` SIMD-groups (`KernelInfo::simd_groups_per_core`): its tagged USC address and the address
+    /// of the scratch buffer's header (`drm_asahi_helper_program`). The buffer grows to the largest stack and the
+    /// most SIMD-groups asked for and is shared by every command of the address space: groups of several kernels
+    /// resident on a core never outnumber the largest of their counts (`scratch::SUBGROUPS`).
+    pub fn scratch(&mut self, dwords: u32, groups: u32) -> io::Result<(u32, u64)> {
         if dwords > (8 << 12) * 4 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{dwords} words of stack per thread")));
         }
-        let have = self.scratch.as_ref().map_or(0, |s| s.layout.dwords());
-        if (dwords as u64) > have {
-            let layout = scratch::Layout::new(dwords);
-            let buf = scratch::Buffer::new(layout, self.core_entries.len(), PAGE);
+        let groups = groups.clamp(1, scratch::SUBGROUPS);
+        let (have, have_groups) = self.scratch.as_ref().map_or((0, 0), |s| (s.layout.dwords(), s.subgroups));
+        if (dwords as u64) > have || groups > have_groups {
+            let layout = scratch::Layout::new((dwords as u64).max(have) as u32);
+            let groups = groups.max(have_groups);
+            let buf = scratch::Buffer::new(layout, self.core_entries.len(), groups, PAGE);
             let mut bo = self.alloc_data_aligned(buf.size, buf.align)?;
             let header = buf.header(bo.va, &self.core_entries);
             bo.as_mut_slice()[..header.len()].copy_from_slice(&header);
             match &mut self.scratch {
                 Some(s) => {
                     let old = std::mem::replace(&mut s.buffer, bo);
-                    s.retired.push(old);
+                    s.retired.push((old, s.layout, s.subgroups));
                     s.layout = layout;
+                    s.subgroups = groups;
                 }
                 None => {
                     let mut helper = self.alloc_usc(scratch::HELPER.len() as u64)?;
                     helper.as_mut_slice()[..scratch::HELPER.len()].copy_from_slice(scratch::HELPER);
-                    self.scratch = Some(Scratch { helper, buffer: bo, layout, retired: Vec::new() });
+                    self.scratch = Some(Scratch { helper, buffer: bo, layout, subgroups: groups, retired: Vec::new() });
                 }
             }
         }
@@ -494,9 +500,27 @@ impl Vm {
         Ok(((s.helper.va - self.usc_base) as u32 | 1, s.buffer.va))
     }
 
+    /// Of every scratch buffer of the address space (the current one and those it replaced), the most allocations
+    /// a core held at once and the allocations the helper refused, by the header counters
+    /// (`scratch::core_counters`); read once the commands that use them are done. None before the first.
+    pub fn scratch_counters(&self) -> Option<(u32, u32, u32)> {
+        let s = self.scratch.as_ref()?;
+        let (mut most, mut failed) = (0, 0);
+        let buffers = s.retired.iter().map(|(b, l, g)| (b, *l, *g)).chain(std::iter::once((&s.buffer, s.layout, s.subgroups)));
+        for (bo, layout, groups) in buffers {
+            let header = &bo.as_slice()[..scratch::Buffer::new(layout, self.core_entries.len(), groups, PAGE).blocks_offset as usize];
+            for &id in &self.core_entries {
+                let (_, max, f) = scratch::core_counters(header, id);
+                most = most.max(max);
+                failed += f;
+            }
+        }
+        Some((most, failed, s.subgroups))
+    }
+
     /// The scratch buffer's header and block lists, to check the helper's counters (`scratch::core_counters`).
     pub fn scratch_header(&self) -> Option<&[u8]> {
-        self.scratch.as_ref().map(|s| &s.buffer.as_slice()[..scratch::Buffer::new(s.layout, self.core_entries.len(), PAGE).blocks_offset as usize])
+        self.scratch.as_ref().map(|s| &s.buffer.as_slice()[..scratch::Buffer::new(s.layout, self.core_entries.len(), s.subgroups, PAGE).blocks_offset as usize])
     }
 
     fn create(&self, size: u64, va: u64, bind_flags: u32, heap: Option<&Rc<RefCell<RangeAllocator>>>) -> io::Result<Bo> {
@@ -701,6 +725,13 @@ impl Drop for Mapping {
 
 impl Drop for Vm {
     fn drop(&mut self) {
+        // AGX_SCRATCH_STATS=1: whether the scratch buffer had enough SIMD-group allocations (at exit, the commands
+        // done)
+        if std::env::var_os("AGX_SCRATCH_STATS").is_some() {
+            if let Some((most, failed, groups)) = self.scratch_counters() {
+                eprintln!("[agx_runtime] scratch: {groups} SIMD-group allocations per core, at most {most} held at once, {failed} refused");
+            }
+        }
         // unbind the scratch objects while the address space exists
         self.scratch = None;
         let mut vd = drm_asahi_vm_destroy { vm_id: self.id, pad: 0 };
@@ -829,9 +860,58 @@ pub fn cdm_dispatch_with(
     c
 }
 
+/// Whether a control stream word is the barrier `cdm_dispatch_ordered` puts between dispatches.
+pub fn is_order_barrier(w: &[u8]) -> bool {
+    w == order_barrier_word()
+}
+
+/// `cdm_dispatch_with`, its barrier `CDM_ORDER_BARRIER` when `ordering_only`.
+pub fn cdm_dispatch_ordered(
+    pipeline_words: u32,
+    uniform_halves: u32,
+    g14x: bool,
+    global: [u32; 3],
+    local: [u32; 3],
+    barrier: bool,
+    ordering_only: bool,
+) -> Vec<u8> {
+    let mut c = cdm_dispatch_with(pipeline_words, uniform_halves, g14x, global, local, barrier);
+    if barrier && ordering_only {
+        let at = c.len() - 12;
+        c[at..at + 4].copy_from_slice(&order_barrier_word());
+    }
+    c
+}
+
 /// The CDM barrier word (Mesa's unk0..19, the USC cache invalidate included) that orders the dispatches of one
 /// command, as a standalone word of a control stream.
 pub const CDM_BARRIER: [u8; 4] = (3u32 << 29 | 0xfffff).to_le_bytes();
+
+/// The barrier between two dispatches of one command: `CDM_BARRIER` without bit 11 (Mesa's genxml `Unk 11`, which
+/// libagx_dgc.h leaves out of its base set too). The dispatches stay ordered and see each other's stores (ping-pong
+/// test of 64 dispatches reading values other cores wrote, /scratch/mmq/launch/lbc.c: exact; 0x7f, 0xfff00 wrong), and
+/// the instruction cache keeps the code of the earlier dispatches: with bit 11 (and bits 0-9), every dispatch fetched
+/// all its code from memory again: a 7 KB straight-line kernel repeated cost 16.3 us per dispatch, 7.0 without it (an
+/// empty kernel 2.3-3 either way; two such kernels alternating 16 us either way: together beyond the 12 KB cache).
+pub const CDM_ORDER_BARRIER: [u8; 4] = (3u32 << 29 | (0xfffff & !(1 << 11))).to_le_bytes();
+
+/// ZLUDA_AGX_ORDER_BARRIER_BITS=HEX (experiment): bits 0-26 of `CDM_ORDER_BARRIER` in its place.
+fn order_barrier_word() -> [u8; 4] {
+    static W: std::sync::OnceLock<[u8; 4]> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("ZLUDA_AGX_ORDER_BARRIER_BITS")
+            .ok()
+            .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+            .map_or(CDM_ORDER_BARRIER, |b| (3u32 << 29 | (b & 0x7ff_ffff)).to_le_bytes())
+    })
+}
+
+/// Whether the barriers between the dispatches of one command are `CDM_ORDER_BARRIER` when no code was loaded since
+/// the queue's last dispatch; `ZLUDA_AGX_ORDER_BARRIER=0`: the full `CDM_BARRIER` everywhere.
+pub fn order_barriers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ZLUDA_AGX_ORDER_BARRIER").map_or(true, |v| v != "0"))
+}
 
 /// Firmware timestamps of one compute command, in `command_timestamp_frequency_hz` units.
 #[derive(Clone, Copy, Debug)]
@@ -1309,6 +1389,24 @@ mod tests {
         assert!(words(&with).contains(&(3 << 29 | 0xfffff)));
         assert!(!words(&without).contains(&(3 << 29 | 0xfffff)));
         assert_eq!(words(&without)[words(&without).len() - 2..], [2 << 29, 0], "still terminated");
+    }
+
+    #[test]
+    fn the_ordering_barrier_is_the_full_one_without_bit_11() {
+        let words = |c: &[u8]| c.chunks(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect::<Vec<_>>();
+        assert_eq!(u32::from_le_bytes(CDM_BARRIER) ^ u32::from_le_bytes(CDM_ORDER_BARRIER), 1 << 11);
+        let full = cdm_dispatch_with(0x1000, 16, false, [32, 1, 1], [32, 1, 1], true);
+        let ordered = cdm_dispatch_ordered(0x1000, 16, false, [32, 1, 1], [32, 1, 1], true, true);
+        let (f, o) = (words(&full), words(&ordered));
+        assert_eq!(f.len(), o.len());
+        let n = f.len();
+        assert_eq!(f[..n - 3], o[..n - 3], "the same launch");
+        assert_eq!(o[n - 3..], [u32::from_le_bytes(CDM_ORDER_BARRIER), 2 << 29, 0]);
+        assert_eq!(cdm_dispatch_ordered(0x1000, 16, false, [32, 1, 1], [32, 1, 1], true, false), full);
+        assert_eq!(
+            cdm_dispatch_ordered(0x1000, 16, false, [32, 1, 1], [32, 1, 1], false, true),
+            cdm_dispatch_with(0x1000, 16, false, [32, 1, 1], [32, 1, 1], false)
+        );
     }
 
     #[test]
@@ -2135,7 +2233,7 @@ impl LoadedModule {
             let words_only = words_only.as_deref_mut();
             // a shader that uses the stack gets its scratch from the helper program
             let stack_dwords = k.stack_bytes.div_ceil(4);
-            let helper = if stack_dwords > 0 { Some(vm.scratch(stack_dwords)?) } else { None };
+            let helper = if stack_dwords > 0 { Some(vm.scratch(stack_dwords, k.simd_groups_per_core())?) } else { None };
             let mut halves = halves.to_vec();
             if let Some(h) = k.texture_heap_half {
                 let heap = vm.texture_heap();
@@ -2164,12 +2262,21 @@ impl LoadedModule {
             // Separate queue commands are ordered by firmware. Dispatches
             // within one command need the CDM barrier even when their code
             // is cached, or dependent kernels can overlap and read stale data.
-            let barrier = (batched && queue.trailing_barrier.get())
-                || queue.usc_seen.get() != vm.usc_generation
-                || always_usc_barrier();
+            let invalidate = queue.usc_seen.get() != vm.usc_generation || always_usc_barrier();
+            let barrier = (batched && queue.trailing_barrier.get()) || invalidate;
             queue.usc_seen.set(vm.usc_generation);
-            let stream =
-                cdm_dispatch_with((pw - vm.usc_base) as u32, pipeline.uniform_halves(), g14x, global, local, barrier);
+            // (a barrier between dispatches of one command only orders them: the code they run was loaded before the
+            // command, and its pipeline words are in USC ring slots no earlier dispatch of the command used)
+            let ordering_only = batched && !invalidate && order_barriers();
+            let stream = cdm_dispatch_ordered(
+                (pw - vm.usc_base) as u32,
+                pipeline.uniform_halves(),
+                g14x,
+                global,
+                local,
+                barrier,
+                ordering_only,
+            );
             if let Some(words) = words_only {
                 // the launch and its barrier, without the stream terminate, for a stream of several dispatches
                 words.extend_from_slice(&stream[..stream.len() - 8]);

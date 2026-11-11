@@ -1021,3 +1021,82 @@ the shipped kernel is only run and timed.
   340-344, tg128 76-80 (was ~71). Output identical to the CPU backend.
 - Next: flash_attn_ext_f16 decode (1392 B stack per thread, ~205 us/launch) and code size of the MMVQ dequant
   (q5 qh merging: and/or/shift chains the bfi combine does not catch).
+
+## 2026-11-10: register caps, cold start, MMQ spills, loop-carried mma accumulators (branch claude/mmq-regs-2026-11-10)
+
+M2 Max, qwen2.5-0.5b Q5_K_M, kernels built with clang only; A/B runs alternate (the GPU is shared with the simulator
+agent: absolute numbers drift by ~5% between hours).
+
+- **.noreturn functions do not cap a module (aa8b6ed3).** llama.cpp's modules got -agx-default-max-gprs=72 only
+  because clang emits ggml's `.noreturn` no_device_code `.func`. Uncapped: pp512 982/978 -> 1134/1137 (+16%).
+  Compiling such a module in parallel parts (parts::split) was tried and rejected: cold llama-bench 226 s, 1057 MB
+  against 183 s, 544 MB compiled whole with lazy kernels.
+- **Cold start (7b3f2783, 01de4da5).** A large module's first kernel ran the front end over the whole module (~25 s
+  for each of llama's five 5-10 MB modules, 17 s of it the first pipeline: InstCombine 6.5 s, SROA 5.4 s) so that its
+  64-185 kernels could skip it later; llama uses a few. The portable AIR is now made only where kernels share
+  functions (Cycles); other large modules compile each kernel from its own PTX on request. A kernel asked for leaves
+  the precompile queue (it waited for the workers to reach it in source order), and precompiles run at nice 10.
+  Cold llama-bench 184 s / ~1 GB -> 86-99 s / 230 MB, warm 10.5 -> 1.8 s, same pp/tg, identical completion; Cycles
+  cold 41 s, warm 1.3 s, unchanged.
+- **MMQ spills: cause found, fix not worth it.** The Q5_1 J=128 kernel (61% of pp512 GPU time) uses 128 registers
+  and spills 6.5k times. clang's NVPTX output orders all 128 mma (+cvt) of a block before the float accumulations
+  (ptxas reorders on NVIDIA); the matrix operands themselves are converted next to their use. An IR pass that moves
+  pure instructions up to the operands they are the last user of (/scratch/mmq/patches/agx-shorten-live-ranges.patch)
+  interleaves them, but the machine scheduler re-hoists the mmas; with -enable-misched=false spills 6531 -> 5434 and
+  mma-result spills 980 -> 1, yet pp512 is the same (1169-1176 vs 1144-1178), and the pass alone is 9% slower. What
+  is left is ggml's sum[64] + A tiles + scales, >128 live by design. A larger reported SM count (more stream-k
+  blocks) gives +17% (38 -> 114 "SMs"): a device-model decision left to the user (not committed).
+- **Loop-carried mma accumulators (bd9df1d2).** tinygrad's TC GEMM carries C = D in place across its k-loop, so
+  every iteration moved each accumulator unit -> PTX -> unit (~23 shuffles/selects per mma). The f32 C/D moves are
+  now noinline marker functions that LLVMZludaAgxCancelMmaLayouts cancels through phis (and sinks to the loop exit)
+  before inlining them. f16 GEMM 2048^3: 1.9-2.0 -> 2.55-2.8 TFLOPS; mmatest bit-identical; mma PTX-formalization
+  tests unchanged; llama fa=1 identical.
+- Cycles compile time: each of its 394 shared functions is compiled 3.9x on average (once per calling kernel:
+  1.90 M IR instructions through the backend for 486 k unique); compiling functions once is a compile-unit design
+  change, not started.
+- **Prompt processing through cuBLAS.** llama.cpp configured with -DGGML_CUDA_FORCE_CUBLAS=ON (same clang/zcc
+  toolchain) dequantizes to f16 and calls cublasGemmEx: ZLUDA's MLIR hgemm (simdgroup matrices in the unit's layout)
+  instead of MMQ's emulated int8 mma. pp512 fa0 ~1100 -> ~2590, fa1 ~1110 -> ~3290, pp128 fa1 ~745 -> ~1950; tg the
+  same; fa=1 completion identical to the CPU backend. Then **split-K (d136aa34)** for tile GEMMs of few threadgroups
+  (2-8 chunks of K into a per-stream f32 workspace, agx_splitk_reduce): 896x512x4864 1444 -> 978 us, 128x512x896
+  139 -> 56 us; pp512 fa1 ~3290 -> ~3740, fa0 ~2590 -> ~3280, pp128 fa1 ~1950 -> ~2590. Large tile GEMMs peak at
+  ~5.6 TFLOPS (608+ tiles): the hgemm kernel itself is the next lever, then flash_attn_ext_f16 prefill (~27%).
+- **f16 accumulators through the markers (b22e7804):** c16_unit(d16_ptx(x)) = round-to-f16-and-back of x in the
+  unit layout. mmatest f16 chain +13%, flash-attn prefill shuffles -12% but no measurable pp change. Markers whose
+  argument IPO dropped (always-undef C) are left alone (an assertion in isa-mma-k8.ptx otherwise).
+- **Software-pipelined tile GEMMs (4b25b80d, 88f9e398):** the next K step's fragments are loaded during the current
+  step's products; f16 4096^3 5.6 -> 6.3 TFLOPS, llama shapes -4..-18% (f32 -10..-20% on the large ones).
+- **Portable AIR only for > 1 MB of shared functions (add97ed9):** llama's flash-attention modules (457 KB of
+  functions in 12 MB) now compile per kernel from their own PTX: cold llama-bench (fa1, pp+tg) cuBLAS build 142 -> 60
+  s, 938 -> 225 MB; and the FA kernels run faster than through the portable path (calls and the 72-register cap
+  there): ZLUDA_AGX_PORTABLE=1 vs default, alternating, pp512 3861-3967 vs 4426-4445, pp2048 2870-2896 vs 3680-3683.
+
+## 2026-11-11: the shared unit, GEMM barriers, outstanding loads (branch claude/opt-2026-11-11)
+
+PTX from clang only (llama.cpp, Rodinia, Cycles built with zcc / clang). All numbers G14C, alternating A/B rounds.
+
+- **Integer mma D back to float (ca57c8e6).** ggml's MMQ converts every s32 D (C = 0) back to float; finish_d's
+  fptosi of the unit's exact f32 sum is now `__zluda_ptx_impl_agx_exact_fptosi`, and LLVMZludaAgxCancelMmaLayouts
+  takes `sitofp` of it as the float itself (ZLUDA_AGX_EXACT_FPTOSI=0 disables). Q5_1 module: converts 29.5k ->
+  15.2k (instructions -4.8%); MMQ pp512 fa0 1056-1073 -> 1299-1304, fa1 1087-1091 -> 1335-1350 (+22%); completions
+  identical. The gain is out of proportion to the count because convert, imad, bit-field ops, floor and 64-bit
+  adds share one unit per half (1 instruction / cycle / core against 4 for the ALU): MMQ was bound by it.
+- **s8 operands as i8 (5ba89e74).** `trunc i8` + `sitofp i8` instead of shl / ashr: convert s8_to_f reads byte 2 from
+  the high half, bytes 1 and 3 take one shift; shared-unit ops 46.3k -> 35.2k, s8 mma microbenchmark ~2x, MMQ +1-3%,
+  test-backend-ops quantized MUL_MAT 1501/1501.
+- **Tile GEMMs without a barrier per K chunk (b4ab01dc).** The SIMD-groups share no threadgroup memory: chunks of 128
+  with a barrier -> one trip without: GEMMs -10..-14% (4864x512x896 850 -> 737-768 us, 4096^3 24.0 -> 21.4 ms),
+  cuBLAS-build pp512 fa1 3948-4196 -> 4395-4576; alpha/beta checks identical.
+- **Sixteen outstanding loads (llvm adecae6a + default change).** AGXInsertWaits' 8 came from Mesa: 16 is correct
+  (32 M checked loads, GEMMs, llama, formalization) and GEMMs 1-4% faster; llama end to end neutral.
+- **Decode flash attention:** ZLUDA_AGX_CC=8.9 makes ggml use its VEC kernel for batch 1: fa1 tg128 103-113 ->
+  119-156, tg @ d2048 96-102 -> 132-145, completions identical. Not the default: the reported cc picks cubins in
+  apps like Blender (deferred decision, /scratch/DEFERRED-DECISIONS.md #3). The MMA kernel stays latency bound in
+  decode (stream-k gives ~4 blocks for short contexts).
+- **Found and fixed (llvm 08869361, ab637967):** the pre-ISel SimplifyCFG from llvm main (cbe2b564) put `unreachable`
+  back after llvm.trap; StructurizeCFG then failed ("failed to annotate the control flow graph") for traps in nested
+  ifs on G14G and G14C: 56 PTX-formalization programs. AGXUnifyExits runs after it now.
+- Rodinia myocyte is now correct (solver completes 100 steps, matches the host f32 / f64 runs); it was STATUS -1
+  with the 2026-11-08 compiler. Its "RUN COMPUTATION" grows 2 -> 15 s because it now does the work.
+- Not adopted: AGXShortenLiveRanges again (spills -1%), MAX_BATCH 256 (no gain), dp4a packed-multiply tricks (signed
+  bytes carry across the 16-bit lanes).

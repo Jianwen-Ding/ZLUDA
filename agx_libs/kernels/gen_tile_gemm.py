@@ -20,6 +20,10 @@ KERNELS = {  # file: [(name, A and B type, C type)]
 VARIANTS = [("", False, False), ("_ta", True, False), ("_tb", False, True), ("_tatb", True, True)]
 # `_u` kernels make no alignment assumption (odd leading dimensions or strides, matrices not 8-byte aligned)
 ALIGNMENTS = [("", True), ("_u", False)]
+# The next step's fragments loaded while the current step's products run (see kernel()), f16 and f32 kernels
+PREFETCH = True
+# The K span of the outer loop (see kernel())
+CHUNK = 1 << 20
 
 
 def kernel(name, ab, c, ta, tb, aligned=True):
@@ -35,6 +39,11 @@ def kernel(name, ab, c, ta, tb, aligned=True):
     w("      attributes {known_block_size = array<i32: 128, 1, 1>} {")
     for v in [0, 1, 2, 8, 16, 24, 32, 64, 128]:
         w(f"    %i{v} = arith.constant {v} : index")
+    w("    %m16 = arith.constant -16 : index")
+    # K is a multiple of 8 (the plan's): said here, every fragment's step index is a multiple of 8, so the two
+    # elements of a fragment row that a lane loads are one aligned 32-bit access (the prefetch's clamped index hid it)
+    w("    %m8 = arith.constant -8 : index")
+    w("    %K8 = arith.andi %K, %m8 : index")
     # The plan launches the aligned kernel with 8-byte aligned matrices and even leading dimensions and batch
     # strides: said here, the two elements of a matrix row a lane loads are one aligned 32-bit access even for
     # 16-bit types. The `_u` kernel takes them as they are.
@@ -88,43 +97,106 @@ def kernel(name, ab, c, ta, tb, aligned=True):
     w("    %fz = arith.constant 0.0 : f32")
     w(f"    %zero = air.simdgroup_matrix_fill %fz : {acc}")
     ts = ", ".join([acc] * 16)
-    w("    %acc:16 = scf.for %kk = %i0 to %K step %i128")
+    # K in chunks of CHUNK (one trip for any K the libraries see): the SIMD-groups run independently, without a
+    # barrier per chunk. Measured on G14C (gemmbench, f16 and f32, llama shapes and 4096^3): chunks of 128 with a
+    # barrier (the earlier kernel) -> no barrier -4..-7%, chunks of 896 without barrier -7..-9%.
+    w(f"    %chunk = arith.constant {CHUNK} : index")
+    w("    %acc:16 = scf.for %kk = %i0 to %K8 step %chunk")
     w("        iter_args(" + ", ".join(f"%o{i}{j} = %zero" for i in range(4) for j in range(4)) + f") -> ({ts}) {{")
-    w("      gpu.barrier memfence []")
-    w("      %kk_end0 = arith.addi %kk, %i128 : index")
-    w("      %kk_end = arith.minui %kk_end0, %K : index")
-    w("      %in:16 = scf.for %k = %kk to %kk_end step %i8")
-    w("          iter_args(" + ", ".join(f"%a{i}{j} = %o{i}{j}" for i in range(4) for j in range(4))
-      + f") -> ({ts}) {{")
-    # With B transposed (and A not) in 16-bit, each A fragment is instead loaded just before its four products
-    # (agx_cost: hgemm _tb -9..-13% on G14G; G13G moves both ways, sgemm _tb loses).
-    a_late = tb and not ta and ab == "f16"
-    if not a_late:
-        for i in range(4):
-            idx = f"%k, {rows[i]}] transpose" if ta else f"{rows[i]}, %k]"
-            w(f"        %ma{i} = air.simdgroup_matrix_load %A[{idx} : {mem(ab)} -> {mab}")
-    tys = acc if ab == "f32" else f"{mab}, {acc}"
-    # With A transposed (and B not), each B fragment is loaded just before its four products: fewer fragments live at
-    # once (agx_cost at K = 256: -8% on G14G, -19% on G13G for agx_sgemm_tile64_ta); the other variants lose or
-    # move both ways with it, so they load all of B first.
-    interleave = ta and not tb
-    for j in range(4):
-        idx = f"{cols[j]}, %k] transpose" if tb else f"%k, {cols[j]}]"
-        w(f"        %mb{j} = air.simdgroup_matrix_load %B[{idx} : {mem(ab)} -> {mab}")
-        if interleave:
+    w("      %kk_end0 = arith.addi %kk, %chunk : index")
+    w("      %kk_end = arith.minui %kk_end0, %K8 : index")
+    prefetch = PREFETCH
+    if prefetch:
+        # Software pipelining: the fragments of step k + 8 are loaded while step k's products run; the last step
+        # loads its own again (clamped) instead of branching. The loop runs two steps per trip with the two
+        # fragment sets taking turns (double buffering): with one set carried, the prefetched fragments were
+        # copied into the carried registers at the end of each trip, and the copies waited for the loads.
+        w("      %kk_last = arith.subi %kk_end, %i8 : index")
+        def loads(k, pre, out):
             for i in range(4):
-                w(f"        %n{i}{j} = air.simdgroup_matrix_multiply_accumulate %ma{i}, %mb{j}, %a{i}{j} : {tys}")
-    if not interleave:
-        for i in range(4):
-            if a_late:
+                idx = f"{k}, {rows[i]}] transpose" if ta else f"{rows[i]}, {k}]"
+                w(f"      {pre}%{out}a{i} = air.simdgroup_matrix_load %A[{idx} : {mem(ab)} -> {mab}")
+            for j in range(4):
+                idx = f"{cols[j]}, {k}] transpose" if tb else f"{k}, {cols[j]}]"
+                w(f"      {pre}%{out}b{j} = air.simdgroup_matrix_load %B[{idx} : {mem(ab)} -> {mab}")
+        tys_p = f"{mab}, {acc}"
+        def products(fa, fb, accs, out, pre):
+            for i in range(4):
+                for j in range(4):
+                    w(f"      {pre}%{out}{i}{j} = air.simdgroup_matrix_multiply_accumulate {fa(i)}, {fb(j)}, "
+                      f"{accs(i, j)} : {tys_p}")
+        loads("%kk", "", "p")
+        frag = ", ".join([mab] * 8)
+        w("      %span = arith.subi %kk_end, %kk : index")
+        w("      %span16 = arith.andi %span, %m16 : index")
+        w("      %kk_end16 = arith.addi %kk, %span16 : index")
+        # The loop counts steps of 8 and each fragment index is (step clamped) * 8, so that the alignment of the
+        # fragment addresses is plain to LLVM (through the loop phis, umin and geps it is past the known-bits depth,
+        # and the vectorizer then keeps the two 16-bit elements of a lane as two loads)
+        w("      %s0 = arith.divui %kk, %i8 : index")
+        w("      %s_end = arith.divui %kk_end16, %i8 : index")
+        w("      %s_last = arith.divui %kk_last, %i8 : index")
+        w("      %in:24 = scf.for %s = %s0 to %s_end step %i2")
+        w("          iter_args(" + ", ".join(f"%a{i}{j} = %o{i}{j}" for i in range(4) for j in range(4))
+          + ", " + ", ".join(f"%ca{i} = %pa{i}" for i in range(4)) + ", " + ", ".join(f"%cb{j} = %pb{j}" for j in range(4))
+          + f") -> ({ts}, {frag}) {{")
+        w("        %sn0 = arith.addi %s, %i1 : index")
+        w("        %sn = arith.minui %sn0, %s_last : index")
+        w("        %kn = arith.muli %sn, %i8 : index")
+        loads("%kn", "  ", "n")
+        products(lambda i: f"%ca{i}", lambda j: f"%cb{j}", lambda i, j: f"%a{i}{j}", "p", "  ")
+        w("        %sm0 = arith.addi %s, %i2 : index")
+        w("        %sm = arith.minui %sm0, %s_last : index")
+        w("        %km = arith.muli %sm, %i8 : index")
+        loads("%km", "  ", "q")
+        products(lambda i: f"%na{i}", lambda j: f"%nb{j}", lambda i, j: f"%p{i}{j}", "n", "  ")
+        w("        scf.yield " + ", ".join(f"%n{i}{j}" for i in range(4) for j in range(4)) + ", "
+          + ", ".join(f"%qa{i}" for i in range(4)) + ", " + ", ".join(f"%qb{j}" for j in range(4)) + f" : {ts}, {frag}")
+        w("      }")
+        # an odd last step: the carried fragments are its own
+        w("      %odd = arith.cmpi ne, %span16, %span : index")
+        w(f"      %fin:16 = scf.if %odd -> ({ts}) {{")
+        products(lambda i: f"%in#{16 + i}", lambda j: f"%in#{20 + j}", lambda i, j: f"%in#{4 * i + j}", "r", "  ")
+        w("        scf.yield " + ", ".join(f"%r{i}{j}" for i in range(4) for j in range(4)) + f" : {ts}")
+        w("      } else {")
+        w("        scf.yield " + ", ".join(f"%in#{k}" for k in range(16)) + f" : {ts}")
+        w("      }")
+        w("      scf.yield " + ", ".join(f"%fin#{k}" for k in range(16)) + f" : {ts}")
+        w("    }")
+    else:
+      w("      %in:16 = scf.for %k = %kk to %kk_end step %i8")
+      w("          iter_args(" + ", ".join(f"%a{i}{j} = %o{i}{j}" for i in range(4) for j in range(4))
+        + f") -> ({ts}) {{")
+    if not prefetch:
+        # With B transposed (and A not) in 16-bit, each A fragment is instead loaded just before its four products
+        # (agx_cost: hgemm _tb -9..-13% on G14G; G13G moves both ways, sgemm _tb loses).
+        a_late = tb and not ta and ab == "f16"
+        if not a_late:
+            for i in range(4):
                 idx = f"%k, {rows[i]}] transpose" if ta else f"{rows[i]}, %k]"
                 w(f"        %ma{i} = air.simdgroup_matrix_load %A[{idx} : {mem(ab)} -> {mab}")
-            for j in range(4):
-                w(f"        %n{i}{j} = air.simdgroup_matrix_multiply_accumulate %ma{i}, %mb{j}, %a{i}{j} : {tys}")
-    w("        scf.yield " + ", ".join(f"%n{i}{j}" for i in range(4) for j in range(4)) + f" : {ts}")
-    w("      }")
-    w("      scf.yield " + ", ".join(f"%in#{k}" for k in range(16)) + f" : {ts}")
-    w("    }")
+        tys = acc if ab == "f32" else f"{mab}, {acc}"
+        # With A transposed (and B not), each B fragment is loaded just before its four products: fewer fragments live at
+        # once (agx_cost at K = 256: -8% on G14G, -19% on G13G for agx_sgemm_tile64_ta); the other variants lose or
+        # move both ways with it, so they load all of B first.
+        interleave = ta and not tb
+        for j in range(4):
+            idx = f"{cols[j]}, %k] transpose" if tb else f"%k, {cols[j]}]"
+            w(f"        %mb{j} = air.simdgroup_matrix_load %B[{idx} : {mem(ab)} -> {mab}")
+            if interleave:
+                for i in range(4):
+                    w(f"        %n{i}{j} = air.simdgroup_matrix_multiply_accumulate %ma{i}, %mb{j}, %a{i}{j} : {tys}")
+        if not interleave:
+            for i in range(4):
+                if a_late:
+                    idx = f"%k, {rows[i]}] transpose" if ta else f"{rows[i]}, %k]"
+                    w(f"        %ma{i} = air.simdgroup_matrix_load %A[{idx} : {mem(ab)} -> {mab}")
+                for j in range(4):
+                    w(f"        %n{i}{j} = air.simdgroup_matrix_multiply_accumulate %ma{i}, %mb{j}, %a{i}{j} : {tys}")
+        w("        scf.yield " + ", ".join(f"%n{i}{j}" for i in range(4) for j in range(4)) + f" : {ts}")
+        w("      }")
+        w("      scf.yield " + ", ".join(f"%in#{k}" for k in range(16)) + f" : {ts}")
+        w("    }")
     w("")
     w("    // C = alpha * acc + beta * C, C not read when beta is 0 (one branch for the tile).")
     w("    %no_c = arith.cmpf oeq, %beta, %fz : f32")

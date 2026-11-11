@@ -85,6 +85,8 @@ pub(crate) struct Driver {
     /// An error that makes the context unusable until it is destroyed, as in CUDA: a failed device assert
     /// (CUDA_ERROR_ASSERT). Every call returns it meanwhile.
     sticky: Option<CUerror>,
+    /// Scratch allocations the stack helper refused so far (reported once each, `after_sync`).
+    scratch_refused: u32,
     /// The launches whose commands have not been seen to finish, oldest first: what a failed command was.
     launches: std::collections::VecDeque<LaunchRecord>,
     /// Per (module, kernel) built in checked mode, its first launch since the last synchronisation and how many
@@ -138,6 +140,9 @@ struct LazySource {
     kernels: std::collections::HashSet<String>,
     compiled: HashMap<String, usize>,
     pending: HashMap<String, CompileResultSlot>,
+    /// The kernels the precompile workers have not started (precompile_kernels): one asked for first leaves the
+    /// queue and compiles on the asking thread
+    queue: PrecompileQueue,
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Bytes of the module's text outside its kernels (functions, globals: what every kernel's own text for
     /// specialization keeps), measured once at the first kernel loaded on request
@@ -184,6 +189,26 @@ type CompileResultSlot = std::sync::Arc<(
     std::sync::Condvar,
 )>;
 
+thread_local! {
+    /// A thread compiling kernels ahead of their use (precompile_kernels): its zoc runs at a low CPU priority (the
+    /// thread's nice value, which a child inherits), and not through the shared zoc server, so that the compilations
+    /// a launch waits for get the cores first. llama.cpp loads five 5-10 MB modules of 64-185 kernels and uses a few of
+    /// each. Cold llama-bench (M2 Max): 184 s when a kernel asked for waited for the workers to reach it in their
+    /// queue, 168-174 s now that it leaves the queue (LazySource::queue), 163 s with no precompilation; Blender Cycles,
+    /// which uses them all: cold 1-sample render 40.7 s (90.2 s without precompilation, warm 1.3 s).
+    static BACKGROUND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The calling thread's nice value raised to 10 (Linux: setpriority of PRIO_PROCESS 0 is the calling thread's).
+fn lower_this_thread_priority() {
+    extern "C" {
+        fn setpriority(which: i32, who: u32, prio: i32) -> i32;
+    }
+    unsafe { setpriority(0, 0, 10) };
+}
+
+type PrecompileQueue = std::sync::Arc<Mutex<std::collections::VecDeque<String>>>;
+
 fn precompile_kernels(
     ptx: std::sync::Arc<str>,
     portable: Option<std::sync::Arc<PortableAir>>,
@@ -191,7 +216,7 @@ fn precompile_kernels(
     cpu: String,
     workers: usize,
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> HashMap<String, CompileResultSlot> {
+) -> (HashMap<String, CompileResultSlot>, PrecompileQueue) {
     let pending: HashMap<_, _> = names
         .iter()
         .map(|name| {
@@ -213,6 +238,9 @@ fn precompile_kernels(
             cancelled.clone(),
         );
         std::thread::spawn(move || loop {
+            if !BACKGROUND.with(|b| b.replace(true)) {
+                lower_this_thread_priority();
+            }
             if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
@@ -225,7 +253,7 @@ fn precompile_kernels(
             ready.notify_all();
         });
     }
-    pending
+    (pending, queue)
 }
 
 /// (module, kernel, the bytes of its scalar arguments with their sizes and the equality classes of 8-byte
@@ -288,6 +316,10 @@ fn submit_batch(queue: &mut Queue, mut b: Batch) -> Result<(), CUerror> {
         // (with ZLUDA_AGX_HAZARD_BARRIERS the last dispatch has no barrier of its own)
         if hazard_barriers() {
             b.words.extend_from_slice(&agx_runtime::CDM_BARRIER);
+        } else if b.words.len() >= 4 && agx_runtime::is_order_barrier(&b.words[b.words.len() - 4..]) {
+            // the command's last barrier stays the full one (what a command of one dispatch has)
+            let at = b.words.len() - 4;
+            b.words[at..].copy_from_slice(&agx_runtime::CDM_BARRIER);
         }
         queue.submit_words(&b.words, None, None, &b.waits).map_err(from_io)?;
     }
@@ -296,7 +328,7 @@ fn submit_batch(queue: &mut Queue, mut b: Batch) -> Result<(), CUerror> {
 
 /// Kernel launches of a graph gathered into the control stream of one compute command: each dispatch followed by
 /// the barrier after a launch (the dispatches run in order and see each other's stores, as consecutive commands of a
-/// queue do), submitted at the end of the graph, before any other operation and every `MAX_BATCH` launches. One
+/// queue do), submitted at the end of the graph, before any other operation and every `max_batch()` launches. One
 /// command per launch costs ~20-30 us of host time (the submit ioctl) and ~15-20 us between commands on the GPU;
 /// gathered, the launches of a graph cost a few us each.
 struct Batch {
@@ -317,7 +349,11 @@ fn hazard_barriers() -> bool {
     *ON.get_or_init(|| std::env::var("ZLUDA_AGX_HAZARD_BARRIERS").is_ok_and(|v| v == "1"))
 }
 
-const MAX_BATCH: u32 = 64;
+/// Launches per batched command (`ZLUDA_AGX_MAX_BATCH`, default 64).
+fn max_batch() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("ZLUDA_AGX_MAX_BATCH").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(64))
+}
 
 /// A graph's kernel launches go into one command (`Batch`), submitted by the end of cuGraphLaunch;
 /// ZLUDA_AGX_GRAPH_BATCH=0 makes one command per launch. Gathered: llama.cpp prompt processing 335 -> 413 t/s,
@@ -748,7 +784,7 @@ impl Driver {
             match r {
                 Ok((fence, _, _)) => {
                     b.count += 1;
-                    if b.count >= MAX_BATCH {
+                    if b.count >= max_batch() {
                         submit_batch(queue, batch.take().unwrap())?;
                     }
                     fence
@@ -1553,6 +1589,7 @@ fn new_driver() -> Result<Driver, CUerror> {
         host_allocs: HashMap::new(),
         managed: Default::default(),
         sticky: None,
+        scratch_refused: 0,
         launches: Default::default(),
         checked_launches: Default::default(),
         captured_launches: Default::default(),
@@ -1715,6 +1752,21 @@ impl Driver {
             }
         }
         self.checked_launches.clear();
+        // The scratch buffer has an allocation for as many SIMD-groups per core as a core can hold of the kernels
+        // that use it (agx_runtime Vm::scratch); a group the helper refused would run without its stack.
+        // AGX_SCRATCH_STATS=1 prints the counters.
+        if let Some((most, refused, groups)) = self.ctx.vm.scratch_counters() {
+            if std::env::var_os("AGX_SCRATCH_STATS").is_some() {
+                eprintln!("[zluda_agx] scratch: {groups} SIMD-group allocations per core, at most {most} held at once, {refused} refused");
+            }
+            if refused > self.scratch_refused {
+                self.scratch_refused = refused;
+                eprintln!("zluda_agx: the stack helper refused {refused} SIMD-groups a stack ({groups} per core, {most} held)");
+                if self.sticky.is_none() {
+                    self.sticky = Some(CUerror::LAUNCH_FAILED);
+                }
+            }
+        }
         sticky_after_sync(&mut self.sticky, failed)
     }
 
@@ -1851,8 +1903,11 @@ const LARGE_MODULE_BYTES: usize = 4 << 20;
 /// A kernel of a large module is specialized at launch (`specialized`) when its own PTX, with the module's functions
 /// and globals, is at most this size.
 const SPEC_KERNEL_BYTES: usize = 1 << 20;
-/// The stack per thread a large module is first compiled with.
-const LARGE_MODULE_STACK_TRY: u32 = 16384;
+/// The stack per thread a large module is first compiled with. The backend reserves 40 bytes more, rounded up to 16
+/// (AGXFrameLowering::getStackAdjustUnits): from 16384, 16432 bytes took a third 8 KiB block of the scratch layout
+/// (`agx_runtime::scratch::Layout`, 24 KiB per thread: Blender Cycles' scratch 3.7 GB, 0.4 s of every run to
+/// allocate and free), from 16336 exactly 4096 words, two blocks. Cycles' frames need 8-9 KiB.
+const LARGE_MODULE_STACK_TRY: u32 = 16336;
 
 /// Compiles PTX for `cpu` with zoc, through the compilation cache.
 pub(crate) fn compile_ptx(ptx: &[u8], cpu: &str) -> Result<(Vec<u8>, String), String> {
@@ -1919,6 +1974,16 @@ fn compile_or_cached(
     if f32_textures {
         options.push("strict-fp-f32-textures");
     }
+    // (the stack a large module is first compiled with changes its kernels' stack size)
+    let large = sources.iter().map(|s| s.len()).sum::<usize>() > LARGE_MODULE_BYTES;
+    let stack_try = std::env::var("ZLUDA_AGX_STACK_TRY")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(LARGE_MODULE_STACK_TRY);
+    let stack_try_option = format!("stack-try={stack_try}");
+    if large {
+        options.push(&stack_try_option);
+    }
     let lineinfo = agx_lineinfo() && !checked;
     let fast_mma = agx_fast_mma();
     if fast_mma {
@@ -1962,7 +2027,7 @@ fn compile_or_cached(
     let compile = || -> Result<(Vec<u8>, String), String> {
         compiled.set(true);
         if crate::log_enabled() {
-            eprintln!("[zluda_agx] invoking zoc: PTX modules={}, bytes={}, target={cpu}, ", sources.len(), sources.iter().map(|s| s.len()).sum::<usize>());
+            eprintln!("[zluda_agx] invoking zoc: PTX modules={}, bytes={}, target={cpu}, kernel={}", sources.len(), sources.iter().map(|s| s.len()).sum::<usize>(), kernel.map_or("-", |(k, _)| k));
         }
         // (the AGX object alone: no AIR for Metal, which nothing on Asahi reads)
         let mut args: Vec<String> = ["--target", "air", "--arch", cpu, "--object-only", "--agx-only"].iter().map(|a| a.to_string()).collect();
@@ -1973,7 +2038,6 @@ fn compile_or_cached(
         // a large module (Blender Cycles: 13 MB of PTX, 75 kernels) a kernel at a time, with called functions kept
         // as calls: fully inlined, Cycles' largest kernel alone did not fit in 8 GB (llvm_zluda AIR_EXPERIMENTS.md).
         // Its own zoc: the options are LLVM's, for the whole process.
-        let large = sources.iter().map(|s| s.len()).sum::<usize>() > LARGE_MODULE_BYTES;
         let served = if large { None } else { zoc_server::compile(&zoc, &args, sources) };
         if let Some(result) = served {
             if crate::log_enabled() {
@@ -2035,10 +2099,6 @@ fn compile_or_cached(
         // Max whether or not it is touched, and the frames of called functions are only known once compiled. So a
         // large module is first compiled with a small reservation, which the backend refuses if the frames do not fit,
         // and then with all that is addressable. ZLUDA_AGX_STACK_TRY overrides the first (0: not tried).
-        let stack_try = std::env::var("ZLUDA_AGX_STACK_TRY")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(LARGE_MODULE_STACK_TRY);
         let mut out = run((large && stack_try != 0).then_some(stack_try))?;
         if large && stack_try != 0 && !out.status.success() {
             if crate::log_enabled() {
@@ -2047,7 +2107,7 @@ fn compile_or_cached(
             out = run(None)?;
         }
         if crate::log_enabled() {
-            eprintln!("[zluda_agx] zoc finished: {}, elapsed={:.3}s", out.status, started.elapsed().as_secs_f64());
+            eprintln!("[zluda_agx] zoc finished: {}, elapsed={:.3}s, bytes={}, kernel={}", out.status, started.elapsed().as_secs_f64(), sources.iter().map(|s| s.len()).sum::<usize>(), kernel.map_or("-", |(k, _)| k));
         }
         if let (Some(out_path), Some((_, portable)), true) = (&portable_out, kernel, out.status.success()) {
             let (mut flag_tmp, mut flag) = (out_path.as_os_str().to_owned(), portable.as_os_str().to_owned());
@@ -2110,7 +2170,7 @@ mod zoc_server {
 
     /// The object and the assembly from the server, or None when the caller should run zoc itself.
     pub(super) fn compile(zoc: &Path, args: &[String], sources: &[&[u8]]) -> Option<Result<(Vec<u8>, String), String>> {
-        if std::env::var("ZLUDA_AGX_ZOC_SERVER").as_deref() == Ok("0") {
+        if std::env::var("ZLUDA_AGX_ZOC_SERVER").as_deref() == Ok("0") || super::BACKGROUND.with(|b| b.get()) {
             return None;
         }
         let mut guard = SERVER.try_lock().ok()?;
@@ -2359,12 +2419,23 @@ pub(crate) unsafe fn cuDeviceTotalMem_v2(bytes: *mut usize, dev: CUdevice) -> CU
 /// and an application that ships a binary per architecture picks it from this number and fails to load it: 8.0 is a
 /// data-center architecture that those for graphics cards leave out (Blender's with 8.6, 8.9 and 12.0), which then
 /// take their PTX.
-const CC: (c_int, c_int) = (8, 0);
+const CC_DEFAULT: (c_int, c_int) = (8, 0);
+
+/// The reported compute capability: CC_DEFAULT, or `ZLUDA_AGX_CC=major.minor` (experiments only).
+fn cc() -> (c_int, c_int) {
+    static CC: std::sync::OnceLock<(c_int, c_int)> = std::sync::OnceLock::new();
+    *CC.get_or_init(|| {
+        std::env::var("ZLUDA_AGX_CC").ok().and_then(|v| {
+            let (a, b) = v.split_once('.')?;
+            Some((a.parse().ok()?, b.parse().ok()?))
+        }).unwrap_or(CC_DEFAULT)
+    })
+}
 
 pub(crate) unsafe fn cuDeviceComputeCapability(major: *mut c_int, minor: *mut c_int, dev: CUdevice) -> CUresult {
     check_device(dev)?;
-    out(major, CC.0)?;
-    out(minor, CC.1)
+    out(major, cc().0)?;
+    out(minor, cc().1)
 }
 
 pub(crate) unsafe fn cuDeviceGetAttribute(pi: *mut c_int, attrib: CUdevice_attribute, dev: CUdevice) -> CUresult {
@@ -2390,8 +2461,8 @@ pub(crate) unsafe fn cuDeviceGetAttribute(pi: *mut c_int, attrib: CUdevice_attri
             // a core runs up to 96 SIMD-groups (G14 occupancy at the smallest register allocation)
             A::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR => 96 * 32,
             A::CU_DEVICE_ATTRIBUTE_MAX_BLOCKS_PER_MULTIPROCESSOR => 32,
-            A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR => CC.0,
-            A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR => CC.1,
+            A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR => cc().0,
+            A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR => cc().1,
             A::CU_DEVICE_ATTRIBUTE_INTEGRATED | A::CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING => 1,
             // managed and mapped host memory are GPU allocations mapped at their GPU address
             A::CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY | A::CU_DEVICE_ATTRIBUTE_CAN_MAP_HOST_MEMORY => 1,
@@ -2646,7 +2717,31 @@ unsafe fn load_module_data(d: &mut Driver, bytes: *const u8) -> Result<usize, CU
         None
     };
     // (a large module's kernels from its portable AIR, the front end once: compile_ptx_kernel)
-    let portable = lazy.as_ref().filter(|_| image.len() > LARGE_MODULE_BYTES).and_then(|_| PortableAir::new()).map(std::sync::Arc::new);
+    // Only where the kernels share functions (Blender Cycles): each kernel from its own PTX would run the front end
+    // over all of them again. A module of independent kernels (llama.cpp's: 5-10 MB, 64-185 kernels, a few used)
+    // compiles each kernel from its own PTX instead, the whole module's front end (about 25 s each) off the path of
+    // the first launch: cold llama-bench pp512 168-174 s, 1 GB -> 99 s, 232 MB; warm 10.5 -> 1.8 s, the same pp512.
+    // ZLUDA_AGX_PORTABLE=0 / 1: never / always for a large module.
+    let portable_env = std::env::var("ZLUDA_AGX_PORTABLE").ok();
+    let portable = lazy
+        .as_ref()
+        .filter(|(text, _)| {
+            image.len() > LARGE_MODULE_BYTES
+                && match portable_env.as_deref() {
+                    Some("0") => false,
+                    Some("1") => true,
+                    // (and only where those functions are too large to compile again with each kernel: the
+                    // limit of a kernel's own PTX for launch-time specialization, SPEC_KERNEL_BYTES. llama.cpp's
+                    // flash attention modules, 8.7 and 12.2 MB with 457 KB of functions, compiled their first
+                    // kernels in 43 and 53 s through the portable AIR)
+                    _ => {
+                        crate::specialize::defines_shared_functions(text)
+                            && crate::specialize::non_entry_bytes(text) > SPEC_KERNEL_BYTES
+                    }
+                }
+        })
+        .and_then(|_| PortableAir::new())
+        .map(std::sync::Arc::new);
     let initial_ptx = lazy
         .as_ref()
         .filter(|_| portable.is_none())
@@ -2738,10 +2833,10 @@ unsafe fn load_module_data(d: &mut Driver, bytes: *const u8) -> Result<usize, CU
             .unwrap_or(default_workers)
             .min(16);
         let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let pending = if workers > 0 {
+        let (pending, queue) = if workers > 0 {
             precompile_kernels(ptx.clone(), portable.clone(), &names[1..], cpu, workers, cancelled.clone())
         } else {
-            HashMap::new()
+            (HashMap::new(), Default::default())
         };
         d.lazy_sources.insert(h, LazySource {
             ptx,
@@ -2749,6 +2844,7 @@ unsafe fn load_module_data(d: &mut Driver, bytes: *const u8) -> Result<usize, CU
             kernels: names.into_iter().collect(),
             compiled: HashMap::new(),
             pending,
+            queue,
             cancelled,
             shared_bytes: None,
         });
@@ -2958,7 +3054,12 @@ fn module_function(d: &mut Driver, parent: usize, name: &str) -> Result<usize, C
                 let start = Instant::now();
                 let ptx = source.ptx.clone();
                 let portable = source.portable.clone();
-                let pending = source.pending.get(&name).cloned();
+                // (a kernel that no precompile worker has started: out of their queue, compiled here)
+                let unstarted = {
+                    let mut queue = source.queue.lock().unwrap_or_else(|e| e.into_inner());
+                    queue.iter().position(|k| *k == name).and_then(|i| queue.remove(i)).is_some()
+                };
+                let pending = source.pending.get(&name).cloned().filter(|_| !unstarted);
                 let module = if let Some(slot) = pending {
                     let (lock, ready) = &*slot;
                     let mut result = lock.lock().unwrap_or_else(|e| e.into_inner());

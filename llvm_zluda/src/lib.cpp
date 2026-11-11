@@ -6027,10 +6027,51 @@ static bool zludaSinkMmaMarker(CallInst *X, LoopInfo &LI, DominatorTree &DT)
     return true;
 }
 
+// __zluda_ptx_impl_agx_exact_fptosi(F): the fptosi of an integer mma's sum F, an exact integer in f32. A sitofp of it
+// to float is F (to another floating-point type, F extended or rounded); the calls become plain fptosi.
+static int zludaResolveExactFptosi(Module *M)
+{
+    int folded = 0;
+    // ZLUDA_AGX_EXACT_FPTOSI=0: the calls only become fptosi (experiments)
+    const char *Env = getenv("ZLUDA_AGX_EXACT_FPTOSI");
+    bool Fold = !(Env && Env[0] == '0');
+    for (Function &F : make_early_inc_range(*M))
+    {
+        if (!F.getName().starts_with("__zluda_ptx_impl_agx_exact_fptosi") || F.isDeclaration())
+            continue;
+        SmallVector<CallInst *, 64> Calls;
+        for (User *U : F.users())
+            if (auto *C = dyn_cast<CallInst>(U); C && C->getCalledFunction() == &F && C->arg_size() == 1)
+                Calls.push_back(C);
+        for (CallInst *C : Calls)
+        {
+            Value *X = C->getArgOperand(0);
+            for (User *U : make_early_inc_range(C->users()))
+            {
+                auto *S = dyn_cast<SIToFPInst>(U);
+                if (!Fold || !S || S->getOperand(0) != C)
+                    continue;
+                IRBuilder<> B(S);
+                Value *R = B.CreateFPCast(X, S->getType());
+                S->replaceAllUsesWith(R);
+                S->eraseFromParent();
+                folded++;
+            }
+            IRBuilder<> B(C);
+            Value *I = B.CreateFPToSI(X, C->getType());
+            C->replaceAllUsesWith(I);
+            C->eraseFromParent();
+        }
+        if (F.use_empty())
+            F.eraseFromParent();
+    }
+    return folded;
+}
+
 int LLVMZludaAgxCancelMmaLayouts(LLVMModuleRef MRef)
 {
     Module *M = unwrap(MRef);
-    int cancelled = 0;
+    int cancelled = zludaResolveExactFptosi(M);
     SmallVector<Function *, 8> Markers;
     for (Function &F : *M)
     {

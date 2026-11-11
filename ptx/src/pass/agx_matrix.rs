@@ -512,6 +512,11 @@ declare i32 @llvm.agx.quad.shuffle.i32(i32, i32)
 declare i64 @__zluda_ptx_impl_agx_round_pack(i1, i64, i1, i32, i32, i32)
 attributes #0 = { alwaysinline convergent nounwind }
 attributes #1 = { noinline convergent nounwind willreturn memory(none) }
+attributes #2 = { noinline nounwind willreturn memory(none) }
+define internal i32 @__zluda_ptx_impl_agx_exact_fptosi(float %x) #2 {
+  %r = fptosi float %x to i32
+  ret i32 %r
+}
 "#;
 
 fn define(
@@ -1851,7 +1856,9 @@ fn finish_d(ir: &mut Ir, d: &ast::MmaDetails, int: bool, c: &[String], j: u32, v
         ir.cast("zext", "i16", &h, "i32")
     } else if int {
         let f = ir.cast("bitcast", "i32", value, "float");
-        let v = ir.cast("fptosi", "float", &f, "i32");
+        // the unit's sum is an exact integer (is_fast_int): LLVMZludaAgxCancelMmaLayouts takes sitofp of this
+        // conversion as the float itself (ggml's MMQ converts each D with C = 0 back to float)
+        let v = ir.def(&format!("call i32 @__zluda_ptx_impl_agx_exact_fptosi(float {f})"));
         let cj = c.get(j as usize).ok_or_else(|| todo("mma fragment size"))?;
         if d.satfinite {
             let v64 = ir.cast("sext", "i32", &v, "i64");

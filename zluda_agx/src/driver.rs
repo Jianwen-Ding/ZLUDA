@@ -326,7 +326,7 @@ fn submit_batch(queue: &mut Queue, mut b: Batch) -> Result<(), CUerror> {
 
 /// Kernel launches of a graph gathered into the control stream of one compute command: each dispatch followed by
 /// the barrier after a launch (the dispatches run in order and see each other's stores, as consecutive commands of a
-/// queue do), submitted at the end of the graph, before any other operation and every `MAX_BATCH` launches. One
+/// queue do), submitted at the end of the graph, before any other operation and every `max_batch()` launches. One
 /// command per launch costs ~20-30 us of host time (the submit ioctl) and ~15-20 us between commands on the GPU;
 /// gathered, the launches of a graph cost a few us each.
 struct Batch {
@@ -347,7 +347,11 @@ fn hazard_barriers() -> bool {
     *ON.get_or_init(|| std::env::var("ZLUDA_AGX_HAZARD_BARRIERS").is_ok_and(|v| v == "1"))
 }
 
-const MAX_BATCH: u32 = 64;
+/// Launches per batched command (`ZLUDA_AGX_MAX_BATCH`, default 64).
+fn max_batch() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("ZLUDA_AGX_MAX_BATCH").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(64))
+}
 
 /// A graph's kernel launches go into one command (`Batch`), submitted by the end of cuGraphLaunch;
 /// ZLUDA_AGX_GRAPH_BATCH=0 makes one command per launch. Gathered: llama.cpp prompt processing 335 -> 413 t/s,
@@ -778,7 +782,7 @@ impl Driver {
             match r {
                 Ok((fence, _, _)) => {
                     b.count += 1;
-                    if b.count >= MAX_BATCH {
+                    if b.count >= max_batch() {
                         submit_batch(queue, batch.take().unwrap())?;
                     }
                     fence
@@ -2389,12 +2393,23 @@ pub(crate) unsafe fn cuDeviceTotalMem_v2(bytes: *mut usize, dev: CUdevice) -> CU
 /// and an application that ships a binary per architecture picks it from this number and fails to load it: 8.0 is a
 /// data-center architecture that those for graphics cards leave out (Blender's with 8.6, 8.9 and 12.0), which then
 /// take their PTX.
-const CC: (c_int, c_int) = (8, 0);
+const CC_DEFAULT: (c_int, c_int) = (8, 0);
+
+/// The reported compute capability: CC_DEFAULT, or `ZLUDA_AGX_CC=major.minor` (experiments only).
+fn cc() -> (c_int, c_int) {
+    static CC: std::sync::OnceLock<(c_int, c_int)> = std::sync::OnceLock::new();
+    *CC.get_or_init(|| {
+        std::env::var("ZLUDA_AGX_CC").ok().and_then(|v| {
+            let (a, b) = v.split_once('.')?;
+            Some((a.parse().ok()?, b.parse().ok()?))
+        }).unwrap_or(CC_DEFAULT)
+    })
+}
 
 pub(crate) unsafe fn cuDeviceComputeCapability(major: *mut c_int, minor: *mut c_int, dev: CUdevice) -> CUresult {
     check_device(dev)?;
-    out(major, CC.0)?;
-    out(minor, CC.1)
+    out(major, cc().0)?;
+    out(minor, cc().1)
 }
 
 pub(crate) unsafe fn cuDeviceGetAttribute(pi: *mut c_int, attrib: CUdevice_attribute, dev: CUdevice) -> CUresult {
@@ -2420,8 +2435,8 @@ pub(crate) unsafe fn cuDeviceGetAttribute(pi: *mut c_int, attrib: CUdevice_attri
             // a core runs up to 96 SIMD-groups (G14 occupancy at the smallest register allocation)
             A::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR => 96 * 32,
             A::CU_DEVICE_ATTRIBUTE_MAX_BLOCKS_PER_MULTIPROCESSOR => 32,
-            A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR => CC.0,
-            A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR => CC.1,
+            A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR => cc().0,
+            A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR => cc().1,
             A::CU_DEVICE_ATTRIBUTE_INTEGRATED | A::CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING => 1,
             // managed and mapped host memory are GPU allocations mapped at their GPU address
             A::CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY | A::CU_DEVICE_ATTRIBUTE_CAN_MAP_HOST_MEMORY => 1,

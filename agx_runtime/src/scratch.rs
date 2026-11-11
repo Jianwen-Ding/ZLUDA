@@ -20,8 +20,11 @@
 /// Mesa's `libagx_helper`, ending in `stop` and its `trap` padding. It is position independent.
 pub const HELPER: &[u8] = include_bytes!("data/libagx_helper.bin");
 
-/// SIMD-groups per core with an allocation: Mesa's value, the only one measured (the helper refuses a group when a
-/// core has none left, with an effect on the shader that is not known).
+/// SIMD-groups per core with an allocation at most: Mesa's value (the helper refuses a group when a core has none
+/// left, with an effect on the shader that is not known). A buffer needs only as many as the SIMD-groups a core can
+/// hold of the kernels that use it (`Vm::scratch`): a core holds at most 96, fewer of a kernel with more registers,
+/// and resident groups of several kernels never outnumber the largest of their counts (each group takes at least
+/// 1 / count of the register file).
 pub const SUBGROUPS: u32 = 128;
 
 const HEADER_BYTES: u64 = 8 + 128 * 88;
@@ -77,6 +80,8 @@ pub struct Buffer {
     pub align: u64,
     /// Offset of the blocks; the bytes before it are `header`.
     pub blocks_offset: u64,
+    /// SIMD-groups per core with an allocation (1 ..= `SUBGROUPS`).
+    pub subgroups: u32,
 }
 
 /// The present cores, as header entries (`cluster * next_pow2(cores_per_cluster) + core`).
@@ -95,13 +100,15 @@ pub fn core_entries(core_masks: &[u64], clusters: u32, cores_per_cluster: u32) -
 }
 
 impl Buffer {
-    pub fn new(layout: Layout, cores: usize, page: u64) -> Buffer {
+    /// The buffer of `subgroups` allocations per core (clamped to 1 ..= `SUBGROUPS`) for `cores` cores.
+    pub fn new(layout: Layout, cores: usize, subgroups: u32, page: u64) -> Buffer {
+        let subgroups = subgroups.clamp(1, SUBGROUPS);
         let block = layout.block_bytes();
-        let blocks_offset = (HEADER_BYTES + SUBGROUPS as u64 * 16 * cores as u64).next_multiple_of(block);
-        let per_core = block * layout.blocks as u64 * SUBGROUPS as u64;
+        let blocks_offset = (HEADER_BYTES + subgroups as u64 * 16 * cores as u64).next_multiple_of(block);
+        let per_core = block * layout.blocks as u64 * subgroups as u64;
         let align = block.max(page);
         let size = (blocks_offset + per_core * cores as u64).next_multiple_of(align);
-        Buffer { layout, size, align, blocks_offset }
+        Buffer { layout, size, align, blocks_offset, subgroups }
     }
 
     /// The header and block lists of the buffer at GPU address `va`, for the cores `entries` (`core_entries`).
@@ -109,13 +116,13 @@ impl Buffer {
         let l = self.layout;
         let block = l.block_bytes();
         let mut h = vec![0u8; self.blocks_offset as usize];
-        h[0..4].copy_from_slice(&SUBGROUPS.to_le_bytes());
+        h[0..4].copy_from_slice(&self.subgroups.to_le_bytes());
         let mut list = HEADER_BYTES;
         let mut blocks = va + self.blocks_offset;
         for &id in entries {
             let e = (8 + id as u64 * CORE_ENTRY_BYTES) as usize;
             h[e..e + 8].copy_from_slice(&(va + list).to_le_bytes());
-            for _ in 0..SUBGROUPS {
+            for _ in 0..self.subgroups {
                 let base = (blocks >> 8) as u32;
                 let stride = (block >> 8) as u32;
                 let at = list as usize;
@@ -163,8 +170,25 @@ mod tests {
     #[test]
     fn sizes_match_the_measured_runs() {
         // 57 MiB and 912 MiB on the 38 cores of the M2 Max
-        assert_eq!(Buffer::new(Layout::new(80), 38, 16384).size >> 20, 57);
-        assert_eq!(Buffer::new(Layout::new(1036), 38, 16384).size >> 20, 912);
+        assert_eq!(Buffer::new(Layout::new(80), 38, SUBGROUPS, 16384).size >> 20, 57);
+        assert_eq!(Buffer::new(Layout::new(1036), 38, SUBGROUPS, 16384).size >> 20, 912);
+    }
+
+    #[test]
+    fn fewer_subgroups_make_a_smaller_buffer() {
+        // Blender Cycles' kernels: 16 KiB of stack, 22 SIMD-groups per core (72 registers)
+        let full = Buffer::new(Layout::new(4096), 38, SUBGROUPS, 16384);
+        let fit = Buffer::new(Layout::new(4096), 38, 22, 16384);
+        assert_eq!((full.size >> 20, fit.size >> 20), (2432, 418));
+        let masks = [0x3ff, 0x1ff, 0x1ff, 0x3ff];
+        let entries = core_entries(&masks, 4, 10);
+        let h = fit.header(0x11_4000_0000, &entries);
+        assert_eq!(u32::from_le_bytes(h[0..4].try_into().unwrap()), 22);
+        // each core's block list: 22 entries, then the next core's
+        let list = |id: u32| u64::from_le_bytes(h[(8 + id as u64 * CORE_ENTRY_BYTES) as usize..][..8].try_into().unwrap());
+        assert_eq!(list(entries[1]) - list(entries[0]), 22 * 16);
+        assert_eq!(Buffer::new(Layout::new(4096), 38, 0, 16384).subgroups, 1);
+        assert_eq!(Buffer::new(Layout::new(4096), 38, 500, 16384).subgroups, SUBGROUPS);
     }
 
     #[test]
@@ -175,7 +199,7 @@ mod tests {
         let masks = [0x3ff, 0x1ff, 0x1ff, 0x3ff];
         let entries = core_entries(&masks, 4, 10);
         assert_eq!(entries.len(), 38);
-        let b = Buffer::new(Layout::new(80), entries.len(), 16384);
+        let b = Buffer::new(Layout::new(80), entries.len(), SUBGROUPS, 16384);
         let mut h = b.header(0x11_4000_0000, &entries);
         assert_eq!(h.len(), golden.len());
         let mut g = golden.to_vec();

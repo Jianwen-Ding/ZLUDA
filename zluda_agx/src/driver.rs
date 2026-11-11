@@ -85,6 +85,8 @@ pub(crate) struct Driver {
     /// An error that makes the context unusable until it is destroyed, as in CUDA: a failed device assert
     /// (CUDA_ERROR_ASSERT). Every call returns it meanwhile.
     sticky: Option<CUerror>,
+    /// Scratch allocations the stack helper refused so far (reported once each, `after_sync`).
+    scratch_refused: u32,
     /// The launches whose commands have not been seen to finish, oldest first: what a failed command was.
     launches: std::collections::VecDeque<LaunchRecord>,
     /// Per (module, kernel) built in checked mode, its first launch since the last synchronisation and how many
@@ -1587,6 +1589,7 @@ fn new_driver() -> Result<Driver, CUerror> {
         host_allocs: HashMap::new(),
         managed: Default::default(),
         sticky: None,
+        scratch_refused: 0,
         launches: Default::default(),
         checked_launches: Default::default(),
         captured_launches: Default::default(),
@@ -1749,6 +1752,21 @@ impl Driver {
             }
         }
         self.checked_launches.clear();
+        // The scratch buffer has an allocation for as many SIMD-groups per core as a core can hold of the kernels
+        // that use it (agx_runtime Vm::scratch); a group the helper refused would run without its stack.
+        // AGX_SCRATCH_STATS=1 prints the counters.
+        if let Some((most, refused, groups)) = self.ctx.vm.scratch_counters() {
+            if std::env::var_os("AGX_SCRATCH_STATS").is_some() {
+                eprintln!("[zluda_agx] scratch: {groups} SIMD-group allocations per core, at most {most} held at once, {refused} refused");
+            }
+            if refused > self.scratch_refused {
+                self.scratch_refused = refused;
+                eprintln!("zluda_agx: the stack helper refused {refused} SIMD-groups a stack ({groups} per core, {most} held)");
+                if self.sticky.is_none() {
+                    self.sticky = Some(CUerror::LAUNCH_FAILED);
+                }
+            }
+        }
         sticky_after_sync(&mut self.sticky, failed)
     }
 
@@ -1885,8 +1903,11 @@ const LARGE_MODULE_BYTES: usize = 4 << 20;
 /// A kernel of a large module is specialized at launch (`specialized`) when its own PTX, with the module's functions
 /// and globals, is at most this size.
 const SPEC_KERNEL_BYTES: usize = 1 << 20;
-/// The stack per thread a large module is first compiled with.
-const LARGE_MODULE_STACK_TRY: u32 = 16384;
+/// The stack per thread a large module is first compiled with. The backend reserves 40 bytes more, rounded up to 16
+/// (AGXFrameLowering::getStackAdjustUnits): from 16384, 16432 bytes took a third 8 KiB block of the scratch layout
+/// (`agx_runtime::scratch::Layout`, 24 KiB per thread: Blender Cycles' scratch 3.7 GB, 0.4 s of every run to
+/// allocate and free), from 16336 exactly 4096 words, two blocks. Cycles' frames need 8-9 KiB.
+const LARGE_MODULE_STACK_TRY: u32 = 16336;
 
 /// Compiles PTX for `cpu` with zoc, through the compilation cache.
 pub(crate) fn compile_ptx(ptx: &[u8], cpu: &str) -> Result<(Vec<u8>, String), String> {
@@ -1953,6 +1974,16 @@ fn compile_or_cached(
     if f32_textures {
         options.push("strict-fp-f32-textures");
     }
+    // (the stack a large module is first compiled with changes its kernels' stack size)
+    let large = sources.iter().map(|s| s.len()).sum::<usize>() > LARGE_MODULE_BYTES;
+    let stack_try = std::env::var("ZLUDA_AGX_STACK_TRY")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(LARGE_MODULE_STACK_TRY);
+    let stack_try_option = format!("stack-try={stack_try}");
+    if large {
+        options.push(&stack_try_option);
+    }
     let lineinfo = agx_lineinfo() && !checked;
     let fast_mma = agx_fast_mma();
     if fast_mma {
@@ -2007,7 +2038,6 @@ fn compile_or_cached(
         // a large module (Blender Cycles: 13 MB of PTX, 75 kernels) a kernel at a time, with called functions kept
         // as calls: fully inlined, Cycles' largest kernel alone did not fit in 8 GB (llvm_zluda AIR_EXPERIMENTS.md).
         // Its own zoc: the options are LLVM's, for the whole process.
-        let large = sources.iter().map(|s| s.len()).sum::<usize>() > LARGE_MODULE_BYTES;
         let served = if large { None } else { zoc_server::compile(&zoc, &args, sources) };
         if let Some(result) = served {
             if crate::log_enabled() {
@@ -2069,10 +2099,6 @@ fn compile_or_cached(
         // Max whether or not it is touched, and the frames of called functions are only known once compiled. So a
         // large module is first compiled with a small reservation, which the backend refuses if the frames do not fit,
         // and then with all that is addressable. ZLUDA_AGX_STACK_TRY overrides the first (0: not tried).
-        let stack_try = std::env::var("ZLUDA_AGX_STACK_TRY")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(LARGE_MODULE_STACK_TRY);
         let mut out = run((large && stack_try != 0).then_some(stack_try))?;
         if large && stack_try != 0 && !out.status.success() {
             if crate::log_enabled() {

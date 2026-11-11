@@ -145,7 +145,7 @@ fn main() {
 
     // the stack, from the helper program
     let stack_dwords = stack.div_ceil(4);
-    let helper = if stack_dwords > 0 { Some(vm.scratch(stack_dwords).unwrap_or_else(|e| die(&e.to_string()))) } else { None };
+    let helper = if stack_dwords > 0 { Some(vm.scratch(stack_dwords, agx_runtime::scratch::SUBGROUPS).unwrap_or_else(|e| die(&e.to_string()))) } else { None };
 
     // USC object: pipeline words at 0, code at 0x400 (64-byte aligned, with 64 bytes of slack after it).
     let code_off = 0x400u64;

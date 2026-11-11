@@ -354,9 +354,10 @@ struct Scratch {
     helper: Bo,
     buffer: Bo,
     layout: scratch::Layout,
-    /// Smaller buffers that commands in flight may still use; freed with the address space.
-    #[allow(dead_code)]
-    retired: Vec<Bo>,
+    /// SIMD-groups per core with an allocation (`scratch::Buffer::subgroups`).
+    subgroups: u32,
+    /// Smaller buffers that commands in flight may still use, with their layouts; freed with the address space.
+    retired: Vec<(Bo, scratch::Layout, u32)>,
 }
 
 pub const USC_HEAP_SIZE: u64 = 1 << 32;
@@ -462,30 +463,35 @@ impl Vm {
         self.textures.as_ref().filter(|t| !t.sampler_slots.is_empty()).map(|t| (t.samplers.va, t.sampler_slots.len() as u32))
     }
 
-    /// The helper program of a command whose shader uses `dwords` 32-bit words of stack per thread: its tagged USC
-    /// address and the address of the scratch buffer's header (`drm_asahi_helper_program`). The buffer grows to the
-    /// largest size asked for and is shared by every command of the address space.
-    pub fn scratch(&mut self, dwords: u32) -> io::Result<(u32, u64)> {
+    /// The helper program of a command whose shader uses `dwords` 32-bit words of stack per thread and of which a
+    /// core holds `groups` SIMD-groups (`KernelInfo::simd_groups_per_core`): its tagged USC address and the address
+    /// of the scratch buffer's header (`drm_asahi_helper_program`). The buffer grows to the largest stack and the
+    /// most SIMD-groups asked for and is shared by every command of the address space: groups of several kernels
+    /// resident on a core never outnumber the largest of their counts (`scratch::SUBGROUPS`).
+    pub fn scratch(&mut self, dwords: u32, groups: u32) -> io::Result<(u32, u64)> {
         if dwords > (8 << 12) * 4 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{dwords} words of stack per thread")));
         }
-        let have = self.scratch.as_ref().map_or(0, |s| s.layout.dwords());
-        if (dwords as u64) > have {
-            let layout = scratch::Layout::new(dwords);
-            let buf = scratch::Buffer::new(layout, self.core_entries.len(), PAGE);
+        let groups = groups.clamp(1, scratch::SUBGROUPS);
+        let (have, have_groups) = self.scratch.as_ref().map_or((0, 0), |s| (s.layout.dwords(), s.subgroups));
+        if (dwords as u64) > have || groups > have_groups {
+            let layout = scratch::Layout::new((dwords as u64).max(have) as u32);
+            let groups = groups.max(have_groups);
+            let buf = scratch::Buffer::new(layout, self.core_entries.len(), groups, PAGE);
             let mut bo = self.alloc_data_aligned(buf.size, buf.align)?;
             let header = buf.header(bo.va, &self.core_entries);
             bo.as_mut_slice()[..header.len()].copy_from_slice(&header);
             match &mut self.scratch {
                 Some(s) => {
                     let old = std::mem::replace(&mut s.buffer, bo);
-                    s.retired.push(old);
+                    s.retired.push((old, s.layout, s.subgroups));
                     s.layout = layout;
+                    s.subgroups = groups;
                 }
                 None => {
                     let mut helper = self.alloc_usc(scratch::HELPER.len() as u64)?;
                     helper.as_mut_slice()[..scratch::HELPER.len()].copy_from_slice(scratch::HELPER);
-                    self.scratch = Some(Scratch { helper, buffer: bo, layout, retired: Vec::new() });
+                    self.scratch = Some(Scratch { helper, buffer: bo, layout, subgroups: groups, retired: Vec::new() });
                 }
             }
         }
@@ -494,9 +500,27 @@ impl Vm {
         Ok(((s.helper.va - self.usc_base) as u32 | 1, s.buffer.va))
     }
 
+    /// Of every scratch buffer of the address space (the current one and those it replaced), the most allocations
+    /// a core held at once and the allocations the helper refused, by the header counters
+    /// (`scratch::core_counters`); read once the commands that use them are done. None before the first.
+    pub fn scratch_counters(&self) -> Option<(u32, u32, u32)> {
+        let s = self.scratch.as_ref()?;
+        let (mut most, mut failed) = (0, 0);
+        let buffers = s.retired.iter().map(|(b, l, g)| (b, *l, *g)).chain(std::iter::once((&s.buffer, s.layout, s.subgroups)));
+        for (bo, layout, groups) in buffers {
+            let header = &bo.as_slice()[..scratch::Buffer::new(layout, self.core_entries.len(), groups, PAGE).blocks_offset as usize];
+            for &id in &self.core_entries {
+                let (_, max, f) = scratch::core_counters(header, id);
+                most = most.max(max);
+                failed += f;
+            }
+        }
+        Some((most, failed, s.subgroups))
+    }
+
     /// The scratch buffer's header and block lists, to check the helper's counters (`scratch::core_counters`).
     pub fn scratch_header(&self) -> Option<&[u8]> {
-        self.scratch.as_ref().map(|s| &s.buffer.as_slice()[..scratch::Buffer::new(s.layout, self.core_entries.len(), PAGE).blocks_offset as usize])
+        self.scratch.as_ref().map(|s| &s.buffer.as_slice()[..scratch::Buffer::new(s.layout, self.core_entries.len(), s.subgroups, PAGE).blocks_offset as usize])
     }
 
     fn create(&self, size: u64, va: u64, bind_flags: u32, heap: Option<&Rc<RefCell<RangeAllocator>>>) -> io::Result<Bo> {
@@ -701,6 +725,13 @@ impl Drop for Mapping {
 
 impl Drop for Vm {
     fn drop(&mut self) {
+        // AGX_SCRATCH_STATS=1: whether the scratch buffer had enough SIMD-group allocations (at exit, the commands
+        // done)
+        if std::env::var_os("AGX_SCRATCH_STATS").is_some() {
+            if let Some((most, failed, groups)) = self.scratch_counters() {
+                eprintln!("[agx_runtime] scratch: {groups} SIMD-group allocations per core, at most {most} held at once, {failed} refused");
+            }
+        }
         // unbind the scratch objects while the address space exists
         self.scratch = None;
         let mut vd = drm_asahi_vm_destroy { vm_id: self.id, pad: 0 };
@@ -2202,7 +2233,7 @@ impl LoadedModule {
             let words_only = words_only.as_deref_mut();
             // a shader that uses the stack gets its scratch from the helper program
             let stack_dwords = k.stack_bytes.div_ceil(4);
-            let helper = if stack_dwords > 0 { Some(vm.scratch(stack_dwords)?) } else { None };
+            let helper = if stack_dwords > 0 { Some(vm.scratch(stack_dwords, k.simd_groups_per_core())?) } else { None };
             let mut halves = halves.to_vec();
             if let Some(h) = k.texture_heap_half {
                 let heap = vm.texture_heap();

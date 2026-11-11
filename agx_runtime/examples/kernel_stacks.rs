@@ -10,7 +10,7 @@ fn main() {
         stacked.sort_by_key(|(n, _)| n.to_string());
         println!("{path}: {} kernels, {} with a stack", module.kernels.len(), stacked.len());
         for (name, k) in stacked {
-            println!("  {:5} bytes  {}", k.stack_bytes, name);
+            println!("  {:5} bytes  {:3} registers  {:2} SIMD-groups per core  {}", k.stack_bytes, k.gprs, k.simd_groups_per_core(), name);
         }
     }
 }

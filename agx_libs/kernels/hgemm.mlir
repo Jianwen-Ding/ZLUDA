@@ -85,10 +85,10 @@ gpu.module @agx_blas_f16 {
     %col3 = arith.addi %col, %i24 : index
     %fz = arith.constant 0.0 : f32
     %zero = air.simdgroup_matrix_fill %fz : vector<64xf32>
-    %acc:16 = scf.for %kk = %i0 to %K8 step %i128
+    %chunk = arith.constant 1048576 : index
+    %acc:16 = scf.for %kk = %i0 to %K8 step %chunk
         iter_args(%o00 = %zero, %o01 = %zero, %o02 = %zero, %o03 = %zero, %o10 = %zero, %o11 = %zero, %o12 = %zero, %o13 = %zero, %o20 = %zero, %o21 = %zero, %o22 = %zero, %o23 = %zero, %o30 = %zero, %o31 = %zero, %o32 = %zero, %o33 = %zero) -> (vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>) {
-      gpu.barrier memfence []
-      %kk_end0 = arith.addi %kk, %i128 : index
+      %kk_end0 = arith.addi %kk, %chunk : index
       %kk_end = arith.minui %kk_end0, %K8 : index
       %kk_last = arith.subi %kk_end, %i8 : index
       %pa0 = air.simdgroup_matrix_load %A[%row, %kk] : memref<?x?xf16, strided<[?, 1], offset: ?>, 1> -> vector<64xf16>
@@ -424,10 +424,10 @@ gpu.module @agx_blas_f16 {
     %col3 = arith.addi %col, %i24 : index
     %fz = arith.constant 0.0 : f32
     %zero = air.simdgroup_matrix_fill %fz : vector<64xf32>
-    %acc:16 = scf.for %kk = %i0 to %K8 step %i128
+    %chunk = arith.constant 1048576 : index
+    %acc:16 = scf.for %kk = %i0 to %K8 step %chunk
         iter_args(%o00 = %zero, %o01 = %zero, %o02 = %zero, %o03 = %zero, %o10 = %zero, %o11 = %zero, %o12 = %zero, %o13 = %zero, %o20 = %zero, %o21 = %zero, %o22 = %zero, %o23 = %zero, %o30 = %zero, %o31 = %zero, %o32 = %zero, %o33 = %zero) -> (vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>) {
-      gpu.barrier memfence []
-      %kk_end0 = arith.addi %kk, %i128 : index
+      %kk_end0 = arith.addi %kk, %chunk : index
       %kk_end = arith.minui %kk_end0, %K8 : index
       %kk_last = arith.subi %kk_end, %i8 : index
       %pa0 = air.simdgroup_matrix_load %A[%row, %kk] : memref<?x?xf16, strided<[?, 1], offset: ?>, 1> -> vector<64xf16>
@@ -951,10 +951,10 @@ gpu.module @agx_blas_f16 {
     %col3 = arith.addi %col, %i24 : index
     %fz = arith.constant 0.0 : f32
     %zero = air.simdgroup_matrix_fill %fz : vector<64xf32>
-    %acc:16 = scf.for %kk = %i0 to %K8 step %i128
+    %chunk = arith.constant 1048576 : index
+    %acc:16 = scf.for %kk = %i0 to %K8 step %chunk
         iter_args(%o00 = %zero, %o01 = %zero, %o02 = %zero, %o03 = %zero, %o10 = %zero, %o11 = %zero, %o12 = %zero, %o13 = %zero, %o20 = %zero, %o21 = %zero, %o22 = %zero, %o23 = %zero, %o30 = %zero, %o31 = %zero, %o32 = %zero, %o33 = %zero) -> (vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>) {
-      gpu.barrier memfence []
-      %kk_end0 = arith.addi %kk, %i128 : index
+      %kk_end0 = arith.addi %kk, %chunk : index
       %kk_end = arith.minui %kk_end0, %K8 : index
       %kk_last = arith.subi %kk_end, %i8 : index
       %pa0 = air.simdgroup_matrix_load %A[%kk, %row] transpose : memref<?x?xf16, strided<[?, 1], offset: ?>, 1> -> vector<64xf16>
@@ -1279,10 +1279,10 @@ gpu.module @agx_blas_f16 {
     %col3 = arith.addi %col, %i24 : index
     %fz = arith.constant 0.0 : f32
     %zero = air.simdgroup_matrix_fill %fz : vector<64xf32>
-    %acc:16 = scf.for %kk = %i0 to %K8 step %i128
+    %chunk = arith.constant 1048576 : index
+    %acc:16 = scf.for %kk = %i0 to %K8 step %chunk
         iter_args(%o00 = %zero, %o01 = %zero, %o02 = %zero, %o03 = %zero, %o10 = %zero, %o11 = %zero, %o12 = %zero, %o13 = %zero, %o20 = %zero, %o21 = %zero, %o22 = %zero, %o23 = %zero, %o30 = %zero, %o31 = %zero, %o32 = %zero, %o33 = %zero) -> (vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>) {
-      gpu.barrier memfence []
-      %kk_end0 = arith.addi %kk, %i128 : index
+      %kk_end0 = arith.addi %kk, %chunk : index
       %kk_end = arith.minui %kk_end0, %K8 : index
       %kk_last = arith.subi %kk_end, %i8 : index
       %pa0 = air.simdgroup_matrix_load %A[%row, %kk] : memref<?x?xf16, strided<[?, 1], offset: ?>, 1> -> vector<64xf16>
@@ -1607,10 +1607,10 @@ gpu.module @agx_blas_f16 {
     %col3 = arith.addi %col, %i24 : index
     %fz = arith.constant 0.0 : f32
     %zero = air.simdgroup_matrix_fill %fz : vector<64xf32>
-    %acc:16 = scf.for %kk = %i0 to %K8 step %i128
+    %chunk = arith.constant 1048576 : index
+    %acc:16 = scf.for %kk = %i0 to %K8 step %chunk
         iter_args(%o00 = %zero, %o01 = %zero, %o02 = %zero, %o03 = %zero, %o10 = %zero, %o11 = %zero, %o12 = %zero, %o13 = %zero, %o20 = %zero, %o21 = %zero, %o22 = %zero, %o23 = %zero, %o30 = %zero, %o31 = %zero, %o32 = %zero, %o33 = %zero) -> (vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>) {
-      gpu.barrier memfence []
-      %kk_end0 = arith.addi %kk, %i128 : index
+      %kk_end0 = arith.addi %kk, %chunk : index
       %kk_end = arith.minui %kk_end0, %K8 : index
       %kk_last = arith.subi %kk_end, %i8 : index
       %pa0 = air.simdgroup_matrix_load %A[%kk, %row] transpose : memref<?x?xf16, strided<[?, 1], offset: ?>, 1> -> vector<64xf16>
@@ -1935,10 +1935,10 @@ gpu.module @agx_blas_f16 {
     %col3 = arith.addi %col, %i24 : index
     %fz = arith.constant 0.0 : f32
     %zero = air.simdgroup_matrix_fill %fz : vector<64xf32>
-    %acc:16 = scf.for %kk = %i0 to %K8 step %i128
+    %chunk = arith.constant 1048576 : index
+    %acc:16 = scf.for %kk = %i0 to %K8 step %chunk
         iter_args(%o00 = %zero, %o01 = %zero, %o02 = %zero, %o03 = %zero, %o10 = %zero, %o11 = %zero, %o12 = %zero, %o13 = %zero, %o20 = %zero, %o21 = %zero, %o22 = %zero, %o23 = %zero, %o30 = %zero, %o31 = %zero, %o32 = %zero, %o33 = %zero) -> (vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>) {
-      gpu.barrier memfence []
-      %kk_end0 = arith.addi %kk, %i128 : index
+      %kk_end0 = arith.addi %kk, %chunk : index
       %kk_end = arith.minui %kk_end0, %K8 : index
       %kk_last = arith.subi %kk_end, %i8 : index
       %pa0 = air.simdgroup_matrix_load %A[%kk, %row] transpose : memref<?x?xf16, strided<[?, 1], offset: ?>, 1> -> vector<64xf16>
@@ -2215,10 +2215,10 @@ gpu.module @agx_blas_f16 {
     %col3 = arith.addi %col, %i24 : index
     %fz = arith.constant 0.0 : f32
     %zero = air.simdgroup_matrix_fill %fz : vector<64xf32>
-    %acc:16 = scf.for %kk = %i0 to %K8 step %i128
+    %chunk = arith.constant 1048576 : index
+    %acc:16 = scf.for %kk = %i0 to %K8 step %chunk
         iter_args(%o00 = %zero, %o01 = %zero, %o02 = %zero, %o03 = %zero, %o10 = %zero, %o11 = %zero, %o12 = %zero, %o13 = %zero, %o20 = %zero, %o21 = %zero, %o22 = %zero, %o23 = %zero, %o30 = %zero, %o31 = %zero, %o32 = %zero, %o33 = %zero) -> (vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>) {
-      gpu.barrier memfence []
-      %kk_end0 = arith.addi %kk, %i128 : index
+      %kk_end0 = arith.addi %kk, %chunk : index
       %kk_end = arith.minui %kk_end0, %K8 : index
       %kk_last = arith.subi %kk_end, %i8 : index
       %pa0 = air.simdgroup_matrix_load %A[%row, %kk] : memref<?x?xf16, strided<[?, 1], offset: ?>, 1> -> vector<64xf16>
@@ -2495,10 +2495,10 @@ gpu.module @agx_blas_f16 {
     %col3 = arith.addi %col, %i24 : index
     %fz = arith.constant 0.0 : f32
     %zero = air.simdgroup_matrix_fill %fz : vector<64xf32>
-    %acc:16 = scf.for %kk = %i0 to %K8 step %i128
+    %chunk = arith.constant 1048576 : index
+    %acc:16 = scf.for %kk = %i0 to %K8 step %chunk
         iter_args(%o00 = %zero, %o01 = %zero, %o02 = %zero, %o03 = %zero, %o10 = %zero, %o11 = %zero, %o12 = %zero, %o13 = %zero, %o20 = %zero, %o21 = %zero, %o22 = %zero, %o23 = %zero, %o30 = %zero, %o31 = %zero, %o32 = %zero, %o33 = %zero) -> (vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>) {
-      gpu.barrier memfence []
-      %kk_end0 = arith.addi %kk, %i128 : index
+      %kk_end0 = arith.addi %kk, %chunk : index
       %kk_end = arith.minui %kk_end0, %K8 : index
       %kk_last = arith.subi %kk_end, %i8 : index
       %pa0 = air.simdgroup_matrix_load %A[%kk, %row] transpose : memref<?x?xf16, strided<[?, 1], offset: ?>, 1> -> vector<64xf16>
@@ -3021,10 +3021,10 @@ gpu.module @agx_blas_f16 {
     %col3 = arith.addi %col, %i24 : index
     %fz = arith.constant 0.0 : f32
     %zero = air.simdgroup_matrix_fill %fz : vector<64xf32>
-    %acc:16 = scf.for %kk = %i0 to %K8 step %i128
+    %chunk = arith.constant 1048576 : index
+    %acc:16 = scf.for %kk = %i0 to %K8 step %chunk
         iter_args(%o00 = %zero, %o01 = %zero, %o02 = %zero, %o03 = %zero, %o10 = %zero, %o11 = %zero, %o12 = %zero, %o13 = %zero, %o20 = %zero, %o21 = %zero, %o22 = %zero, %o23 = %zero, %o30 = %zero, %o31 = %zero, %o32 = %zero, %o33 = %zero) -> (vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>) {
-      gpu.barrier memfence []
-      %kk_end0 = arith.addi %kk, %i128 : index
+      %kk_end0 = arith.addi %kk, %chunk : index
       %kk_end = arith.minui %kk_end0, %K8 : index
       %kk_last = arith.subi %kk_end, %i8 : index
       %pa0 = air.simdgroup_matrix_load %A[%row, %kk] : memref<?x?xf16, strided<[?, 1], offset: ?>, 1> -> vector<64xf16>
@@ -3339,10 +3339,10 @@ gpu.module @agx_blas_f16 {
     %col3 = arith.addi %col, %i24 : index
     %fz = arith.constant 0.0 : f32
     %zero = air.simdgroup_matrix_fill %fz : vector<64xf32>
-    %acc:16 = scf.for %kk = %i0 to %K8 step %i128
+    %chunk = arith.constant 1048576 : index
+    %acc:16 = scf.for %kk = %i0 to %K8 step %chunk
         iter_args(%o00 = %zero, %o01 = %zero, %o02 = %zero, %o03 = %zero, %o10 = %zero, %o11 = %zero, %o12 = %zero, %o13 = %zero, %o20 = %zero, %o21 = %zero, %o22 = %zero, %o23 = %zero, %o30 = %zero, %o31 = %zero, %o32 = %zero, %o33 = %zero) -> (vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>) {
-      gpu.barrier memfence []
-      %kk_end0 = arith.addi %kk, %i128 : index
+      %kk_end0 = arith.addi %kk, %chunk : index
       %kk_end = arith.minui %kk_end0, %K8 : index
       %kk_last = arith.subi %kk_end, %i8 : index
       %pa0 = air.simdgroup_matrix_load %A[%kk, %row] transpose : memref<?x?xf16, strided<[?, 1], offset: ?>, 1> -> vector<64xf16>
@@ -3657,10 +3657,10 @@ gpu.module @agx_blas_f16 {
     %col3 = arith.addi %col, %i24 : index
     %fz = arith.constant 0.0 : f32
     %zero = air.simdgroup_matrix_fill %fz : vector<64xf32>
-    %acc:16 = scf.for %kk = %i0 to %K8 step %i128
+    %chunk = arith.constant 1048576 : index
+    %acc:16 = scf.for %kk = %i0 to %K8 step %chunk
         iter_args(%o00 = %zero, %o01 = %zero, %o02 = %zero, %o03 = %zero, %o10 = %zero, %o11 = %zero, %o12 = %zero, %o13 = %zero, %o20 = %zero, %o21 = %zero, %o22 = %zero, %o23 = %zero, %o30 = %zero, %o31 = %zero, %o32 = %zero, %o33 = %zero) -> (vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>) {
-      gpu.barrier memfence []
-      %kk_end0 = arith.addi %kk, %i128 : index
+      %kk_end0 = arith.addi %kk, %chunk : index
       %kk_end = arith.minui %kk_end0, %K8 : index
       %kk_last = arith.subi %kk_end, %i8 : index
       %pa0 = air.simdgroup_matrix_load %A[%row, %kk] : memref<?x?xf16, strided<[?, 1], offset: ?>, 1> -> vector<64xf16>
@@ -3975,10 +3975,10 @@ gpu.module @agx_blas_f16 {
     %col3 = arith.addi %col, %i24 : index
     %fz = arith.constant 0.0 : f32
     %zero = air.simdgroup_matrix_fill %fz : vector<64xf32>
-    %acc:16 = scf.for %kk = %i0 to %K8 step %i128
+    %chunk = arith.constant 1048576 : index
+    %acc:16 = scf.for %kk = %i0 to %K8 step %chunk
         iter_args(%o00 = %zero, %o01 = %zero, %o02 = %zero, %o03 = %zero, %o10 = %zero, %o11 = %zero, %o12 = %zero, %o13 = %zero, %o20 = %zero, %o21 = %zero, %o22 = %zero, %o23 = %zero, %o30 = %zero, %o31 = %zero, %o32 = %zero, %o33 = %zero) -> (vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>) {
-      gpu.barrier memfence []
-      %kk_end0 = arith.addi %kk, %i128 : index
+      %kk_end0 = arith.addi %kk, %chunk : index
       %kk_end = arith.minui %kk_end0, %K8 : index
       %kk_last = arith.subi %kk_end, %i8 : index
       %pa0 = air.simdgroup_matrix_load %A[%kk, %row] transpose : memref<?x?xf16, strided<[?, 1], offset: ?>, 1> -> vector<64xf16>
@@ -4293,10 +4293,10 @@ gpu.module @agx_blas_f16 {
     %col3 = arith.addi %col, %i24 : index
     %fz = arith.constant 0.0 : f32
     %zero = air.simdgroup_matrix_fill %fz : vector<64xf32>
-    %acc:16 = scf.for %kk = %i0 to %K8 step %i128
+    %chunk = arith.constant 1048576 : index
+    %acc:16 = scf.for %kk = %i0 to %K8 step %chunk
         iter_args(%o00 = %zero, %o01 = %zero, %o02 = %zero, %o03 = %zero, %o10 = %zero, %o11 = %zero, %o12 = %zero, %o13 = %zero, %o20 = %zero, %o21 = %zero, %o22 = %zero, %o23 = %zero, %o30 = %zero, %o31 = %zero, %o32 = %zero, %o33 = %zero) -> (vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>) {
-      gpu.barrier memfence []
-      %kk_end0 = arith.addi %kk, %i128 : index
+      %kk_end0 = arith.addi %kk, %chunk : index
       %kk_end = arith.minui %kk_end0, %K8 : index
       %kk_last = arith.subi %kk_end, %i8 : index
       %pa0 = air.simdgroup_matrix_load %A[%row, %kk] : memref<?x?xf16, strided<[?, 1], offset: ?>, 1> -> vector<64xf16>
@@ -4563,10 +4563,10 @@ gpu.module @agx_blas_f16 {
     %col3 = arith.addi %col, %i24 : index
     %fz = arith.constant 0.0 : f32
     %zero = air.simdgroup_matrix_fill %fz : vector<64xf32>
-    %acc:16 = scf.for %kk = %i0 to %K8 step %i128
+    %chunk = arith.constant 1048576 : index
+    %acc:16 = scf.for %kk = %i0 to %K8 step %chunk
         iter_args(%o00 = %zero, %o01 = %zero, %o02 = %zero, %o03 = %zero, %o10 = %zero, %o11 = %zero, %o12 = %zero, %o13 = %zero, %o20 = %zero, %o21 = %zero, %o22 = %zero, %o23 = %zero, %o30 = %zero, %o31 = %zero, %o32 = %zero, %o33 = %zero) -> (vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>) {
-      gpu.barrier memfence []
-      %kk_end0 = arith.addi %kk, %i128 : index
+      %kk_end0 = arith.addi %kk, %chunk : index
       %kk_end = arith.minui %kk_end0, %K8 : index
       %kk_last = arith.subi %kk_end, %i8 : index
       %pa0 = air.simdgroup_matrix_load %A[%kk, %row] transpose : memref<?x?xf16, strided<[?, 1], offset: ?>, 1> -> vector<64xf16>
@@ -4833,10 +4833,10 @@ gpu.module @agx_blas_f16 {
     %col3 = arith.addi %col, %i24 : index
     %fz = arith.constant 0.0 : f32
     %zero = air.simdgroup_matrix_fill %fz : vector<64xf32>
-    %acc:16 = scf.for %kk = %i0 to %K8 step %i128
+    %chunk = arith.constant 1048576 : index
+    %acc:16 = scf.for %kk = %i0 to %K8 step %chunk
         iter_args(%o00 = %zero, %o01 = %zero, %o02 = %zero, %o03 = %zero, %o10 = %zero, %o11 = %zero, %o12 = %zero, %o13 = %zero, %o20 = %zero, %o21 = %zero, %o22 = %zero, %o23 = %zero, %o30 = %zero, %o31 = %zero, %o32 = %zero, %o33 = %zero) -> (vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>) {
-      gpu.barrier memfence []
-      %kk_end0 = arith.addi %kk, %i128 : index
+      %kk_end0 = arith.addi %kk, %chunk : index
       %kk_end = arith.minui %kk_end0, %K8 : index
       %kk_last = arith.subi %kk_end, %i8 : index
       %pa0 = air.simdgroup_matrix_load %A[%row, %kk] : memref<?x?xf16, strided<[?, 1], offset: ?>, 1> -> vector<64xf16>
@@ -5103,10 +5103,10 @@ gpu.module @agx_blas_f16 {
     %col3 = arith.addi %col, %i24 : index
     %fz = arith.constant 0.0 : f32
     %zero = air.simdgroup_matrix_fill %fz : vector<64xf32>
-    %acc:16 = scf.for %kk = %i0 to %K8 step %i128
+    %chunk = arith.constant 1048576 : index
+    %acc:16 = scf.for %kk = %i0 to %K8 step %chunk
         iter_args(%o00 = %zero, %o01 = %zero, %o02 = %zero, %o03 = %zero, %o10 = %zero, %o11 = %zero, %o12 = %zero, %o13 = %zero, %o20 = %zero, %o21 = %zero, %o22 = %zero, %o23 = %zero, %o30 = %zero, %o31 = %zero, %o32 = %zero, %o33 = %zero) -> (vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>) {
-      gpu.barrier memfence []
-      %kk_end0 = arith.addi %kk, %i128 : index
+      %kk_end0 = arith.addi %kk, %chunk : index
       %kk_end = arith.minui %kk_end0, %K8 : index
       %kk_last = arith.subi %kk_end, %i8 : index
       %pa0 = air.simdgroup_matrix_load %A[%kk, %row] transpose : memref<?x?xf16, strided<[?, 1], offset: ?>, 1> -> vector<64xf16>

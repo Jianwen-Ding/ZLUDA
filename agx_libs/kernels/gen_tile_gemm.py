@@ -22,6 +22,8 @@ VARIANTS = [("", False, False), ("_ta", True, False), ("_tb", False, True), ("_t
 ALIGNMENTS = [("", True), ("_u", False)]
 # The next step's fragments loaded while the current step's products run (see kernel()), f16 and f32 kernels
 PREFETCH = True
+# The K span of the outer loop (see kernel())
+CHUNK = 1 << 20
 
 
 def kernel(name, ab, c, ta, tb, aligned=True):
@@ -95,10 +97,13 @@ def kernel(name, ab, c, ta, tb, aligned=True):
     w("    %fz = arith.constant 0.0 : f32")
     w(f"    %zero = air.simdgroup_matrix_fill %fz : {acc}")
     ts = ", ".join([acc] * 16)
-    w("    %acc:16 = scf.for %kk = %i0 to %K8 step %i128")
+    # K in chunks of CHUNK (one trip for any K the libraries see): the SIMD-groups run independently, without a
+    # barrier per chunk. Measured on G14C (gemmbench, f16 and f32, llama shapes and 4096^3): chunks of 128 with a
+    # barrier (the earlier kernel) -> no barrier -4..-7%, chunks of 896 without barrier -7..-9%.
+    w(f"    %chunk = arith.constant {CHUNK} : index")
+    w("    %acc:16 = scf.for %kk = %i0 to %K8 step %chunk")
     w("        iter_args(" + ", ".join(f"%o{i}{j} = %zero" for i in range(4) for j in range(4)) + f") -> ({ts}) {{")
-    w("      gpu.barrier memfence []")
-    w("      %kk_end0 = arith.addi %kk, %i128 : index")
+    w("      %kk_end0 = arith.addi %kk, %chunk : index")
     w("      %kk_end = arith.minui %kk_end0, %K8 : index")
     prefetch = PREFETCH
     if prefetch:

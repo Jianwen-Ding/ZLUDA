@@ -1070,3 +1070,33 @@ agent: absolute numbers drift by ~5% between hours).
   functions in 12 MB) now compile per kernel from their own PTX: cold llama-bench (fa1, pp+tg) cuBLAS build 142 -> 60
   s, 938 -> 225 MB; and the FA kernels run faster than through the portable path (calls and the 72-register cap
   there): ZLUDA_AGX_PORTABLE=1 vs default, alternating, pp512 3861-3967 vs 4426-4445, pp2048 2870-2896 vs 3680-3683.
+
+## 2026-11-11: the shared unit, GEMM barriers, outstanding loads (branch claude/opt-2026-11-11)
+
+PTX from clang only (llama.cpp, Rodinia, Cycles built with zcc / clang). All numbers G14C, alternating A/B rounds.
+
+- **Integer mma D back to float (ca57c8e6).** ggml's MMQ converts every s32 D (C = 0) back to float; finish_d's
+  fptosi of the unit's exact f32 sum is now `__zluda_ptx_impl_agx_exact_fptosi`, and LLVMZludaAgxCancelMmaLayouts
+  takes `sitofp` of it as the float itself (ZLUDA_AGX_EXACT_FPTOSI=0 disables). Q5_1 module: converts 29.5k ->
+  15.2k (instructions -4.8%); MMQ pp512 fa0 1056-1073 -> 1299-1304, fa1 1087-1091 -> 1335-1350 (+22%); completions
+  identical. The gain is out of proportion to the count because convert, imad, bit-field ops, floor and 64-bit
+  adds share one unit per half (1 instruction / cycle / core against 4 for the ALU): MMQ was bound by it.
+- **s8 operands as i8 (5ba89e74).** `trunc i8` + `sitofp i8` instead of shl / ashr: convert s8_to_f reads byte 2 from
+  the high half, bytes 1 and 3 take one shift; shared-unit ops 46.3k -> 35.2k, s8 mma microbenchmark ~2x, MMQ +1-3%,
+  test-backend-ops quantized MUL_MAT 1501/1501.
+- **Tile GEMMs without a barrier per K chunk (b4ab01dc).** The SIMD-groups share no threadgroup memory: chunks of 128
+  with a barrier -> one trip without: GEMMs -10..-14% (4864x512x896 850 -> 737-768 us, 4096^3 24.0 -> 21.4 ms),
+  cuBLAS-build pp512 fa1 3948-4196 -> 4395-4576; alpha/beta checks identical.
+- **Sixteen outstanding loads (llvm adecae6a + default change).** AGXInsertWaits' 8 came from Mesa: 16 is correct
+  (32 M checked loads, GEMMs, llama, formalization) and GEMMs 1-4% faster; llama end to end neutral.
+- **Decode flash attention:** ZLUDA_AGX_CC=8.9 makes ggml use its VEC kernel for batch 1: fa1 tg128 103-113 ->
+  119-156, tg @ d2048 96-102 -> 132-145, completions identical. Not the default: the reported cc picks cubins in
+  apps like Blender (deferred decision, /scratch/DEFERRED-DECISIONS.md #3). The MMA kernel stays latency bound in
+  decode (stream-k gives ~4 blocks for short contexts).
+- **Found and fixed (llvm 08869361, ab637967):** the pre-ISel SimplifyCFG from llvm main (cbe2b564) put `unreachable`
+  back after llvm.trap; StructurizeCFG then failed ("failed to annotate the control flow graph") for traps in nested
+  ifs on G14G and G14C: 56 PTX-formalization programs. AGXUnifyExits runs after it now.
+- Rodinia myocyte is now correct (solver completes 100 steps, matches the host f32 / f64 runs); it was STATUS -1
+  with the 2026-11-08 compiler. Its "RUN COMPUTATION" grows 2 -> 15 s because it now does the work.
+- Not adopted: AGXShortenLiveRanges again (spills -1%), MAX_BATCH 256 (no gain), dp4a packed-multiply tricks (signed
+  bytes carry across the 16-bit lanes).

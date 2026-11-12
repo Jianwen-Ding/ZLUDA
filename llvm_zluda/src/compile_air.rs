@@ -119,7 +119,14 @@ pub fn compile_air(
         let name = CString::new(format!("linked_module_{}", i + 1)).unwrap();
         linked.link(load_module(ctx, ir, &name)?)?;
     }
-    if !others.is_empty() {
+    // A single module's functions stay external for O3 (internal, O3 inlines and specializes them differently: Blender
+    // Cycles' shade_surface 2% slower on the M2 Max, its first stage 12% faster), but those no kernel reaches go
+    // first (ZLUDA_AIR_INTERNALIZE: 1 internal, 0 kept, default dce: Cycles 348 of its 667 functions).
+    let internalize = std::env::var("ZLUDA_AIR_INTERNALIZE").unwrap_or_default();
+    // (a module without kernels, all of whose functions are hidden, keeps them)
+    let dead_only = others.is_empty() && internalize != "1" && has_visible_definition(&linked);
+    let restore = if dead_only { hidden_functions(&linked) } else { Vec::new() };
+    if !others.is_empty() || internalize == "1" || dead_only && internalize != "0" {
         internalize_functions(&linked);
     }
     unsafe { LLVMZludaAgxKeepGlobals(linked.get()) };
@@ -135,6 +142,12 @@ pub fn compile_air(
     let air = target_machine(AIR_TRIPLE, c"")?;
     let options = PassBuilderOptions::new();
     let fail = |err: *mut std::ffi::c_char| Message::new(unsafe { CStr::from_ptr(err) }).to_str().to_string();
+    if dead_only && internalize != "0" {
+        run(&linked, c"globaldce", &air, &options)?;
+        restore_hidden(&linked, &restore);
+        // (ZLUDA's helpers defined in the module, such as the mma ones, stay internal)
+        internalize_helpers(&linked);
+    }
     // ZLUDA's lowering of what PTX has and the GPU has not, on its own IR (ZLUDA's address spaces, the
     // __zluda_air.* primitives), as for the Agx target: clusters as threadgroups, isspacep and the generic
     // addresses of shared and private memory, cluster shared memory over 32 KiB in device memory
@@ -960,4 +973,52 @@ fn finish_air(ctx: &Context, module: &Module, strict_fp: bool, compare_functions
         return Err(fail(err));
     }
     Ok(())
+}
+
+/// The names of the module's hidden function definitions (which internalize_functions makes internal).
+fn hidden_functions(module: &Module) -> Vec<CString> {
+    let mut names = Vec::new();
+    unsafe {
+        let mut f = llvm_sys::core::LLVMGetFirstFunction(module.get());
+        while !f.is_null() {
+            if llvm_sys::core::LLVMIsDeclaration(f) == 0
+                && llvm_sys::core::LLVMGetVisibility(f) == llvm_sys::LLVMVisibility::LLVMHiddenVisibility
+            {
+                let mut len = 0;
+                let name = llvm_sys::core::LLVMGetValueName2(f, &mut len);
+                names.push(CStr::from_ptr(name).to_owned());
+            }
+            f = llvm_sys::core::LLVMGetNextFunction(f);
+        }
+    }
+    names
+}
+
+/// Those of `names` still defined become external hidden functions again.
+fn restore_hidden(module: &Module, names: &[CString]) {
+    for name in names {
+        let f = unsafe { llvm_sys::core::LLVMGetNamedFunction(module.get(), name.as_ptr()) };
+        if !f.is_null() {
+            unsafe {
+                llvm_sys::core::LLVMSetLinkage(f, llvm_sys::LLVMLinkage::LLVMExternalLinkage);
+                llvm_sys::core::LLVMSetVisibility(f, llvm_sys::LLVMVisibility::LLVMHiddenVisibility);
+            }
+        }
+    }
+}
+
+/// Whether the module defines a function that is not hidden (a kernel).
+fn has_visible_definition(module: &Module) -> bool {
+    unsafe {
+        let mut f = llvm_sys::core::LLVMGetFirstFunction(module.get());
+        while !f.is_null() {
+            if llvm_sys::core::LLVMIsDeclaration(f) == 0
+                && llvm_sys::core::LLVMGetVisibility(f) != llvm_sys::LLVMVisibility::LLVMHiddenVisibility
+            {
+                return true;
+            }
+            f = llvm_sys::core::LLVMGetNextFunction(f);
+        }
+    }
+    false
 }

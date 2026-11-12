@@ -41,6 +41,30 @@ section. GPU times are from the M2 Max behind the AIR service; "suite" is PTX-fo
   is now the slow part. Not over-inlining: shade_surface_mnee packaged alone keeps 162 functions, and
   `-air-keep-function-cost` 20000 / 5000 / 2000 left it byte-identical (its large functions are kept already).
 
+## 2026-11-12: m8n8.trans and movmatrix routed, why decode flash attention is slow at cc 8.0 (branch claude/ldm-trans-2026-11-12)
+
+- **ldmatrix/stmatrix .m8n8.trans and movmatrix route by lane bit exchanges** (agx_matrix.rs `route_words`,
+  `trans_row_addresses`). Thread (g, t) of .trans reads the address of row 8i + 2t + h; movmatrix reads thread
+  8t + g/2 + 4h. Both indices are bit permutations of the lane with constant bits, which AGX's quad merge split in
+  two (.trans) or four (movmatrix). Now: swaps of lane bits (one shuffle_xor + select each), then each constant bit
+  one shuffle_xor shared by its two values; checked lane by lane at compile time (`route_source`). x4.trans test
+  kernel 113 -> 75 instructions. llama.cpp decode FA kernel `flash_attn_ext_f16<64,64,1,8>`: 21699 -> 20597
+  instructions, simd_shuffle 1152 -> 384, stack ops 800 -> 622, object 153224 -> 147856 bytes. PTX-formalization
+  ldmatrix/stmatrix/movmatrix files on agx_run 22/22. llama MMQ build fa=1 (same libcuda, zoc only, 3 rounds):
+  pp512 1331-1339 -> 1330-1342, tg64 110.6-115.5 -> 114.8-116.6, completion identical.
+- The 384 remaining index shuffles of that kernel are llama's own movmatrix fallback (`ggml_cuda_movmatrix` with
+  `__shfl_sync`): the llama build passes `-DCUDART_VERSION=11060`, so ggml does not emit the movmatrix instruction.
+  A backend routing of such shuffles needs a guard (all 32 threads active, tid.x == lane): exited threads may sit
+  in the middle of a route. Not done.
+- **Why decode FA is slow at cc 8.0 (unbatched ZLUDA_AGX_PROFILE, tg16, qwen2.5-0.5b):** the MMA kernel takes 77.5 us
+  per call vs 20.3 us for the VEC kernel (+5.4 us combine) that cc 8.9 selects; 28.7% vs 9.6% of GPU time. Its
+  grid is 4 workgroups (stream-k, ntiles_KV x ntiles_dst at a short context) of 128 threads: one block per core on 4
+  of 38 cores, each running one KV tile. Its main loop is ~14k instructions (~100 KB) and the kernel 147 KB; at the
+  measured ~70 ns per cold 64-byte code line (2026-11-10 MMVQ capture), fetching the executed path alone is ~50 us.
+  So this kernel is bound by instruction fetch, not by the matrix unit (384 simd_matrix_fmadd32): code size is the
+  lever (f16 -> f32 operand conversions `fadd32 x, h, -0.0` ~270 per tile block, 3 near-copies of the tile body of
+  2.6-2.8k instructions each, icmpsel/iadd address arithmetic).
+
 ## 2026-11-08: mma and ldmatrix as bit exchanges, closures in registers (branch claude/mma-bitmove-2026-11-08)
 
 All inputs are built with clang (zcc, ptx/tools/cycles_clang); the baseline is origin/master zoc with
@@ -1100,3 +1124,33 @@ PTX from clang only (llama.cpp, Rodinia, Cycles built with zcc / clang). All num
   with the 2026-11-08 compiler. Its "RUN COMPUTATION" grows 2 -> 15 s because it now does the work.
 - Not adopted: AGXShortenLiveRanges again (spills -1%), MAX_BATCH 256 (no gain), dp4a packed-multiply tricks (signed
   bytes carry across the 16-bit lanes).
+
+## 2026-11-12: uniform constants ranked by weighted use, cap 128 (llvm-project f7a163e66d4f)
+
+CPU-only (llc over the 78 Cycles kernels in /scratch/mmq/cyc/all, flags as zluda_agx's large-module path plus
+-agx-uniform-constants; /scratch/tools/safe-run.sh, one job at a time). No GPU timing taken (freeze risk, see
+/scratch/crash1112/NOTES.md): instruction counts only.
+- The pass gave the uniform slots to the first 64 distinct MOV_IMM32 values in program order. Now: ranked by use count
+  (x8 per loop depth, ties in program order), cap 128 (extension 6 pairs: agx_runtime sizes uniforms per kernel, no
+  fixed limit below the 512-half file).
+- intersect_mnee instructions: mov_imm only 681,702; flag at 64 in program order 641,069 (mov_imm 27,170); ranked at
+  64: 640,645 (-0.07%, the ranking alone is nothing); cap 128: 627,947 (mov_imm 14,017); cap 224: 626,439 (468 of 512
+  halves used, not worth it).
+- All 78 kernels, cap 128: 0 failures, 2,657,990 instructions vs 2,794,794 without the flag (-4.9%), CPU 61.3 s
+  (64.2 before), peak 1.0 GB. AGX lit 254/255 (air/bitcode-input: no `cmp` here).
+- Render (monkey, /scratch/cyc1112d/ab-short.sh, 3 alternating warm 1024^2 64spp, states 2M; old = the 04:44 build, new =
+  rebuilt with this llc): old 1.93 / 1.917 / 1.916 s, new 1.785 / 1.88 / 1.872 s (mean 1.920 -> 1.846 s, -3.8%, every pair
+  faster); cold 512^2 1spp 39.7 -> 40.1 s (same). Images: max diff 1 in <=16 of 4.2 M bytes (old vs old: 12), i.e. noise.
+  Caveat: old-rel was built earlier, so ZLUDA sources may differ slightly besides this change. Only 3 warm pairs, short runs.
+- Pitfall: a static count of mov_imm values from the flag-off output overstates the gain (mov_imm 0 / 1 are 16-bit
+  immediates the pass does not touch).
+- llama.cpp check of the same change (MMQ build, fa=1, same libcuda, only zoc varied, 3 alternating warm rounds): old /
+  ranked-64 / ranked-128 all pp512 1330-1337 and tg64 111-116 t/s: neutral. The pre-crash libcuda's higher tg64 (~170 vs 113-134 t/s) is
+  origin/claude/cc89-2026-11-12 (cc 8.9 default, not on master; deferred decision #3): HEAD + ZLUDA_AGX_CC=8.9 gives 170.9.
+- cc 8.9 check on Cycles (clang-built, PTX; monkey, same build, ZLUDA_AGX_CC=8.0 vs 8.9, /scratch/cyc1112d/cyc-cc.sh): renders
+  fine (rc 0), cold 39.0 vs 39.2 s, warm 1024^2 64spp 1.849/1.911/1.8 vs 1.749/1.923/1.884 s (mean 1.853 vs 1.852: no
+  difference), images max diff 1 (noise). Not checked at 8.9: Halide apps, tinygrad (NVRTC sm_89), Rodinia, and Blender's
+  own cubins (the real risk for deferred decision #3: its shipped 8.9 cubin would be picked over PTX).
+- cc 8.9 on Rodinia (/scratch/cyc1112d/rod-cc.sh, HEAD libcuda + new zoc, ZLUDA_AGX_CC=8.0 vs 8.9): nw (2048 10, traceback
+  result.txt, fresh file each run) and hotspot3D (512x8 100 iters, output.out) produce byte-identical outputs. Still not
+  checked at 8.9: Halide apps, tinygrad (NVRTC sm_89), Blender with its own cubins.

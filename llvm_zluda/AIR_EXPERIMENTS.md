@@ -1120,3 +1120,6 @@ CPU-only (llc over the 78 Cycles kernels in /scratch/mmq/cyc/all, flags as zluda
   Caveat: old-rel was built earlier, so ZLUDA sources may differ slightly besides this change. Only 3 warm pairs, short runs.
 - Pitfall: a static count of mov_imm values from the flag-off output overstates the gain (mov_imm 0 / 1 are 16-bit
   immediates the pass does not touch).
+- llama.cpp check of the same change (MMQ build, fa=1, same libcuda, only zoc varied, 3 alternating warm rounds): old /
+  ranked-64 / ranked-128 all pp512 1330-1337 and tg64 111-116 t/s: neutral. Separate finding, see /scratch/cyc1112d/NOTES.md:
+  the pre-crash libcuda (04:44 build) gave tg64 ~148 t/s against ~113 for builds of current HEAD; cause not found.

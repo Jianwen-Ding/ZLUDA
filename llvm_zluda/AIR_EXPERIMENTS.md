@@ -1100,3 +1100,21 @@ PTX from clang only (llama.cpp, Rodinia, Cycles built with zcc / clang). All num
   with the 2026-11-08 compiler. Its "RUN COMPUTATION" grows 2 -> 15 s because it now does the work.
 - Not adopted: AGXShortenLiveRanges again (spills -1%), MAX_BATCH 256 (no gain), dp4a packed-multiply tricks (signed
   bytes carry across the 16-bit lanes).
+
+## 2026-11-12: uniform constants ranked by weighted use, cap 128 (llvm-project f7a163e66d4f)
+
+CPU-only (llc over the 78 Cycles kernels in /scratch/mmq/cyc/all, flags as zluda_agx's large-module path plus
+-agx-uniform-constants; /scratch/tools/safe-run.sh, one job at a time). No GPU timing taken (freeze risk, see
+/scratch/crash1112/NOTES.md): instruction counts only.
+- The pass gave the uniform slots to the first 64 distinct MOV_IMM32 values in program order. Now: ranked by use count
+  (x8 per loop depth, ties in program order), cap 128 (extension 6 pairs: agx_runtime sizes uniforms per kernel, no
+  fixed limit below the 512-half file).
+- intersect_mnee instructions: mov_imm only 681,702; flag at 64 in program order 641,069 (mov_imm 27,170); ranked at
+  64: 640,645 (-0.07%, the ranking alone is nothing); cap 128: 627,947 (mov_imm 14,017); cap 224: 626,439 (468 of 512
+  halves used, not worth it).
+- All 78 kernels, cap 128: 0 failures, 2,657,990 instructions vs 2,794,794 without the flag (-4.9%), CPU 61.3 s
+  (64.2 before), peak 1.0 GB. AGX lit 254/255 (air/bitcode-input: no `cmp` here).
+- Not measured: render/launch time (per-launch the params block grows by up to 512 B for kernels with many constants).
+  Next: Cycles A/B with /scratch/cyc1112c/ab.sh when the user OKs a GPU run.
+- Pitfall: a static count of mov_imm values from the flag-off output overstates the gain (mov_imm 0 / 1 are 16-bit
+  immediates the pass does not touch).

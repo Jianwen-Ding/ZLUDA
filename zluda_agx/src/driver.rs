@@ -2250,6 +2250,16 @@ mod zoc_server {
 
 /// The module in an image: an AGX object, or PTX text (NUL-terminated).
 pub(crate) fn load_image(image: &[u8], cpu: &str) -> Result<module::Module, CUerror> {
+    // (e_machine EM_CUDA: an NVIDIA cubin, machine code for an NVIDIA architecture, which nothing here can run)
+    if image.starts_with(b"\x7fELF") && image.get(18..20) == Some(&190u16.to_le_bytes()[..]) {
+        let (major, minor) = cc();
+        eprintln!(
+            "zluda_agx: the application loaded NVIDIA machine code (a cubin), which ZLUDA cannot run; it may have \
+             chosen it for the reported compute capability {major}.{minor}: ZLUDA_AGX_CC=8.0 makes applications \
+             that also ship PTX take it"
+        );
+        return Err(CUerror::NO_BINARY_FOR_GPU);
+    }
     if image.starts_with(b"\x7fELF") {
         return module::Module::load_object(image).map_err(|e| {
             if crate::log_enabled() {
@@ -2424,13 +2434,16 @@ pub(crate) unsafe fn cuDeviceTotalMem_v2(bytes: *mut usize, dev: CUdevice) -> CU
 }
 
 /// CUDA compute capability reported for AGX: within what ZLUDA's PTX front end accepts, and a real architecture, as
-/// libraries check it (cuBLAS's creation fails on a version no GPU has, 8.7). The driver loads PTX and not machine code,
-/// and an application that ships a binary per architecture picks it from this number and fails to load it: 8.0 is a
-/// data-center architecture that those for graphics cards leave out (Blender's with 8.6, 8.9 and 12.0), which then
-/// take their PTX.
-const CC_DEFAULT: (c_int, c_int) = (8, 0);
+/// libraries check it (cuBLAS's creation fails on a version no GPU has, 8.7). 8.9 (Ada) rather than 8.0: applications
+/// choose kernels by it, and at 8.0 they pick the paths of a data-center GPU with fast tensor cores (llama.cpp's
+/// flash-attention decode takes its mma kernel, emulated on AGX: token generation 132 -> 156 t/s at 8.9).
+/// The driver loads PTX and not machine code. A fat binary always gives its PTX (ptx_in_fatbin); an application
+/// that ships a separate machine-code file per architecture and chooses it from this number (Blender's official
+/// builds with sm_89 cubins) gets CUDA_ERROR_NO_BINARY_FOR_GPU and a message (load_image): with
+/// `ZLUDA_AGX_CC=8.0` such an application takes its PTX instead.
+const CC_DEFAULT: (c_int, c_int) = (8, 9);
 
-/// The reported compute capability: CC_DEFAULT, or `ZLUDA_AGX_CC=major.minor` (experiments only).
+/// The reported compute capability: CC_DEFAULT, or `ZLUDA_AGX_CC=major.minor`.
 fn cc() -> (c_int, c_int) {
     static CC: std::sync::OnceLock<(c_int, c_int)> = std::sync::OnceLock::new();
     *CC.get_or_init(|| {

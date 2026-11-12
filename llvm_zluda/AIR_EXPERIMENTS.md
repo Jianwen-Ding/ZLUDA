@@ -41,6 +41,30 @@ section. GPU times are from the M2 Max behind the AIR service; "suite" is PTX-fo
   is now the slow part. Not over-inlining: shade_surface_mnee packaged alone keeps 162 functions, and
   `-air-keep-function-cost` 20000 / 5000 / 2000 left it byte-identical (its large functions are kept already).
 
+## 2026-11-12: m8n8.trans and movmatrix routed, why decode flash attention is slow at cc 8.0 (branch claude/ldm-trans-2026-11-12)
+
+- **ldmatrix/stmatrix .m8n8.trans and movmatrix route by lane bit exchanges** (agx_matrix.rs `route_words`,
+  `trans_row_addresses`). Thread (g, t) of .trans reads the address of row 8i + 2t + h; movmatrix reads thread
+  8t + g/2 + 4h. Both indices are bit permutations of the lane with constant bits, which AGX's quad merge split in
+  two (.trans) or four (movmatrix). Now: swaps of lane bits (one shuffle_xor + select each), then each constant bit
+  one shuffle_xor shared by its two values; checked lane by lane at compile time (`route_source`). x4.trans test
+  kernel 113 -> 75 instructions. llama.cpp decode FA kernel `flash_attn_ext_f16<64,64,1,8>`: 21699 -> 20597
+  instructions, simd_shuffle 1152 -> 384, stack ops 800 -> 622, object 153224 -> 147856 bytes. PTX-formalization
+  ldmatrix/stmatrix/movmatrix files on agx_run 22/22. llama MMQ build fa=1 (same libcuda, zoc only, 3 rounds):
+  pp512 1331-1339 -> 1330-1342, tg64 110.6-115.5 -> 114.8-116.6, completion identical.
+- The 384 remaining index shuffles of that kernel are llama's own movmatrix fallback (`ggml_cuda_movmatrix` with
+  `__shfl_sync`): the llama build passes `-DCUDART_VERSION=11060`, so ggml does not emit the movmatrix instruction.
+  A backend routing of such shuffles needs a guard (all 32 threads active, tid.x == lane): exited threads may sit
+  in the middle of a route. Not done.
+- **Why decode FA is slow at cc 8.0 (unbatched ZLUDA_AGX_PROFILE, tg16, qwen2.5-0.5b):** the MMA kernel takes 77.5 us
+  per call vs 20.3 us for the VEC kernel (+5.4 us combine) that cc 8.9 selects; 28.7% vs 9.6% of GPU time. Its
+  grid is 4 workgroups (stream-k, ntiles_KV x ntiles_dst at a short context) of 128 threads: one block per core on 4
+  of 38 cores, each running one KV tile. Its main loop is ~14k instructions (~100 KB) and the kernel 147 KB; at the
+  measured ~70 ns per cold 64-byte code line (2026-11-10 MMVQ capture), fetching the executed path alone is ~50 us.
+  So this kernel is bound by instruction fetch, not by the matrix unit (384 simd_matrix_fmadd32): code size is the
+  lever (f16 -> f32 operand conversions `fadd32 x, h, -0.0` ~270 per tile block, 3 near-copies of the tile body of
+  2.6-2.8k instructions each, icmpsel/iadd address arithmetic).
+
 ## 2026-11-08: mma and ldmatrix as bit exchanges, closures in registers (branch claude/mma-bitmove-2026-11-08)
 
 All inputs are built with clang (zcc, ptx/tools/cycles_clang); the baseline is origin/master zoc with

@@ -152,11 +152,13 @@ struct LazySource {
 /// Where a large lazily loaded module keeps its portable AIR, removed with the module.
 struct PortableAir {
     dir: tempfile::TempDir,
+    /// The cache key's hash of the module's PTX, computed once for all its kernels
+    source_hash: std::sync::OnceLock<u128>,
 }
 
 impl PortableAir {
     fn new() -> Option<Self> {
-        tempfile::tempdir().ok().map(|dir| PortableAir { dir })
+        tempfile::tempdir().ok().map(|dir| PortableAir { dir, source_hash: std::sync::OnceLock::new() })
     }
     fn path(&self) -> std::path::PathBuf {
         self.dir.path().join("module.portable.air")
@@ -172,7 +174,10 @@ fn compile_lazy_kernel(
     cpu: &str,
 ) -> Result<(Vec<u8>, String), String> {
     match portable {
-        Some(p) => compile_ptx_kernel(ptx.as_bytes(), name, &p.path(), cpu),
+        Some(p) => {
+            let hash = *p.source_hash.get_or_init(|| agx_runtime::cache::source_hash(ptx.as_bytes()));
+            compile_ptx_kernel(ptx.as_bytes(), name, &p.path(), cpu, Some(hash))
+        }
         None => compile_ptx(crate::specialize::without_other_entries(ptx, name).as_bytes(), cpu),
     }
 }
@@ -1917,7 +1922,7 @@ pub(crate) fn compile_ptx(ptx: &[u8], cpu: &str) -> Result<(Vec<u8>, String), St
 /// Compiles PTX modules into one AGX object: one module, or several linked together (`cuLink*`: functions declared
 /// `.extern` in one are defined `.visible` in another).
 pub(crate) fn compile_ptx_linked(sources: &[&[u8]], cpu: &str) -> Result<(Vec<u8>, String), String> {
-    compile_or_cached(sources, cpu, false, None).map(|o| o.expect("compiled"))
+    compile_or_cached(sources, cpu, false, None, None).map(|o| o.expect("compiled"))
 }
 
 /// Compiles kernel `kernel` of a large PTX module (over `LARGE_MODULE_BYTES`) alone, with the global data layout of
@@ -1930,13 +1935,14 @@ pub(crate) fn compile_ptx_kernel(
     kernel: &str,
     portable: &std::path::Path,
     cpu: &str,
+    source_hash: Option<u128>,
 ) -> Result<(Vec<u8>, String), String> {
-    compile_or_cached(&[ptx], cpu, false, Some((kernel, portable))).map(|o| o.expect("compiled"))
+    compile_or_cached(&[ptx], cpu, false, Some((kernel, portable)), source_hash).map(|o| o.expect("compiled"))
 }
 
 /// The compilation cache's object for PTX, without compiling it on a miss (`None`).
 pub(crate) fn cached_ptx(ptx: &[u8], cpu: &str) -> Option<(Vec<u8>, String)> {
-    compile_or_cached(&[ptx], cpu, true, None).ok().flatten()
+    compile_or_cached(&[ptx], cpu, true, None, None).ok().flatten()
 }
 
 fn compile_or_cached(
@@ -1944,7 +1950,10 @@ fn compile_or_cached(
     cpu: &str,
     cached_only: bool,
     kernel: Option<(&str, &std::path::Path)>,
+    source_hash: Option<u128>,
 ) -> Result<Option<(Vec<u8>, String)>, String> {
+    // (a link's key is its joined sources: a single source's hash only)
+    let source_hash = source_hash.filter(|_| sources.len() == 1);
     let zoc = zoc_path();
     let stamp = std::fs::metadata(&zoc)
         .and_then(|m| m.modified())
@@ -2016,12 +2025,12 @@ fn compile_or_cached(
     // kernel makes it from the AIR without the front end again; its FILE.o3 flag as the entry's text)
     let mut portable_options = options.clone();
     portable_options.push("portable");
-    let portable_key = Key { source, chip: cpu, compiler: &compiler, options: &portable_options };
+    let portable_key = Key { source, source_hash, chip: cpu, compiler: &compiler, options: &portable_options };
     let kernel_option = kernel.map(|(k, _)| format!("kernel={k}"));
     if let Some(k) = &kernel_option {
         options.push(k);
     }
-    let key = Key { source, chip: cpu, compiler: &compiler, options: &options };
+    let key = Key { source, source_hash, chip: cpu, compiler: &compiler, options: &options };
     let compiled = std::cell::Cell::new(false);
     let started = Instant::now();
     let compile = || -> Result<(Vec<u8>, String), String> {

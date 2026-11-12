@@ -815,6 +815,99 @@ impl Ir {
 
 // ---------------------------------------------------------------- ldmatrix, stmatrix, movmatrix
 
+/// A step of a lane routing with constant-mask shuffles: thread l takes the value of thread l ^ 2^a ^ 2^b where
+/// lane bits a and b differ (`Swap`: the value of the thread with the two bits exchanged), or of thread l ^ 2^a where
+/// lane bit a is not k (`Force`: the value of the thread with bit a set to k).
+#[derive(Clone, Copy)]
+enum Route {
+    Swap(u32, u32),
+    Force(u32, u32),
+}
+
+/// The thread whose value thread `l` holds after `steps`, each reading its partner's value of the step before.
+fn route_source(steps: &[Route], l: u32) -> u32 {
+    steps.iter().rev().fold(l, |x, s| match *s {
+        Route::Swap(a, b) if ((x >> a) ^ (x >> b)) & 1 != 0 => x ^ (1 << a) ^ (1 << b),
+        Route::Swap(..) => x,
+        Route::Force(a, k) => (x & !(1 << a)) | (k << a),
+    })
+}
+
+/// The 64-bit `base` of thread 8i + 2t + h in thread (g, t), for each i < `number` and h < 2 (index 2i + h): the
+/// row addresses of ldmatrix and stmatrix .m8n8.trans. The value moves by lane bit exchanges (one shuffle_xor and a
+/// select each, all threads taking part): bits 0 -> 1 -> 2 -> 0 rotated, then bit 2 set to h and bits 3 and 4 to
+/// those of i, each fixed bit one shuffle_xor shared by the two values it gives. A thread then holds the address of
+/// row 2t + h of matrix i in every quad; a shuffle of index 8i + 2t + h is split in two by AGX's quad merge.
+fn trans_row_addresses(ir: &mut Ir, lane: &str, base: &str, number: u32) -> Vec<String> {
+    let rotate = [Route::Swap(0, 1), Route::Swap(1, 2)];
+    let fixed = |i: u32, h: u32| [Route::Force(2, h), Route::Force(3, i & 1), Route::Force(4, i >> 1)];
+    let exact = (0..number).all(|i| {
+        (0..2).all(|h| {
+            let steps = [&rotate[..], &fixed(i, h)[..]].concat();
+            (0..32).all(|l| route_source(&steps, l) == 8 * i + 2 * (l & 3) + h)
+        })
+    });
+    if !exact {
+        return (0..2 * number)
+            .map(|x| {
+                let l = ir.op("and", "i32", lane, "3");
+                let l = ir.linear(2, &l, 0, "0", 8 * (x / 2) + x % 2);
+                row_address(ir, base, &l)
+            })
+            .collect();
+    }
+    ir.declarations.insert("declare i32 @llvm.agx.simd.shuffle.xor.i32(i32, i32)".to_string());
+    let bit = |ir: &mut Ir, b: u32| {
+        let x = ir.op("lshr", "i32", lane, &b.to_string());
+        let x = ir.op("and", "i32", &x, "1");
+        ir.icmp("ne", "i32", &x, "0")
+    };
+    let xor = |ir: &mut Ir, v: &str, mask: u32| ir.def(&format!("call i32 @llvm.agx.simd.shuffle.xor.i32(i32 {v}, i32 {mask})"));
+    let lo = ir.cast("trunc", "i64", base, "i32");
+    let hi = ir.op("lshr", "i64", base, "32");
+    let hi = ir.cast("trunc", "i64", &hi, "i32");
+    let mut words = vec![lo, hi];
+    for step in rotate {
+        let Route::Swap(a, b) = step else { unreachable!() };
+        let (ba, bb) = (bit(ir, a), bit(ir, b));
+        let differ = ir.op("xor", "i1", &ba, &bb);
+        for w in words.iter_mut() {
+            let t = xor(ir, w, (1 << a) | (1 << b));
+            *w = ir.select(&differ, "i32", &t, w);
+        }
+    }
+    // bit 2 to h, then bit 3 to i & 1 and bit 4 to i >> 1: a value per fixed prefix, each fixed bit one shuffle
+    let mut level: Vec<(u32, Vec<String>)> = vec![(0, words)];
+    for (b, values) in [(2, vec![0, 1]), (3, (0..number.min(2)).collect::<Vec<_>>()), (4, (0..number.div_ceil(2)).collect())] {
+        let set = bit(ir, b);
+        let mut next = Vec::new();
+        for (key, words) in &level {
+            let moved = words.iter().map(|w| xor(ir, w, 1 << b)).collect::<Vec<_>>();
+            for &k in &values {
+                // bit b of this thread is k: its own value; else its partner's
+                let w = words
+                    .iter()
+                    .zip(&moved)
+                    .map(|(own, other)| if k == 1 { ir.select(&set, "i32", own, other) } else { ir.select(&set, "i32", other, own) })
+                    .collect();
+                next.push((key | (k << b), w));
+            }
+        }
+        level = next;
+    }
+    (0..2 * number)
+        .map(|x| {
+            let (i, h) = (x / 2, x % 2);
+            let key = (h << 2) | ((i & 1) << 3) | ((i >> 1) << 4);
+            let words = &level.iter().find(|(k, _)| *k == key).unwrap().1;
+            let lo = ir.cast("zext", "i32", &words[0], "i64");
+            let hi = ir.cast("zext", "i32", &words[1], "i64");
+            let hi = ir.op("shl", "i64", &hi, "32");
+            ir.op("or", "i64", &lo, &hi)
+        })
+        .collect()
+}
+
 // The address of the row given by thread `lane` (an i32 value).
 fn row_address(ir: &mut Ir, base: &str, lane: &str) -> String {
     ir.shuffle(base, 64, lane, false)
@@ -901,6 +994,15 @@ fn ldmatrix(
     } else {
         None
     };
+    // m8n8.trans: thread (g, t) reads rows 8i + 2t and 8i + 2t + 1 of the addresses, the same in every quad. They are
+    // routed with constant-mask exchanges (`trans_row_addresses`) instead of shuffles of a per-thread index, which
+    // AGX's quad merge splits into two.
+    let trans_rows = if d.shape == ast::MatrixShape::M8n8 && d.transpose {
+        let lane_id = ir.linear(4, g, 1, t, 0);
+        Some(trans_row_addresses(ir, &lane_id, &base, d.number.get() as u32))
+    } else {
+        None
+    };
     let mut regs = Vec::new();
     for i in 0..d.number.get() as u32 {
         match d.shape {
@@ -923,8 +1025,13 @@ fn ldmatrix(
                 let off = ir.cast("zext", "i32", &off, "i64");
                 let mut halves = Vec::new();
                 for h in 0..2 {
-                    let l = ir.linear(0, g, 2, t, 8 * i + h);
-                    let row = row_address(ir, &base, &l);
+                    let row = match &trans_rows {
+                        Some(rows) => rows[(2 * i + h) as usize].clone(),
+                        None => {
+                            let l = ir.linear(0, g, 2, t, 8 * i + h);
+                            row_address(ir, &base, &l)
+                        }
+                    };
                     let a = ir.address(&row, &off, ptr_type);
                     let x = ir.load("i16", &a, ptr_type, 2);
                     halves.push(ir.cast("zext", "i16", &x, "i32"));
@@ -985,6 +1092,13 @@ fn stmatrix(
     if d.shape == ast::MatrixShape::M16n8 {
         return stmatrix_m16n8(ir, lane, d, p, ptr_type, regs);
     }
+    // the rows of m8n8.trans, as ldmatrix routes them
+    let trans_rows = if d.shape == ast::MatrixShape::M8n8 && d.transpose {
+        let lane_id = ir.linear(4, g, 1, t, 0);
+        Some(trans_row_addresses(ir, &lane_id, &base, d.number.get() as u32))
+    } else {
+        None
+    };
     for i in 0..d.number.get() as u32 {
         let v = regs.get(i as usize).ok_or_else(|| todo("stmatrix registers"))?;
         match d.shape {
@@ -1000,8 +1114,13 @@ fn stmatrix(
                 let off = ir.op("mul", "i32", g, "2");
                 let off = ir.cast("zext", "i32", &off, "i64");
                 for h in 0..2 {
-                    let l = ir.linear(0, g, 2, t, 8 * i + h);
-                    let row = row_address(ir, &base, &l);
+                    let row = match &trans_rows {
+                        Some(rows) => rows[(2 * i + h) as usize].clone(),
+                        None => {
+                            let l = ir.linear(0, g, 2, t, 8 * i + h);
+                            row_address(ir, &base, &l)
+                        }
+                    };
                     let a = ir.address(&row, &off, ptr_type);
                     let x = ir.op("lshr", "i32", v, &(16 * h).to_string());
                     let x = ir.cast("trunc", "i32", &x, "i16");

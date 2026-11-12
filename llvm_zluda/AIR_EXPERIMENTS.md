@@ -1123,3 +1123,7 @@ CPU-only (llc over the 78 Cycles kernels in /scratch/mmq/cyc/all, flags as zluda
 - llama.cpp check of the same change (MMQ build, fa=1, same libcuda, only zoc varied, 3 alternating warm rounds): old /
   ranked-64 / ranked-128 all pp512 1330-1337 and tg64 111-116 t/s: neutral. The pre-crash libcuda's higher tg64 (~170 vs 113-134 t/s) is
   origin/claude/cc89-2026-11-12 (cc 8.9 default, not on master; deferred decision #3): HEAD + ZLUDA_AGX_CC=8.9 gives 170.9.
+- cc 8.9 check on Cycles (clang-built, PTX; monkey, same build, ZLUDA_AGX_CC=8.0 vs 8.9, /scratch/cyc1112d/cyc-cc.sh): renders
+  fine (rc 0), cold 39.0 vs 39.2 s, warm 1024^2 64spp 1.849/1.911/1.8 vs 1.749/1.923/1.884 s (mean 1.853 vs 1.852: no
+  difference), images max diff 1 (noise). Not checked at 8.9: Halide apps, tinygrad (NVRTC sm_89), Rodinia, and Blender's
+  own cubins (the real risk for deferred decision #3: its shipped 8.9 cubin would be picked over PTX).

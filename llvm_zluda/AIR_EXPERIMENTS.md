@@ -1127,3 +1127,6 @@ CPU-only (llc over the 78 Cycles kernels in /scratch/mmq/cyc/all, flags as zluda
   fine (rc 0), cold 39.0 vs 39.2 s, warm 1024^2 64spp 1.849/1.911/1.8 vs 1.749/1.923/1.884 s (mean 1.853 vs 1.852: no
   difference), images max diff 1 (noise). Not checked at 8.9: Halide apps, tinygrad (NVRTC sm_89), Rodinia, and Blender's
   own cubins (the real risk for deferred decision #3: its shipped 8.9 cubin would be picked over PTX).
+- cc 8.9 on Rodinia (/scratch/cyc1112d/rod-cc.sh, HEAD libcuda + new zoc, ZLUDA_AGX_CC=8.0 vs 8.9): nw (2048 10, traceback
+  result.txt, fresh file each run) and hotspot3D (512x8 100 iters, output.out) produce byte-identical outputs. Still not
+  checked at 8.9: Halide apps, tinygrad (NVRTC sm_89), Blender with its own cubins.

@@ -1121,5 +1121,5 @@ CPU-only (llc over the 78 Cycles kernels in /scratch/mmq/cyc/all, flags as zluda
 - Pitfall: a static count of mov_imm values from the flag-off output overstates the gain (mov_imm 0 / 1 are 16-bit
   immediates the pass does not touch).
 - llama.cpp check of the same change (MMQ build, fa=1, same libcuda, only zoc varied, 3 alternating warm rounds): old /
-  ranked-64 / ranked-128 all pp512 1330-1337 and tg64 111-116 t/s: neutral. Separate finding, see /scratch/cyc1112d/NOTES.md:
-  the pre-crash libcuda (04:44 build) gave tg64 ~148 t/s against ~113 for builds of current HEAD; cause not found.
+  ranked-64 / ranked-128 all pp512 1330-1337 and tg64 111-116 t/s: neutral. The pre-crash libcuda's higher tg64 (~170 vs 113-134 t/s) is
+  origin/claude/cc89-2026-11-12 (cc 8.9 default, not on master; deferred decision #3): HEAD + ZLUDA_AGX_CC=8.9 gives 170.9.

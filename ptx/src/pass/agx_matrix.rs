@@ -856,45 +856,12 @@ fn trans_row_addresses(ir: &mut Ir, lane: &str, base: &str, number: u32) -> Vec<
             })
             .collect();
     }
-    ir.declarations.insert("declare i32 @llvm.agx.simd.shuffle.xor.i32(i32, i32)".to_string());
-    let bit = |ir: &mut Ir, b: u32| {
-        let x = ir.op("lshr", "i32", lane, &b.to_string());
-        let x = ir.op("and", "i32", &x, "1");
-        ir.icmp("ne", "i32", &x, "0")
-    };
-    let xor = |ir: &mut Ir, v: &str, mask: u32| ir.def(&format!("call i32 @llvm.agx.simd.shuffle.xor.i32(i32 {v}, i32 {mask})"));
     let lo = ir.cast("trunc", "i64", base, "i32");
     let hi = ir.op("lshr", "i64", base, "32");
     let hi = ir.cast("trunc", "i64", &hi, "i32");
-    let mut words = vec![lo, hi];
-    for step in rotate {
-        let Route::Swap(a, b) = step else { unreachable!() };
-        let (ba, bb) = (bit(ir, a), bit(ir, b));
-        let differ = ir.op("xor", "i1", &ba, &bb);
-        for w in words.iter_mut() {
-            let t = xor(ir, w, (1 << a) | (1 << b));
-            *w = ir.select(&differ, "i32", &t, w);
-        }
-    }
-    // bit 2 to h, then bit 3 to i & 1 and bit 4 to i >> 1: a value per fixed prefix, each fixed bit one shuffle
-    let mut level: Vec<(u32, Vec<String>)> = vec![(0, words)];
-    for (b, values) in [(2, vec![0, 1]), (3, (0..number.min(2)).collect::<Vec<_>>()), (4, (0..number.div_ceil(2)).collect())] {
-        let set = bit(ir, b);
-        let mut next = Vec::new();
-        for (key, words) in &level {
-            let moved = words.iter().map(|w| xor(ir, w, 1 << b)).collect::<Vec<_>>();
-            for &k in &values {
-                // bit b of this thread is k: its own value; else its partner's
-                let w = words
-                    .iter()
-                    .zip(&moved)
-                    .map(|(own, other)| if k == 1 { ir.select(&set, "i32", own, other) } else { ir.select(&set, "i32", other, own) })
-                    .collect();
-                next.push((key | (k << b), w));
-            }
-        }
-        level = next;
-    }
+    // bit 2 to h, then bit 3 to i & 1 and bit 4 to i >> 1
+    let fixed = [(2, vec![0, 1]), (3, (0..number.min(2)).collect::<Vec<_>>()), (4, (0..number.div_ceil(2)).collect())];
+    let level = route_words(ir, lane, vec![lo, hi], &rotate, &fixed);
     (0..2 * number)
         .map(|x| {
             let (i, h) = (x / 2, x % 2);
@@ -906,6 +873,48 @@ fn trans_row_addresses(ir: &mut Ir, lane: &str, base: &str, number: u32) -> Vec<
             ir.op("or", "i64", &lo, &hi)
         })
         .collect()
+}
+
+/// The i32 `words` of a value routed by `swaps` (all threads taking part), then with each lane bit b of `fixed` set
+/// to each of its values k: one shuffle_xor per word and swap, and per word and fixed bit of each value so far,
+/// shared by that bit's values. Returns (the OR of k << b, the words) for every combination of fixed values.
+fn route_words(ir: &mut Ir, lane: &str, mut words: Vec<String>, swaps: &[Route], fixed: &[(u32, Vec<u32>)]) -> Vec<(u32, Vec<String>)> {
+    ir.declarations.insert("declare i32 @llvm.agx.simd.shuffle.xor.i32(i32, i32)".to_string());
+    let bit = |ir: &mut Ir, b: u32| {
+        let x = ir.op("lshr", "i32", lane, &b.to_string());
+        let x = ir.op("and", "i32", &x, "1");
+        ir.icmp("ne", "i32", &x, "0")
+    };
+    let xor = |ir: &mut Ir, v: &str, mask: u32| ir.def(&format!("call i32 @llvm.agx.simd.shuffle.xor.i32(i32 {v}, i32 {mask})"));
+    for step in swaps {
+        let Route::Swap(a, b) = *step else { unreachable!("route_words: swaps only") };
+        let (ba, bb) = (bit(ir, a), bit(ir, b));
+        let differ = ir.op("xor", "i1", &ba, &bb);
+        for w in words.iter_mut() {
+            let t = xor(ir, w, (1 << a) | (1 << b));
+            *w = ir.select(&differ, "i32", &t, w);
+        }
+    }
+    let mut level: Vec<(u32, Vec<String>)> = vec![(0, words)];
+    for (b, values) in fixed {
+        let b = *b;
+        let set = bit(ir, b);
+        let mut next = Vec::new();
+        for (key, words) in &level {
+            let moved = words.iter().map(|w| xor(ir, w, 1 << b)).collect::<Vec<_>>();
+            for &k in values {
+                // bit b of this thread is k: its own value; else its partner's
+                let w = words
+                    .iter()
+                    .zip(&moved)
+                    .map(|(own, other)| if k == 1 { ir.select(&set, "i32", own, other) } else { ir.select(&set, "i32", other, own) })
+                    .collect();
+                next.push((key | (k << b), w));
+            }
+        }
+        level = next;
+    }
+    level
 }
 
 // The address of the row given by thread `lane` (an i32 value).
@@ -1191,10 +1200,28 @@ fn movmatrix(ir: &mut Ir, lane: &Lane, src: &str) -> String {
     let g2 = ir.op("lshr", "i32", &g, "1");
     let shift = ir.op("and", "i32", &g, "1");
     let shift = ir.op("mul", "i32", &shift, "16");
+    // thread (g, t) reads thread 8t + g / 2 + 4h: lane bits 0 <-> 3 and 1 <-> 4 exchanged, bit 2 set to h (constant-mask
+    // exchanges, `route_words`; a shuffle of that index is split in four by AGX's quad merge)
+    let swaps = [Route::Swap(0, 3), Route::Swap(1, 4)];
+    let routed = (0..2).all(|h| {
+        let steps = [Route::Swap(0, 3), Route::Swap(1, 4), Route::Force(2, h)];
+        (0..32).all(|l| route_source(&steps, l) == 8 * (l & 3) + (l >> 3) + 4 * h)
+    });
+    let level = if routed {
+        let lane_id = ir.linear(4, &g, 1, &t, 0);
+        Some(route_words(ir, &lane_id, vec![src.to_string()], &swaps, &[(2, vec![0, 1])]))
+    } else {
+        None
+    };
     let mut halves = Vec::new();
     for h in 0..2 {
-        let l = ir.linear(8, &t, 1, &g2, 4 * h);
-        let x = ir.shuffle(src, 32, &l, false);
+        let x = match &level {
+            Some(level) => level.iter().find(|(k, _)| *k == h << 2).unwrap().1[0].clone(),
+            None => {
+                let l = ir.linear(8, &t, 1, &g2, 4 * h);
+                ir.shuffle(src, 32, &l, false)
+            }
+        };
         let x = ir.op("lshr", "i32", &x, &shift);
         halves.push(ir.op("and", "i32", &x, "65535"));
     }

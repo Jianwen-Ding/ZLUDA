@@ -1114,7 +1114,9 @@ CPU-only (llc over the 78 Cycles kernels in /scratch/mmq/cyc/all, flags as zluda
   halves used, not worth it).
 - All 78 kernels, cap 128: 0 failures, 2,657,990 instructions vs 2,794,794 without the flag (-4.9%), CPU 61.3 s
   (64.2 before), peak 1.0 GB. AGX lit 254/255 (air/bitcode-input: no `cmp` here).
-- Not measured: render/launch time (per-launch the params block grows by up to 512 B for kernels with many constants).
-  Next: Cycles A/B with /scratch/cyc1112c/ab.sh when the user OKs a GPU run.
+- Render (monkey, /scratch/cyc1112d/ab-short.sh, 3 alternating warm 1024^2 64spp, states 2M; old = the 04:44 build, new =
+  rebuilt with this llc): old 1.93 / 1.917 / 1.916 s, new 1.785 / 1.88 / 1.872 s (mean 1.920 -> 1.846 s, -3.8%, every pair
+  faster); cold 512^2 1spp 39.7 -> 40.1 s (same). Images: max diff 1 in <=16 of 4.2 M bytes (old vs old: 12), i.e. noise.
+  Caveat: old-rel was built earlier, so ZLUDA sources may differ slightly besides this change. Only 3 warm pairs, short runs.
 - Pitfall: a static count of mov_imm values from the flag-off output overstates the gain (mov_imm 0 / 1 are 16-bit
   immediates the pass does not touch).

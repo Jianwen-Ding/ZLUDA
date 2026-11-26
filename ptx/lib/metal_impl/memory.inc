@@ -31,7 +31,7 @@
     // conditional phase and the payload reports of .layout::v1): mbarrier.init does not write the 8 bytes. The
     // helpers keep them in a table in threadgroup memory keyed by the object's threadgroup address (+1, 0 = free),
     // assumed zero at launch.
-#define MB_SLOTS 16
+#define MB_SLOTS 32
 #define MB_TIMEOUT_ROUNDS 24
     struct MbSlot
     {

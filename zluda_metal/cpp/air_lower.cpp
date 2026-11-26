@@ -366,17 +366,17 @@ static void resolveCluster(Module &m)
 }
 
 // NaN constants: PTX arithmetic producing a NaN gives the canonical NaN (all ones but the sign: 0x7fffffff for .f32),
-// which the AGX hardware produces at run time (+canonical-nan); LLVM's constant folding gives its default quiet NaN
+// which the AGX hardware produces at run time (+canonical-nan); LLVM's constant folding of f32 gives its default quiet NaN
 // (0x7fc00000) instead. NaN constants of the program (bit patterns of the PTX source, the helper library) are hidden
 // behind opaque calls during the cleanups; afterwards every default NaN constant comes from folding and is replaced by
-// the canonical NaN, and the program's constants are restored.
+// the canonical NaN, and the program's constants are restored. (f64 keeps NaN payloads in PTX, as LLVM's folding does.)
 static void hideSourceNaNs(Module &m)
 {
     std::vector<std::pair<Instruction *, unsigned>> work;
     for (Function &f : m)
         for (Instruction &i : instructions(f))
             for (unsigned k = 0; k < i.getNumOperands(); k++)
-                if (auto *cf = dyn_cast<ConstantFP>(i.getOperand(k)); cf && cf->isNaN())
+                if (auto *cf = dyn_cast<ConstantFP>(i.getOperand(k)); cf && cf->isNaN() && cf->getType()->isFloatTy())
                     work.push_back({&i, k});
     for (auto [i, k] : work)
     {
@@ -405,7 +405,7 @@ static void canonicalizeFoldedNaNs(Module &m)
     for (Function &f : m)
         for (Instruction &i : instructions(f))
             for (unsigned k = 0; k < i.getNumOperands(); k++)
-                if (auto *cf = dyn_cast<ConstantFP>(i.getOperand(k)); cf && cf->isNaN())
+                if (auto *cf = dyn_cast<ConstantFP>(i.getOperand(k)); cf && cf->isNaN() && cf->getType()->isFloatTy())
                 {
                     const fltSemantics &sem = cf->getValueAPF().getSemantics();
                     APInt bits = cf->getValueAPF().bitcastToAPInt();

@@ -836,6 +836,24 @@ fn link_weak(t: &str) -> String {
         }
         i += 1;
     }
+    // an item starts at the last line that begins with a linkage / state-space / function keyword (directives
+    // without `;` such as .version may precede it in the same scanned statement)
+    for it in items.iter_mut() {
+        let st = &t[it.0..it.1];
+        let lim = st.find('{').unwrap_or(st.len());
+        let mut best = None;
+        let mut off = 0;
+        for line in st[..lim].split_inclusive('\n') {
+            let w = line.split_whitespace().next().unwrap_or("");
+            if [".extern", ".weak", ".visible", ".global", ".const", ".shared", ".func", ".entry"].contains(&w) {
+                best = Some(off + (line.len() - line.trim_start().len()));
+            }
+            off += line.len();
+        }
+        if let Some(b) = best {
+            it.0 += b;
+        }
+    }
     let mut drop: Vec<(usize, usize)> = Vec::new();
     let mut names: Vec<&String> = items.iter().map(|x| &x.2).collect();
     names.sort();

@@ -625,8 +625,59 @@
     static inline uint32_t elem_bits(uint32_t t) { return t == T_E2M1 ? 4 : 8; }
 
     // scalar cvt d, a
+    // Fast paths of the common conversions, bit-exact with xcvt: ctrl is an immediate, so after
+    // inlining only one path remains. The hardware's conversions are exact here (half subnormals
+    // are kept; an f32 subnormal rounds to a signed zero in f16 anyway; doubles are soft-f64);
+    // NaN results are the canonical NaN, saturation is explicit.
+    static inline bool cvt_fast(uint64_t a, uint32_t ctrl, uint64_t *r)
+    {
+        uint32_t c = ctrl & ~C_FTZ;
+        if (c == (T_F32 | T_F16 << 5)) // cvt.f32.f16
+        {
+            uint16_t h = (uint16_t)a;
+            if ((h & 0x7C00) == 0x7C00 && (h & 0x3FF))
+                *r = 0x7FFFFFFF;
+            else
+                *r = __builtin_bit_cast(uint32_t, (float)__builtin_bit_cast(_Float16, h));
+            return true;
+        }
+        if (c == (T_F16 | T_F32 << 5)) // cvt.rn.f16.f32
+        {
+            uint32_t u = (uint32_t)a;
+            if ((u & 0x7FFFFFFF) > 0x7F800000)
+                *r = 0x7FFF;
+            else
+                *r = __builtin_bit_cast(uint16_t, (_Float16)__builtin_bit_cast(float, u));
+            return true;
+        }
+        if (c == (T_F64 | T_F32 << 5) && !(ctrl & C_FTZ)) // cvt.f64.f32
+        {
+            uint32_t u = (uint32_t)a;
+            if ((u & 0x7FFFFFFF) > 0x7F800000)
+                *r = 0x7FFFFFFFFFFFFFFFull;
+            else
+                *r = __builtin_bit_cast(uint64_t, (double)__builtin_bit_cast(float, u));
+            return true;
+        }
+        if (c == (T_S32 | T_F32 << 5 | RM_RZ << 10 | C_IRND) || c == (T_U32 | T_F32 << 5 | RM_RZ << 10 | C_IRND))
+        {
+            // cvt.rzi.{s32,u32}.f32: truncate, saturating, NaN -> 0 (subnormals truncate to 0 either way)
+            float f = __builtin_bit_cast(float, (uint32_t)a);
+            bool sgn = (c & 31) == T_S32;
+            uint32_t v;
+            if (f != f)
+                v = 0;
+            else if (sgn)
+                v = f >= 2147483648.0f ? 0x7FFFFFFFu : f <= -2147483648.0f ? 0x80000000u : (uint32_t)(int32_t)f;
+            else
+                v = f >= 4294967296.0f ? 0xFFFFFFFFu : !(f > 0.0f) ? 0u : (uint32_t)f;
+            *r = v;
+            return true;
+        }
+        return false;
+    }
 #define CVT_SCALAR(DN, DT, SN, ST) \
-    DT FUNC(cvt_##DN##_##SN)(ST a, uint32_t ctrl) { return (DT)xcvt((uint64_t)a, ctrl, 127, 0, 0); }
+    DT FUNC(cvt_##DN##_##SN)(ST a, uint32_t ctrl) { uint64_t fr; if (cvt_fast((uint64_t)a, ctrl, &fr)) return (DT)fr; return (DT)xcvt((uint64_t)a, ctrl, 127, 0, 0); }
 #define CVT_SCALAR_S(SN, ST)        \
     CVT_SCALAR(8, uint8_t, SN, ST)   \
     CVT_SCALAR(16, uint16_t, SN, ST) \

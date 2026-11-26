@@ -1348,6 +1348,7 @@ dependencies = [
  "llvm_zluda",
  "ptx",
  "ptx_parser",
+ "serde_json",
 ]
 
 [[package]]

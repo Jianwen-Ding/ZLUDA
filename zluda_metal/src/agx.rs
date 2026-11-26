@@ -601,6 +601,7 @@ impl Kernel {
                 mem.map(*va, v.clone());
             }
         }
+        let timing = std::env::var_os("ZLUDA_AGX_STATS").map(|_| time_dispatch(&d, &mem, r));
         let res = func::run(&d, &mut mem);
         {
             let mut h = heap().lock().unwrap();
@@ -615,6 +616,51 @@ impl Kernel {
         }
         let st = res?;
         last_stats().lock().unwrap().push((r.name.clone(), st.instructions));
+        if let Some(path) = std::env::var_os("ZLUDA_AGX_STATS") {
+            use std::io::Write;
+            let (time_us, cycles, err) = match timing {
+                Some(Ok(t)) => (t.0, t.1, String::new()),
+                Some(Err(e)) => (f64::NAN, f64::NAN, e),
+                None => (f64::NAN, f64::NAN, String::new()),
+            };
+            let line = serde_json::json!({
+                "kernel": r.name, "grid": grid, "block": block, "instructions": st.instructions,
+                "time_us": if time_us.is_finite() { serde_json::json!(time_us) } else { serde_json::Value::Null },
+                "core_cycles": if cycles.is_finite() { serde_json::json!(cycles) } else { serde_json::Value::Null },
+                "gprs": r.gprs, "code_bytes": self.code.len(), "timing_error": err,
+            });
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(f, "{line}");
+            }
+        }
         Ok(())
     }
+}
+
+/// The AGX Performance Simulator's prediction of the dispatch (CUDA-runtime launch profile, each
+/// SIMD group's path from the functional model over the launch's memory): (microseconds, core cycles).
+fn time_dispatch(d: &Dispatch, mem: &Memory, r: &Record) -> Result<(f64, f64), String> {
+    use agx_sim::dispatch::{self, Launch};
+    static PARAMS: OnceLock<Result<agx_sim::cost::Params, String>> = OnceLock::new();
+    let p = PARAMS.get_or_init(agx_sim::cost::Params::new).as_ref().map_err(|e| e.clone())?;
+    let mut l = Launch::default();
+    l.grid = d.grid;
+    l.wg = d.wg;
+    l.regs = (r.gprs * 2).max(8);
+    l.tg_bytes = d.shared_bytes;
+    l.uniforms = d.uniforms.clone();
+    l.regions = mem.regions.iter().map(|(va, b)| (*va, b.len() as u64)).collect();
+    // the runtime profile (agx_dispatch --launch-profile runtime): back-to-back commands
+    (l.launch_ns, l.wg_launch_ns, l.group_launch_ns, l.fetch_line_ns, l.stack_launch_ns, l.store_gbps,
+     l.store_launch_ns, l.later_waves_warm, l.partial_warm, l.chain_waves) =
+        (2300.0, 100.0, 3.2, 70.0, 5000.0, 365.0, 700.0, true, true, true);
+    l.fetch_jump_line_ns = 300.0;
+    l.stack_slot_ns = 1150.0;
+    l.icache_lines = 192;
+    l.icache_victims = 192;
+    l.validate()?;
+    let prepared = func::PreparedDispatch::new(d)?;
+    let tracer = |wg: [u32; 3]| prepared.trace_workgroup(mem, wg);
+    let rep = dispatch::simulate_with(&d.code, &l, p, Some(&tracer))?;
+    Ok((rep.time_ns / 1000.0, rep.core_cycles))
 }

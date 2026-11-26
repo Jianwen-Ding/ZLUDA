@@ -201,6 +201,44 @@ void runCleanup(Module &m, bool inlineAll, bool inferAddressSpaces)
 // integer that is (ptrtoint P) + offsets, possibly through phi/select, is
 // rewritten as a GEP chain on P.
 // ---------------------------------------------------------------------------
+// alloca / stacksave / stackrestore (ptx/lib/metal_impl/memory.inc): a per-thread stack, an entry-block alloca of
+// each kernel, and its stack offset (the stack grows down from its end)
+static void resolveLocalStack(Module &m)
+{
+    Function *base = m.getFunction("__zluda_metal_local_stack");
+    Function *sp = m.getFunction("__zluda_metal_local_sp");
+    const unsigned size = 2048;
+    std::map<Function *, std::pair<Value *, Value *>> perKernel;
+    for (Function *ph : {base, sp})
+    {
+        if (!ph)
+            continue;
+        std::vector<CallInst *> calls;
+        for (User *u : ph->users())
+            if (auto *ci = dyn_cast<CallInst>(u))
+                calls.push_back(ci);
+        for (CallInst *ci : calls)
+        {
+            Function *f = ci->getFunction();
+            auto it = perKernel.find(f);
+            if (it == perKernel.end())
+            {
+                IRBuilder<> b(&*f->getEntryBlock().getFirstInsertionPt());
+                AllocaInst *stack = b.CreateAlloca(ArrayType::get(b.getInt8Ty(), size), amd::Private, nullptr, "ptx.stack");
+                stack->setAlignment(Align(64));
+                AllocaInst *off = b.CreateAlloca(b.getInt32Ty(), amd::Private, nullptr, "ptx.sp");
+                b.CreateStore(b.getInt32(size), off);
+                it = perKernel.emplace(f, std::make_pair((Value *)stack, (Value *)off)).first;
+            }
+            Value *v = ph == base ? it->second.first : it->second.second;
+            if (v->getType() != ci->getType())
+                v = new AddrSpaceCastInst(v, ci->getType(), "", ci);
+            ci->replaceAllUsesWith(v);
+            ci->eraseFromParent();
+        }
+    }
+}
+
 // isspacep (ptx/lib/metal_impl/memory.inc): `__zluda_metal_isspacep(generic pointer, kind)` is decided from the
 // pointer's provenance after PointerRecovery (AGX has no generic addressing: every generic access must resolve
 // statically anyway). kind: 0 global, 1 shared::cta, 2 local, 3 const, 4 param, 5 shared::cluster. A pointer
@@ -2146,6 +2184,7 @@ void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals
             break;
         runCleanup(m, false, true);
     }
+    resolveLocalStack(m);
     resolveIsSpacep(m);
     for (Function &f : m)
         if (!f.isDeclaration() && f.getCallingConv() != CallingConv::AMDGPU_KERNEL && !f.use_empty())

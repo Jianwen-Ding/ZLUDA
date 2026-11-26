@@ -1056,3 +1056,23 @@
     unsigned __int128 FUNC(mov_b128_pack)(uint64_t lo, uint64_t hi) { return ((unsigned __int128)hi << 64) | lo; }
     typedef uint64_t U64x2 __attribute__((ext_vector_type(2)));
     U64x2 FUNC(mov_b128_unpack)(unsigned __int128 q) { return U64x2{(uint64_t)q, (uint64_t)(q >> 64)}; }
+
+    // ---------------------------------------------------------------- alloca / stacksave / stackrestore
+    // the per-thread stack and its offset are placeholders resolved by the AIR lowering (resolveLocalStack)
+#define LOCAL_SPACE __attribute__((address_space(5)))
+    LOCAL_SPACE uint8_t *__zluda_metal_local_stack();
+    LOCAL_SPACE uint32_t *__zluda_metal_local_sp();
+    // alloca: the stack grows down; the block is aligned to max(8, align) (ptx_int.sail exec_misc)
+    uint64_t FUNC(alloca_u64)(uint64_t size, uint32_t align)
+    {
+        LOCAL_SPACE uint32_t *sp = __zluda_metal_local_sp();
+        uint32_t al = align < 8 ? 8 : align;
+        uint32_t off = (uint32_t)(((int64_t)*sp - (int64_t)size) & ~(int64_t)(al - 1));
+        *sp = off;
+        return (uint64_t)(uintptr_t)(__zluda_metal_local_stack() + off);
+    }
+    uint64_t FUNC(stacksave_u64)() { return (uint64_t)(uintptr_t)(__zluda_metal_local_stack() + *__zluda_metal_local_sp()); }
+    void FUNC(stackrestore_u64)(uint64_t a)
+    {
+        *__zluda_metal_local_sp() = (uint32_t)(a - (uint64_t)(uintptr_t)__zluda_metal_local_stack());
+    }

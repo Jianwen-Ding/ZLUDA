@@ -608,6 +608,27 @@ pub(super) fn lower<'i>(opcode: &str, base: &str, m: &[&str], ops: &[HOp<'i>]) -
             }
             err("mov.b128 form")
         }
+        // alloca.u64 ptr, size{, align}; stacksave.u64 ptr; stackrestore.u64 ptr
+        "alloca" if m == ["u64"] => {
+            let (d, n, al) = match ops {
+                [d, n] => (d, n.op.clone(), imm(8)),
+                [d, n, a] => (d, n.op.clone(), a.op.clone()),
+                _ => return err("alloca operands"),
+            };
+            Call::new("alloca_u64")
+                .dst(d.op.clone(), ScalarType::U64)
+                .src(n, ScalarType::U64)
+                .src(al, ScalarType::U32)
+                .build()
+        }
+        "stacksave" if m == ["u64"] => {
+            let [d] = ops else { return err("stacksave operands") };
+            Call::new("stacksave_u64").dst(d.op.clone(), ScalarType::U64).build()
+        }
+        "stackrestore" if m == ["u64"] => {
+            let [a] = ops else { return err("stackrestore operands") };
+            Call::new("stackrestore_u64").src(a.op.clone(), ScalarType::U64).build()
+        }
         "ldu" => {
             let [d, a] = ops else { return err("ldu operands") };
             let Some(a) = addr(a) else { return err("ldu address") };

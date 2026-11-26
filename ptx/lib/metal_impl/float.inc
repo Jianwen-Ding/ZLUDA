@@ -487,6 +487,19 @@
         uint32_t op = ctrl & 3;
         int rm = (ctrl >> 9) & 7;
         bool ftz = ctrl & F_FTZ;
+        if (rm == RM_RN && f_pf(ctrl, T_F32) == (ftz ? PF_FTZ : 0u))
+        {
+            // to nearest without saturation: the backend's correctly rounded IEEE operation
+            // (subnormal operands and results kept: ftz flushes them explicitly), canonical NaN
+            auto fl = [&](uint32_t u) { return (ftz && (u & 0x7F800000u) == 0) ? (u & 0x80000000u) : u; };
+            float fx = __builtin_bit_cast(float, op == 2 ? 0x3F800000u : fl(a));
+            float fy = __builtin_bit_cast(float, op == 2 ? fl(a) : fl(b));
+            float fr = op == 1 ? __zluda_ieee_sqrt_f32(fx) : __zluda_ieee_fdiv_f32(fx, fy);
+            uint32_t r = __builtin_bit_cast(uint32_t, fr);
+            if ((r & 0x7FFFFFFFu) > 0x7F800000u)
+                return 0x7FFFFFFFu;
+            return fl(r);
+        }
         XF x = xdec_t(op == 2 ? 0x3F800000u : a, T_F32, ftz), y = xdec_t(op == 2 ? a : b, T_F32, ftz);
         XF v = op == 1 ? xf_sqrt(x, 24) : xf_div(x, y, 24);
         return (uint32_t)xfin(v, T_F32, rm, f_pf(ctrl, T_F32), 0, 0, false);

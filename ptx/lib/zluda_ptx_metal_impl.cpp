@@ -56,6 +56,15 @@ extern "C"
     float air_sqrt(float) __asm("air.sqrt.f32");
     _Float16 air_tanh_f16(_Float16) __asm("air.tanh.f16");
 
+    // IEEE binary32 operations (subnormals kept, correctly rounded) whatever the kernel's
+    // denormal mode: replaced by air_lower.cpp (lowerIEEEHelperCalls)
+    float __zluda_ieee_fadd_f32(float, float);
+    float __zluda_ieee_fsub_f32(float, float);
+    float __zluda_ieee_fmul_f32(float, float);
+    float __zluda_ieee_fdiv_f32(float, float);
+    float __zluda_ieee_sqrt_f32(float);
+    float __zluda_ieee_fma_f32(float, float, float);
+
     // ---------------------------------------------------------------------
     // Special registers
     // ---------------------------------------------------------------------

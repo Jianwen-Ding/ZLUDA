@@ -2318,7 +2318,8 @@ static void resolveFPModes(Function &f)
                     }
                 }
             }
-            if (m.ieee32 && isF32Op(i))
+            // (ZLUDA_AGX_FTZ_ALL: a measurement aid, not PTX: every float operation flushes)
+            if (m.ieee32 && isF32Op(i) && !getenv("ZLUDA_AGX_FTZ_ALL"))
                 i.setMetadata("agx.keep-denormals", keep);
             // plain operations in a directed-rounding region (the helper library's) round in it too
             if (auto *bo = dyn_cast<BinaryOperator>(&i))
@@ -2423,8 +2424,50 @@ static void exposeThreadgroupGlobals(Module &m)
     }
 }
 
+// Helpers that need IEEE binary32 operations whatever the kernel's denormal mode call
+// __zluda_ieee_{fadd,fsub,fmul,fdiv,sqrt,fma}_f32 (declared in zluda_ptx_metal_impl.cpp): the LLVM
+// operation, tagged !agx.keep-denormals for llvm-air2agx (subnormals kept, correctly rounded).
+static void lowerIEEEHelperCalls(Module &m)
+{
+    LLVMContext &c = m.getContext();
+    MDNode *keep = MDNode::get(c, {});
+    std::vector<CallInst *> calls;
+    for (Function &f : m)
+        if (f.isDeclaration() && f.getName().starts_with("__zluda_ieee_"))
+            for (User *u : f.users())
+                if (auto *ci = dyn_cast<CallInst>(u))
+                    calls.push_back(ci);
+    for (CallInst *ci : calls)
+    {
+        StringRef n = ci->getCalledFunction()->getName().drop_front(strlen("__zluda_ieee_"));
+        IRBuilder<> b(ci);
+        Value *a0 = ci->getArgOperand(0);
+        Value *r = nullptr;
+        if (n == "fadd_f32")
+            r = b.CreateFAdd(a0, ci->getArgOperand(1));
+        else if (n == "fsub_f32")
+            r = b.CreateFSub(a0, ci->getArgOperand(1));
+        else if (n == "fmul_f32")
+            r = b.CreateFMul(a0, ci->getArgOperand(1));
+        else if (n == "fdiv_f32")
+            r = b.CreateFDiv(a0, ci->getArgOperand(1));
+        else if (n == "sqrt_f32")
+            r = b.CreateUnaryIntrinsic(Intrinsic::sqrt, a0);
+        else if (n == "fma_f32")
+            r = b.CreateIntrinsic(Intrinsic::fma, {a0->getType()}, {a0, ci->getArgOperand(1), ci->getArgOperand(2)});
+        else
+            fail("unknown IEEE helper operation " + n.str());
+        if (g_portable_air)
+            if (auto *ri = dyn_cast<Instruction>(r))
+                ri->setMetadata("agx.keep-denormals", keep);
+        ci->replaceAllUsesWith(r);
+        ci->eraseFromParent();
+    }
+}
+
 void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals &globals)
 {
+    lowerIEEEHelperCalls(m);
     // a PTX body that falls off its end returns
     for (Function &f : m)
         for (BasicBlock &bb : f)

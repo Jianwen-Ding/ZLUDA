@@ -186,31 +186,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
-name = "cuda_macros"
-version = "0.0.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "rustc-hash",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "cuda_types"
-version = "0.0.0"
-dependencies = [
- "bitflags 2.11.1",
- "cuda_macros",
- "hip_runtime-sys",
- "hipblaslt-sys",
- "hipfft-sys",
- "miopen-sys",
- "rocblas-sys",
- "rocm_smi-sys",
- "rocsparse-sys",
-]
-
-[[package]]
 name = "derive_more"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -358,24 +333,6 @@ version = "1.11.0"
 dependencies = [
  "bindgen",
  "cmake",
-]
-
-[[package]]
-name = "hip_runtime-sys"
-version = "0.0.0"
-
-[[package]]
-name = "hipblaslt-sys"
-version = "0.1.0"
-dependencies = [
- "hip_runtime-sys",
-]
-
-[[package]]
-name = "hipfft-sys"
-version = "0.0.0"
-dependencies = [
- "hip_runtime-sys",
 ]
 
 [[package]]
@@ -547,13 +504,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff70ce3e48ae43fa075863cef62e8b43b71a4f2382229920e0df362592919430"
 dependencies = [
  "adler2",
-]
-
-[[package]]
-name = "miopen-sys"
-version = "0.0.0"
-dependencies = [
- "hip_runtime-sys",
 ]
 
 [[package]]
@@ -891,24 +841,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "rocblas-sys"
-version = "0.1.0"
-dependencies = [
- "hip_runtime-sys",
-]
-
-[[package]]
-name = "rocm_smi-sys"
-version = "0.0.0"
-
-[[package]]
-name = "rocsparse-sys"
-version = "0.0.0"
-dependencies = [
- "hip_runtime-sys",
 ]
 
 [[package]]
@@ -1344,7 +1276,6 @@ version = "0.0.0"
 dependencies = [
  "agx-sim",
  "cc",
- "cuda_types",
  "llvm_zluda",
  "ptx",
  "ptx_parser",

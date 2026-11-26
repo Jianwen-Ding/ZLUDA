@@ -245,7 +245,7 @@ extern "C++"
     tn_u32x##NV FUNC(wgmma_##NV##_p)(tn_u32x##NV c, mx_u32x8 x, uint64_t da, uint64_t db, bool p,     \
                                     uint64_t ctl)                                                     \
     {                                                                                                  \
-        return tn_wgmma<tn_u32x##NV, NV>(c, x, da, db, p, ctl);                                       \
+        return tn_wgmma<tn_u32x##NV, NV>(c, x, da, db, p != (bool)((ctl >> 41) & 1), ctl);           \
     }
     TN_WGMMA(8)
     TN_WGMMA(16)
@@ -885,7 +885,7 @@ extern "C++"
     }
     void FUNC(tcgen05_mma_p)(tn_u32x32 x, uint64_t da, uint64_t db, uint64_t zm, bool p, uint64_t ctl)
     {
-        TN_SERIAL(tn_mma(x, da, db, zm, p, (uint32_t)ctl);)
+        TN_SERIAL(tn_mma(x, da, db, zm, p != (bool)((ctl >> 14) & 1), (uint32_t)ctl);)
     }
 
     // ---------------------------------------------------------------- cp / shift

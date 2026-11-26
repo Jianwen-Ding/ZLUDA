@@ -202,7 +202,8 @@ fn lower_wgmma<'i>(m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
             | (((tra != 0) as u32) << 4)
             | (((trb != 0) as u32) << 5)
             | ((sel as u32 & 3) << 6)
-            | ((sdreg.is_some() as u32) << 8);
+            | ((sdreg.is_some() as u32) << 8)
+            | (((nr > 0 && rest[0].neg) as u32) << 9);
         let nv = vec_size(nd);
         let mut c = Call::new(format!("wgmma_{nv}{}", if sdreg.is_some() { "_p" } else { "" }))
             .tvdst(pad(d.clone(), nv, true)?, nv as u8, ScalarType::B32)
@@ -454,6 +455,7 @@ fn lower_tc_mma<'i>(m: &[&str], ops: &[HOp<'i>]) -> Result<ast::Instruction<Pars
     x[4] = elem(&ops.get(i).ok_or("tcgen05.mma idesc")?.op)?;
     i += 1;
     let mut en: Option<Op> = None;
+    let mut en_neg = false;
     let mut zm = imm(0);
     let mut has_zm = false;
     let mut has_mask = false;
@@ -469,6 +471,7 @@ fn lower_tc_mma<'i>(m: &[&str], ops: &[HOp<'i>]) -> Result<ast::Instruction<Pars
             i += 1;
         }
         en = ops.get(i).map(|h| h.op.clone());
+        en_neg = ops.get(i).map_or(false, |h| h.neg);
     } else {
         if let Some(h) = ops.get(i) {
             if let ast::ParsedOperand::VecPack(v) = &h.op {
@@ -483,6 +486,7 @@ fn lower_tc_mma<'i>(m: &[&str], ops: &[HOp<'i>]) -> Result<ast::Instruction<Pars
             }
         }
         en = ops.get(i).map(|h| h.op.clone());
+        en_neg = ops.get(i).map_or(false, |h| h.neg);
         if let Some(h) = ops.get(i + 1) {
             if ws {
                 zm = h.op.clone();
@@ -518,7 +522,8 @@ fn lower_tc_mma<'i>(m: &[&str], ops: &[HOp<'i>]) -> Result<ast::Instruction<Pars
         | (has(m, "ashift") as u64) << 8
         | (has_zm as u64) << 9
         | (has_mask as u64) << 10
-        | (en_reg.is_some() as u64) << 11;
+        | (en_reg.is_some() as u64) << 11
+        | (en_neg as u64) << 14;
     // block scale vector size: 0 default, 1 block16, 2 scale_vec::2X, 3 scale_vec::4X
     ctl |= (if has(m, "block16") {
         1

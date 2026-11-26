@@ -889,12 +889,232 @@ def gemv_t(p, t):
 """.format(p=p, t=t, args=GEMV_ARGS.format(t=t), head=gemv_head(t), ybeta=gemv_ybeta(t, "          "))
 
 
+# --------------------------------------------------------------------------------------------- complex (c, z)
+# A complex vector or matrix is its real type's memref, interleaved: element k is (re, im) at 2 k, 2 k + 1; offsets,
+# increments and strides are in complex elements.
+
+def cidx(name, off, i, inc, ind="      "):
+    """%name_r / %name_i: the real and imaginary indexes of element off + i * inc"""
+    return ("""{ind}%{n}_m = arith.muli %{i}, %{inc} : i32
+{ind}%{n}_a = arith.addi %{off}, %{n}_m : i32
+{ind}%{n}_2 = arith.addi %{n}_a, %{n}_a : i32
+{ind}%{n}_3 = arith.addi %{n}_2, %c1_ : i32
+{ind}%{n}_r = arith.index_cast %{n}_2 : i32 to index
+{ind}%{n}_i = arith.index_cast %{n}_3 : i32 to index
+""").format(n=name, off=off, i=i, inc=inc, ind=ind)
+
+
+def cld(v, mem, n, t, ind="      "):
+    return ("{ind}%{v}r = memref.load %{m}[%{n}_r] : memref<?x{t}, 1>\n"
+            "{ind}%{v}i = memref.load %{m}[%{n}_i] : memref<?x{t}, 1>\n").format(v=v, m=mem, n=n, t=t, ind=ind)
+
+
+def cst(v, mem, n, t, ind="      "):
+    return ("{ind}memref.store %{v}r, %{m}[%{n}_r] : memref<?x{t}, 1>\n"
+            "{ind}memref.store %{v}i, %{m}[%{n}_i] : memref<?x{t}, 1>\n").format(v=v, m=mem, n=n, t=t, ind=ind)
+
+
+def cfma(o, ar, ai, br, bi, cr, ci, t, ind="      "):
+    """%o r/i = a * b + c (complex)"""
+    return ("""{ind}%{o}_p = arith.mulf %{ai}, %{bi} : {t}
+{ind}%{o}_q = arith.subf %{cr}, %{o}_p : {t}
+{ind}%{o}r = math.fma %{ar}, %{br}, %{o}_q : {t}
+{ind}%{o}_s = arith.mulf %{ai}, %{br} : {t}
+{ind}%{o}_u = arith.addf %{ci}, %{o}_s : {t}
+{ind}%{o}i = math.fma %{ar}, %{bi}, %{o}_u : {t}
+""").format(o=o, ar=ar, ai=ai, br=br, bi=bi, cr=cr, ci=ci, t=t, ind=ind)
+
+
+def caxpy(p, t):
+    """y = alpha x + y (mode 0), x = alpha x (mode 1: scal, y unused)"""
+    return """    gpu.func @{p}axpy(%n: i32, %mode: i32, %ar: {t}, %ai: {t}, %x: memref<?x{t}, 1>, %xo: i32, %xi: i32, %y: memref<?x{t}, 1>, %yo: i32, %yi: i32) kernel {{
+{gid}      %c1_ = arith.constant 1 : i32
+      %c0_ = arith.constant 0 : i32
+      %zero = arith.constant 0.0 : {t}
+      %sc = arith.cmpi ne, %mode, %c0_ : i32
+      scf.for %k = %i to %n step %stride : i32 {{
+{ix}{lx}        scf.if %sc {{
+{s}{sx}        }} else {{
+{iy}{ly}{a}{sy}        }}
+      }}
+      gpu.return
+    }}
+""".format(p=p, t=t, gid=gid(), ix=cidx("ix", "xo", "k", "xi", "        "), lx=cld("X", "x", "ix", t, "        "),
+           iy=cidx("iy", "yo", "k", "yi", "          "), ly=cld("Y", "y", "iy", t, "          "),
+           a=cfma("R", "ar", "ai", "Xr", "Xi", "Yr", "Yi", t, "          "), sy=cst("R", "y", "iy", t, "          "),
+           s=cfma("s", "ar", "ai", "Xr", "Xi", "zero", "zero", t, "          "), sx=cst("s", "x", "ix", t, "          "))
+
+
+def creduce(p, t):
+    """partial complex sums per block of one SIMD group: op 0 x . y, 1 conj(x) . y, 3 the sum of x (final pass)"""
+    return """    gpu.func @{p}reduce(%n: i32, %op: i32, %x: memref<?x{t}, 1>, %xo: i32, %xi: i32, %y: memref<?x{t}, 1>, %yo: i32, %yi: i32, %out: memref<?x{t}, 1>) kernel {{
+{gid}      %c1_ = arith.constant 1 : i32
+      %c3 = arith.constant 3 : i32
+      %zero = arith.constant 0.0 : {t}
+      %one = arith.constant 1.0 : {t}
+      %fin = arith.cmpi eq, %op, %c3 : i32
+      %cj = arith.cmpi eq, %op, %c1_ : i32
+      %r:2 = scf.for %k = %i to %n step %stride iter_args(%sr = %zero, %si = %zero) -> ({t}, {t}) : i32 {{
+{ix}{lx}        %xin = arith.negf %Xi : {t}
+        %xc = arith.select %cj, %xin, %Xi : {t}
+        %v:2 = scf.if %fin -> ({t}, {t}) {{
+          %a1 = arith.addf %sr, %Xr : {t}
+          %a2 = arith.addf %si, %Xi : {t}
+          scf.yield %a1, %a2 : {t}, {t}
+        }} else {{
+{iy}{ly}{f}          scf.yield %qr, %qi : {t}, {t}
+        }}
+        scf.yield %v#0, %v#1 : {t}, {t}
+      }}
+      %s0 = gpu.subgroup_reduce add %r#0 : ({t}) -> {t}
+      %s1 = gpu.subgroup_reduce add %r#1 : ({t}) -> {t}
+      %lane = gpu.lane_id
+      %c0i = arith.constant 0 : index
+      %first = arith.cmpi eq, %lane, %c0i : index
+      scf.if %first {{
+        %b2 = arith.addi %bid, %bid : index
+        %b3 = arith.addi %b2, %c1i : index
+        memref.store %s0, %out[%b2] : memref<?x{t}, 1>
+        memref.store %s1, %out[%b3] : memref<?x{t}, 1>
+      }}
+      gpu.return
+    }}
+""".format(p=p, t=t, gid=gid() + "      %c1i = arith.constant 1 : index\n", ix=cidx("ix", "xo", "k", "xi", "        "),
+           lx=cld("X", "x", "ix", t, "        "), iy=cidx("iy", "yo", "k", "yi", "          "),
+           ly=cld("Y", "y", "iy", t, "          "), f=cfma("q", "Xr", "xc", "Yr", "Yi", "sr", "si", t, "          "))
+
+
+def cgemv(p, t):
+    """y = alpha op(A) x + beta y, op(A)(i, j) = A[ao + i ars + j acs], conjugated if conj; a thread per row"""
+    return """    gpu.func @{p}gemv(%m: i32, %n: i32, %conj: i32, %ar: {t}, %ai: {t}, %a: memref<?x{t}, 1>, %ao: i32, %ars: i32, %acs: i32, %x: memref<?x{t}, 1>, %xo: i32, %xi: i32, %br: {t}, %bi: {t}, %y: memref<?x{t}, 1>, %yo: i32, %yi: i32) kernel {{
+{gid}      %c1_ = arith.constant 1 : i32
+      %c0 = arith.constant 0 : i32
+      %zero = arith.constant 0.0 : {t}
+      %cj = arith.cmpi ne, %conj, %c0 : i32
+      %bzr = arith.cmpf oeq, %br, %zero : {t}
+      %bzi = arith.cmpf oeq, %bi, %zero : {t}
+      %bz = arith.andi %bzr, %bzi : i1
+      scf.for %r = %i to %m step %stride : i32 {{
+        %rr = arith.muli %r, %ars : i32
+        %rowbase = arith.addi %ao, %rr : i32
+        %acc:2 = scf.for %j = %c0 to %n step %c1_ iter_args(%sr = %zero, %si = %zero) -> ({t}, {t}) : i32 {{
+{ia}{la}          %ain = arith.negf %Ai : {t}
+          %ac = arith.select %cj, %ain, %Ai : {t}
+{ix}{lx}{f}          scf.yield %qr, %qi : {t}, {t}
+        }}
+{iy}        %old:2 = scf.if %bz -> ({t}, {t}) {{
+          scf.yield %zero, %zero : {t}, {t}
+        }} else {{
+{ly}{g}          scf.yield %or, %oi : {t}, {t}
+        }}
+{h}{sy}      }}
+      gpu.return
+    }}
+""".format(p=p, t=t, gid=gid(), ia=cidx("ia", "rowbase", "j", "acs", "          "),
+           la=cld("A", "a", "ia", t, "          "),
+           ix=cidx("ix", "xo", "j", "xi", "          "), lx=cld("X", "x", "ix", t, "          "),
+           f=cfma("q", "Ar", "ac", "Xr", "Xi", "sr", "si", t, "          "),
+           iy=cidx("iy", "yo", "r", "yi", "        "), ly=cld("Y", "y", "iy", t, "          "),
+           g=cfma("o", "br", "bi", "Yr", "Yi", "zero", "zero", t, "          "),
+           h=cfma("w", "ar", "ai", "acc#0", "acc#1", "old#0", "old#1", t, "        "), sy=cst("w", "y", "iy", t, "        "))
+
+
+def cgemm(p, t, tile):
+    """C = alpha op(A) op(B) + beta C (complex), batched over grid z; op(A)(i, l) = A[ao + i ars + l acs] conjugated
+    if conja (likewise B); C(i, j) = C[co + i + j ldc]. Blocks of 16 x 16 threads, each a tile x tile block of C
+    (rows i0 + r 16, columns j0 + q 16)."""
+    w = []
+    w.append("""    gpu.func @{p}gemm(%m: i32, %n: i32, %k: i32, %ar: {t}, %ai: {t}, %a: memref<?x{t}, 1>, %ao: i32, %ars: i32, %acs: i32, %sa: i32, %conja: i32, %b: memref<?x{t}, 1>, %bo: i32, %brs: i32, %bcs: i32, %sb: i32, %conjb: i32, %br: {t}, %bi: {t}, %c: memref<?x{t}, 1>, %co: i32, %ldc: i32, %sc: i32) kernel {{
+      %tx = gpu.thread_id x
+      %ty = gpu.thread_id y
+      %bx = gpu.block_id x
+      %by = gpu.block_id y
+      %bz = gpu.block_id z
+      %txi = arith.index_cast %tx : index to i32
+      %tyi = arith.index_cast %ty : index to i32
+      %bxi = arith.index_cast %bx : index to i32
+      %byi = arith.index_cast %by : index to i32
+      %bzi = arith.index_cast %bz : index to i32
+      %c0 = arith.constant 0 : i32
+      %c1_ = arith.constant 1 : i32
+      %c16 = arith.constant 16 : i32
+      %cT = arith.constant {bt} : i32
+      %zero = arith.constant 0.0 : {t}
+      %ca = arith.cmpi ne, %conja, %c0 : i32
+      %cb = arith.cmpi ne, %conjb, %c0 : i32
+      %rb = arith.muli %bxi, %cT : i32
+      %i0 = arith.addi %rb, %txi : i32
+      %cbk = arith.muli %byi, %cT : i32
+      %j0 = arith.addi %cbk, %tyi : i32
+      %zsa = arith.muli %bzi, %sa : i32
+      %abase = arith.addi %ao, %zsa : i32
+      %zsb = arith.muli %bzi, %sb : i32
+      %bbase = arith.addi %bo, %zsb : i32
+      %zsc = arith.muli %bzi, %sc : i32
+      %cbase = arith.addi %co, %zsc : i32
+      %mm1 = arith.subi %m, %c1_ : i32
+      %nm1 = arith.subi %n, %c1_ : i32""".format(p=p, t=t, bt=16 * tile))
+    for r in range(tile):
+        w.append("""      %cr{r} = arith.constant {o} : i32
+      %row{r} = arith.addi %i0, %cr{r} : i32
+      %rowc{r} = arith.minsi %row{r}, %mm1 : i32
+      %rofs{r} = arith.muli %rowc{r}, %ars : i32
+      %arow{r} = arith.addi %abase, %rofs{r} : i32
+      %col{r} = arith.addi %j0, %cr{r} : i32
+      %colc{r} = arith.minsi %col{r}, %nm1 : i32
+      %cofs{r} = arith.muli %colc{r}, %bcs : i32
+      %bcol{r} = arith.addi %bbase, %cofs{r} : i32""".format(r=r, o=16 * r))
+    tiles = [(r, q) for r in range(tile) for q in range(tile)]
+    nacc = 2 * len(tiles)
+    w.append("      %%res:%d = scf.for %%l = %%c0 to %%k step %%c1_ iter_args(%s) -> (%s) : i32 {" % (
+        nacc, ", ".join("%%s%d%dr = %%zero, %%s%d%di = %%zero" % (r, q, r, q) for r, q in tiles), ", ".join([t] * nacc)))
+    for r in range(tile):
+        w.append(cidx("ai%d" % r, "arow%d" % r, "l", "acs", "        ").rstrip("\n"))
+        w.append(cld("a%d" % r, "a", "ai%d" % r, t, "        ").rstrip("\n"))
+        w.append("        %%a%din = arith.negf %%a%di : %s\n        %%a%dc = arith.select %%ca, %%a%din, %%a%di : %s" % (r, r, t, r, r, r, t))
+        w.append(cidx("bi%d" % r, "bcol%d" % r, "l", "brs", "        ").rstrip("\n"))
+        w.append(cld("b%d" % r, "b", "bi%d" % r, t, "        ").rstrip("\n"))
+        w.append("        %%b%din = arith.negf %%b%di : %s\n        %%b%dc = arith.select %%cb, %%b%din, %%b%di : %s" % (r, r, t, r, r, r, t))
+    outs = []
+    for r, q in tiles:
+        w.append(cfma("n%d%d" % (r, q), "a%dr" % r, "a%dc" % r, "b%dr" % q, "b%dc" % q, "s%d%dr" % (r, q), "s%d%di" % (r, q), t, "        ").rstrip("\n"))
+        outs += ["%%n%d%dr" % (r, q), "%%n%d%di" % (r, q)]
+    w.append("        scf.yield %s : %s\n      }" % (", ".join(outs), ", ".join([t] * nacc)))
+    w.append("""      %bzr = arith.cmpf oeq, %br, %zero : {t}
+      %bzi_ = arith.cmpf oeq, %bi, %zero : {t}
+      %bzero = arith.andi %bzr, %bzi_ : i1""".format(t=t))
+    for idx_, (r, q) in enumerate(tiles):
+        tq = "%d%d" % (r, q)
+        w.append("""      %inr{tq} = arith.cmpi slt, %row{r}, %m : i32
+      %inc{tq} = arith.cmpi slt, %col{q}, %n : i32
+      %in{tq} = arith.andi %inr{tq}, %inc{tq} : i1
+      scf.if %in{tq} {{
+        %cl{tq} = arith.muli %col{q}, %ldc : i32
+        %cc{tq} = arith.addi %cbase, %cl{tq} : i32
+{ci}        %old{tq}:2 = scf.if %bzero -> ({t}, {t}) {{
+          scf.yield %zero, %zero : {t}, {t}
+        }} else {{
+{lc}{bc}          scf.yield %e{tq}r, %e{tq}i : {t}, {t}
+        }}
+{fin}{st}      }}""".format(tq=tq, r=r, q=q, t=t, ci=cidx("x" + tq, "cc" + tq, "row%d" % r, "c1_", "        "),
+                    lc=cld("o" + tq, "c", "x" + tq, t, "          "),
+                    bc=cfma("e" + tq, "br", "bi", "o%sr" % tq, "o%si" % tq, "zero", "zero", t, "          "),
+                    fin=cfma("v" + tq, "ar", "ai", "res#%d" % (2 * idx_), "res#%d" % (2 * idx_ + 1), "old%s#0" % tq, "old%s#1" % tq, t, "        "),
+                    st=cst("v" + tq, "c", "x" + tq, t, "        ")))
+    w.append("      gpu.return\n    }\n")
+    return "\n".join(w)
+
+
 def main():
     out = [hdr()]
     for p, t in TYPES.items():
         for f in (axpy, scal, copy_swap, reduce, amax, rot, ger, geam, trsv, gemv_n, gemv_t):
             out.append(f(p, t))
         out.append(gemm(p + "gemm", t, t, t, t))
+    for p, t, tile in (("c", "f32", 2), ("z", "f64", 1)):
+        for f in (caxpy, creduce, cgemv):
+            out.append(f(p, t))
+        out.append(cgemm(p, t, tile))
     # cublasGemmEx / Hgemm: half or bfloat inputs, float accumulation, the output in either
     for a in ("f16", "bf16"):
         for c in (a, "f32"):

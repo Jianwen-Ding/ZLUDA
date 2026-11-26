@@ -45,6 +45,8 @@ pub struct Handle {
     stream: *mut c_void,
     pointer_mode: c_int,
     math_mode: c_int,
+    atomics_mode: c_int,
+    sm_count_target: c_int,
 }
 pub type cublasHandle_t = *mut Handle;
 
@@ -1028,6 +1030,151 @@ unsafe fn dgmm<T: Elem>(h: cublasHandle_t, side: c_int, m: c_int, n: c_int, a: *
     geam_launch(m, n, G_PROD, T::from_f64(1.0), a as u64, 0, 1, lda, 0, 0, T::default(), x as u64, xo, brs, bcs, c as u64, 0, 1, ldc)
 }
 
+// ------------------------------------------------------------------------------------------------- complex
+
+/// cuComplex / cuDoubleComplex: (re, im) of the real element type
+type Cx<T> = [T; 2];
+
+fn cp<T: Elem>() -> &'static str {
+    if T::P == "s" { "c" } else { "z" }
+}
+
+fn cbytes<T: Elem>(v: Cx<T>) -> [Arg<'static>; 2] {
+    [Arg::Value(v[0].bytes()), Arg::Value(v[1].bytes())]
+}
+
+unsafe fn caxpy<T: Elem>(h: cublasHandle_t, n: c_int, alpha: Cx<T>, x: u64, incx: c_int, y: u64, incy: c_int, scal: bool) -> R {
+    check(h)?;
+    if n <= 0 || (scal && incx <= 0) {
+        return Ok(());
+    }
+    let (xo, xi) = if scal { (0, incx) } else { vec_of(n, incx) };
+    let (yo, yi) = vec_of(n, incy);
+    let [ar, ai] = cbytes(alpha);
+    launch(&format!("{}axpy", cp::<T>()), [grid1(n, 256), 1, 1], [256, 1, 1], &[
+        i32v(n), i32v(scal as i32), ar, ai, Arg::Addr(x), i32v(xo), i32v(xi), Arg::Addr(y), i32v(yo), i32v(yi),
+    ])
+}
+
+/// copy / swap of complex vectors: the real kernel on the real and the imaginary parts
+unsafe fn ccopy<T: Elem>(h: cublasHandle_t, n: c_int, x: u64, incx: c_int, y: u64, incy: c_int, swap: bool) -> R {
+    check(h)?;
+    if n <= 0 {
+        return Ok(());
+    }
+    let (xo, xi) = vec_of(n, incx);
+    let (yo, yi) = vec_of(n, incy);
+    for part in 0..2 {
+        launch(&format!("{}copy", T::P), [grid1(n, 256), 1, 1], [256, 1, 1], &[
+            i32v(n), i32v(swap as i32), Arg::Addr(x), i32v(2 * xo + part), i32v(2 * xi), Arg::Addr(y), i32v(2 * yo + part),
+            i32v(2 * yi),
+        ])?;
+    }
+    Ok(())
+}
+
+unsafe fn cdot<T: Elem>(h: cublasHandle_t, n: c_int, x: u64, incx: c_int, y: u64, incy: c_int, r: *mut Cx<T>, conj: bool) -> R {
+    check(h)?;
+    let v = if n <= 0 {
+        [T::default(); 2]
+    } else {
+        let sz = 2 * std::mem::size_of::<T>() as u64;
+        let g = ((n as u32).div_ceil(32)).clamp(1, 256);
+        let part = Tmp::new(g as u64 * sz)?;
+        let res = Tmp::new(sz)?;
+        let (xo, xi) = vec_of(n, incx);
+        let (yo, yi) = vec_of(n, incy);
+        let k = format!("{}reduce", cp::<T>());
+        launch(&k, [g, 1, 1], [32, 1, 1], &[
+            i32v(n), i32v(conj as i32), Arg::Addr(x), i32v(xo), i32v(xi), Arg::Addr(y), i32v(yo), i32v(yi), Arg::Addr(part.0),
+        ])?;
+        launch(&k, [1, 1, 1], [32, 1, 1], &[
+            i32v(g as i32), i32v(3), Arg::Addr(part.0), i32v(0), i32v(1), Arg::Addr(part.0), i32v(0), i32v(1), Arg::Addr(res.0),
+        ])?;
+        dev_read::<Cx<T>>(res.0)?
+    };
+    result(h, r, v)
+}
+
+/// nrm2 (op 1) / asum (op 2) of a complex vector: the real reductions of both parts
+unsafe fn cnorm<T: Elem>(h: cublasHandle_t, n: c_int, x: u64, incx: c_int, r: *mut T, op: i32) -> R {
+    check(h)?;
+    let v = if n <= 0 || incx <= 0 {
+        T::default()
+    } else if incx == 1 {
+        reduce::<T>(2 * n, op, x, 1, x, 1)?
+    } else {
+        let sz = std::mem::size_of::<T>() as u64;
+        let s0 = reduce::<T>(n, op, x, 2 * incx, x, 2 * incx)?;
+        let s1 = reduce::<T>(n, op, x + sz, 2 * incx, x + sz, 2 * incx)?;
+        T::from_f64(s0.to_f64() + s1.to_f64())
+    };
+    result(h, r, if op == 1 { T::from_f64(v.to_f64().sqrt()) } else { v })
+}
+
+unsafe fn cgemv<T: Elem>(h: cublasHandle_t, trans: c_int, m: c_int, n: c_int, alpha: *const Cx<T>, a: u64, lda: c_int,
+                         x: u64, incx: c_int, beta: *const Cx<T>, y: u64, incy: c_int) -> R {
+    check(h)?;
+    if !op_ok(trans) || m < 0 || n < 0 || lda < m.max(1) || incx == 0 || incy == 0 {
+        return Err(CUBLAS_STATUS_INVALID_VALUE);
+    }
+    let (al, be) = (scalar(h, alpha)?, scalar(h, beta)?);
+    let (rows, cols) = if trans == OP_N { (m, n) } else { (n, m) };
+    if rows == 0 {
+        return Ok(());
+    }
+    elems(lda, n)?;
+    let (rs, cs) = strides(trans, lda);
+    let (xo, xi) = vec_of(cols, incx);
+    let (yo, yi) = vec_of(rows, incy);
+    let ([ar, ai], [br, bi]) = (cbytes(al), cbytes(be));
+    launch(&format!("{}gemv", cp::<T>()), [grid1(rows, 64), 1, 1], [64, 1, 1], &[
+        i32v(rows), i32v(cols), i32v((trans == OP_C) as i32), ar, ai, Arg::Addr(a), i32v(0), i32v(rs), i32v(cs),
+        Arg::Addr(x), i32v(xo), i32v(xi), br, bi, Arg::Addr(y), i32v(yo), i32v(yi),
+    ])
+}
+
+unsafe fn cgemm<T: Elem>(h: cublasHandle_t, ta: c_int, tb: c_int, m: c_int, n: c_int, k: c_int, alpha: *const Cx<T>, a: u64,
+                         lda: c_int, sa: i64, b: u64, ldb: c_int, sb: i64, beta: *const Cx<T>, c: u64, ldc: c_int, sc: i64,
+                         batch: c_int) -> R {
+    check(h)?;
+    if !op_ok(ta) || !op_ok(tb) || m < 0 || n < 0 || k < 0 || batch < 0 || ldc < m.max(1)
+        || lda < (if ta == OP_N { m } else { k }).max(1) || ldb < (if tb == OP_N { k } else { n }).max(1)
+    {
+        return Err(CUBLAS_STATUS_INVALID_VALUE);
+    }
+    let (al, be) = (scalar(h, alpha)?, scalar(h, beta)?);
+    if m == 0 || n == 0 || batch == 0 {
+        return Ok(());
+    }
+    let big = |v: i64| v > i32::MAX as i64 / 2 || v < i32::MIN as i64 / 2;
+    if big(sa) || big(sb) || big(sc) || big(sc * batch as i64) || big(ldc as i64 * n as i64) {
+        return Err(fail("matrices beyond 2^30 elements are not supported", CUBLAS_STATUS_NOT_SUPPORTED));
+    }
+    let (ars, acs) = strides(ta, lda);
+    let (brs, bcs) = strides(tb, ldb);
+    let tile = if T::P == "s" { 32 } else { 16 };
+    let ([ar, ai], [br, bi]) = (cbytes(al), cbytes(be));
+    launch(&format!("{}gemm", cp::<T>()), [(m as u32).div_ceil(tile), (n as u32).div_ceil(tile), batch as u32], [16, 16, 1], &[
+        i32v(m), i32v(n), i32v(k), ar, ai, Arg::Addr(a), i32v(0), i32v(ars), i32v(acs), i32v(sa as i32), i32v((ta == OP_C) as i32),
+        Arg::Addr(b), i32v(0), i32v(brs), i32v(bcs), i32v(sb as i32), i32v((tb == OP_C) as i32), br, bi, Arg::Addr(c), i32v(0),
+        i32v(ldc), i32v(sc as i32),
+    ])
+}
+
+/// Csrot / Zdrot: the real rotation of one part (0 real, 1 imaginary) of complex vectors
+unsafe fn crot<T: Elem>(n: c_int, x: u64, incx: c_int, y: u64, incy: c_int, part: i32, hm: [T; 4]) -> R {
+    if n <= 0 {
+        return Ok(());
+    }
+    let (xo, xi) = vec_of(n, incx);
+    let (yo, yi) = vec_of(n, incy);
+    launch(&format!("{}rot", T::P), [grid1(n, 256), 1, 1], [256, 1, 1], &[
+        i32v(n), Arg::Value(hm[0].bytes()), Arg::Value(hm[1].bytes()), Arg::Value(hm[2].bytes()), Arg::Value(hm[3].bytes()),
+        Arg::Addr(x), i32v(2 * xo + part), i32v(2 * xi), Arg::Addr(y), i32v(2 * yo + part), i32v(2 * yi),
+    ])
+}
+
 // ================================================================================================= entry points
 
 macro_rules! entry {
@@ -1048,7 +1195,7 @@ entry! {
             return Err(fail("cuBLAS needs ZLUDA_METAL_BACKEND=agx", CUBLAS_STATUS_NOT_SUPPORTED));
         }
         library()?;
-        *handle = Box::into_raw(Box::new(Handle { stream: std::ptr::null_mut(), pointer_mode: 0, math_mode: 0 }));
+        *handle = Box::into_raw(Box::new(Handle { stream: std::ptr::null_mut(), pointer_mode: 0, math_mode: 0, atomics_mode: 0, sm_count_target: 0 }));
         Ok(())
     }
     fn cublasDestroy_v2(handle: cublasHandle_t) {
@@ -1093,6 +1240,67 @@ entry! {
     }
     fn cublasSetWorkspace_v2(handle: cublasHandle_t, _ws: *mut c_void, _bytes: usize) {
         check(handle)
+    }
+    fn cublasSetAtomicsMode(handle: cublasHandle_t, mode: c_int) {
+        check(handle)?;
+        if !matches!(mode, 0 | 1) {
+            return Err(CUBLAS_STATUS_INVALID_VALUE);
+        }
+        (*handle).atomics_mode = mode;
+        Ok(())
+    }
+    fn cublasGetAtomicsMode(handle: cublasHandle_t, mode: *mut c_int) {
+        check(handle)?;
+        if mode.is_null() {
+            return Err(CUBLAS_STATUS_INVALID_VALUE);
+        }
+        *mode = (*handle).atomics_mode;
+        Ok(())
+    }
+    fn cublasSetSmCountTarget(handle: cublasHandle_t, count: c_int) {
+        check(handle)?;
+        if count < 0 {
+            return Err(CUBLAS_STATUS_INVALID_VALUE);
+        }
+        (*handle).sm_count_target = count;
+        Ok(())
+    }
+    fn cublasGetSmCountTarget(handle: cublasHandle_t, count: *mut c_int) {
+        check(handle)?;
+        if count.is_null() {
+            return Err(CUBLAS_STATUS_INVALID_VALUE);
+        }
+        *count = (*handle).sm_count_target;
+        Ok(())
+    }
+    // libraryPropertyType: major, minor, patch of the version cublasGetVersion reports (12.4.0)
+    fn cublasGetProperty(kind: c_int, value: *mut c_int) {
+        if value.is_null() {
+            return Err(CUBLAS_STATUS_INVALID_VALUE);
+        }
+        *value = match kind {
+            0 => 12,
+            1 => 4,
+            2 => 0,
+            _ => return Err(CUBLAS_STATUS_INVALID_VALUE),
+        };
+        Ok(())
+    }
+    fn cublasLoggerConfigure(_on: c_int, _stdout: c_int, _stderr: c_int, _file: *const c_char) {
+        Ok(())
+    }
+    // the asynchronous copies are synchronous (as the launches)
+    fn cublasSetVectorAsync(n: c_int, elem: c_int, x: *const c_void, incx: c_int, y: *mut c_void, incy: c_int, _s: *mut c_void) {
+        strided_copy(n, 1, elem, x as *const u8, incx as i64, 0, false, y as *mut u8, incy as i64, 0, true)
+    }
+    fn cublasGetVectorAsync(n: c_int, elem: c_int, x: *const c_void, incx: c_int, y: *mut c_void, incy: c_int, _s: *mut c_void) {
+        strided_copy(n, 1, elem, x as *const u8, incx as i64, 0, true, y as *mut u8, incy as i64, 0, false)
+    }
+    fn cublasSetMatrixAsync(rows: c_int, cols: c_int, elem: c_int, a: *const c_void, lda: c_int, b: *mut c_void, ldb: c_int, _s: *mut c_void) {
+        strided_copy(rows, cols, elem, a as *const u8, 1, lda as i64, false, b as *mut u8, 1, ldb as i64, true)
+    }
+    fn cublasGetMatrixAsync(rows: c_int, cols: c_int, elem: c_int, a: *const c_void, lda: c_int, b: *mut c_void, ldb: c_int, _s: *mut c_void) {
+        strided_copy(rows, cols, elem, a as *const u8, 1, lda as i64, true, b as *mut u8, 1, ldb as i64, false)
     }
     fn cublasSetVector(n: c_int, elem: c_int, x: *const c_void, incx: c_int, y: *mut c_void, incy: c_int) {
         strided_copy(n, 1, elem, x as *const u8, incx as i64, 0, false, y as *mut u8, incy as i64, 0, true)
@@ -1245,6 +1453,173 @@ entry! {
     fn cublasDdgmm(h: cublasHandle_t, side: c_int, m: c_int, n: c_int, a: *const f64, lda: c_int, x: *const f64, incx: c_int, c: *mut f64, ldc: c_int) { dgmm(h, side, m, n, a, lda, x, incx, c, ldc) }
 }
 
+entry! {
+    fn cublasCaxpy_v2(h: cublasHandle_t, n: c_int, alpha: *const Cx<f32>, x: *const Cx<f32>, incx: c_int, y: *mut Cx<f32>, incy: c_int) { check(h)?; caxpy::<f32>(h, n, scalar(h, alpha)?, x as u64, incx, y as u64, incy, false) }
+    fn cublasCscal_v2(h: cublasHandle_t, n: c_int, alpha: *const Cx<f32>, x: *mut Cx<f32>, incx: c_int) { check(h)?; caxpy::<f32>(h, n, scalar(h, alpha)?, x as u64, incx, x as u64, incx, true) }
+    fn cublasCsscal_v2(h: cublasHandle_t, n: c_int, alpha: *const f32, x: *mut Cx<f32>, incx: c_int) { check(h)?; caxpy::<f32>(h, n, [scalar(h, alpha)?, 0.0], x as u64, incx, x as u64, incx, true) }
+    fn cublasCcopy_v2(h: cublasHandle_t, n: c_int, x: *const Cx<f32>, incx: c_int, y: *mut Cx<f32>, incy: c_int) { ccopy::<f32>(h, n, x as u64, incx, y as u64, incy, false) }
+    fn cublasCswap_v2(h: cublasHandle_t, n: c_int, x: *mut Cx<f32>, incx: c_int, y: *mut Cx<f32>, incy: c_int) { ccopy::<f32>(h, n, x as u64, incx, y as u64, incy, true) }
+    fn cublasCdotu_v2(h: cublasHandle_t, n: c_int, x: *const Cx<f32>, incx: c_int, y: *const Cx<f32>, incy: c_int, r: *mut Cx<f32>) { cdot::<f32>(h, n, x as u64, incx, y as u64, incy, r, false) }
+    fn cublasCdotc_v2(h: cublasHandle_t, n: c_int, x: *const Cx<f32>, incx: c_int, y: *const Cx<f32>, incy: c_int, r: *mut Cx<f32>) { cdot::<f32>(h, n, x as u64, incx, y as u64, incy, r, true) }
+    fn cublasScnrm2_v2(h: cublasHandle_t, n: c_int, x: *const Cx<f32>, incx: c_int, r: *mut f32) { cnorm::<f32>(h, n, x as u64, incx, r, 1) }
+    fn cublasScasum_v2(h: cublasHandle_t, n: c_int, x: *const Cx<f32>, incx: c_int, r: *mut f32) { cnorm::<f32>(h, n, x as u64, incx, r, 2) }
+    fn cublasCsrot_v2(h: cublasHandle_t, n: c_int, x: *mut Cx<f32>, incx: c_int, y: *mut Cx<f32>, incy: c_int, c: *const f32, s: *const f32) { check(h)?; let (c, s) = (scalar(h, c)?, scalar(h, s)?); for part in 0..2 { crot::<f32>(n, x as u64, incx, y as u64, incy, part, [c, -s, s, c])?; } Ok(()) }
+    fn cublasCgemv_v2(h: cublasHandle_t, t: c_int, m: c_int, n: c_int, alpha: *const Cx<f32>, a: *const Cx<f32>, lda: c_int, x: *const Cx<f32>, incx: c_int, beta: *const Cx<f32>, y: *mut Cx<f32>, incy: c_int) { cgemv(h, t, m, n, alpha, a as u64, lda, x as u64, incx, beta, y as u64, incy) }
+    fn cublasCgemm_v2(h: cublasHandle_t, ta: c_int, tb: c_int, m: c_int, n: c_int, k: c_int, alpha: *const Cx<f32>, a: *const Cx<f32>, lda: c_int, b: *const Cx<f32>, ldb: c_int, beta: *const Cx<f32>, c: *mut Cx<f32>, ldc: c_int) { cgemm(h, ta, tb, m, n, k, alpha, a as u64, lda, 0, b as u64, ldb, 0, beta, c as u64, ldc, 0, 1) }
+    fn cublasCgemm3m(h: cublasHandle_t, ta: c_int, tb: c_int, m: c_int, n: c_int, k: c_int, alpha: *const Cx<f32>, a: *const Cx<f32>, lda: c_int, b: *const Cx<f32>, ldb: c_int, beta: *const Cx<f32>, c: *mut Cx<f32>, ldc: c_int) { cgemm(h, ta, tb, m, n, k, alpha, a as u64, lda, 0, b as u64, ldb, 0, beta, c as u64, ldc, 0, 1) }
+    fn cublasCgemmStridedBatched(h: cublasHandle_t, ta: c_int, tb: c_int, m: c_int, n: c_int, k: c_int, alpha: *const Cx<f32>, a: *const Cx<f32>, lda: c_int, sa: i64, b: *const Cx<f32>, ldb: c_int, sb: i64, beta: *const Cx<f32>, c: *mut Cx<f32>, ldc: c_int, sc: i64, batch: c_int) { cgemm(h, ta, tb, m, n, k, alpha, a as u64, lda, sa, b as u64, ldb, sb, beta, c as u64, ldc, sc, batch) }
+    fn cublasCgemmBatched(h: cublasHandle_t, ta: c_int, tb: c_int, m: c_int, n: c_int, k: c_int, alpha: *const Cx<f32>, a: *const *const Cx<f32>, lda: c_int, b: *const *const Cx<f32>, ldb: c_int, beta: *const Cx<f32>, c: *const *mut Cx<f32>, ldc: c_int, batch: c_int) { if batch < 0 { return Err(CUBLAS_STATUS_INVALID_VALUE); } for i in 0..batch { cgemm(h, ta, tb, m, n, k, alpha, ptrs(a as _, i)?, lda, 0, ptrs(b as _, i)?, ldb, 0, beta, ptrs(c as _, i)?, ldc, 0, 1)?; } Ok(()) }
+    fn cublasZaxpy_v2(h: cublasHandle_t, n: c_int, alpha: *const Cx<f64>, x: *const Cx<f64>, incx: c_int, y: *mut Cx<f64>, incy: c_int) { check(h)?; caxpy::<f64>(h, n, scalar(h, alpha)?, x as u64, incx, y as u64, incy, false) }
+    fn cublasZscal_v2(h: cublasHandle_t, n: c_int, alpha: *const Cx<f64>, x: *mut Cx<f64>, incx: c_int) { check(h)?; caxpy::<f64>(h, n, scalar(h, alpha)?, x as u64, incx, x as u64, incx, true) }
+    fn cublasZdscal_v2(h: cublasHandle_t, n: c_int, alpha: *const f64, x: *mut Cx<f64>, incx: c_int) { check(h)?; caxpy::<f64>(h, n, [scalar(h, alpha)?, 0.0], x as u64, incx, x as u64, incx, true) }
+    fn cublasZcopy_v2(h: cublasHandle_t, n: c_int, x: *const Cx<f64>, incx: c_int, y: *mut Cx<f64>, incy: c_int) { ccopy::<f64>(h, n, x as u64, incx, y as u64, incy, false) }
+    fn cublasZswap_v2(h: cublasHandle_t, n: c_int, x: *mut Cx<f64>, incx: c_int, y: *mut Cx<f64>, incy: c_int) { ccopy::<f64>(h, n, x as u64, incx, y as u64, incy, true) }
+    fn cublasZdotu_v2(h: cublasHandle_t, n: c_int, x: *const Cx<f64>, incx: c_int, y: *const Cx<f64>, incy: c_int, r: *mut Cx<f64>) { cdot::<f64>(h, n, x as u64, incx, y as u64, incy, r, false) }
+    fn cublasZdotc_v2(h: cublasHandle_t, n: c_int, x: *const Cx<f64>, incx: c_int, y: *const Cx<f64>, incy: c_int, r: *mut Cx<f64>) { cdot::<f64>(h, n, x as u64, incx, y as u64, incy, r, true) }
+    fn cublasDznrm2_v2(h: cublasHandle_t, n: c_int, x: *const Cx<f64>, incx: c_int, r: *mut f64) { cnorm::<f64>(h, n, x as u64, incx, r, 1) }
+    fn cublasDzasum_v2(h: cublasHandle_t, n: c_int, x: *const Cx<f64>, incx: c_int, r: *mut f64) { cnorm::<f64>(h, n, x as u64, incx, r, 2) }
+    fn cublasZdrot_v2(h: cublasHandle_t, n: c_int, x: *mut Cx<f64>, incx: c_int, y: *mut Cx<f64>, incy: c_int, c: *const f64, s: *const f64) { check(h)?; let (c, s) = (scalar(h, c)?, scalar(h, s)?); for part in 0..2 { crot::<f64>(n, x as u64, incx, y as u64, incy, part, [c, -s, s, c])?; } Ok(()) }
+    fn cublasZgemv_v2(h: cublasHandle_t, t: c_int, m: c_int, n: c_int, alpha: *const Cx<f64>, a: *const Cx<f64>, lda: c_int, x: *const Cx<f64>, incx: c_int, beta: *const Cx<f64>, y: *mut Cx<f64>, incy: c_int) { cgemv(h, t, m, n, alpha, a as u64, lda, x as u64, incx, beta, y as u64, incy) }
+    fn cublasZgemm_v2(h: cublasHandle_t, ta: c_int, tb: c_int, m: c_int, n: c_int, k: c_int, alpha: *const Cx<f64>, a: *const Cx<f64>, lda: c_int, b: *const Cx<f64>, ldb: c_int, beta: *const Cx<f64>, c: *mut Cx<f64>, ldc: c_int) { cgemm(h, ta, tb, m, n, k, alpha, a as u64, lda, 0, b as u64, ldb, 0, beta, c as u64, ldc, 0, 1) }
+    fn cublasZgemm3m(h: cublasHandle_t, ta: c_int, tb: c_int, m: c_int, n: c_int, k: c_int, alpha: *const Cx<f64>, a: *const Cx<f64>, lda: c_int, b: *const Cx<f64>, ldb: c_int, beta: *const Cx<f64>, c: *mut Cx<f64>, ldc: c_int) { cgemm(h, ta, tb, m, n, k, alpha, a as u64, lda, 0, b as u64, ldb, 0, beta, c as u64, ldc, 0, 1) }
+    fn cublasZgemmStridedBatched(h: cublasHandle_t, ta: c_int, tb: c_int, m: c_int, n: c_int, k: c_int, alpha: *const Cx<f64>, a: *const Cx<f64>, lda: c_int, sa: i64, b: *const Cx<f64>, ldb: c_int, sb: i64, beta: *const Cx<f64>, c: *mut Cx<f64>, ldc: c_int, sc: i64, batch: c_int) { cgemm(h, ta, tb, m, n, k, alpha, a as u64, lda, sa, b as u64, ldb, sb, beta, c as u64, ldc, sc, batch) }
+    fn cublasZgemmBatched(h: cublasHandle_t, ta: c_int, tb: c_int, m: c_int, n: c_int, k: c_int, alpha: *const Cx<f64>, a: *const *const Cx<f64>, lda: c_int, b: *const *const Cx<f64>, ldb: c_int, beta: *const Cx<f64>, c: *const *mut Cx<f64>, ldc: c_int, batch: c_int) { if batch < 0 { return Err(CUBLAS_STATUS_INVALID_VALUE); } for i in 0..batch { cgemm(h, ta, tb, m, n, k, alpha, ptrs(a as _, i)?, lda, 0, ptrs(b as _, i)?, ldb, 0, beta, ptrs(c as _, i)?, ldc, 0, 1)?; } Ok(()) }
+}
+
+/// A dimension of a _64 entry point (beyond int32: not supported)
+fn n32(v: i64) -> Result<c_int, cublasStatus_t> {
+    c_int::try_from(v).map_err(|_| fail(format!("dimension {v} beyond 2^31"), CUBLAS_STATUS_NOT_SUPPORTED))
+}
+
+fn ok(st: cublasStatus_t) -> R {
+    if st == CUBLAS_STATUS_SUCCESS { Ok(()) } else { Err(st) }
+}
+
+// the _64 entry points: the int32 routines for dimensions that fit (larger ones are not supported)
+entry! {
+    fn cublasSetVectorAsync_64(n: i64, elem: c_int, x: *const c_void, incx: i64, y: *mut c_void, incy: i64, _s: *mut c_void) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasSetVectorAsync(n, elem, x, incx, y, incy, _s)) }
+    fn cublasGetVectorAsync_64(n: i64, elem: c_int, x: *const c_void, incx: i64, y: *mut c_void, incy: i64, _s: *mut c_void) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasGetVectorAsync(n, elem, x, incx, y, incy, _s)) }
+    fn cublasSetMatrixAsync_64(rows: i64, cols: i64, elem: c_int, a: *const c_void, lda: i64, b: *mut c_void, ldb: i64, _s: *mut c_void) { let rows = n32(rows)?; let cols = n32(cols)?; let lda = n32(lda)?; let ldb = n32(ldb)?; ok(cublasSetMatrixAsync(rows, cols, elem, a, lda, b, ldb, _s)) }
+    fn cublasGetMatrixAsync_64(rows: i64, cols: i64, elem: c_int, a: *const c_void, lda: i64, b: *mut c_void, ldb: i64, _s: *mut c_void) { let rows = n32(rows)?; let cols = n32(cols)?; let lda = n32(lda)?; let ldb = n32(ldb)?; ok(cublasGetMatrixAsync(rows, cols, elem, a, lda, b, ldb, _s)) }
+    fn cublasSetVector_64(n: i64, elem: c_int, x: *const c_void, incx: i64, y: *mut c_void, incy: i64) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasSetVector(n, elem, x, incx, y, incy)) }
+    fn cublasGetVector_64(n: i64, elem: c_int, x: *const c_void, incx: i64, y: *mut c_void, incy: i64) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasGetVector(n, elem, x, incx, y, incy)) }
+    fn cublasSetMatrix_64(rows: i64, cols: i64, elem: c_int, a: *const c_void, lda: i64, b: *mut c_void, ldb: i64) { let rows = n32(rows)?; let cols = n32(cols)?; let lda = n32(lda)?; let ldb = n32(ldb)?; ok(cublasSetMatrix(rows, cols, elem, a, lda, b, ldb)) }
+    fn cublasGetMatrix_64(rows: i64, cols: i64, elem: c_int, a: *const c_void, lda: i64, b: *mut c_void, ldb: i64) { let rows = n32(rows)?; let cols = n32(cols)?; let lda = n32(lda)?; let ldb = n32(ldb)?; ok(cublasGetMatrix(rows, cols, elem, a, lda, b, ldb)) }
+    fn cublasSaxpy_v2_64(h: cublasHandle_t, n: i64, alpha: *const f32, x: *const f32, incx: i64, y: *mut f32, incy: i64) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasSaxpy_v2(h, n, alpha, x, incx, y, incy)) }
+    fn cublasDaxpy_v2_64(h: cublasHandle_t, n: i64, alpha: *const f64, x: *const f64, incx: i64, y: *mut f64, incy: i64) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasDaxpy_v2(h, n, alpha, x, incx, y, incy)) }
+    fn cublasSscal_v2_64(h: cublasHandle_t, n: i64, alpha: *const f32, x: *mut f32, incx: i64) { let n = n32(n)?; let incx = n32(incx)?; ok(cublasSscal_v2(h, n, alpha, x, incx)) }
+    fn cublasDscal_v2_64(h: cublasHandle_t, n: i64, alpha: *const f64, x: *mut f64, incx: i64) { let n = n32(n)?; let incx = n32(incx)?; ok(cublasDscal_v2(h, n, alpha, x, incx)) }
+    fn cublasScopy_v2_64(h: cublasHandle_t, n: i64, x: *const f32, incx: i64, y: *mut f32, incy: i64) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasScopy_v2(h, n, x, incx, y, incy)) }
+    fn cublasDcopy_v2_64(h: cublasHandle_t, n: i64, x: *const f64, incx: i64, y: *mut f64, incy: i64) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasDcopy_v2(h, n, x, incx, y, incy)) }
+    fn cublasSswap_v2_64(h: cublasHandle_t, n: i64, x: *mut f32, incx: i64, y: *mut f32, incy: i64) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasSswap_v2(h, n, x, incx, y, incy)) }
+    fn cublasDswap_v2_64(h: cublasHandle_t, n: i64, x: *mut f64, incx: i64, y: *mut f64, incy: i64) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasDswap_v2(h, n, x, incx, y, incy)) }
+    fn cublasSdot_v2_64(h: cublasHandle_t, n: i64, x: *const f32, incx: i64, y: *const f32, incy: i64, r: *mut f32) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasSdot_v2(h, n, x, incx, y, incy, r)) }
+    fn cublasDdot_v2_64(h: cublasHandle_t, n: i64, x: *const f64, incx: i64, y: *const f64, incy: i64, r: *mut f64) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasDdot_v2(h, n, x, incx, y, incy, r)) }
+    fn cublasSnrm2_v2_64(h: cublasHandle_t, n: i64, x: *const f32, incx: i64, r: *mut f32) { let n = n32(n)?; let incx = n32(incx)?; ok(cublasSnrm2_v2(h, n, x, incx, r)) }
+    fn cublasDnrm2_v2_64(h: cublasHandle_t, n: i64, x: *const f64, incx: i64, r: *mut f64) { let n = n32(n)?; let incx = n32(incx)?; ok(cublasDnrm2_v2(h, n, x, incx, r)) }
+    fn cublasSasum_v2_64(h: cublasHandle_t, n: i64, x: *const f32, incx: i64, r: *mut f32) { let n = n32(n)?; let incx = n32(incx)?; ok(cublasSasum_v2(h, n, x, incx, r)) }
+    fn cublasDasum_v2_64(h: cublasHandle_t, n: i64, x: *const f64, incx: i64, r: *mut f64) { let n = n32(n)?; let incx = n32(incx)?; ok(cublasDasum_v2(h, n, x, incx, r)) }
+    fn cublasIsamax_v2_64(h: cublasHandle_t, n: i64, x: *const f32, incx: i64, r: *mut i64) { let n = n32(n)?; let incx = n32(incx)?; check(h)?; let mode = (*h).pointer_mode; let mut r32: c_int = 0; (*h).pointer_mode = 0; let st = cublasIsamax_v2(h, n, x, incx, &mut r32 as *mut c_int); (*h).pointer_mode = mode; ok(st)?; result(h, r, r32 as i64) }
+    fn cublasIdamax_v2_64(h: cublasHandle_t, n: i64, x: *const f64, incx: i64, r: *mut i64) { let n = n32(n)?; let incx = n32(incx)?; check(h)?; let mode = (*h).pointer_mode; let mut r32: c_int = 0; (*h).pointer_mode = 0; let st = cublasIdamax_v2(h, n, x, incx, &mut r32 as *mut c_int); (*h).pointer_mode = mode; ok(st)?; result(h, r, r32 as i64) }
+    fn cublasIsamin_v2_64(h: cublasHandle_t, n: i64, x: *const f32, incx: i64, r: *mut i64) { let n = n32(n)?; let incx = n32(incx)?; check(h)?; let mode = (*h).pointer_mode; let mut r32: c_int = 0; (*h).pointer_mode = 0; let st = cublasIsamin_v2(h, n, x, incx, &mut r32 as *mut c_int); (*h).pointer_mode = mode; ok(st)?; result(h, r, r32 as i64) }
+    fn cublasIdamin_v2_64(h: cublasHandle_t, n: i64, x: *const f64, incx: i64, r: *mut i64) { let n = n32(n)?; let incx = n32(incx)?; check(h)?; let mode = (*h).pointer_mode; let mut r32: c_int = 0; (*h).pointer_mode = 0; let st = cublasIdamin_v2(h, n, x, incx, &mut r32 as *mut c_int); (*h).pointer_mode = mode; ok(st)?; result(h, r, r32 as i64) }
+    fn cublasSgemv_v2_64(h: cublasHandle_t, t: c_int, m: i64, n: i64, alpha: *const f32, a: *const f32, lda: i64, x: *const f32, incx: i64, beta: *const f32, y: *mut f32, incy: i64) { let m = n32(m)?; let n = n32(n)?; let lda = n32(lda)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasSgemv_v2(h, t, m, n, alpha, a, lda, x, incx, beta, y, incy)) }
+    fn cublasDgemv_v2_64(h: cublasHandle_t, t: c_int, m: i64, n: i64, alpha: *const f64, a: *const f64, lda: i64, x: *const f64, incx: i64, beta: *const f64, y: *mut f64, incy: i64) { let m = n32(m)?; let n = n32(n)?; let lda = n32(lda)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasDgemv_v2(h, t, m, n, alpha, a, lda, x, incx, beta, y, incy)) }
+    fn cublasSgemm_v2_64(h: cublasHandle_t, ta: c_int, tb: c_int, m: i64, n: i64, k: i64, alpha: *const f32, a: *const f32, lda: i64, b: *const f32, ldb: i64, beta: *const f32, c: *mut f32, ldc: i64) { let m = n32(m)?; let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; ok(cublasSgemm_v2(h, ta, tb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc)) }
+    fn cublasDgemm_v2_64(h: cublasHandle_t, ta: c_int, tb: c_int, m: i64, n: i64, k: i64, alpha: *const f64, a: *const f64, lda: i64, b: *const f64, ldb: i64, beta: *const f64, c: *mut f64, ldc: i64) { let m = n32(m)?; let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; ok(cublasDgemm_v2(h, ta, tb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc)) }
+    fn cublasSgemmStridedBatched_64(h: cublasHandle_t, ta: c_int, tb: c_int, m: i64, n: i64, k: i64, alpha: *const f32, a: *const f32, lda: i64, sa: i64, b: *const f32, ldb: i64, sb: i64, beta: *const f32, c: *mut f32, ldc: i64, sc: i64, batch: i64) { let m = n32(m)?; let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; let batch = n32(batch)?; ok(cublasSgemmStridedBatched(h, ta, tb, m, n, k, alpha, a, lda, sa, b, ldb, sb, beta, c, ldc, sc, batch)) }
+    fn cublasDgemmStridedBatched_64(h: cublasHandle_t, ta: c_int, tb: c_int, m: i64, n: i64, k: i64, alpha: *const f64, a: *const f64, lda: i64, sa: i64, b: *const f64, ldb: i64, sb: i64, beta: *const f64, c: *mut f64, ldc: i64, sc: i64, batch: i64) { let m = n32(m)?; let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; let batch = n32(batch)?; ok(cublasDgemmStridedBatched(h, ta, tb, m, n, k, alpha, a, lda, sa, b, ldb, sb, beta, c, ldc, sc, batch)) }
+    fn cublasSgemmBatched_64(h: cublasHandle_t, ta: c_int, tb: c_int, m: i64, n: i64, k: i64, alpha: *const f32, a: *const *const f32, lda: i64, b: *const *const f32, ldb: i64, beta: *const f32, c: *const *mut f32, ldc: i64, batch: i64) { let m = n32(m)?; let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; let batch = n32(batch)?; ok(cublasSgemmBatched(h, ta, tb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc, batch)) }
+    fn cublasDgemmBatched_64(h: cublasHandle_t, ta: c_int, tb: c_int, m: i64, n: i64, k: i64, alpha: *const f64, a: *const *const f64, lda: i64, b: *const *const f64, ldb: i64, beta: *const f64, c: *const *mut f64, ldc: i64, batch: i64) { let m = n32(m)?; let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; let batch = n32(batch)?; ok(cublasDgemmBatched(h, ta, tb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc, batch)) }
+    fn cublasHgemm_64(h: cublasHandle_t, ta: c_int, tb: c_int, m: i64, n: i64, k: i64, alpha: *const u16, a: *const u16, lda: i64, b: *const u16, ldb: i64, beta: *const u16, c: *mut u16, ldc: i64) { let m = n32(m)?; let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; ok(cublasHgemm(h, ta, tb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc)) }
+    fn cublasHgemmStridedBatched_64(h: cublasHandle_t, ta: c_int, tb: c_int, m: i64, n: i64, k: i64, alpha: *const u16, a: *const u16, lda: i64, sa: i64, b: *const u16, ldb: i64, sb: i64, beta: *const u16, c: *mut u16, ldc: i64, sc: i64, batch: i64) { let m = n32(m)?; let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; let batch = n32(batch)?; ok(cublasHgemmStridedBatched(h, ta, tb, m, n, k, alpha, a, lda, sa, b, ldb, sb, beta, c, ldc, sc, batch)) }
+    fn cublasGemmEx_64(h: cublasHandle_t, ta: c_int, tb: c_int, m: i64, n: i64, k: i64, alpha: *const c_void, a: *const c_void, at: c_int, lda: i64, b: *const c_void, bt: c_int, ldb: i64, beta: *const c_void, c: *mut c_void, ct: c_int, ldc: i64, compute: c_int, _algo: c_int) { let m = n32(m)?; let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; ok(cublasGemmEx(h, ta, tb, m, n, k, alpha, a, at, lda, b, bt, ldb, beta, c, ct, ldc, compute, _algo)) }
+    fn cublasGemmStridedBatchedEx_64(h: cublasHandle_t, ta: c_int, tb: c_int, m: i64, n: i64, k: i64, alpha: *const c_void, a: *const c_void, at: c_int, lda: i64, sa: i64, b: *const c_void, bt: c_int, ldb: i64, sb: i64, beta: *const c_void, c: *mut c_void, ct: c_int, ldc: i64, sc: i64, batch: i64, compute: c_int, _algo: c_int) { let m = n32(m)?; let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; let batch = n32(batch)?; ok(cublasGemmStridedBatchedEx(h, ta, tb, m, n, k, alpha, a, at, lda, sa, b, bt, ldb, sb, beta, c, ct, ldc, sc, batch, compute, _algo)) }
+    fn cublasGemmBatchedEx_64(h: cublasHandle_t, ta: c_int, tb: c_int, m: i64, n: i64, k: i64, alpha: *const c_void, a: *const *const c_void, at: c_int, lda: i64, b: *const *const c_void, bt: c_int, ldb: i64, beta: *const c_void, c: *const *mut c_void, ct: c_int, ldc: i64, batch: i64, compute: c_int, _algo: c_int) { let m = n32(m)?; let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; let batch = n32(batch)?; ok(cublasGemmBatchedEx(h, ta, tb, m, n, k, alpha, a, at, lda, b, bt, ldb, beta, c, ct, ldc, batch, compute, _algo)) }
+    fn cublasSrot_v2_64(h: cublasHandle_t, n: i64, x: *mut f32, incx: i64, y: *mut f32, incy: i64, c: *const f32, s: *const f32) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasSrot_v2(h, n, x, incx, y, incy, c, s)) }
+    fn cublasSrotm_v2_64(h: cublasHandle_t, n: i64, x: *mut f32, incx: i64, y: *mut f32, incy: i64, param: *const f32) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasSrotm_v2(h, n, x, incx, y, incy, param)) }
+    fn cublasSger_v2_64(h: cublasHandle_t, m: i64, n: i64, alpha: *const f32, x: *const f32, incx: i64, y: *const f32, incy: i64, a: *mut f32, lda: i64) { let m = n32(m)?; let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; let lda = n32(lda)?; ok(cublasSger_v2(h, m, n, alpha, x, incx, y, incy, a, lda)) }
+    fn cublasSsyr_v2_64(h: cublasHandle_t, uplo: c_int, n: i64, alpha: *const f32, x: *const f32, incx: i64, a: *mut f32, lda: i64) { let n = n32(n)?; let incx = n32(incx)?; let lda = n32(lda)?; ok(cublasSsyr_v2(h, uplo, n, alpha, x, incx, a, lda)) }
+    fn cublasSsyr2_v2_64(h: cublasHandle_t, uplo: c_int, n: i64, alpha: *const f32, x: *const f32, incx: i64, y: *const f32, incy: i64, a: *mut f32, lda: i64) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; let lda = n32(lda)?; ok(cublasSsyr2_v2(h, uplo, n, alpha, x, incx, y, incy, a, lda)) }
+    fn cublasSgemvStridedBatched_64(h: cublasHandle_t, t: c_int, m: i64, n: i64, alpha: *const f32, a: *const f32, lda: i64, sa: i64, x: *const f32, incx: i64, sx: i64, beta: *const f32, y: *mut f32, incy: i64, sy: i64, batch: i64) { let m = n32(m)?; let n = n32(n)?; let lda = n32(lda)?; let incx = n32(incx)?; let incy = n32(incy)?; let batch = n32(batch)?; ok(cublasSgemvStridedBatched(h, t, m, n, alpha, a, lda, sa, x, incx, sx, beta, y, incy, sy, batch)) }
+    fn cublasSgemvBatched_64(h: cublasHandle_t, t: c_int, m: i64, n: i64, alpha: *const f32, a: *const *const f32, lda: i64, x: *const *const f32, incx: i64, beta: *const f32, y: *const *mut f32, incy: i64, batch: i64) { let m = n32(m)?; let n = n32(n)?; let lda = n32(lda)?; let incx = n32(incx)?; let incy = n32(incy)?; let batch = n32(batch)?; ok(cublasSgemvBatched(h, t, m, n, alpha, a, lda, x, incx, beta, y, incy, batch)) }
+    fn cublasSsymv_v2_64(h: cublasHandle_t, uplo: c_int, n: i64, alpha: *const f32, a: *const f32, lda: i64, x: *const f32, incx: i64, beta: *const f32, y: *mut f32, incy: i64) { let n = n32(n)?; let lda = n32(lda)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasSsymv_v2(h, uplo, n, alpha, a, lda, x, incx, beta, y, incy)) }
+    fn cublasSsbmv_v2_64(h: cublasHandle_t, uplo: c_int, n: i64, k: i64, alpha: *const f32, a: *const f32, lda: i64, x: *const f32, incx: i64, beta: *const f32, y: *mut f32, incy: i64) { let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasSsbmv_v2(h, uplo, n, k, alpha, a, lda, x, incx, beta, y, incy)) }
+    fn cublasSspmv_v2_64(h: cublasHandle_t, uplo: c_int, n: i64, alpha: *const f32, ap: *const f32, x: *const f32, incx: i64, beta: *const f32, y: *mut f32, incy: i64) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasSspmv_v2(h, uplo, n, alpha, ap, x, incx, beta, y, incy)) }
+    fn cublasSgbmv_v2_64(h: cublasHandle_t, t: c_int, m: i64, n: i64, kl: i64, ku: i64, alpha: *const f32, a: *const f32, lda: i64, x: *const f32, incx: i64, beta: *const f32, y: *mut f32, incy: i64) { let m = n32(m)?; let n = n32(n)?; let kl = n32(kl)?; let ku = n32(ku)?; let lda = n32(lda)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasSgbmv_v2(h, t, m, n, kl, ku, alpha, a, lda, x, incx, beta, y, incy)) }
+    fn cublasStrmv_v2_64(h: cublasHandle_t, uplo: c_int, t: c_int, diag: c_int, n: i64, a: *const f32, lda: i64, x: *mut f32, incx: i64) { let n = n32(n)?; let lda = n32(lda)?; let incx = n32(incx)?; ok(cublasStrmv_v2(h, uplo, t, diag, n, a, lda, x, incx)) }
+    fn cublasStbmv_v2_64(h: cublasHandle_t, uplo: c_int, t: c_int, diag: c_int, n: i64, k: i64, a: *const f32, lda: i64, x: *mut f32, incx: i64) { let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let incx = n32(incx)?; ok(cublasStbmv_v2(h, uplo, t, diag, n, k, a, lda, x, incx)) }
+    fn cublasStpmv_v2_64(h: cublasHandle_t, uplo: c_int, t: c_int, diag: c_int, n: i64, ap: *const f32, x: *mut f32, incx: i64) { let n = n32(n)?; let incx = n32(incx)?; ok(cublasStpmv_v2(h, uplo, t, diag, n, ap, x, incx)) }
+    fn cublasStrsv_v2_64(h: cublasHandle_t, uplo: c_int, t: c_int, diag: c_int, n: i64, a: *const f32, lda: i64, x: *mut f32, incx: i64) { let n = n32(n)?; let lda = n32(lda)?; let incx = n32(incx)?; ok(cublasStrsv_v2(h, uplo, t, diag, n, a, lda, x, incx)) }
+    fn cublasStbsv_v2_64(h: cublasHandle_t, uplo: c_int, t: c_int, diag: c_int, n: i64, k: i64, a: *const f32, lda: i64, x: *mut f32, incx: i64) { let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let incx = n32(incx)?; ok(cublasStbsv_v2(h, uplo, t, diag, n, k, a, lda, x, incx)) }
+    fn cublasStpsv_v2_64(h: cublasHandle_t, uplo: c_int, t: c_int, diag: c_int, n: i64, ap: *const f32, x: *mut f32, incx: i64) { let n = n32(n)?; let incx = n32(incx)?; ok(cublasStpsv_v2(h, uplo, t, diag, n, ap, x, incx)) }
+    fn cublasSsymm_v2_64(h: cublasHandle_t, side: c_int, uplo: c_int, m: i64, n: i64, alpha: *const f32, a: *const f32, lda: i64, b: *const f32, ldb: i64, beta: *const f32, c: *mut f32, ldc: i64) { let m = n32(m)?; let n = n32(n)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; ok(cublasSsymm_v2(h, side, uplo, m, n, alpha, a, lda, b, ldb, beta, c, ldc)) }
+    fn cublasSsyrk_v2_64(h: cublasHandle_t, uplo: c_int, t: c_int, n: i64, k: i64, alpha: *const f32, a: *const f32, lda: i64, beta: *const f32, c: *mut f32, ldc: i64) { let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let ldc = n32(ldc)?; ok(cublasSsyrk_v2(h, uplo, t, n, k, alpha, a, lda, beta, c, ldc)) }
+    fn cublasSsyr2k_v2_64(h: cublasHandle_t, uplo: c_int, t: c_int, n: i64, k: i64, alpha: *const f32, a: *const f32, lda: i64, b: *const f32, ldb: i64, beta: *const f32, c: *mut f32, ldc: i64) { let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; ok(cublasSsyr2k_v2(h, uplo, t, n, k, alpha, a, lda, b, ldb, beta, c, ldc)) }
+    fn cublasSsyrkx_64(h: cublasHandle_t, uplo: c_int, t: c_int, n: i64, k: i64, alpha: *const f32, a: *const f32, lda: i64, b: *const f32, ldb: i64, beta: *const f32, c: *mut f32, ldc: i64) { let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; ok(cublasSsyrkx(h, uplo, t, n, k, alpha, a, lda, b, ldb, beta, c, ldc)) }
+    fn cublasStrmm_v2_64(h: cublasHandle_t, side: c_int, uplo: c_int, t: c_int, diag: c_int, m: i64, n: i64, alpha: *const f32, a: *const f32, lda: i64, b: *const f32, ldb: i64, c: *mut f32, ldc: i64) { let m = n32(m)?; let n = n32(n)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; ok(cublasStrmm_v2(h, side, uplo, t, diag, m, n, alpha, a, lda, b, ldb, c, ldc)) }
+    fn cublasStrsm_v2_64(h: cublasHandle_t, side: c_int, uplo: c_int, t: c_int, diag: c_int, m: i64, n: i64, alpha: *const f32, a: *const f32, lda: i64, b: *mut f32, ldb: i64) { let m = n32(m)?; let n = n32(n)?; let lda = n32(lda)?; let ldb = n32(ldb)?; ok(cublasStrsm_v2(h, side, uplo, t, diag, m, n, alpha, a, lda, b, ldb)) }
+    fn cublasStrsmBatched_64(h: cublasHandle_t, side: c_int, uplo: c_int, t: c_int, diag: c_int, m: i64, n: i64, alpha: *const f32, a: *const *const f32, lda: i64, b: *const *mut f32, ldb: i64, batch: i64) { let m = n32(m)?; let n = n32(n)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let batch = n32(batch)?; ok(cublasStrsmBatched(h, side, uplo, t, diag, m, n, alpha, a, lda, b, ldb, batch)) }
+    fn cublasSgeam_64(h: cublasHandle_t, ta: c_int, tb: c_int, m: i64, n: i64, alpha: *const f32, a: *const f32, lda: i64, beta: *const f32, b: *const f32, ldb: i64, c: *mut f32, ldc: i64) { let m = n32(m)?; let n = n32(n)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; ok(cublasSgeam(h, ta, tb, m, n, alpha, a, lda, beta, b, ldb, c, ldc)) }
+    fn cublasSdgmm_64(h: cublasHandle_t, side: c_int, m: i64, n: i64, a: *const f32, lda: i64, x: *const f32, incx: i64, c: *mut f32, ldc: i64) { let m = n32(m)?; let n = n32(n)?; let lda = n32(lda)?; let incx = n32(incx)?; let ldc = n32(ldc)?; ok(cublasSdgmm(h, side, m, n, a, lda, x, incx, c, ldc)) }
+    fn cublasDrot_v2_64(h: cublasHandle_t, n: i64, x: *mut f64, incx: i64, y: *mut f64, incy: i64, c: *const f64, s: *const f64) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasDrot_v2(h, n, x, incx, y, incy, c, s)) }
+    fn cublasDrotm_v2_64(h: cublasHandle_t, n: i64, x: *mut f64, incx: i64, y: *mut f64, incy: i64, param: *const f64) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasDrotm_v2(h, n, x, incx, y, incy, param)) }
+    fn cublasDger_v2_64(h: cublasHandle_t, m: i64, n: i64, alpha: *const f64, x: *const f64, incx: i64, y: *const f64, incy: i64, a: *mut f64, lda: i64) { let m = n32(m)?; let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; let lda = n32(lda)?; ok(cublasDger_v2(h, m, n, alpha, x, incx, y, incy, a, lda)) }
+    fn cublasDsyr_v2_64(h: cublasHandle_t, uplo: c_int, n: i64, alpha: *const f64, x: *const f64, incx: i64, a: *mut f64, lda: i64) { let n = n32(n)?; let incx = n32(incx)?; let lda = n32(lda)?; ok(cublasDsyr_v2(h, uplo, n, alpha, x, incx, a, lda)) }
+    fn cublasDsyr2_v2_64(h: cublasHandle_t, uplo: c_int, n: i64, alpha: *const f64, x: *const f64, incx: i64, y: *const f64, incy: i64, a: *mut f64, lda: i64) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; let lda = n32(lda)?; ok(cublasDsyr2_v2(h, uplo, n, alpha, x, incx, y, incy, a, lda)) }
+    fn cublasDgemvStridedBatched_64(h: cublasHandle_t, t: c_int, m: i64, n: i64, alpha: *const f64, a: *const f64, lda: i64, sa: i64, x: *const f64, incx: i64, sx: i64, beta: *const f64, y: *mut f64, incy: i64, sy: i64, batch: i64) { let m = n32(m)?; let n = n32(n)?; let lda = n32(lda)?; let incx = n32(incx)?; let incy = n32(incy)?; let batch = n32(batch)?; ok(cublasDgemvStridedBatched(h, t, m, n, alpha, a, lda, sa, x, incx, sx, beta, y, incy, sy, batch)) }
+    fn cublasDgemvBatched_64(h: cublasHandle_t, t: c_int, m: i64, n: i64, alpha: *const f64, a: *const *const f64, lda: i64, x: *const *const f64, incx: i64, beta: *const f64, y: *const *mut f64, incy: i64, batch: i64) { let m = n32(m)?; let n = n32(n)?; let lda = n32(lda)?; let incx = n32(incx)?; let incy = n32(incy)?; let batch = n32(batch)?; ok(cublasDgemvBatched(h, t, m, n, alpha, a, lda, x, incx, beta, y, incy, batch)) }
+    fn cublasDsymv_v2_64(h: cublasHandle_t, uplo: c_int, n: i64, alpha: *const f64, a: *const f64, lda: i64, x: *const f64, incx: i64, beta: *const f64, y: *mut f64, incy: i64) { let n = n32(n)?; let lda = n32(lda)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasDsymv_v2(h, uplo, n, alpha, a, lda, x, incx, beta, y, incy)) }
+    fn cublasDsbmv_v2_64(h: cublasHandle_t, uplo: c_int, n: i64, k: i64, alpha: *const f64, a: *const f64, lda: i64, x: *const f64, incx: i64, beta: *const f64, y: *mut f64, incy: i64) { let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasDsbmv_v2(h, uplo, n, k, alpha, a, lda, x, incx, beta, y, incy)) }
+    fn cublasDspmv_v2_64(h: cublasHandle_t, uplo: c_int, n: i64, alpha: *const f64, ap: *const f64, x: *const f64, incx: i64, beta: *const f64, y: *mut f64, incy: i64) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasDspmv_v2(h, uplo, n, alpha, ap, x, incx, beta, y, incy)) }
+    fn cublasDgbmv_v2_64(h: cublasHandle_t, t: c_int, m: i64, n: i64, kl: i64, ku: i64, alpha: *const f64, a: *const f64, lda: i64, x: *const f64, incx: i64, beta: *const f64, y: *mut f64, incy: i64) { let m = n32(m)?; let n = n32(n)?; let kl = n32(kl)?; let ku = n32(ku)?; let lda = n32(lda)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasDgbmv_v2(h, t, m, n, kl, ku, alpha, a, lda, x, incx, beta, y, incy)) }
+    fn cublasDtrmv_v2_64(h: cublasHandle_t, uplo: c_int, t: c_int, diag: c_int, n: i64, a: *const f64, lda: i64, x: *mut f64, incx: i64) { let n = n32(n)?; let lda = n32(lda)?; let incx = n32(incx)?; ok(cublasDtrmv_v2(h, uplo, t, diag, n, a, lda, x, incx)) }
+    fn cublasDtbmv_v2_64(h: cublasHandle_t, uplo: c_int, t: c_int, diag: c_int, n: i64, k: i64, a: *const f64, lda: i64, x: *mut f64, incx: i64) { let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let incx = n32(incx)?; ok(cublasDtbmv_v2(h, uplo, t, diag, n, k, a, lda, x, incx)) }
+    fn cublasDtpmv_v2_64(h: cublasHandle_t, uplo: c_int, t: c_int, diag: c_int, n: i64, ap: *const f64, x: *mut f64, incx: i64) { let n = n32(n)?; let incx = n32(incx)?; ok(cublasDtpmv_v2(h, uplo, t, diag, n, ap, x, incx)) }
+    fn cublasDtrsv_v2_64(h: cublasHandle_t, uplo: c_int, t: c_int, diag: c_int, n: i64, a: *const f64, lda: i64, x: *mut f64, incx: i64) { let n = n32(n)?; let lda = n32(lda)?; let incx = n32(incx)?; ok(cublasDtrsv_v2(h, uplo, t, diag, n, a, lda, x, incx)) }
+    fn cublasDtbsv_v2_64(h: cublasHandle_t, uplo: c_int, t: c_int, diag: c_int, n: i64, k: i64, a: *const f64, lda: i64, x: *mut f64, incx: i64) { let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let incx = n32(incx)?; ok(cublasDtbsv_v2(h, uplo, t, diag, n, k, a, lda, x, incx)) }
+    fn cublasDtpsv_v2_64(h: cublasHandle_t, uplo: c_int, t: c_int, diag: c_int, n: i64, ap: *const f64, x: *mut f64, incx: i64) { let n = n32(n)?; let incx = n32(incx)?; ok(cublasDtpsv_v2(h, uplo, t, diag, n, ap, x, incx)) }
+    fn cublasDsymm_v2_64(h: cublasHandle_t, side: c_int, uplo: c_int, m: i64, n: i64, alpha: *const f64, a: *const f64, lda: i64, b: *const f64, ldb: i64, beta: *const f64, c: *mut f64, ldc: i64) { let m = n32(m)?; let n = n32(n)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; ok(cublasDsymm_v2(h, side, uplo, m, n, alpha, a, lda, b, ldb, beta, c, ldc)) }
+    fn cublasDsyrk_v2_64(h: cublasHandle_t, uplo: c_int, t: c_int, n: i64, k: i64, alpha: *const f64, a: *const f64, lda: i64, beta: *const f64, c: *mut f64, ldc: i64) { let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let ldc = n32(ldc)?; ok(cublasDsyrk_v2(h, uplo, t, n, k, alpha, a, lda, beta, c, ldc)) }
+    fn cublasDsyr2k_v2_64(h: cublasHandle_t, uplo: c_int, t: c_int, n: i64, k: i64, alpha: *const f64, a: *const f64, lda: i64, b: *const f64, ldb: i64, beta: *const f64, c: *mut f64, ldc: i64) { let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; ok(cublasDsyr2k_v2(h, uplo, t, n, k, alpha, a, lda, b, ldb, beta, c, ldc)) }
+    fn cublasDsyrkx_64(h: cublasHandle_t, uplo: c_int, t: c_int, n: i64, k: i64, alpha: *const f64, a: *const f64, lda: i64, b: *const f64, ldb: i64, beta: *const f64, c: *mut f64, ldc: i64) { let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; ok(cublasDsyrkx(h, uplo, t, n, k, alpha, a, lda, b, ldb, beta, c, ldc)) }
+    fn cublasDtrmm_v2_64(h: cublasHandle_t, side: c_int, uplo: c_int, t: c_int, diag: c_int, m: i64, n: i64, alpha: *const f64, a: *const f64, lda: i64, b: *const f64, ldb: i64, c: *mut f64, ldc: i64) { let m = n32(m)?; let n = n32(n)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; ok(cublasDtrmm_v2(h, side, uplo, t, diag, m, n, alpha, a, lda, b, ldb, c, ldc)) }
+    fn cublasDtrsm_v2_64(h: cublasHandle_t, side: c_int, uplo: c_int, t: c_int, diag: c_int, m: i64, n: i64, alpha: *const f64, a: *const f64, lda: i64, b: *mut f64, ldb: i64) { let m = n32(m)?; let n = n32(n)?; let lda = n32(lda)?; let ldb = n32(ldb)?; ok(cublasDtrsm_v2(h, side, uplo, t, diag, m, n, alpha, a, lda, b, ldb)) }
+    fn cublasDtrsmBatched_64(h: cublasHandle_t, side: c_int, uplo: c_int, t: c_int, diag: c_int, m: i64, n: i64, alpha: *const f64, a: *const *const f64, lda: i64, b: *const *mut f64, ldb: i64, batch: i64) { let m = n32(m)?; let n = n32(n)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let batch = n32(batch)?; ok(cublasDtrsmBatched(h, side, uplo, t, diag, m, n, alpha, a, lda, b, ldb, batch)) }
+    fn cublasDgeam_64(h: cublasHandle_t, ta: c_int, tb: c_int, m: i64, n: i64, alpha: *const f64, a: *const f64, lda: i64, beta: *const f64, b: *const f64, ldb: i64, c: *mut f64, ldc: i64) { let m = n32(m)?; let n = n32(n)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; ok(cublasDgeam(h, ta, tb, m, n, alpha, a, lda, beta, b, ldb, c, ldc)) }
+    fn cublasDdgmm_64(h: cublasHandle_t, side: c_int, m: i64, n: i64, a: *const f64, lda: i64, x: *const f64, incx: i64, c: *mut f64, ldc: i64) { let m = n32(m)?; let n = n32(n)?; let lda = n32(lda)?; let incx = n32(incx)?; let ldc = n32(ldc)?; ok(cublasDdgmm(h, side, m, n, a, lda, x, incx, c, ldc)) }
+    fn cublasCaxpy_v2_64(h: cublasHandle_t, n: i64, alpha: *const Cx<f32>, x: *const Cx<f32>, incx: i64, y: *mut Cx<f32>, incy: i64) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasCaxpy_v2(h, n, alpha, x, incx, y, incy)) }
+    fn cublasCscal_v2_64(h: cublasHandle_t, n: i64, alpha: *const Cx<f32>, x: *mut Cx<f32>, incx: i64) { let n = n32(n)?; let incx = n32(incx)?; ok(cublasCscal_v2(h, n, alpha, x, incx)) }
+    fn cublasCsscal_v2_64(h: cublasHandle_t, n: i64, alpha: *const f32, x: *mut Cx<f32>, incx: i64) { let n = n32(n)?; let incx = n32(incx)?; ok(cublasCsscal_v2(h, n, alpha, x, incx)) }
+    fn cublasCcopy_v2_64(h: cublasHandle_t, n: i64, x: *const Cx<f32>, incx: i64, y: *mut Cx<f32>, incy: i64) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasCcopy_v2(h, n, x, incx, y, incy)) }
+    fn cublasCswap_v2_64(h: cublasHandle_t, n: i64, x: *mut Cx<f32>, incx: i64, y: *mut Cx<f32>, incy: i64) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasCswap_v2(h, n, x, incx, y, incy)) }
+    fn cublasCdotu_v2_64(h: cublasHandle_t, n: i64, x: *const Cx<f32>, incx: i64, y: *const Cx<f32>, incy: i64, r: *mut Cx<f32>) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasCdotu_v2(h, n, x, incx, y, incy, r)) }
+    fn cublasCdotc_v2_64(h: cublasHandle_t, n: i64, x: *const Cx<f32>, incx: i64, y: *const Cx<f32>, incy: i64, r: *mut Cx<f32>) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasCdotc_v2(h, n, x, incx, y, incy, r)) }
+    fn cublasScnrm2_v2_64(h: cublasHandle_t, n: i64, x: *const Cx<f32>, incx: i64, r: *mut f32) { let n = n32(n)?; let incx = n32(incx)?; ok(cublasScnrm2_v2(h, n, x, incx, r)) }
+    fn cublasScasum_v2_64(h: cublasHandle_t, n: i64, x: *const Cx<f32>, incx: i64, r: *mut f32) { let n = n32(n)?; let incx = n32(incx)?; ok(cublasScasum_v2(h, n, x, incx, r)) }
+    fn cublasCsrot_v2_64(h: cublasHandle_t, n: i64, x: *mut Cx<f32>, incx: i64, y: *mut Cx<f32>, incy: i64, c: *const f32, s: *const f32) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasCsrot_v2(h, n, x, incx, y, incy, c, s)) }
+    fn cublasCgemv_v2_64(h: cublasHandle_t, t: c_int, m: i64, n: i64, alpha: *const Cx<f32>, a: *const Cx<f32>, lda: i64, x: *const Cx<f32>, incx: i64, beta: *const Cx<f32>, y: *mut Cx<f32>, incy: i64) { let m = n32(m)?; let n = n32(n)?; let lda = n32(lda)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasCgemv_v2(h, t, m, n, alpha, a, lda, x, incx, beta, y, incy)) }
+    fn cublasCgemm_v2_64(h: cublasHandle_t, ta: c_int, tb: c_int, m: i64, n: i64, k: i64, alpha: *const Cx<f32>, a: *const Cx<f32>, lda: i64, b: *const Cx<f32>, ldb: i64, beta: *const Cx<f32>, c: *mut Cx<f32>, ldc: i64) { let m = n32(m)?; let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; ok(cublasCgemm_v2(h, ta, tb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc)) }
+    fn cublasCgemm3m_64(h: cublasHandle_t, ta: c_int, tb: c_int, m: i64, n: i64, k: i64, alpha: *const Cx<f32>, a: *const Cx<f32>, lda: i64, b: *const Cx<f32>, ldb: i64, beta: *const Cx<f32>, c: *mut Cx<f32>, ldc: i64) { let m = n32(m)?; let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; ok(cublasCgemm3m(h, ta, tb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc)) }
+    fn cublasCgemmStridedBatched_64(h: cublasHandle_t, ta: c_int, tb: c_int, m: i64, n: i64, k: i64, alpha: *const Cx<f32>, a: *const Cx<f32>, lda: i64, sa: i64, b: *const Cx<f32>, ldb: i64, sb: i64, beta: *const Cx<f32>, c: *mut Cx<f32>, ldc: i64, sc: i64, batch: i64) { let m = n32(m)?; let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; let batch = n32(batch)?; ok(cublasCgemmStridedBatched(h, ta, tb, m, n, k, alpha, a, lda, sa, b, ldb, sb, beta, c, ldc, sc, batch)) }
+    fn cublasCgemmBatched_64(h: cublasHandle_t, ta: c_int, tb: c_int, m: i64, n: i64, k: i64, alpha: *const Cx<f32>, a: *const *const Cx<f32>, lda: i64, b: *const *const Cx<f32>, ldb: i64, beta: *const Cx<f32>, c: *const *mut Cx<f32>, ldc: i64, batch: i64) { let m = n32(m)?; let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; let batch = n32(batch)?; ok(cublasCgemmBatched(h, ta, tb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc, batch)) }
+    fn cublasZaxpy_v2_64(h: cublasHandle_t, n: i64, alpha: *const Cx<f64>, x: *const Cx<f64>, incx: i64, y: *mut Cx<f64>, incy: i64) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasZaxpy_v2(h, n, alpha, x, incx, y, incy)) }
+    fn cublasZscal_v2_64(h: cublasHandle_t, n: i64, alpha: *const Cx<f64>, x: *mut Cx<f64>, incx: i64) { let n = n32(n)?; let incx = n32(incx)?; ok(cublasZscal_v2(h, n, alpha, x, incx)) }
+    fn cublasZdscal_v2_64(h: cublasHandle_t, n: i64, alpha: *const f64, x: *mut Cx<f64>, incx: i64) { let n = n32(n)?; let incx = n32(incx)?; ok(cublasZdscal_v2(h, n, alpha, x, incx)) }
+    fn cublasZcopy_v2_64(h: cublasHandle_t, n: i64, x: *const Cx<f64>, incx: i64, y: *mut Cx<f64>, incy: i64) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasZcopy_v2(h, n, x, incx, y, incy)) }
+    fn cublasZswap_v2_64(h: cublasHandle_t, n: i64, x: *mut Cx<f64>, incx: i64, y: *mut Cx<f64>, incy: i64) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasZswap_v2(h, n, x, incx, y, incy)) }
+    fn cublasZdotu_v2_64(h: cublasHandle_t, n: i64, x: *const Cx<f64>, incx: i64, y: *const Cx<f64>, incy: i64, r: *mut Cx<f64>) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasZdotu_v2(h, n, x, incx, y, incy, r)) }
+    fn cublasZdotc_v2_64(h: cublasHandle_t, n: i64, x: *const Cx<f64>, incx: i64, y: *const Cx<f64>, incy: i64, r: *mut Cx<f64>) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasZdotc_v2(h, n, x, incx, y, incy, r)) }
+    fn cublasDznrm2_v2_64(h: cublasHandle_t, n: i64, x: *const Cx<f64>, incx: i64, r: *mut f64) { let n = n32(n)?; let incx = n32(incx)?; ok(cublasDznrm2_v2(h, n, x, incx, r)) }
+    fn cublasDzasum_v2_64(h: cublasHandle_t, n: i64, x: *const Cx<f64>, incx: i64, r: *mut f64) { let n = n32(n)?; let incx = n32(incx)?; ok(cublasDzasum_v2(h, n, x, incx, r)) }
+    fn cublasZdrot_v2_64(h: cublasHandle_t, n: i64, x: *mut Cx<f64>, incx: i64, y: *mut Cx<f64>, incy: i64, c: *const f64, s: *const f64) { let n = n32(n)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasZdrot_v2(h, n, x, incx, y, incy, c, s)) }
+    fn cublasZgemv_v2_64(h: cublasHandle_t, t: c_int, m: i64, n: i64, alpha: *const Cx<f64>, a: *const Cx<f64>, lda: i64, x: *const Cx<f64>, incx: i64, beta: *const Cx<f64>, y: *mut Cx<f64>, incy: i64) { let m = n32(m)?; let n = n32(n)?; let lda = n32(lda)?; let incx = n32(incx)?; let incy = n32(incy)?; ok(cublasZgemv_v2(h, t, m, n, alpha, a, lda, x, incx, beta, y, incy)) }
+    fn cublasZgemm_v2_64(h: cublasHandle_t, ta: c_int, tb: c_int, m: i64, n: i64, k: i64, alpha: *const Cx<f64>, a: *const Cx<f64>, lda: i64, b: *const Cx<f64>, ldb: i64, beta: *const Cx<f64>, c: *mut Cx<f64>, ldc: i64) { let m = n32(m)?; let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; ok(cublasZgemm_v2(h, ta, tb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc)) }
+    fn cublasZgemm3m_64(h: cublasHandle_t, ta: c_int, tb: c_int, m: i64, n: i64, k: i64, alpha: *const Cx<f64>, a: *const Cx<f64>, lda: i64, b: *const Cx<f64>, ldb: i64, beta: *const Cx<f64>, c: *mut Cx<f64>, ldc: i64) { let m = n32(m)?; let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; ok(cublasZgemm3m(h, ta, tb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc)) }
+    fn cublasZgemmStridedBatched_64(h: cublasHandle_t, ta: c_int, tb: c_int, m: i64, n: i64, k: i64, alpha: *const Cx<f64>, a: *const Cx<f64>, lda: i64, sa: i64, b: *const Cx<f64>, ldb: i64, sb: i64, beta: *const Cx<f64>, c: *mut Cx<f64>, ldc: i64, sc: i64, batch: i64) { let m = n32(m)?; let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; let batch = n32(batch)?; ok(cublasZgemmStridedBatched(h, ta, tb, m, n, k, alpha, a, lda, sa, b, ldb, sb, beta, c, ldc, sc, batch)) }
+    fn cublasZgemmBatched_64(h: cublasHandle_t, ta: c_int, tb: c_int, m: i64, n: i64, k: i64, alpha: *const Cx<f64>, a: *const *const Cx<f64>, lda: i64, b: *const *const Cx<f64>, ldb: i64, beta: *const Cx<f64>, c: *const *mut Cx<f64>, ldc: i64, batch: i64) { let m = n32(m)?; let n = n32(n)?; let k = n32(k)?; let lda = n32(lda)?; let ldb = n32(ldb)?; let ldc = n32(ldc)?; let batch = n32(batch)?; ok(cublasZgemmBatched(h, ta, tb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc, batch)) }
+}
+
 /// rows x cols elements of `elem` bytes, element (i, j) at i * inc + j * ld (in elements) on both sides; the
 /// device side (src_dev / dst_dev) through its host mapping
 unsafe fn strided_copy(rows: c_int, cols: c_int, elem: c_int, src: *const u8, sinc: i64, sld: i64, src_dev: bool,
@@ -1285,6 +1660,11 @@ pub unsafe extern "system" fn cublasGetStatusName(s: cublasStatus_t) -> *const c
         _ => "CUBLAS_STATUS_UNKNOWN\0",
     })
     .as_ptr() as *const c_char
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn cublasGetCudartVersion() -> usize {
+    12040
 }
 
 #[no_mangle]

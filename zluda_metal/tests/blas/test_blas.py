@@ -629,6 +629,185 @@ def argument_checks(b):
     return sum(r != 7 for r in bad), 0
 
 
+# ------------------------------------------------------------------------------------------- complex
+CPX = {np.complex64: ("C", ctypes.c_float, np.float32), np.complex128: ("Z", ctypes.c_double, np.float64)}
+
+
+def cstrided(n, inc, dt):
+    st = (rng.standard_normal(max(1, 1 + (n - 1) * abs(inc))) + 1j * rng.standard_normal(max(1, 1 + (n - 1) * abs(inc)))).astype(dt)
+    idx = np.arange(n) * abs(inc)
+    if inc < 0:
+        idx = idx[::-1]
+    return st, idx
+
+
+def cptr(v, rt):
+    x = (rt * 2)(v.real, v.imag)
+    return ctypes.byref(x), x
+
+
+def crel(got, want):
+    return float(np.max(np.abs(np.asarray(got) - want)) / max(np.max(np.abs(want)), 1e-30))
+
+
+def ctol(dt, k=1):
+    return (4e-5 if dt == np.complex64 else 2e-12) * max(1, np.sqrt(k))
+
+
+for dt in (np.complex64, np.complex128):
+    @case
+    def complex_level1(b, dt=dt):
+        Pc, rt, real = CPX[dt]
+        n = 513
+        x, ix = cstrided(n, 2, dt)
+        y, iy = cstrided(n, -3, dt)
+        px, x0 = b.dev(x)
+        py, y0 = b.dev(y)
+        al = 0.5 - 1.25j
+        b.call("cublas%saxpy_v2" % Pc, b.h, n, cptr(al, rt)[0], c_void_p(px), 2, c_void_p(py), -3)
+        want = y0.astype(np.complex128).copy()
+        want[iy] += al * x0.astype(np.complex128)[ix]
+        e = crel(b.get(py, y0), want)
+        yv = b.get(py, y0).astype(np.complex128)
+        xv = x0.astype(np.complex128)
+        r = (rt * 2)()
+        for nm, wantd in (("dotu", np.sum(xv[ix] * yv[iy])), ("dotc", np.sum(np.conj(xv[ix]) * yv[iy]))):
+            b.call("cublas%s%s_v2" % (Pc, nm), b.h, n, c_void_p(px), 2, c_void_p(py), -3, r)
+            e = max(e, abs(complex(r[0], r[1]) - wantd) / np.sum(np.abs(xv[ix] * yv[iy])))
+        rr = rt()
+        nn = "Sc" if Pc == "C" else "Dz"
+        for inc in (1, 2):
+            sel = xv[::inc][:n // inc]
+            b.call("cublas%snrm2_v2" % nn, b.h, n // inc, c_void_p(px), inc, ctypes.byref(rr))
+            e = max(e, abs(rr.value - np.linalg.norm(sel)) / np.linalg.norm(sel))
+            b.call("cublas%sasum_v2" % nn, b.h, n // inc, c_void_p(px), inc, ctypes.byref(rr))
+            w = np.sum(np.abs(sel.real) + np.abs(sel.imag))
+            e = max(e, abs(rr.value - w) / w)
+        # scal, sscal, rot, swap, copy
+        b.call("cublas%sscal_v2" % Pc, b.h, n, cptr(2 - 1j, rt)[0], c_void_p(px), 2)
+        xv2 = xv.copy()
+        xv2[ix] *= 2 - 1j
+        b.call("cublas%s%sscal_v2" % (Pc, "s" if Pc == "C" else "d"), b.h, n, ctypes.byref(rt(-0.5)), c_void_p(px), 2)
+        xv2[ix] *= -0.5
+        e = max(e, crel(b.get(px, x0), xv2))
+        c_, s_ = 0.8, 0.6
+        b.call("cublas%srot_v2" % ("Cs" if Pc == "C" else "Zd"), b.h, n, c_void_p(px), 2, c_void_p(py), -3,
+               ctypes.byref(rt(c_)), ctypes.byref(rt(s_)))
+        wx, wy = xv2.copy(), yv.copy()
+        wx[ix], wy[iy] = c_ * xv2[ix] + s_ * yv[iy], c_ * yv[iy] - s_ * xv2[ix]
+        e = max(e, crel(b.get(px, x0), wx), crel(b.get(py, y0), wy))
+        b.call("cublas%sswap_v2" % Pc, b.h, n, c_void_p(px), 2, c_void_p(py), -3)
+        wx2, wy2 = wx.copy(), wy.copy()
+        wx2[ix], wy2[iy] = wy[iy], wx[ix]
+        b.call("cublas%scopy_v2" % Pc, b.h, n, c_void_p(py), -3, c_void_p(px), 2)
+        wx2[ix] = wy2[iy]
+        e = max(e, crel(b.get(px, x0), wx2), crel(b.get(py, y0), wy2))
+        return e, ctol(dt, n)
+
+    for trans in (N, T, 2):
+        @case
+        def complex_gemv(b, dt=dt, trans=trans):
+            Pc, rt, real = CPX[dt]
+            m, n, lda = 45, 70, 47
+            A = (rng.standard_normal((n, lda)) + 1j * rng.standard_normal((n, lda))).astype(dt)
+            Am = A.astype(np.complex128)[:, :m].T
+            op = {N: Am, T: Am.T, 2: Am.conj().T}[trans]
+            x, ix = cstrided(op.shape[1], 1, dt)
+            y, iy = cstrided(op.shape[0], -2, dt)
+            pa, _ = b.dev(A)
+            px, _ = b.dev(x)
+            py, y0 = b.dev(y)
+            al, be = 1 + 0.5j, -0.25 + 1j
+            b.call("cublas%sgemv_v2" % Pc, b.h, trans, m, n, cptr(al, rt)[0], c_void_p(pa), lda, c_void_p(px), 1,
+                   cptr(be, rt)[0], c_void_p(py), -2)
+            want = y0.astype(np.complex128).copy()
+            want[iy] = al * op @ x.astype(np.complex128)[ix] + be * want[iy]
+            return crel(b.get(py, y0), want), ctol(dt, n)
+
+    for ta, tb, m, n, k, beta in ((N, N, 40, 33, 20, 0j), (2, T, 17, 64, 50, 1 - 1j), (T, 2, 64, 48, 32, 0.5j)):
+        @case
+        def complex_gemm(b, dt=dt, ta=ta, tb=tb, m=m, n=n, k=k, beta=beta):
+            Pc, rt, real = CPX[dt]
+            ra, ca = (m, k) if ta == N else (k, m)
+            rb, cb = (k, n) if tb == N else (n, k)
+            A = (rng.standard_normal((ca, ra + 1)) + 1j * rng.standard_normal((ca, ra + 1))).astype(dt)
+            B = (rng.standard_normal((cb, rb + 2)) + 1j * rng.standard_normal((cb, rb + 2))).astype(dt)
+            C = (rng.standard_normal((n, m + 3)) + 1j * rng.standard_normal((n, m + 3))).astype(dt)
+            pa, _ = b.dev(A)
+            pb, _ = b.dev(B)
+            pc, c0 = b.dev(C)
+            al = 0.5 + 2j
+            for nm in ("gemm_v2", "gemm3m"):
+                pc, c0 = b.dev(C)
+                b.call("cublas%s%s" % (Pc, nm), b.h, ta, tb, m, n, k, cptr(al, rt)[0], c_void_p(pa), ra + 1, c_void_p(pb), rb + 2,
+                       cptr(beta, rt)[0], c_void_p(pc), m + 3)
+            opf = lambda M, t: {N: M, T: M.T, 2: M.conj().T}[t]
+            Am = A.astype(np.complex128)[:, :ra].T
+            Bm = B.astype(np.complex128)[:, :rb].T
+            want = c0.astype(np.complex128).copy()
+            want[:, :m] = (al * opf(Am, ta) @ opf(Bm, tb) + beta * want[:, :m].T).T
+            return crel(b.get(pc, c0), want), ctol(dt, k)
+
+    @case
+    def complex_gemm_strided_batched(b, dt=dt):
+        Pc, rt, real = CPX[dt]
+        m, n, k, batch = 20, 18, 9, 3
+        A = (rng.standard_normal((batch, k, m)) + 1j * rng.standard_normal((batch, k, m))).astype(dt)
+        B = (rng.standard_normal((batch, n, k)) + 1j * rng.standard_normal((batch, n, k))).astype(dt)
+        C = (rng.standard_normal((batch, n, m)) + 1j * rng.standard_normal((batch, n, m))).astype(dt)
+        pa, _ = b.dev(A)
+        pb, _ = b.dev(B)
+        pc, c0 = b.dev(C)
+        b.call("cublas%sgemmStridedBatched" % Pc, b.h, N, N, m, n, k, cptr(1j, rt)[0], c_void_p(pa), m, c_int64(m * k),
+               c_void_p(pb), k, c_int64(k * n), cptr(1 + 0j, rt)[0], c_void_p(pc), m, c_int64(m * n), batch)
+        want = np.stack([(1j * A[i].T.astype(np.complex128) @ B[i].T + C[i].T).T for i in range(batch)])
+        return crel(b.get(pc, c0), want), ctol(dt, k)
+
+
+@case
+def misc_api_and_64(b):
+    """GetProperty, atomics mode, the Async copies, the _64 entry points"""
+    f = b.l
+    e = 0.0
+    v = c_int()
+    for kind, want in ((0, 12), (1, 4), (2, 0)):
+        b.ok(f.cublasGetProperty(kind, ctypes.byref(v)), "cublasGetProperty")
+        e += v.value != want
+    b.ok(f.cublasSetAtomicsMode(b.h, 1), "cublasSetAtomicsMode")
+    b.ok(f.cublasGetAtomicsMode(b.h, ctypes.byref(v)), "cublasGetAtomicsMode")
+    e += v.value != 1
+    e += f.cublasSetAtomicsMode(b.h, 5) != 7
+    b.ok(f.cublasSetAtomicsMode(b.h, 0), "cublasSetAtomicsMode")
+    n = 100
+    x = rng.standard_normal(2 * n).astype(np.float32)
+    p = c_void_p(b.cu.alloc(bytes(4 * n)))
+    b.ok(f.cublasSetVectorAsync(n, 4, x.ctypes.data_as(c_void_p), 2, p, 1, None), "cublasSetVectorAsync")
+    out = np.zeros(n, np.float32)
+    b.ok(f.cublasGetVectorAsync_64(c_int64(n), 4, p, c_int64(1), out.ctypes.data_as(c_void_p), c_int64(1), None), "GetVectorAsync_64")
+    e += rel(out, x[::2])
+    m2 = np.zeros((5, 3), np.float32)
+    b.ok(f.cublasGetMatrixAsync(3, 5, 4, p, 10, m2.ctypes.data_as(c_void_p), 3, None), "cublasGetMatrixAsync")
+    e += rel(m2.ravel(), np.concatenate([x[::2][10 * j:10 * j + 3] for j in range(5)]))
+    # _64 compute routines
+    y = rng.standard_normal(n).astype(np.float32)
+    py, y0 = b.dev(y)
+    al = ctypes.c_float(2.0)
+    b.ok(f.cublasSaxpy_v2_64(b.h, c_int64(n), ctypes.byref(al), p, c_int64(1), py, c_int64(1)), "cublasSaxpy_v2_64")
+    e += rel(b.get(py, y0), y.astype(np.float64) + 2.0 * x[::2])
+    i64 = c_int64()
+    b.ok(f.cublasIsamax_v2_64(b.h, c_int64(n), p, c_int64(1), ctypes.byref(i64)), "cublasIsamax_v2_64")
+    e += i64.value != int(np.argmax(np.abs(x[::2]))) + 1
+    A = rng.standard_normal((8, 8)).astype(np.float32)
+    pa, _ = b.dev(A)
+    pc, c0 = b.dev(np.zeros((8, 8), np.float32))
+    zero = ctypes.c_float(0.0)
+    b.ok(f.cublasSgemm_v2_64(b.h, N, N, c_int64(8), c_int64(8), c_int64(8), ctypes.byref(al), c_void_p(pa), c_int64(8),
+                             c_void_p(pa), c_int64(8), ctypes.byref(zero), c_void_p(pc), c_int64(8)), "cublasSgemm_v2_64")
+    e += rel(b.get(pc, c0), (2.0 * A.T.astype(np.float64) @ A.T).T)
+    e += f.cublasSscal_v2_64(b.h, c_int64(1 << 40), ctypes.byref(al), p, c_int64(1)) != 15
+    return e, 1e-5
+
+
 def f16(x):
     return x.astype(np.float16)
 

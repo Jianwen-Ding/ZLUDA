@@ -14,12 +14,26 @@ pub fn preprocess(text: &str) -> Cow<'_, str> {
     if !needs_work(text) && !super::preprocess_calls::needs_work(text) {
         return Cow::Borrowed(text);
     }
+    // a rewrite that fails leaves the text as it is (the parser reports what it does not accept)
+    let r = std::panic::catch_unwind(|| rewrite_all(text));
+    match r {
+        Ok(s) => Cow::Owned(s),
+        Err(_) => Cow::Borrowed(text),
+    }
+}
+
+fn rewrite_all(text: &str) -> String {
     let s = drop_directives(text);
     let s = fold_expressions(&s);
     let s = expand_param_names(&s);
     let s = array_operands(&s);
-    let s = if super::preprocess_calls::needs_work(&s) { super::preprocess_calls::rewrite(&s) } else { s };
-    Cow::Owned(s)
+    let s = colour_members(&s);
+    let s = vector_members_in_lists(&s);
+    if super::preprocess_calls::needs_work(&s) {
+        super::preprocess_calls::rewrite(&s)
+    } else {
+        s
+    }
 }
 
 fn needs_work(text: &str) -> bool {
@@ -1139,4 +1153,179 @@ fn rewrite_array_stmt(stmt: &str, at: &str) -> Option<String> {
         // the statement's `;` follows: close the scope after it
         Some(format!("{lead}{prefix}{{ {} {inst}; }}", pre.join(" ")))
     }
+}
+
+// ------------------------------------------------------------------------------------------------ vector members
+
+/// `v.r v.g v.b v.a` of a vector register are `v.x v.y v.z v.w` (6.4.2)
+fn colour_members(t: &str) -> String {
+    if !t.contains(".v2") && !t.contains(".v4") {
+        return t.to_string();
+    }
+    // names declared `.reg .v2 / .v4 ...`
+    let mut names: Vec<String> = Vec::new();
+    for st in t.split(|c| c == ';' || c == '{' || c == '}' || c == '(' || c == ')') {
+        for part in st.split(',') {
+            let ws: Vec<&str> = part.split_whitespace().collect();
+            if let Some(p) = ws.iter().position(|w| *w == ".v2" || *w == ".v4") {
+                if ws.contains(&".reg") || p > 0 || st.contains(".reg") {
+                    if let Some(n) = ws.last() {
+                        let n: String = n.bytes().take_while(|c| is_word(*c) && *c != b'.' && *c != b'<').map(|c| c as char).collect();
+                        if !n.is_empty() && !n.starts_with('.') {
+                            names.push(n);
+                        }
+                    }
+                }
+            }
+        }
+        // further names of the same declaration: `.reg .v2 .u32 v, w;`
+        let ws: Vec<&str> = st.split_whitespace().collect();
+        if ws.first() == Some(&".reg") && (ws.contains(&".v2") || ws.contains(&".v4")) {
+            for part in st.split(',').skip(1) {
+                let n: String = part.trim().bytes().take_while(|c| is_word(*c) && *c != b'.' && *c != b'<').map(|c| c as char).collect();
+                if !n.is_empty() {
+                    names.push(n);
+                }
+            }
+        }
+    }
+    if names.is_empty() {
+        return t.to_string();
+    }
+    let b = t.as_bytes();
+    let mut out = String::with_capacity(t.len());
+    let mut i = 0;
+    while i < b.len() {
+        if (b[i].is_ascii_alphabetic() || b[i] == b'%' || b[i] == b'_') && (i == 0 || !is_word(b[i - 1])) {
+            let s = i;
+            while i < b.len() && is_word(b[i]) && b[i] != b'.' {
+                i += 1;
+            }
+            let name = &t[s..i];
+            out.push_str(name);
+            if i + 2 <= b.len() && b[i] == b'.' && names.iter().any(|n| n == name) {
+                let m = b.get(i + 1).copied();
+                let after = b.get(i + 2).copied().map_or(true, |c| !is_word(c));
+                if let (Some(m), true) = (m, after) {
+                    let x = match m {
+                        b'r' => Some('x'),
+                        b'g' => Some('y'),
+                        b'b' => Some('z'),
+                        b'a' => Some('w'),
+                        _ => None,
+                    };
+                    if let Some(x) = x {
+                        out.push('.');
+                        out.push(x);
+                        i += 2;
+                    }
+                }
+            }
+            continue;
+        }
+        let c = t[i..].chars().next().unwrap();
+        out.push(c);
+        i += c.len_utf8();
+    }
+    out
+}
+
+/// a vector operand `{a, v.z, b}` holding members of vector registers: the members go through scoped scalar registers
+/// (moved before a source list, after a destination list)
+fn vector_members_in_lists(t: &str) -> String {
+    if !t.contains(".v2") && !t.contains(".v4") {
+        return t.to_string();
+    }
+    // element types of the vector registers
+    let mut ty: Vec<(String, String)> = Vec::new();
+    for st in t.split(|c| c == ';' || c == '{' || c == '}') {
+        let ws: Vec<&str> = st.split_whitespace().collect();
+        if ws.first() == Some(&".reg") {
+            if let Some(p) = ws.iter().position(|w| *w == ".v2" || *w == ".v4") {
+                if let Some(e) = ws.get(p + 1) {
+                    let decl = st.splitn(2, e).nth(1).unwrap_or("");
+                    for n in decl.split(',') {
+                        let n: String = n.trim().bytes().take_while(|c| is_word(*c) && *c != b'.' && *c != b'<').map(|c| c as char).collect();
+                        if !n.is_empty() {
+                            ty.push((n, e.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if ty.is_empty() {
+        return t.to_string();
+    }
+    let mut out = String::with_capacity(t.len());
+    let mut ctr = 0;
+    for st in t.split_inclusive(';') {
+        let body = &st[..st.len() - if st.ends_with(';') { 1 } else { 0 }];
+        let (Some(lb), Some(rb)) = (body.find('{'), body.rfind('}')) else {
+            out.push_str(st);
+            continue;
+        };
+        if rb <= lb {
+            out.push_str(st);
+            continue;
+        }
+        // a statement start: the text after the last block brace or label before the instruction
+        let head = &body[..lb];
+        let inst_start = head.rfind(|c| c == '\n').map_or(0, |p| p + 1);
+        let inst = &body[inst_start..];
+        let mut ws_it = inst.split_whitespace();
+        let mut opcode = ws_it.next().unwrap_or("");
+        let guard = if opcode.starts_with('@') {
+            let g = opcode;
+            opcode = ws_it.next().unwrap_or("");
+            format!("{g} ")
+        } else {
+            String::new()
+        };
+        if opcode.starts_with('.') || lb < inst_start || !st.ends_with(';') || body[lb + 1..rb].contains('{') {
+            out.push_str(st);
+            continue;
+        }
+        let items: Vec<String> = body[lb + 1..rb].split(',').map(|x| x.trim().to_string()).collect();
+        let mut new_items = Vec::new();
+        let mut decls = Vec::new();
+        let mut moves = Vec::new();
+        let dst = !opcode.starts_with("st") && body[inst_start..lb].trim_end().ends_with(opcode.trim());
+        for it in &items {
+            let mut done = false;
+            if let Some(d) = it.rfind('.') {
+                let (n, m) = (&it[..d], &it[d + 1..]);
+                if matches!(m, "x" | "y" | "z" | "w") {
+                    if let Some((_, e)) = ty.iter().find(|(x, _)| x == n) {
+                        let tmp = format!("%__zluda_vm{ctr}");
+                        ctr += 1;
+                        decls.push(format!(".reg {e} {tmp};"));
+                        let bt = format!(".b{}", e.trim_start_matches(|c: char| !c.is_ascii_digit()));
+                        if dst {
+                            moves.push(format!("{guard}mov{bt} {it}, {tmp};"));
+                        } else {
+                            moves.push(format!("mov{bt} {tmp}, {it};"));
+                        }
+                        new_items.push(tmp);
+                        done = true;
+                    }
+                }
+            }
+            if !done {
+                new_items.push(it.clone());
+            }
+        }
+        if decls.is_empty() {
+            out.push_str(st);
+            continue;
+        }
+        let inst_new = format!("{}{{{}}}{}", &body[inst_start..lb], new_items.join(", "), &body[rb + 1..]);
+        out.push_str(&body[..inst_start]);
+        if dst {
+            out.push_str(&format!("{{ {} {}; {} }}", decls.join(" "), inst_new.trim(), moves.join(" ")));
+        } else {
+            out.push_str(&format!("{{ {} {} {}; }}", decls.join(" "), moves.join(" "), inst_new.trim()));
+        }
+    }
+    out
 }

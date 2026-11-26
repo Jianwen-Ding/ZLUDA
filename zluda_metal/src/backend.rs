@@ -107,6 +107,14 @@ pub fn host_pointer(addr: u64) -> Option<(*mut u8, u64)> {
 pub fn range(addr: u64) -> Option<(u64, u64)> {
     if use_agx() { crate::agx::range(addr) } else { metal_range(addr) }
 }
+/// Host memory the device sees at its own address (AGX backend only: Metal buffers would need
+/// `newBufferWithBytesNoCopy` and their own GPU addresses)
+pub fn register_host(p: *mut u8, len: u64) -> Result<u64, String> {
+    if use_agx() { crate::agx::register_host(p, len) } else { Err("host memory registration needs ZLUDA_METAL_BACKEND=agx".into()) }
+}
+pub fn unregister_host(addr: u64) -> bool {
+    use_agx() && crate::agx::unregister_host(addr)
+}
 pub fn synchronize() -> Result<(), String> {
     if use_agx() { Ok(()) } else { metal_synchronize() }
 }
@@ -142,6 +150,13 @@ pub struct Kernel {
 unsafe impl Send for Kernel {}
 unsafe impl Sync for Kernel {}
 impl Kernel {
+    /// The AGX kernel (its record: registers, stack), on the AGX backend
+    pub fn agx(&self) -> Option<&crate::agx::Kernel> {
+        match &self.imp {
+            KernelImpl::Agx(k) => Some(k),
+            KernelImpl::Metal(_) => None,
+        }
+    }
     pub fn launch(&self, grid: [u32; 3], block: [u32; 3], params: &[u8], dynamic_shared: u32) -> Result<(), String> {
         match &self.imp {
             KernelImpl::Metal(k) => k.launch(grid, block, params, dynamic_shared),

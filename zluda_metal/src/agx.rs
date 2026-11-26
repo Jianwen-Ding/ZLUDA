@@ -25,7 +25,33 @@ const ALIGN: u64 = 256;
 struct Heap {
     next: u64,
     /// base -> bytes
-    allocs: BTreeMap<u64, Vec<u8>>,
+    allocs: BTreeMap<u64, Block>,
+}
+
+/// The bytes of a device allocation: the heap's own, or host memory that the device sees at its host address
+/// (pinned, registered and managed memory of the CUDA driver API, src/cuda/memory.rs)
+enum Block {
+    Owned(Vec<u8>),
+    Host(*mut u8, usize),
+}
+unsafe impl Send for Block {}
+
+impl Block {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Block::Owned(v) => v,
+            Block::Host(p, n) => unsafe { std::slice::from_raw_parts(*p, *n) },
+        }
+    }
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        match self {
+            Block::Owned(v) => v,
+            Block::Host(p, n) => unsafe { std::slice::from_raw_parts_mut(*p, *n) },
+        }
+    }
+    fn len(&self) -> usize {
+        self.bytes().len()
+    }
 }
 
 fn heap() -> &'static Mutex<Heap> {
@@ -38,17 +64,59 @@ fn heap() -> &'static Mutex<Heap> {
     })
 }
 
+impl Heap {
+    /// the first block overlapping [base, base + len)
+    fn overlap(&self, base: u64, len: u64) -> Option<(u64, u64)> {
+        if let Some((b, v)) = self.allocs.range(..=base).next_back() {
+            if base < b + v.len() as u64 {
+                return Some((*b, v.len() as u64));
+            }
+        }
+        self.allocs.range(base..base.saturating_add(len)).next().map(|(b, v)| (*b, v.len() as u64))
+    }
+}
+
 pub fn alloc(size: u64) -> Result<u64, String> {
     let mut h = heap().lock().unwrap();
-    let base = h.next;
+    let mut base = h.next;
+    // skip host memory registered in the heap's range
+    while let Some((b, n)) = h.overlap(base, size.max(1) + ALIGN) {
+        base = (b + n + ALIGN + 0xFFF) & !0xFFF;
+    }
     // keep a gap between allocations so overruns fault instead of corrupting a neighbour
     h.next = (base + size.max(1) + ALIGN + 0xFFF) & !0xFFF;
-    h.allocs.insert(base, vec![0u8; size.max(1) as usize]);
+    h.allocs.insert(base, Block::Owned(vec![0u8; size.max(1) as usize]));
     Ok(base)
 }
 
 pub fn free(addr: u64) -> bool {
-    heap().lock().unwrap().allocs.remove(&addr).is_some()
+    let mut h = heap().lock().unwrap();
+    match h.allocs.get(&addr) {
+        Some(Block::Owned(_)) => h.allocs.remove(&addr).is_some(),
+        _ => false,
+    }
+}
+
+/// Host memory the device accesses at its own address (unified virtual addressing): `len` bytes at `p`
+pub fn register_host(p: *mut u8, len: u64) -> Result<u64, String> {
+    let mut h = heap().lock().unwrap();
+    let base = p as u64;
+    if len == 0 || base == 0 {
+        return Err("empty host range".into());
+    }
+    if let Some((b, n)) = h.overlap(base, len) {
+        return Err(format!("host range 0x{base:x} + {len} overlaps device memory 0x{b:x} + {n}"));
+    }
+    h.allocs.insert(base, Block::Host(p, len as usize));
+    Ok(base)
+}
+
+pub fn unregister_host(addr: u64) -> bool {
+    let mut h = heap().lock().unwrap();
+    match h.allocs.get(&addr) {
+        Some(Block::Host(..)) => h.allocs.remove(&addr).is_some(),
+        _ => false,
+    }
 }
 
 pub fn range(addr: u64) -> Option<(u64, u64)> {
@@ -66,8 +134,44 @@ pub fn host_pointer(addr: u64) -> Option<(*mut u8, u64)> {
     if off >= v.len() as u64 {
         return None;
     }
-    Some((unsafe { v.as_mut_ptr().add(off as usize) }, v.len() as u64 - off))
+    let n = v.len() as u64;
+    Some((unsafe { v.bytes_mut().as_mut_ptr().add(off as usize) }, n - off))
 }
+
+/// The simulated GPU's clock: the predicted time of every kernel timed so far (ns). Kernels are timed when
+/// `ZLUDA_AGX_STATS` is set or something asked for the time (`want_timing`: a CUDA event that records time).
+static SIM_CLOCK_NS: Mutex<f64> = Mutex::new(0.0);
+static TIMING_WANTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn sim_clock_ns() -> f64 {
+    *SIM_CLOCK_NS.lock().unwrap()
+}
+pub fn want_timing() {
+    TIMING_WANTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+fn timing_enabled() -> bool {
+    std::env::var_os("ZLUDA_AGX_STATS").is_some() || TIMING_WANTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Occupancy of a launch of `k` (the simulator's dispatch model, M2 Max): (resident workgroups per core, workgroups
+/// per core guaranteed to run concurrently), for `threads` per workgroup and `shared` threadgroup bytes in all
+pub fn occupancy(k: &Kernel, threads: u32, shared: u32) -> (u32, u32) {
+    let mut l = agx_sim::dispatch::Launch::default();
+    l.wg = [threads, 1, 1];
+    l.regs = (k.record.gprs * 2).max(8);
+    l.tg_bytes = shared;
+    (agx_sim::dispatch::occupancy(&l).1, agx_sim::dispatch::co_resident_workgroups(&l))
+}
+
+/// Serializes the simulated device: a launch copies every allocation in and out, so kernels and host copies of
+/// different threads (CUDA stream workers, src/cuda/stream.rs) must not interleave
+pub fn device_lock() -> std::sync::MutexGuard<'static, ()> {
+    static L: Mutex<()> = Mutex::new(());
+    L.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// GPU cores of the simulated device (M2 Max)
+pub const CORES: u32 = 38;
 
 // ---------------------------------------------------------------------------
 // ELF reading (64-bit little-endian, what llvm-air2agx writes)
@@ -523,6 +627,7 @@ impl Kernel {
         args: &[Arg],
         dynamic_shared: u32,
     ) -> Result<(), String> {
+        let _device = device_lock();
         let params: &[u8] = match args.first() {
             Some(Arg::Bytes(b)) => b,
             _ => &[],
@@ -658,16 +763,16 @@ impl Kernel {
         {
             let h = heap().lock().unwrap();
             for (va, v) in &h.allocs {
-                mem.map(*va, v.clone());
+                mem.map(*va, v.bytes().to_vec());
             }
         }
-        let timing = std::env::var_os("ZLUDA_AGX_STATS").map(|_| time_dispatch(&d, &mem, r));
+        let timing = timing_enabled().then(|| time_dispatch(&d, &mem, r));
         let res = func::run(&d, &mut mem);
         {
             let mut h = heap().lock().unwrap();
             for (va, v) in h.allocs.iter_mut() {
                 if let Ok(b) = mem.read_bytes(*va, v.len()) {
-                    v.copy_from_slice(&b);
+                    v.bytes_mut().copy_from_slice(&b);
                 }
             }
         }
@@ -677,6 +782,11 @@ impl Kernel {
         // an error of the functional model is the kernel's own fault (src/cuda.rs: a sticky context error)
         let st = res.map_err(|e| format!("{DEVICE_FAULT}{e}"))?;
         last_stats().lock().unwrap().push((r.name.clone(), st.instructions));
+        if let Some(Ok((us, _))) = &timing {
+            if us.is_finite() {
+                *SIM_CLOCK_NS.lock().unwrap() += us * 1000.0;
+            }
+        }
         if let Some(path) = std::env::var_os("ZLUDA_AGX_STATS") {
             use std::io::Write;
             let (time_us, cycles, err) = match timing {

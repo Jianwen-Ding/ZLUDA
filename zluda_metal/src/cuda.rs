@@ -1,49 +1,44 @@
-//! CUDA driver API (the libcuda.so surface) implemented on Metal.
+//! CUDA driver API (the libcuda.so surface) implemented on Metal / the AGX simulator.
 //!
-//! One device (the default Metal device), one in-order queue: all CUDA streams
-//! map onto it, which is a valid (if conservative) implementation of stream
-//! semantics. Device pointers are Metal GPU addresses of shared-storage
-//! buffers, so kernels dereference them directly.
+//! One device. Contexts form a per-thread stack (`cuda/context.rs`), allocations, modules, streams and events
+//! belong to the context that made them and go away with it. Device work of a stream runs in the calling thread
+//! when the stream is idle and otherwise on that stream's worker thread, in stream order (`cuda/stream.rs`), so
+//! host callbacks, events and cross-stream waits behave as in CUDA. Device pointers are Metal GPU addresses of
+//! shared-storage buffers (or the AGX simulator's heap), so kernels dereference them directly.
+//!
+//! Every declaration here is written from the CUDA Driver API reference's documented semantics; the numeric
+//! values of enums and error codes are the documented ABI.
 #![allow(non_snake_case, non_camel_case_types, clippy::missing_safety_doc)]
 
 use crate::backend;
 use crate::compile;
-use std::collections::HashMap;
-use std::ffi::{c_void, CStr};
+use std::collections::{HashMap, HashSet};
+use std::ffi::{c_void, CStr, CString};
 use std::os::raw::{c_char, c_int, c_uint};
 use std::ptr;
-use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+mod context;
+mod device;
+mod errors;
+mod graph;
+mod library;
+mod memory;
+mod occupancy;
+mod proc_address;
+mod stream;
+
+pub use context::Context;
+#[allow(unused_imports)]
+pub(crate) use context::current_limit;
+pub use stream::{Event, Stream};
 
 pub type CUresult = c_uint;
 pub type CUdevice = c_int;
 pub type CUdeviceptr = u64;
 
-pub const CUDA_SUCCESS: CUresult = 0;
-pub const CUDA_ERROR_INVALID_VALUE: CUresult = 1;
-pub const CUDA_ERROR_OUT_OF_MEMORY: CUresult = 2;
-pub const CUDA_ERROR_NOT_INITIALIZED: CUresult = 3;
-pub const CUDA_ERROR_NO_DEVICE: CUresult = 100;
-pub const CUDA_ERROR_INVALID_DEVICE: CUresult = 101;
-pub const CUDA_ERROR_INVALID_IMAGE: CUresult = 200;
-pub const CUDA_ERROR_INVALID_CONTEXT: CUresult = 201;
-pub const CUDA_ERROR_NO_BINARY_FOR_GPU: CUresult = 209;
-pub const CUDA_ERROR_INVALID_PTX: CUresult = 218;
-pub const CUDA_ERROR_FILE_NOT_FOUND: CUresult = 301;
-pub const CUDA_ERROR_INVALID_HANDLE: CUresult = 400;
-pub const CUDA_ERROR_NOT_FOUND: CUresult = 500;
-pub const CUDA_ERROR_NOT_READY: CUresult = 600;
-pub const CUDA_ERROR_ILLEGAL_ADDRESS: CUresult = 700;
-pub const CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES: CUresult = 701;
-pub const CUDA_ERROR_LAUNCH_TIMEOUT: CUresult = 702;
-pub const CUDA_ERROR_ASSERT: CUresult = 710;
-pub const CUDA_ERROR_HARDWARE_STACK_ERROR: CUresult = 714;
-pub const CUDA_ERROR_ILLEGAL_INSTRUCTION: CUresult = 715;
-pub const CUDA_ERROR_MISALIGNED_ADDRESS: CUresult = 716;
-pub const CUDA_ERROR_INVALID_PC: CUresult = 718;
-pub const CUDA_ERROR_LAUNCH_FAILED: CUresult = 719;
-pub const CUDA_ERROR_NOT_SUPPORTED: CUresult = 801;
-pub const CUDA_ERROR_UNKNOWN: CUresult = 999;
+pub use errors::*;
 
 /// Compute capability reported to applications
 const CC_MAJOR: c_int = 8;
@@ -51,28 +46,38 @@ const CC_MINOR: c_int = 0;
 const DRIVER_VERSION: c_int = 12080;
 
 // ---------------------------------------------------------------------------
-// Global state
+// Handle registries: a handle is valid while it is registered (CUDA_ERROR_INVALID_HANDLE otherwise)
 // ---------------------------------------------------------------------------
-/// A context. A fault of a kernel run in it (an illegal address, a trap, a failed assert, a hang) is sticky, as in
-/// CUDA: the launch itself returns success (launches are asynchronous in CUDA), and from then on every call that
-/// uses the context returns that error, until the context is destroyed (cuCtxDestroy) or, for the primary
-/// context, reset (cuDevicePrimaryCtxReset).
-pub struct Context {
-    sticky: std::sync::atomic::AtomicU32,
+pub(crate) struct Handles<T> {
+    map: OnceLock<Mutex<HashMap<usize, Arc<T>>>>,
 }
 
-impl Context {
-    fn new() -> Context {
-        Context { sticky: std::sync::atomic::AtomicU32::new(0) }
+impl<T> Handles<T> {
+    pub(crate) const fn new() -> Self {
+        Handles { map: OnceLock::new() }
+    }
+    fn m(&self) -> std::sync::MutexGuard<'_, HashMap<usize, Arc<T>>> {
+        self.map.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner())
+    }
+    pub(crate) fn insert(&self, v: Arc<T>) -> *mut T {
+        let p = Arc::as_ptr(&v) as *mut T;
+        self.m().insert(p as usize, v);
+        p
+    }
+    pub(crate) fn get(&self, p: *const T) -> Option<Arc<T>> {
+        self.m().get(&(p as usize)).cloned()
+    }
+    pub(crate) fn remove(&self, p: *const T) -> Option<Arc<T>> {
+        self.m().remove(&(p as usize))
+    }
+    pub(crate) fn all(&self) -> Vec<Arc<T>> {
+        self.m().values().cloned().collect()
     }
 }
-pub struct Stream {
-    _private: u8,
-}
-pub struct Event {
-    time: Mutex<Option<Instant>>,
-}
 
+// ---------------------------------------------------------------------------
+// Global state
+// ---------------------------------------------------------------------------
 pub struct Module {
     /// `.address_size 32`: each module variable's allocation (name, address, size)
     globals32: Vec<(String, CUdeviceptr, usize)>,
@@ -81,6 +86,11 @@ pub struct Module {
     globals: CUdeviceptr,
     library: backend::Library,
     functions: Mutex<HashMap<String, Box<Function>>>,
+    /// the context that loaded it (0: a context-independent library's module, `cuda/library.rs`)
+    #[allow(dead_code)]
+    ctx: usize,
+    /// `.target sm_XY`: XY (CU_FUNC_ATTRIBUTE_PTX_VERSION)
+    target: c_int,
 }
 
 pub struct Function {
@@ -93,6 +103,35 @@ pub struct Function {
     globals: CUdeviceptr,
     /// the module's trap / assert record (__zluda_fault), if a kernel can trap
     fault: Option<CUdeviceptr>,
+    module: *mut Module,
+    name: CString,
+    /// the library it came from (CUkernel), 0 for a module's function
+    library: AtomicU64,
+    attrs: Mutex<FuncAttrs>,
+}
+unsafe impl Send for Function {}
+unsafe impl Sync for Function {}
+
+/// The settable function attributes (cuFuncSetAttribute)
+#[derive(Clone, Copy)]
+pub(crate) struct FuncAttrs {
+    max_dynamic_shared: u32,
+    carveout: i32,
+    cache_config: u32,
+    cluster: [u32; 3],
+    non_portable_cluster: u32,
+    cluster_policy: u32,
+}
+
+/// live modules (pointer -> owning context) and functions
+static MODULES: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+static FUNCTIONS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+pub(crate) fn module_valid(m: *mut Module) -> bool {
+    MODULES.lock().unwrap().as_ref().is_some_and(|s| s.contains_key(&(m as usize)))
+}
+pub(crate) fn function_valid(f: *mut Function) -> bool {
+    !f.is_null() && FUNCTIONS.lock().unwrap().as_ref().is_some_and(|s| s.contains(&(f as usize)))
 }
 
 struct Global {
@@ -102,12 +141,13 @@ struct Global {
 }
 
 static GLOBAL: OnceLock<Result<Global, String>> = OnceLock::new();
-
-thread_local! {
-    static CURRENT: std::cell::Cell<*mut Context> = const { std::cell::Cell::new(ptr::null_mut()) };
-}
+/// set by an atexit handler: calls during process teardown return CUDA_ERROR_DEINITIALIZED
+static DEINITIALIZED: AtomicBool = AtomicBool::new(false);
 
 fn global() -> Result<&'static Global, CUresult> {
+    if DEINITIALIZED.load(Ordering::Relaxed) {
+        return Err(CUDA_ERROR_DEINITIALIZED);
+    }
     match GLOBAL.get() {
         Some(Ok(g)) => Ok(g),
         Some(Err(_)) => Err(CUDA_ERROR_NO_DEVICE),
@@ -133,29 +173,26 @@ macro_rules! tri {
         }
     };
 }
+pub(crate) use tri;
 
+/// The current context must exist and be usable (no sticky fault): CUDA_ERROR_INVALID_CONTEXT without one
 fn ensure_current() -> Result<&'static Global, CUresult> {
+    context::current()?;
+    global()
+}
+
+fn check_device(dev: CUdevice) -> Result<&'static Global, CUresult> {
     let g = global()?;
-    let ctx = CURRENT.with(|c| {
-        if c.get().is_null() {
-            // the runtime API makes the primary context current implicitly
-            c.set(&*g.primary as *const Context as *mut Context);
-        }
-        c.get()
-    });
-    // a context a kernel faulted in fails every call with that fault
-    match unsafe { (*ctx).sticky.load(std::sync::atomic::Ordering::Acquire) } {
-        0 => Ok(g),
-        code => Err(code),
+    if dev != 0 {
+        return Err(CUDA_ERROR_INVALID_DEVICE);
     }
+    Ok(g)
 }
 
 /// A fault of a kernel: the current context's sticky error (the first fault's code stays), and the message
 fn device_fault(msg: String, code: CUresult) {
-    let ctx = CURRENT.with(|c| c.get());
-    if !ctx.is_null() {
-        let _ = unsafe { &*ctx }.sticky.compare_exchange(0, code, std::sync::atomic::Ordering::AcqRel,
-                                                          std::sync::atomic::Ordering::Acquire);
+    if let Some(ctx) = context::top() {
+        let _ = ctx.sticky.compare_exchange(0, code, Ordering::AcqRel, Ordering::Acquire);
     }
     eprintln!("[zluda metal] {msg}");
     report(msg, code);
@@ -195,12 +232,7 @@ pub(crate) fn launch_result(r: Result<(), String>) -> CUresult {
 
 /// Whether the current context has a sticky error (cuBLAS fails its calls then)
 pub(crate) fn current_sticky() -> CUresult {
-    let ctx = CURRENT.with(|c| c.get());
-    if ctx.is_null() {
-        0
-    } else {
-        unsafe { &*ctx }.sticky.load(std::sync::atomic::Ordering::Acquire)
-    }
+    context::top().map_or(0, |c| c.sticky.load(Ordering::Acquire))
 }
 
 /// A NUL-terminated string at a device (generic) address, at most 512 bytes
@@ -240,19 +272,44 @@ fn check_fault_record(addr: Option<CUdeviceptr>, kernel: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// Initialization and device management
+// Initialization
 // ---------------------------------------------------------------------------
+extern "C" {
+    fn atexit(cb: extern "C" fn()) -> c_int;
+}
+
+extern "C" fn mark_deinitialized() {
+    DEINITIALIZED.store(true, Ordering::Relaxed);
+}
+
+/// cuInit: "Currently, the Flags parameter must be 0" (CUDA_ERROR_INVALID_VALUE otherwise)
 #[no_mangle]
-pub unsafe extern "system" fn cuInit(_flags: c_uint) -> CUresult {
+pub unsafe extern "system" fn cuInit(flags: c_uint) -> CUresult {
+    if flags != 0 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if DEINITIALIZED.load(Ordering::Relaxed) {
+        return CUDA_ERROR_DEINITIALIZED;
+    }
+    let mut first = false;
     let g = GLOBAL.get_or_init(|| {
+        first = true;
         backend::init().map(|device| Global {
             device,
-            primary: Box::new(Context::new()),
+            primary: Box::new(Context::new(true, 0)),
             last_error: Mutex::new(String::new()),
         })
     });
     match g {
-        Ok(_) => CUDA_SUCCESS,
+        Ok(g) => {
+            if first {
+                context::register(&*g.primary);
+                // the driver is torn down at exit: later calls (from other atexit handlers or destructors)
+                // return CUDA_ERROR_DEINITIALIZED
+                atexit(mark_deinitialized);
+            }
+            CUDA_SUCCESS
+        }
         Err(e) => {
             if std::env::var_os("ZLUDA_METAL_LOG").is_some() {
                 eprintln!("[zluda metal] cuInit failed: {e}");
@@ -262,6 +319,7 @@ pub unsafe extern "system" fn cuInit(_flags: c_uint) -> CUresult {
     }
 }
 
+/// cuDriverGetVersion works before cuInit
 #[no_mangle]
 pub unsafe extern "system" fn cuDriverGetVersion(version: *mut c_int) -> CUresult {
     if version.is_null() {
@@ -269,529 +327,6 @@ pub unsafe extern "system" fn cuDriverGetVersion(version: *mut c_int) -> CUresul
     }
     *version = DRIVER_VERSION;
     CUDA_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuDeviceGetCount(count: *mut c_int) -> CUresult {
-    tri!(global());
-    if count.is_null() {
-        return CUDA_ERROR_INVALID_VALUE;
-    }
-    *count = 1;
-    CUDA_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuDeviceGet(device: *mut CUdevice, ordinal: c_int) -> CUresult {
-    tri!(global());
-    if device.is_null() {
-        return CUDA_ERROR_INVALID_VALUE;
-    }
-    if ordinal != 0 {
-        return CUDA_ERROR_INVALID_DEVICE;
-    }
-    *device = 0;
-    CUDA_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuDeviceGetName(
-    name: *mut c_char,
-    len: c_int,
-    dev: CUdevice,
-) -> CUresult {
-    let g = tri!(global());
-    if dev != 0 {
-        return CUDA_ERROR_INVALID_DEVICE;
-    }
-    if name.is_null() || len <= 0 {
-        return CUDA_ERROR_INVALID_VALUE;
-    }
-    let bytes = g.device.name.as_bytes();
-    let n = bytes.len().min(len as usize - 1);
-    ptr::copy_nonoverlapping(bytes.as_ptr(), name as *mut u8, n);
-    *name.add(n) = 0;
-    CUDA_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuDeviceTotalMem_v2(bytes: *mut usize, dev: CUdevice) -> CUresult {
-    let g = tri!(global());
-    if dev != 0 {
-        return CUDA_ERROR_INVALID_DEVICE;
-    }
-    *bytes = g.device.total_memory as usize;
-    CUDA_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuDeviceComputeCapability(
-    major: *mut c_int,
-    minor: *mut c_int,
-    dev: CUdevice,
-) -> CUresult {
-    tri!(global());
-    if dev != 0 {
-        return CUDA_ERROR_INVALID_DEVICE;
-    }
-    *major = CC_MAJOR;
-    *minor = CC_MINOR;
-    CUDA_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuDeviceGetAttribute(
-    value: *mut c_int,
-    attrib: c_int,
-    dev: CUdevice,
-) -> CUresult {
-    let g = tri!(global());
-    if dev != 0 {
-        return CUDA_ERROR_INVALID_DEVICE;
-    }
-    if value.is_null() {
-        return CUDA_ERROR_INVALID_VALUE;
-    }
-    let max_threads = g.device.max_threads_per_threadgroup.min(1024) as c_int;
-    let shared = g.device.max_threadgroup_memory.min(i32::MAX as u64) as c_int;
-    *value = match attrib {
-        1 => max_threads,                       // MAX_THREADS_PER_BLOCK
-        2 | 3 => max_threads,                   // MAX_BLOCK_DIM_X/Y
-        4 => 64,                                // MAX_BLOCK_DIM_Z
-        5 => i32::MAX,                          // MAX_GRID_DIM_X
-        6 | 7 => 65535,                         // MAX_GRID_DIM_Y/Z
-        8 => shared,                            // MAX_SHARED_MEMORY_PER_BLOCK
-        9 => 65536,                             // TOTAL_CONSTANT_MEMORY
-        10 => g.device.simd_width as c_int,     // WARP_SIZE
-        11 => i32::MAX,                         // MAX_PITCH
-        12 => 65536,                            // MAX_REGISTERS_PER_BLOCK
-        13 => 1_398_000,                        // CLOCK_RATE (kHz)
-        14 => 256,                              // TEXTURE_ALIGNMENT
-        15 => 0,                                // GPU_OVERLAP
-        16 => 8,                                // MULTIPROCESSOR_COUNT
-        17 => 0,                                // KERNEL_EXEC_TIMEOUT
-        18 => g.device.unified_memory as c_int, // INTEGRATED
-        19 => 1,                                // CAN_MAP_HOST_MEMORY
-        20 => 0,                                // COMPUTE_MODE (default)
-        31 => 0,                                // CONCURRENT_KERNELS
-        32 => 0,                                // ECC_ENABLED
-        33..=35 => 0,                           // PCI bus/device, TCC driver
-        36 => 3_200_000,                        // MEMORY_CLOCK_RATE
-        37 => 128,                              // GLOBAL_MEMORY_BUS_WIDTH
-        38 => 8 << 20,                          // L2_CACHE_SIZE
-        39 => max_threads,                      // MAX_THREADS_PER_MULTIPROCESSOR
-        40 => 1,                                // ASYNC_ENGINE_COUNT
-        41 => 1,                                // UNIFIED_ADDRESSING
-        75 => CC_MAJOR,                         // COMPUTE_CAPABILITY_MAJOR
-        76 => CC_MINOR,                         // COMPUTE_CAPABILITY_MINOR
-        81 => shared,                           // MAX_SHARED_MEMORY_PER_MULTIPROCESSOR
-        82 => 65536,                            // MAX_REGISTERS_PER_MULTIPROCESSOR
-        83 => 0,                                // MANAGED_MEMORY
-        84 => 0,                                // MULTI_GPU_BOARD
-        97 => shared,                           // MAX_SHARED_MEMORY_PER_BLOCK_OPTIN
-        106 => 32,                              // MAX_BLOCKS_PER_MULTIPROCESSOR
-        0 | 200.. => return CUDA_ERROR_INVALID_VALUE,
-        _ => 0,
-    };
-    CUDA_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuDeviceGetUuid(uuid: *mut [u8; 16], dev: CUdevice) -> CUresult {
-    tri!(global());
-    if dev != 0 {
-        return CUDA_ERROR_INVALID_DEVICE;
-    }
-    *uuid = *b"ZLUDA-METAL-0000";
-    CUDA_SUCCESS
-}
-
-// ---------------------------------------------------------------------------
-// Contexts
-// ---------------------------------------------------------------------------
-#[no_mangle]
-pub unsafe extern "system" fn cuDevicePrimaryCtxRetain(
-    ctx: *mut *mut Context,
-    dev: CUdevice,
-) -> CUresult {
-    let g = tri!(global());
-    if dev != 0 {
-        return CUDA_ERROR_INVALID_DEVICE;
-    }
-    *ctx = &*g.primary as *const Context as *mut Context;
-    CUDA_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuDevicePrimaryCtxRelease_v2(_dev: CUdevice) -> CUresult {
-    tri!(global());
-    CUDA_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuDevicePrimaryCtxRelease(dev: CUdevice) -> CUresult {
-    cuDevicePrimaryCtxRelease_v2(dev)
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuCtxCreate_v2(
-    ctx: *mut *mut Context,
-    _flags: c_uint,
-    dev: CUdevice,
-) -> CUresult {
-    tri!(global());
-    if dev != 0 {
-        return CUDA_ERROR_INVALID_DEVICE;
-    }
-    let c = Box::into_raw(Box::new(Context::new()));
-    *ctx = c;
-    CURRENT.with(|cur| cur.set(c));
-    CUDA_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuCtxDestroy_v2(ctx: *mut Context) -> CUresult {
-    let g = tri!(global());
-    if ctx.is_null() {
-        return CUDA_ERROR_INVALID_CONTEXT;
-    }
-    let _ = backend::synchronize();
-    CURRENT.with(|cur| {
-        if cur.get() == ctx {
-            cur.set(ptr::null_mut());
-        }
-    });
-    if ctx != &*g.primary as *const Context as *mut Context {
-        drop(Box::from_raw(ctx));
-    } else {
-        g.primary.sticky.store(0, std::sync::atomic::Ordering::Release);
-    }
-    CUDA_SUCCESS
-}
-
-/// cudaDeviceReset: the primary context's sticky error is cleared (its allocations and modules are not freed:
-/// ZLUDA's are process-wide)
-#[no_mangle]
-pub unsafe extern "system" fn cuDevicePrimaryCtxReset_v2(dev: CUdevice) -> CUresult {
-    let g = tri!(global());
-    if dev != 0 {
-        return CUDA_ERROR_INVALID_DEVICE;
-    }
-    let _ = backend::synchronize();
-    g.primary.sticky.store(0, std::sync::atomic::Ordering::Release);
-    CUDA_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuDevicePrimaryCtxReset(dev: CUdevice) -> CUresult {
-    cuDevicePrimaryCtxReset_v2(dev)
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuCtxSetCurrent(ctx: *mut Context) -> CUresult {
-    tri!(global());
-    CURRENT.with(|cur| cur.set(ctx));
-    CUDA_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuCtxGetCurrent(ctx: *mut *mut Context) -> CUresult {
-    tri!(global());
-    *ctx = CURRENT.with(|cur| cur.get());
-    CUDA_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuCtxPushCurrent_v2(ctx: *mut Context) -> CUresult {
-    cuCtxSetCurrent(ctx)
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuCtxPopCurrent_v2(ctx: *mut *mut Context) -> CUresult {
-    tri!(global());
-    if !ctx.is_null() {
-        *ctx = CURRENT.with(|cur| cur.get());
-    }
-    CURRENT.with(|cur| cur.set(ptr::null_mut()));
-    CUDA_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuCtxGetDevice(dev: *mut CUdevice) -> CUresult {
-    tri!(ensure_current());
-    *dev = 0;
-    CUDA_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuCtxSynchronize() -> CUresult {
-    tri!(ensure_current());
-    match backend::synchronize() {
-        Ok(()) => CUDA_SUCCESS,
-        Err(e) => {
-            // an asynchronous kernel failed (the Metal backend)
-            device_fault(e, CUDA_ERROR_LAUNCH_FAILED);
-            CUDA_ERROR_LAUNCH_FAILED
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Memory
-// ---------------------------------------------------------------------------
-#[no_mangle]
-pub unsafe extern "system" fn cuMemAlloc_v2(dptr: *mut CUdeviceptr, size: usize) -> CUresult {
-    tri!(ensure_current());
-    if dptr.is_null() {
-        return CUDA_ERROR_INVALID_VALUE;
-    }
-    match backend::alloc(size as u64) {
-        Ok(a) => {
-            *dptr = a;
-            CUDA_SUCCESS
-        }
-        Err(e) => report(e, CUDA_ERROR_OUT_OF_MEMORY),
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuMemFree_v2(dptr: CUdeviceptr) -> CUresult {
-    tri!(ensure_current());
-    if dptr == 0 {
-        return CUDA_SUCCESS;
-    }
-    if backend::free(dptr) {
-        CUDA_SUCCESS
-    } else {
-        CUDA_ERROR_INVALID_VALUE
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> CUresult {
-    let g = tri!(ensure_current());
-    *free = g.device.total_memory as usize;
-    *total = g.device.total_memory as usize;
-    CUDA_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuMemGetAddressRange_v2(
-    base: *mut CUdeviceptr,
-    size: *mut usize,
-    dptr: CUdeviceptr,
-) -> CUresult {
-    tri!(ensure_current());
-    match backend::range(dptr) {
-        Some((b, len)) => {
-            if !base.is_null() {
-                *base = b;
-            }
-            if !size.is_null() {
-                *size = len as usize;
-            }
-            CUDA_SUCCESS
-        }
-        None => CUDA_ERROR_NOT_FOUND,
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuMemAllocHost_v2(pp: *mut *mut c_void, size: usize) -> CUresult {
-    let layout = std::alloc::Layout::from_size_align(size.max(1) + 64, 64).unwrap();
-    let p = std::alloc::alloc(layout);
-    if p.is_null() {
-        return CUDA_ERROR_OUT_OF_MEMORY;
-    }
-    // remember the size in front of the block
-    *(p as *mut usize) = size.max(1) + 64;
-    *pp = p.add(64) as *mut c_void;
-    CUDA_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuMemHostAlloc(
-    pp: *mut *mut c_void,
-    size: usize,
-    _flags: c_uint,
-) -> CUresult {
-    cuMemAllocHost_v2(pp, size)
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuMemFreeHost(p: *mut c_void) -> CUresult {
-    if p.is_null() {
-        return CUDA_SUCCESS;
-    }
-    let base = (p as *mut u8).sub(64);
-    let size = *(base as *mut usize);
-    std::alloc::dealloc(base, std::alloc::Layout::from_size_align(size, 64).unwrap());
-    CUDA_SUCCESS
-}
-
-unsafe fn device_slice(ptr: CUdeviceptr, len: usize) -> Result<*mut u8, CUresult> {
-    match backend::host_pointer(ptr) {
-        Some((p, left)) if left as usize >= len => Ok(p),
-        _ if len == 0 => Ok(ptr::null_mut()),
-        _ => Err(report(
-            format!("invalid device range 0x{ptr:x} + {len}"),
-            CUDA_ERROR_INVALID_VALUE,
-        )),
-    }
-}
-
-fn sync_for_host_access() -> Result<(), CUresult> {
-    backend::synchronize().map_err(|e| {
-        device_fault(e, CUDA_ERROR_LAUNCH_FAILED);
-        CUDA_ERROR_LAUNCH_FAILED
-    })
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuMemcpyHtoD_v2(
-    dst: CUdeviceptr,
-    src: *const c_void,
-    n: usize,
-) -> CUresult {
-    tri!(ensure_current());
-    tri!(sync_for_host_access());
-    let d = tri!(device_slice(dst, n));
-    if n > 0 {
-        ptr::copy(src as *const u8, d, n);
-    }
-    CUDA_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuMemcpyDtoH_v2(
-    dst: *mut c_void,
-    src: CUdeviceptr,
-    n: usize,
-) -> CUresult {
-    tri!(ensure_current());
-    tri!(sync_for_host_access());
-    let s = tri!(device_slice(src, n));
-    if n > 0 {
-        ptr::copy(s, dst as *mut u8, n);
-    }
-    CUDA_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuMemcpyDtoD_v2(
-    dst: CUdeviceptr,
-    src: CUdeviceptr,
-    n: usize,
-) -> CUresult {
-    tri!(ensure_current());
-    tri!(sync_for_host_access());
-    let s = tri!(device_slice(src, n));
-    let d = tri!(device_slice(dst, n));
-    if n > 0 {
-        ptr::copy(s, d, n);
-    }
-    CUDA_SUCCESS
-}
-
-/// Unified addressing copy: either side may be host or device memory
-#[no_mangle]
-pub unsafe extern "system" fn cuMemcpy(dst: CUdeviceptr, src: CUdeviceptr, n: usize) -> CUresult {
-    tri!(ensure_current());
-    tri!(sync_for_host_access());
-    let resolve = |p: CUdeviceptr| match backend::host_pointer(p) {
-        Some((h, _)) => h,
-        None => p as *mut u8,
-    };
-    if n > 0 {
-        ptr::copy(resolve(src), resolve(dst), n);
-    }
-    CUDA_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuMemcpyHtoDAsync_v2(
-    dst: CUdeviceptr,
-    src: *const c_void,
-    n: usize,
-    _stream: *mut Stream,
-) -> CUresult {
-    cuMemcpyHtoD_v2(dst, src, n)
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuMemcpyDtoHAsync_v2(
-    dst: *mut c_void,
-    src: CUdeviceptr,
-    n: usize,
-    _stream: *mut Stream,
-) -> CUresult {
-    cuMemcpyDtoH_v2(dst, src, n)
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuMemcpyDtoDAsync_v2(
-    dst: CUdeviceptr,
-    src: CUdeviceptr,
-    n: usize,
-    _stream: *mut Stream,
-) -> CUresult {
-    cuMemcpyDtoD_v2(dst, src, n)
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuMemcpyAsync(
-    dst: CUdeviceptr,
-    src: CUdeviceptr,
-    n: usize,
-    _stream: *mut Stream,
-) -> CUresult {
-    cuMemcpy(dst, src, n)
-}
-
-unsafe fn memset_impl(dst: CUdeviceptr, elem: &[u8], count: usize) -> CUresult {
-    tri!(ensure_current());
-    tri!(sync_for_host_access());
-    let len = elem.len() * count;
-    let d = tri!(device_slice(dst, len));
-    for i in 0..count {
-        ptr::copy_nonoverlapping(elem.as_ptr(), d.add(i * elem.len()), elem.len());
-    }
-    CUDA_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuMemsetD8_v2(dst: CUdeviceptr, v: u8, n: usize) -> CUresult {
-    memset_impl(dst, &[v], n)
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuMemsetD16_v2(dst: CUdeviceptr, v: u16, n: usize) -> CUresult {
-    memset_impl(dst, &v.to_ne_bytes(), n)
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuMemsetD32_v2(dst: CUdeviceptr, v: u32, n: usize) -> CUresult {
-    memset_impl(dst, &v.to_ne_bytes(), n)
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuMemsetD8Async(
-    dst: CUdeviceptr,
-    v: u8,
-    n: usize,
-    _s: *mut Stream,
-) -> CUresult {
-    cuMemsetD8_v2(dst, v, n)
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuMemsetD32Async(
-    dst: CUdeviceptr,
-    v: u32,
-    n: usize,
-    _s: *mut Stream,
-) -> CUresult {
-    cuMemsetD32_v2(dst, v, n)
 }
 
 // ---------------------------------------------------------------------------
@@ -805,8 +340,22 @@ fn dump(name: &str, data: &[u8]) {
     }
 }
 
+/// `.target sm_XY[a|f], ...` -> XY
+fn ptx_target(ptx: &str) -> c_int {
+    ptx.lines()
+        .find_map(|l| l.trim().strip_prefix(".target"))
+        .and_then(|t| t.split(|c: char| c == ',' || c.is_whitespace()).find_map(|w| w.strip_prefix("sm_")))
+        .and_then(|v| v.trim_end_matches(|c: char| !c.is_ascii_digit()).parse().ok())
+        .unwrap_or(CC_MAJOR * 10 + CC_MINOR)
+}
+
 unsafe fn load_module_from_ptx(module: *mut *mut Module, ptx: &str) -> CUresult {
-    tri!(ensure_current());
+    let ctx = tri!(context::current()) as *const Context as usize;
+    load_module(module, ptx, ctx)
+}
+
+/// Load a module owned by context `ctx` (0: a library's, context independent)
+unsafe fn load_module(module: *mut *mut Module, ptx: &str, ctx: usize) -> CUresult {
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     dump(&format!("module{id}.ptx"), ptx.as_bytes());
@@ -874,13 +423,17 @@ unsafe fn load_module_from_ptx(module: *mut *mut Module, ptx: &str) -> CUresult 
             globals32.push((name.clone(), a, init.len()));
         }
     }
-    *module = Box::into_raw(Box::new(Module {
+    let m = Box::into_raw(Box::new(Module {
         globals32,
         compiled,
         globals,
         library,
         functions: Mutex::new(HashMap::new()),
+        ctx,
+        target: ptx_target(ptx),
     }));
+    MODULES.lock().unwrap().get_or_insert_with(HashMap::new).insert(m as usize, ctx);
+    *module = m;
     CUDA_SUCCESS
 }
 
@@ -907,6 +460,7 @@ pub unsafe extern "system" fn cuModuleLoadData(
     module: *mut *mut Module,
     image: *const c_void,
 ) -> CUresult {
+    tri!(ensure_current());
     if module.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
@@ -918,10 +472,14 @@ pub unsafe extern "system" fn cuModuleLoadData(
 pub unsafe extern "system" fn cuModuleLoadDataEx(
     module: *mut *mut Module,
     image: *const c_void,
-    _num_options: c_uint,
-    _options: *mut c_int,
-    _values: *mut *mut c_void,
+    num_options: c_uint,
+    options: *mut c_int,
+    values: *mut *mut c_void,
 ) -> CUresult {
+    if num_options > 0 && (options.is_null() || values.is_null()) {
+        tri!(global());
+        return CUDA_ERROR_INVALID_VALUE;
+    }
     cuModuleLoadData(module, image)
 }
 
@@ -930,6 +488,7 @@ pub unsafe extern "system" fn cuModuleLoad(
     module: *mut *mut Module,
     fname: *const c_char,
 ) -> CUresult {
+    tri!(ensure_current());
     if module.is_null() || fname.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
@@ -942,13 +501,18 @@ pub unsafe extern "system" fn cuModuleLoad(
     cuModuleLoadData(module, data.as_ptr().cast())
 }
 
-#[no_mangle]
-pub unsafe extern "system" fn cuModuleUnload(module: *mut Module) -> CUresult {
-    if module.is_null() {
-        return CUDA_ERROR_INVALID_HANDLE;
+/// Free a module and its functions (cuModuleUnload, a context's or library's teardown)
+pub(crate) unsafe fn unload_module(module: *mut Module) -> bool {
+    if MODULES.lock().unwrap().as_mut().and_then(|s| s.remove(&(module as usize))).is_none() {
+        return false;
     }
-    let _ = backend::synchronize();
+    stream::wait_all_idle();
     let m = Box::from_raw(module);
+    if let Some(fs) = FUNCTIONS.lock().unwrap().as_mut() {
+        for f in m.functions.lock().unwrap().values() {
+            fs.remove(&(&**f as *const Function as usize));
+        }
+    }
     if m.globals != 0 {
         backend::free(m.globals);
     }
@@ -956,43 +520,52 @@ pub unsafe extern "system" fn cuModuleUnload(module: *mut Module) -> CUresult {
         backend::free(g.1);
     }
     drop(m);
-    CUDA_SUCCESS
+    true
+}
+
+/// the modules a context loaded
+pub(crate) fn modules_of(ctx: usize) -> Vec<*mut Module> {
+    MODULES.lock().unwrap().as_ref().map_or(vec![], |s| {
+        s.iter().filter(|(_, &c)| c == ctx).map(|(&m, _)| m as *mut Module).collect()
+    })
 }
 
 #[no_mangle]
-pub unsafe extern "system" fn cuModuleGetFunction(
-    func: *mut *mut Function,
-    module: *mut Module,
-    name: *const c_char,
-) -> CUresult {
-    if func.is_null() || module.is_null() || name.is_null() {
-        return CUDA_ERROR_INVALID_VALUE;
+pub unsafe extern "system" fn cuModuleUnload(module: *mut Module) -> CUresult {
+    tri!(global());
+    if module.is_null() || !unload_module(module) {
+        return CUDA_ERROR_INVALID_HANDLE;
     }
-    let m = &*module;
-    let name = CStr::from_ptr(name).to_string_lossy().into_owned();
+    CUDA_SUCCESS
+}
+
+/// The function named `name` of module `m`, created on first use
+pub(crate) unsafe fn module_function(m: *mut Module, name: &str) -> Result<*mut Function, CUresult> {
+    let mp = m;
+    let m = &*m;
     let mut functions = m.functions.lock().unwrap();
-    if let Some(f) = functions.get(&name) {
-        *func = &**f as *const Function as *mut Function;
-        return CUDA_SUCCESS;
+    if let Some(f) = functions.get(name) {
+        return Ok(&**f as *const Function as *mut Function);
     }
     let Some(info) = m.compiled.kernels.iter().find(|k| k.name == name) else {
-        return CUDA_ERROR_NOT_FOUND;
+        return Err(CUDA_ERROR_NOT_FOUND);
     };
-    let kernel = match m.library.kernel(&name) {
+    let kernel = match m.library.kernel(name) {
         Ok(k) => k,
-        Err(e) => return report(e, CUDA_ERROR_INVALID_IMAGE),
+        Err(e) => return Err(report(e, CUDA_ERROR_INVALID_IMAGE)),
     };
     let explicit_params = m
         .compiled
         .module32
         .as_ref()
-        .and_then(|m32| m32.explicit_params.get(&name).copied());
+        .and_then(|m32| m32.explicit_params.get(name).copied());
     // 32-bit addresses are the allocations' own (the AGX backend allocates below 4 GiB): base 0
     let hidden32 = if explicit_params.is_some() {
         std::iter::once(0u64).chain(m.globals32.iter().map(|g| g.1)).collect()
     } else {
         vec![]
     };
+    let static_shared = kernel.static_shared.max(info.static_shared) as u32;
     let f = Box::new(Function {
         explicit_params,
         hidden32,
@@ -1000,10 +573,112 @@ pub unsafe extern "system" fn cuModuleGetFunction(
         kernel,
         globals: m.globals,
         fault: m.compiled.globals.iter().find(|g| g.name == "__zluda_fault").map(|g| m.globals + g.offset),
+        module: mp,
+        name: CString::new(name).unwrap_or_default(),
+        library: AtomicU64::new(0),
+        attrs: Mutex::new(FuncAttrs {
+            max_dynamic_shared: device::SHARED_PER_BLOCK.saturating_sub(static_shared),
+            carveout: -1,
+            cache_config: 0,
+            cluster: [0; 3],
+            non_portable_cluster: 0,
+            cluster_policy: 0,
+        }),
     });
-    *func = &*f as *const Function as *mut Function;
-    functions.insert(name, f);
+    let p = &*f as *const Function as *mut Function;
+    FUNCTIONS.lock().unwrap().get_or_insert_with(HashSet::new).insert(p as usize);
+    functions.insert(name.to_string(), f);
+    Ok(p)
+}
+
+/// cuModuleGetFunction: CUDA_ERROR_INVALID_VALUE for a NULL output or name, CUDA_ERROR_INVALID_HANDLE for an
+/// invalid module, CUDA_ERROR_NOT_FOUND for an unknown name
+#[no_mangle]
+pub unsafe extern "system" fn cuModuleGetFunction(
+    func: *mut *mut Function,
+    module: *mut Module,
+    name: *const c_char,
+) -> CUresult {
+    tri!(global());
+    if func.is_null() || name.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if !module_valid(module) {
+        return CUDA_ERROR_INVALID_HANDLE;
+    }
+    let name = CStr::from_ptr(name).to_string_lossy().into_owned();
+    *func = tri!(module_function(module, &name));
     CUDA_SUCCESS
+}
+
+/// The kernels of a module, in PTX order
+pub(crate) unsafe fn module_kernel_names(m: *mut Module) -> Vec<String> {
+    (*m).compiled.kernels.iter().map(|k| k.name.clone()).collect()
+}
+
+/// cuModuleGetFunctionCount (CUDA 12.4)
+#[no_mangle]
+pub unsafe extern "system" fn cuModuleGetFunctionCount(count: *mut c_uint, module: *mut Module) -> CUresult {
+    tri!(global());
+    if count.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if !module_valid(module) {
+        return CUDA_ERROR_INVALID_HANDLE;
+    }
+    *count = (*module).compiled.kernels.len() as c_uint;
+    CUDA_SUCCESS
+}
+
+/// cuModuleEnumerateFunctions (CUDA 12.4): the first `n` functions
+#[no_mangle]
+pub unsafe extern "system" fn cuModuleEnumerateFunctions(
+    functions: *mut *mut Function,
+    n: c_uint,
+    module: *mut Module,
+) -> CUresult {
+    tri!(global());
+    if functions.is_null() && n > 0 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if !module_valid(module) {
+        return CUDA_ERROR_INVALID_HANDLE;
+    }
+    let names = module_kernel_names(module);
+    if (n as usize) > names.len() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    for (i, name) in names.iter().take(n as usize).enumerate() {
+        *functions.add(i) = tri!(module_function(module, name));
+    }
+    CUDA_SUCCESS
+}
+
+/// cuModuleGetLoadingMode (CUDA 11.7): modules are loaded eagerly
+#[no_mangle]
+pub unsafe extern "system" fn cuModuleGetLoadingMode(mode: *mut c_int) -> CUresult {
+    tri!(global());
+    if mode.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    *mode = 1; // CU_MODULE_EAGER_LOADING
+    CUDA_SUCCESS
+}
+
+pub(crate) unsafe fn module_global(
+    m: &Module,
+    name: &str,
+) -> Result<(CUdeviceptr, usize), CUresult> {
+    if let Some(g) = m.globals32.iter().find(|g| g.0 == name) {
+        return Ok((g.1, g.2));
+    }
+    match m.compiled.globals.iter().find(|g| g.name == name) {
+        Some(g) => Ok((m.globals + g.offset, g.size as usize)),
+        None => Err(report(
+            format!("no writable device variable named {name} (constant data is not addressable on Metal)"),
+            CUDA_ERROR_NOT_FOUND,
+        )),
+    }
 }
 
 #[no_mangle]
@@ -1013,117 +688,273 @@ pub unsafe extern "system" fn cuModuleGetGlobal_v2(
     module: *mut Module,
     name: *const c_char,
 ) -> CUresult {
-    if module.is_null() || name.is_null() {
+    tri!(global());
+    if name.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    let m = &*module;
-    let name = CStr::from_ptr(name).to_string_lossy();
-    if let Some(g) = m.globals32.iter().find(|g| g.0 == name) {
-        if !dptr.is_null() {
-            *dptr = g.1;
-        }
-        if !bytes.is_null() {
-            *bytes = g.2;
-        }
-        return CUDA_SUCCESS;
+    if !module_valid(module) {
+        return CUDA_ERROR_INVALID_HANDLE;
     }
-    match m.compiled.globals.iter().find(|g| g.name == name) {
-        Some(g) => {
-            if !dptr.is_null() {
-                *dptr = m.globals + g.offset;
-            }
-            if !bytes.is_null() {
-                *bytes = g.size as usize;
-            }
-            CUDA_SUCCESS
-        }
-        None => report(
-            format!("no writable device variable named {name} (constant data is not addressable on Metal)"),
-            CUDA_ERROR_NOT_FOUND,
-        ),
+    let name = CStr::from_ptr(name).to_string_lossy();
+    let (a, n) = tri!(module_global(&*module, &name));
+    if !dptr.is_null() {
+        *dptr = a;
+    }
+    if !bytes.is_null() {
+        *bytes = n;
+    }
+    CUDA_SUCCESS
+}
+
+/// A function handle (CUfunction, or a CUkernel, which cuLaunchKernel accepts too)
+pub(crate) unsafe fn function<'a>(f: *mut Function) -> Result<&'a Function, CUresult> {
+    if function_valid(f) {
+        Ok(&*f)
+    } else {
+        Err(CUDA_ERROR_INVALID_HANDLE)
     }
 }
 
+impl Function {
+    pub(crate) fn static_shared(&self) -> u32 {
+        self.kernel.static_shared.max(self.info.static_shared) as u32
+    }
+    /// registers (32-bit) per thread
+    pub(crate) fn registers(&self) -> u32 {
+        self.kernel.agx().map_or(32, |k| k.record().gprs.max(1))
+    }
+    /// the largest block the kernel can be launched with
+    pub(crate) fn max_threads(&self) -> u32 {
+        let lim = self.kernel.max_threads.min(1024) as u32;
+        let mut t = lim;
+        while t > 32 && occupancy::blocks_per_sm(self, t, 0) == 0 {
+            t -= 32;
+        }
+        t
+    }
+}
+
+/// cuFuncGetAttribute: every CUfunction_attribute (0 ..= 15); CUDA_ERROR_INVALID_VALUE for others
 #[no_mangle]
 pub unsafe extern "system" fn cuFuncGetAttribute(
     value: *mut c_int,
     attrib: c_int,
     func: *mut Function,
 ) -> CUresult {
-    if value.is_null() || func.is_null() {
+    tri!(global());
+    if value.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    let f = &*func;
+    let f = tri!(function(func));
+    let a = *f.attrs.lock().unwrap();
+    let record = f.kernel.agx().map(|k| k.record());
     *value = match attrib {
-        0 => f.kernel.max_threads.min(1024) as c_int, // MAX_THREADS_PER_BLOCK
-        1 => (f.kernel.static_shared.max(f.info.static_shared)) as c_int, // SHARED_SIZE_BYTES
-        2 => 0,                                       // CONST_SIZE_BYTES
-        3 => 0,                                       // LOCAL_SIZE_BYTES
-        4 => 32,                                      // NUM_REGS
-        5 | 6 => CC_MAJOR * 10 + CC_MINOR,            // PTX_VERSION / BINARY_VERSION
-        7 => 0,                                       // CACHE_MODE_CA
-        8 => 32768,                                   // MAX_DYNAMIC_SHARED_SIZE_BYTES
-        9 => 0,                                       // PREFERRED_SHARED_MEMORY_CARVEOUT
+        0 => f.max_threads() as c_int,                      // MAX_THREADS_PER_BLOCK
+        1 => f.static_shared() as c_int,                    // SHARED_SIZE_BYTES
+        2 => 0,                                             // CONST_SIZE_BYTES
+        3 => record.map_or(0, |r| r.stack) as c_int,        // LOCAL_SIZE_BYTES
+        4 => f.registers() as c_int,                        // NUM_REGS
+        5 => (*f.module).target,                            // PTX_VERSION
+        6 => CC_MAJOR * 10 + CC_MINOR,                      // BINARY_VERSION
+        7 => 0,                                             // CACHE_MODE_CA
+        8 => a.max_dynamic_shared as c_int,                 // MAX_DYNAMIC_SHARED_SIZE_BYTES
+        9 => a.carveout,                                    // PREFERRED_SHARED_MEMORY_CARVEOUT
+        10 => record.is_some_and(|r| r.cluster.is_some()) as c_int, // CLUSTER_SIZE_MUST_BE_SET
+        11..=13 => {
+            // REQUIRED_CLUSTER_WIDTH / HEIGHT / DEPTH
+            let i = (attrib - 11) as usize;
+            record.and_then(|r| r.cluster).map_or(a.cluster[i], |c| c[i]) as c_int
+        }
+        14 => a.non_portable_cluster as c_int, // NON_PORTABLE_CLUSTER_SIZE_ALLOWED
+        15 => a.cluster_policy as c_int,       // CLUSTER_SCHEDULING_POLICY_PREFERENCE
         _ => return CUDA_ERROR_INVALID_VALUE,
     };
     CUDA_SUCCESS
 }
 
+/// cuFuncSetAttribute: MAX_DYNAMIC_SHARED_SIZE_BYTES (up to the opt-in limit minus the static shared memory),
+/// PREFERRED_SHARED_MEMORY_CARVEOUT (-1 ..= 100) and the cluster attributes are settable; the others are read-only
+/// (CUDA_ERROR_INVALID_VALUE)
 #[no_mangle]
 pub unsafe extern "system" fn cuFuncSetAttribute(
-    _func: *mut Function,
-    _attrib: c_int,
-    _value: c_int,
+    func: *mut Function,
+    attrib: c_int,
+    value: c_int,
 ) -> CUresult {
+    tri!(global());
+    let f = tri!(function(func));
+    let mut a = f.attrs.lock().unwrap();
+    match attrib {
+        8 => {
+            if value < 0 || value as u32 > device::SHARED_PER_BLOCK_OPTIN.saturating_sub(f.static_shared()) {
+                return CUDA_ERROR_INVALID_VALUE;
+            }
+            a.max_dynamic_shared = value as u32;
+        }
+        9 => {
+            if !(-1..=100).contains(&value) {
+                return CUDA_ERROR_INVALID_VALUE;
+            }
+            a.carveout = value;
+        }
+        11..=13 if value >= 0 => a.cluster[(attrib - 11) as usize] = value as u32,
+        14 if value == 0 || value == 1 => a.non_portable_cluster = value as u32,
+        15 if (0..=2).contains(&value) => a.cluster_policy = value as u32,
+        _ => return CUDA_ERROR_INVALID_VALUE,
+    }
+    CUDA_SUCCESS
+}
+
+/// cuFuncSetCacheConfig: CU_FUNC_CACHE_PREFER_NONE / SHARED / L1 / EQUAL (a hint)
+#[no_mangle]
+pub unsafe extern "system" fn cuFuncSetCacheConfig(func: *mut Function, config: c_int) -> CUresult {
+    tri!(global());
+    let f = tri!(function(func));
+    if !(0..=3).contains(&config) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    f.attrs.lock().unwrap().cache_config = config as u32;
+    CUDA_SUCCESS
+}
+
+/// cuFuncSetSharedMemConfig (deprecated): a hint
+#[no_mangle]
+pub unsafe extern "system" fn cuFuncSetSharedMemConfig(func: *mut Function, config: c_int) -> CUresult {
+    tri!(global());
+    tri!(function(func));
+    if !(0..=2).contains(&config) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUDA_SUCCESS
+}
+
+/// cuFuncGetModule (CUDA 11.0)
+#[no_mangle]
+pub unsafe extern "system" fn cuFuncGetModule(module: *mut *mut Module, func: *mut Function) -> CUresult {
+    tri!(global());
+    if module.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    *module = tri!(function(func)).module;
+    CUDA_SUCCESS
+}
+
+/// cuFuncGetName (CUDA 12.3): the kernel's (mangled) name, valid as long as the function
+#[no_mangle]
+pub unsafe extern "system" fn cuFuncGetName(name: *mut *const c_char, func: *mut Function) -> CUresult {
+    tri!(global());
+    if name.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    *name = tri!(function(func)).name.as_ptr();
+    CUDA_SUCCESS
+}
+
+/// cuFuncGetParamInfo (CUDA 12.4): offset and size of parameter `index`; CUDA_ERROR_INVALID_VALUE past the last
+#[no_mangle]
+pub unsafe extern "system" fn cuFuncGetParamInfo(
+    func: *mut Function,
+    index: usize,
+    offset: *mut usize,
+    size: *mut usize,
+) -> CUresult {
+    tri!(global());
+    let f = tri!(function(func));
+    let explicit = f.explicit_params.unwrap_or(f.info.params.len());
+    if index >= explicit {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let p = &f.info.params[index];
+    if !offset.is_null() {
+        *offset = p.offset as usize;
+    }
+    if !size.is_null() {
+        *size = p.size as usize;
+    }
+    CUDA_SUCCESS
+}
+
+/// cuFuncIsLoaded / cuFuncLoad (CUDA 12.4): functions are loaded with their module
+#[no_mangle]
+pub unsafe extern "system" fn cuFuncIsLoaded(state: *mut c_int, func: *mut Function) -> CUresult {
+    tri!(global());
+    if state.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    tri!(function(func));
+    *state = 1; // CU_FUNCTION_LOADING_STATE_LOADED
     CUDA_SUCCESS
 }
 
 #[no_mangle]
-pub unsafe extern "system" fn cuFuncSetCacheConfig(
-    _func: *mut Function,
-    _config: c_int,
-) -> CUresult {
+pub unsafe extern "system" fn cuFuncLoad(func: *mut Function) -> CUresult {
+    tri!(global());
+    tri!(function(func));
     CUDA_SUCCESS
 }
 
+// ---------------------------------------------------------------------------
+// Launches
+// ---------------------------------------------------------------------------
 const CU_LAUNCH_PARAM_END: usize = 0;
 const CU_LAUNCH_PARAM_BUFFER_POINTER: usize = 1;
 const CU_LAUNCH_PARAM_BUFFER_SIZE: usize = 2;
 
-#[no_mangle]
-pub unsafe extern "system" fn cuLaunchKernel(
+/// A validated launch, its parameter buffer filled: what a stream (or a graph node) runs
+#[derive(Clone)]
+pub(crate) struct KernelLaunch {
+    f: usize,
+    grid: [u32; 3],
+    block: [u32; 3],
+    shared: u32,
+    params: Vec<u8>,
+}
+
+/// Validate a launch configuration and pack its arguments (cuLaunchKernel's rules): CUDA_ERROR_INVALID_VALUE for
+/// a zero or too large grid / block dimension, more dynamic shared memory than the function's
+/// MAX_DYNAMIC_SHARED_SIZE_BYTES, or missing arguments; CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES when the block does not
+/// fit a multiprocessor (registers)
+pub(crate) unsafe fn prepare_launch(
     func: *mut Function,
-    grid_x: c_uint,
-    grid_y: c_uint,
-    grid_z: c_uint,
-    block_x: c_uint,
-    block_y: c_uint,
-    block_z: c_uint,
+    grid: [c_uint; 3],
+    block: [c_uint; 3],
     shared_mem_bytes: c_uint,
-    _stream: *mut Stream,
     kernel_params: *mut *mut c_void,
     extra: *mut *mut c_void,
-) -> CUresult {
-    let g = tri!(ensure_current());
-    if func.is_null() {
-        return CUDA_ERROR_INVALID_HANDLE;
+) -> Result<KernelLaunch, CUresult> {
+    let g = global()?;
+    let f = function(func)?;
+    let threads = block[0] as u64 * block[1] as u64 * block[2] as u64;
+    if threads == 0 || grid.contains(&0) {
+        return Err(CUDA_ERROR_INVALID_VALUE);
     }
-    let f = &*func;
-    let threads = block_x as u64 * block_y as u64 * block_z as u64;
-    if threads == 0 || grid_x == 0 || grid_y == 0 || grid_z == 0 {
-        return CUDA_ERROR_INVALID_VALUE;
+    if block[0] > device::MAX_BLOCK[0] || block[1] > device::MAX_BLOCK[1] || block[2] > device::MAX_BLOCK[2]
+        || grid[0] > device::MAX_GRID[0] || grid[1] > device::MAX_GRID[1] || grid[2] > device::MAX_GRID[2]
+    {
+        return Err(report(format!("grid {grid:?} / block {block:?} beyond the device limits"), CUDA_ERROR_INVALID_VALUE));
     }
     if threads > f.kernel.max_threads || threads > g.device.max_threads_per_threadgroup {
-        return report(
+        return Err(report(
             format!(
                 "block of {threads} threads exceeds the kernel limit {}",
                 f.kernel.max_threads
             ),
             CUDA_ERROR_INVALID_VALUE,
-        );
+        ));
+    }
+    if shared_mem_bytes > f.attrs.lock().unwrap().max_dynamic_shared {
+        return Err(report(
+            format!("{shared_mem_bytes} bytes of dynamic shared memory exceed the function's \
+                     CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES"),
+            CUDA_ERROR_INVALID_VALUE,
+        ));
     }
     if f.info.static_shared + shared_mem_bytes as u64 > g.device.max_threadgroup_memory {
-        return CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES;
+        return Err(CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES);
+    }
+    if f.kernel.agx().is_some() && occupancy::blocks_per_sm(f, threads as u32, shared_mem_bytes) == 0 {
+        return Err(report(format!("a block of {threads} threads needs more registers than a core has"),
+                          CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES));
     }
     let mut params = vec![0u8; f.info.params_size as usize];
     let explicit = f.explicit_params.unwrap_or(f.info.params.len());
@@ -1138,7 +969,7 @@ pub unsafe extern "system" fn cuLaunchKernel(
         for (i, p) in f.info.params.iter().enumerate().take(explicit) {
             let src = *kernel_params.add(i) as *const u8;
             if src.is_null() {
-                return CUDA_ERROR_INVALID_VALUE;
+                return Err(CUDA_ERROR_INVALID_VALUE);
             }
             ptr::copy_nonoverlapping(
                 src,
@@ -1159,16 +990,16 @@ pub unsafe extern "system" fn cuLaunchKernel(
             match key {
                 CU_LAUNCH_PARAM_BUFFER_POINTER => buffer = val as *const u8,
                 CU_LAUNCH_PARAM_BUFFER_SIZE => size = *(val as *const usize),
-                _ => return CUDA_ERROR_INVALID_VALUE,
+                _ => return Err(CUDA_ERROR_INVALID_VALUE),
             }
             i += 2;
         }
         if buffer.is_null() || size < params.len() {
-            return CUDA_ERROR_INVALID_VALUE;
+            return Err(CUDA_ERROR_INVALID_VALUE);
         }
         ptr::copy_nonoverlapping(buffer, params.as_mut_ptr(), params.len());
-    } else if !f.info.params.is_empty() {
-        return CUDA_ERROR_INVALID_VALUE;
+    } else if explicit > 0 {
+        return Err(CUDA_ERROR_INVALID_VALUE);
     }
     if let Some(off) = f.info.globals_param_offset {
         params[off as usize..off as usize + 8].copy_from_slice(&f.globals.to_ne_bytes());
@@ -1176,182 +1007,146 @@ pub unsafe extern "system" fn cuLaunchKernel(
     if let Some(off) = f.info.dyn_smem_param_offset {
         params[off as usize..off as usize + 4].copy_from_slice(&shared_mem_bytes.to_ne_bytes());
     }
+    Ok(KernelLaunch { f: func as usize, grid, block, shared: shared_mem_bytes, params })
+}
+
+/// Run a prepared launch on the device (in stream order, `cuda/stream.rs`): a fault of the kernel becomes the
+/// context's sticky error
+pub(crate) unsafe fn run_kernel(l: &KernelLaunch) -> CUresult {
+    let f = &*(l.f as *const Function);
     let dynamic_shared = if f.info.dynamic_shared {
-        shared_mem_bytes.max(16)
+        l.shared.max(16)
     } else {
         0
     };
-    let r = launch_result(f.kernel.launch(
-        [grid_x, grid_y, grid_z],
-        [block_x, block_y, block_z],
-        &params,
-        dynamic_shared,
-    ));
+    let r = launch_result(f.kernel.launch(l.grid, l.block, &l.params, dynamic_shared));
     check_fault_record(f.fault, &f.info.name);
     r
 }
 
-// ---------------------------------------------------------------------------
-// Streams and events (single in-order queue)
-// ---------------------------------------------------------------------------
 #[no_mangle]
-pub unsafe extern "system" fn cuStreamCreate(stream: *mut *mut Stream, _flags: c_uint) -> CUresult {
+pub unsafe extern "system" fn cuLaunchKernel(
+    func: *mut Function,
+    grid_x: c_uint,
+    grid_y: c_uint,
+    grid_z: c_uint,
+    block_x: c_uint,
+    block_y: c_uint,
+    block_z: c_uint,
+    shared_mem_bytes: c_uint,
+    stream: *mut Stream,
+    kernel_params: *mut *mut c_void,
+    extra: *mut *mut c_void,
+) -> CUresult {
     tri!(ensure_current());
-    *stream = Box::into_raw(Box::new(Stream { _private: 0 }));
-    CUDA_SUCCESS
+    let l = tri!(prepare_launch(func, [grid_x, grid_y, grid_z], [block_x, block_y, block_z], shared_mem_bytes,
+                                kernel_params, extra));
+    stream::submit_to(stream, stream::Op::Kernel(l))
 }
 
+/// cuLaunchCooperativeKernel: as cuLaunchKernel, and the grid must be co-resident on the device
+/// (CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE otherwise, the bound cuOccupancyMaxActiveBlocksPerMultiprocessor x
+/// multiprocessors). The functional model runs blocks one after another: grid-wide barriers are not supported.
 #[no_mangle]
-pub unsafe extern "system" fn cuStreamCreateWithPriority(
-    stream: *mut *mut Stream,
-    flags: c_uint,
-    _priority: c_int,
+pub unsafe extern "system" fn cuLaunchCooperativeKernel(
+    func: *mut Function,
+    grid_x: c_uint,
+    grid_y: c_uint,
+    grid_z: c_uint,
+    block_x: c_uint,
+    block_y: c_uint,
+    block_z: c_uint,
+    shared_mem_bytes: c_uint,
+    stream: *mut Stream,
+    kernel_params: *mut *mut c_void,
 ) -> CUresult {
-    cuStreamCreate(stream, flags)
+    tri!(ensure_current());
+    let l = tri!(prepare_launch(func, [grid_x, grid_y, grid_z], [block_x, block_y, block_z], shared_mem_bytes,
+                                kernel_params, ptr::null_mut()));
+    tri!(occupancy::check_cooperative(&l));
+    stream::submit_to(stream, stream::Op::Kernel(l))
 }
 
-#[no_mangle]
-pub unsafe extern "system" fn cuStreamDestroy_v2(stream: *mut Stream) -> CUresult {
-    if !stream.is_null() {
-        let _ = backend::synchronize();
-        drop(Box::from_raw(stream));
-    }
-    CUDA_SUCCESS
+/// CUlaunchConfig (cuLaunchKernelEx, CUDA 11.8)
+#[repr(C)]
+pub struct CUlaunchConfig {
+    grid: [c_uint; 3],
+    block: [c_uint; 3],
+    shared_mem_bytes: c_uint,
+    stream: *mut Stream,
+    attrs: *mut CUlaunchAttribute,
+    num_attrs: c_uint,
 }
 
-#[no_mangle]
-pub unsafe extern "system" fn cuStreamSynchronize(_stream: *mut Stream) -> CUresult {
-    cuCtxSynchronize()
+/// CUlaunchAttribute: an id and a 64-byte value union
+#[repr(C)]
+pub struct CUlaunchAttribute {
+    id: c_uint,
+    pad: [u8; 4],
+    value: [u64; 8],
 }
 
+/// cuLaunchKernelEx: the launch attributes COOPERATIVE (2, checked as cuLaunchCooperativeKernel) and
+/// CLUSTER_DIMENSION (4, only 1 x 1 x 1 or the kernel's own `.reqnctapercluster`) change the launch; the
+/// scheduling hints (access policy window, priority, synchronization policy, ...) are accepted and ignored
 #[no_mangle]
-pub unsafe extern "system" fn cuStreamQuery(_stream: *mut Stream) -> CUresult {
-    cuCtxSynchronize()
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuStreamWaitEvent(
-    _s: *mut Stream,
-    _e: *mut Event,
-    _flags: c_uint,
+pub unsafe extern "system" fn cuLaunchKernelEx(
+    config: *const CUlaunchConfig,
+    func: *mut Function,
+    kernel_params: *mut *mut c_void,
+    extra: *mut *mut c_void,
 ) -> CUresult {
-    CUDA_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuEventCreate(event: *mut *mut Event, _flags: c_uint) -> CUresult {
-    *event = Box::into_raw(Box::new(Event {
-        time: Mutex::new(None),
-    }));
-    CUDA_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuEventDestroy_v2(event: *mut Event) -> CUresult {
-    if !event.is_null() {
-        drop(Box::from_raw(event));
-    }
-    CUDA_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuEventRecord(event: *mut Event, _stream: *mut Stream) -> CUresult {
-    if event.is_null() {
-        return CUDA_ERROR_INVALID_HANDLE;
-    }
-    // Events complete when all prior work completed
-    let r = cuCtxSynchronize();
-    *(*event).time.lock().unwrap() = Some(Instant::now());
-    r
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuEventSynchronize(event: *mut Event) -> CUresult {
-    if event.is_null() {
-        return CUDA_ERROR_INVALID_HANDLE;
-    }
-    CUDA_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuEventQuery(event: *mut Event) -> CUresult {
-    cuEventSynchronize(event)
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuEventElapsedTime(
-    ms: *mut f32,
-    start: *mut Event,
-    end: *mut Event,
-) -> CUresult {
-    if ms.is_null() || start.is_null() || end.is_null() {
+    tri!(ensure_current());
+    if config.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    let s = *(*start).time.lock().unwrap();
-    let e = *(*end).time.lock().unwrap();
-    match (s, e) {
-        (Some(s), Some(e)) => {
-            *ms = e.saturating_duration_since(s).as_secs_f32() * 1000.0;
-            CUDA_SUCCESS
-        }
-        _ => CUDA_ERROR_NOT_READY,
+    let c = &*config;
+    if c.num_attrs > 0 && c.attrs.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
     }
+    let l = tri!(prepare_launch(func, c.grid, c.block, c.shared_mem_bytes, kernel_params, extra));
+    for i in 0..c.num_attrs as usize {
+        let a = &*c.attrs.add(i);
+        match a.id {
+            2 => {
+                if a.value[0] as u32 != 0 {
+                    tri!(occupancy::check_cooperative(&l));
+                }
+            }
+            4 => {
+                let d = [a.value[0] as u32, (a.value[0] >> 32) as u32, a.value[1] as u32];
+                let own = (*(l.f as *const Function)).kernel.agx().and_then(|k| k.record().cluster);
+                if d.iter().product::<u32>() > 1 && own != Some(d) {
+                    return report("launch-time thread block clusters are not supported".into(),
+                                  CUDA_ERROR_NOT_SUPPORTED);
+                }
+            }
+            0..=20 => {}
+            _ => return CUDA_ERROR_INVALID_VALUE,
+        }
+    }
+    stream::submit_to(c.stream, stream::Op::Kernel(l))
 }
 
 // ---------------------------------------------------------------------------
-// Errors and entry point lookup
+// Profiler (no-ops)
 // ---------------------------------------------------------------------------
-fn error_name(e: CUresult) -> Option<&'static CStr> {
-    Some(match e {
-        CUDA_SUCCESS => c"CUDA_SUCCESS",
-        CUDA_ERROR_INVALID_VALUE => c"CUDA_ERROR_INVALID_VALUE",
-        CUDA_ERROR_OUT_OF_MEMORY => c"CUDA_ERROR_OUT_OF_MEMORY",
-        CUDA_ERROR_NOT_INITIALIZED => c"CUDA_ERROR_NOT_INITIALIZED",
-        CUDA_ERROR_NO_DEVICE => c"CUDA_ERROR_NO_DEVICE",
-        CUDA_ERROR_INVALID_DEVICE => c"CUDA_ERROR_INVALID_DEVICE",
-        CUDA_ERROR_INVALID_IMAGE => c"CUDA_ERROR_INVALID_IMAGE",
-        CUDA_ERROR_INVALID_CONTEXT => c"CUDA_ERROR_INVALID_CONTEXT",
-        CUDA_ERROR_NO_BINARY_FOR_GPU => c"CUDA_ERROR_NO_BINARY_FOR_GPU",
-        CUDA_ERROR_INVALID_PTX => c"CUDA_ERROR_INVALID_PTX",
-        CUDA_ERROR_FILE_NOT_FOUND => c"CUDA_ERROR_FILE_NOT_FOUND",
-        CUDA_ERROR_INVALID_HANDLE => c"CUDA_ERROR_INVALID_HANDLE",
-        CUDA_ERROR_NOT_FOUND => c"CUDA_ERROR_NOT_FOUND",
-        CUDA_ERROR_NOT_READY => c"CUDA_ERROR_NOT_READY",
-        CUDA_ERROR_ILLEGAL_ADDRESS => c"CUDA_ERROR_ILLEGAL_ADDRESS",
-        CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES => c"CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES",
-        CUDA_ERROR_LAUNCH_TIMEOUT => c"CUDA_ERROR_LAUNCH_TIMEOUT",
-        CUDA_ERROR_ASSERT => c"CUDA_ERROR_ASSERT",
-        CUDA_ERROR_HARDWARE_STACK_ERROR => c"CUDA_ERROR_HARDWARE_STACK_ERROR",
-        CUDA_ERROR_ILLEGAL_INSTRUCTION => c"CUDA_ERROR_ILLEGAL_INSTRUCTION",
-        CUDA_ERROR_MISALIGNED_ADDRESS => c"CUDA_ERROR_MISALIGNED_ADDRESS",
-        CUDA_ERROR_INVALID_PC => c"CUDA_ERROR_INVALID_PC",
-        CUDA_ERROR_LAUNCH_FAILED => c"CUDA_ERROR_LAUNCH_FAILED",
-        CUDA_ERROR_NOT_SUPPORTED => c"CUDA_ERROR_NOT_SUPPORTED",
-        CUDA_ERROR_UNKNOWN => c"CUDA_ERROR_UNKNOWN",
-        _ => return None,
-    })
+#[no_mangle]
+pub unsafe extern "system" fn cuProfilerStart() -> CUresult {
+    tri!(ensure_current());
+    CUDA_SUCCESS
 }
 
 #[no_mangle]
-pub unsafe extern "system" fn cuGetErrorName(e: CUresult, out: *mut *const c_char) -> CUresult {
-    match error_name(e) {
-        Some(n) => {
-            *out = n.as_ptr();
-            CUDA_SUCCESS
-        }
-        None => CUDA_ERROR_INVALID_VALUE,
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuGetErrorString(e: CUresult, out: *mut *const c_char) -> CUresult {
-    cuGetErrorName(e, out)
+pub unsafe extern "system" fn cuProfilerStop() -> CUresult {
+    tri!(ensure_current());
+    CUDA_SUCCESS
 }
 
 /// Last detailed error message of the Metal backend (ZLUDA extension)
 #[no_mangle]
 pub unsafe extern "system" fn zludaMetalGetLastError(buf: *mut c_char, len: usize) -> usize {
-    let Ok(g) = global() else { return 0 };
+    let Some(Ok(g)) = GLOBAL.get() else { return 0 };
     let msg = g.last_error.lock().unwrap().clone();
     if !buf.is_null() && len > 0 {
         let n = msg.len().min(len - 1);
@@ -1361,52 +1156,3 @@ pub unsafe extern "system" fn zludaMetalGetLastError(buf: *mut c_char, len: usiz
     msg.len()
 }
 
-extern "C" {
-    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
-}
-
-#[cfg(target_os = "macos")]
-const RTLD_DEFAULT: *mut c_void = -2isize as *mut c_void;
-#[cfg(not(target_os = "macos"))]
-const RTLD_DEFAULT: *mut c_void = ptr::null_mut();
-
-/// Used by the CUDA runtime (cudart) to find driver entry points
-#[no_mangle]
-pub unsafe extern "system" fn cuGetProcAddress_v2(
-    symbol: *const c_char,
-    pfn: *mut *mut c_void,
-    _cuda_version: c_int,
-    _flags: u64,
-    status: *mut c_int,
-) -> CUresult {
-    if symbol.is_null() || pfn.is_null() {
-        return CUDA_ERROR_INVALID_VALUE;
-    }
-    let base = CStr::from_ptr(symbol).to_string_lossy().into_owned();
-    for suffix in ["_v3", "_v2", ""] {
-        let name = std::ffi::CString::new(format!("{base}{suffix}")).unwrap();
-        let p = dlsym(RTLD_DEFAULT, name.as_ptr());
-        if !p.is_null() {
-            *pfn = p;
-            if !status.is_null() {
-                *status = 0;
-            }
-            return CUDA_SUCCESS;
-        }
-    }
-    *pfn = ptr::null_mut();
-    if !status.is_null() {
-        *status = 1; // CU_GET_PROC_ADDRESS_SYMBOL_NOT_FOUND
-    }
-    CUDA_ERROR_NOT_FOUND
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuGetProcAddress(
-    symbol: *const c_char,
-    pfn: *mut *mut c_void,
-    cuda_version: c_int,
-    flags: u64,
-) -> CUresult {
-    cuGetProcAddress_v2(symbol, pfn, cuda_version, flags, ptr::null_mut())
-}

@@ -764,3 +764,53 @@
             v = -v;
         return (uint32_t)d_round_to(v, T_F32, pf);
     }
+
+    // ---------------------------------------------------------------- packed integer lanes (gx_intx, PTX-EXEC-PRED)
+    // {add,sub,min,max}{.sat}{.relu}.{u8x4,s8x4,u16x2,s16x2} d, a, b; {neg,abs}.{s8x4,s16x2} d, a;
+    // set.CmpOp.{u8x4,s8x4,u16x2,s16x2} d, a, b
+    // ctrl: 0-3 op (0 add 1 sub 2 min 3 max 4 neg 5 abs 6 set), 4 16-bit lanes, 5 signed, 6 .sat, 7 .relu, 8-11 cmp
+    uint32_t FUNC(ipack)(uint32_t a, uint32_t b, uint32_t ctrl)
+    {
+        uint32_t op = ctrl & 15;
+        int w = (ctrl & 16) ? 16 : 8;
+        bool sg = ctrl & 32, sat = ctrl & 64, relu = ctrl & 128;
+        uint32_t cmpc = (ctrl >> 8) & 15;
+        uint32_t lm = (1u << w) - 1, r = 0;
+        int64_t lo = sg ? -(1ll << (w - 1)) : 0, hi = sg ? (1ll << (w - 1)) - 1 : (int64_t)lm;
+        for (int i = 0; i < 32 / w; i++)
+        {
+            uint32_t ua = (a >> (w * i)) & lm, ub = (b >> (w * i)) & lm;
+            int64_t x = sg ? (int64_t)(ua ^ (1u << (w - 1))) - (1ll << (w - 1)) : ua;
+            int64_t y = sg ? (int64_t)(ub ^ (1u << (w - 1))) - (1ll << (w - 1)) : ub;
+            int64_t v;
+            switch (op)
+            {
+            case 0: v = x + y; break;
+            case 1: v = x - y; break;
+            case 2: v = x < y ? x : y; break;
+            case 3: v = x > y ? x : y; break;
+            case 4: v = -x; break;
+            case 5: v = x < 0 ? -x : x; break;
+            default:
+            {
+                bool c;
+                switch (cmpc)
+                {
+                case 0: c = x == y; break;
+                case 1: c = x != y; break;
+                case 2: c = x < y; break;
+                case 3: c = x <= y; break;
+                case 4: c = x > y; break;
+                default: c = x >= y; break;
+                }
+                v = c ? (int64_t)lm : 0;
+            }
+            }
+            if (sat && op < 2)
+                v = v < lo ? lo : v > hi ? hi : v;
+            if (relu && sg && op >= 2 && op <= 3 && v < 0)
+                v = 0;
+            r |= ((uint32_t)v & lm) << (w * i);
+        }
+        return r;
+    }

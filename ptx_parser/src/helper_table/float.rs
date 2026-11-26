@@ -351,7 +351,40 @@ fn negabs<'i>(base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
         .build()
 }
 
+/// packed integer lanes: {add,sub,min,max}{.sat}{.relu}.{u8x4,s8x4,u16x2,s16x2}, {neg,abs}.{s8x4,s16x2},
+/// set.CmpOp.{u8x4,s8x4,u16x2,s16x2}
+fn ipack<'i>(base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
+    let t = *m.iter().find(|x| matches!(**x, "u8x4" | "s8x4" | "u16x2" | "s16x2"))?;
+    let opc: u64 = match base {
+        "add" => 0,
+        "sub" => 1,
+        "min" => 2,
+        "max" => 3,
+        "neg" => 4,
+        "abs" => 5,
+        "set" => 6,
+        _ => return None,
+    };
+    let cmpc = m.iter().find_map(|x| ["eq", "ne", "lt", "le", "gt", "ge"].iter().position(|c| c == x)).unwrap_or(0) as u64;
+    let ctrl = opc
+        | (t.ends_with("x2") as u64) << 4
+        | (t.starts_with('s') as u64) << 5
+        | (m.contains(&"sat") as u64) << 6
+        | (m.contains(&"relu") as u64) << 7
+        | cmpc << 8;
+    let b = if opc == 4 || opc == 5 { imm(0) } else { ops.get(2)?.op.clone() };
+    Call::new("ipack")
+        .dst(ops[0].op.clone(), ScalarType::B32)
+        .src(ops[1].op.clone(), ScalarType::B32)
+        .src(b, ScalarType::B32)
+        .imm(ctrl)
+        .build()
+}
+
 pub(super) fn lower<'i>(_opcode: &str, base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
+    if m.iter().any(|x| matches!(*x, "u8x4" | "s8x4" | "u16x2" | "s16x2")) {
+        return ipack(base, m, ops);
+    }
     match base {
         "add" | "sub" | "mul" | "fma" | "min" | "max" => arith(base, m, ops),
         "set" | "setp" => compare(base, m, ops),

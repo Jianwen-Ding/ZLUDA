@@ -665,7 +665,13 @@ unsafe fn load_module_from_ptx(module: *mut *mut Module, ptx: &str) -> CUresult 
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     dump(&format!("module{id}.ptx"), ptx.as_bytes());
-    let compiled = match compile::compile_ptx(ptx, compile::Options::default()) {
+    let compiled = match compile::compile_ptx(
+        ptx,
+        compile::Options {
+            portable_air: backend::use_agx(),
+            ..Default::default()
+        },
+    ) {
         Ok(c) => c,
         Err(e) => {
             return report(

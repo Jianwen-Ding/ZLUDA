@@ -617,16 +617,19 @@ extern "C"
         default: return e == 0 && f != 0;
         }
     }
+    // c >= 0 on the bits (exact for subnormals, which the hardware's compare flushes);
+    // with .ftz a subnormal c is a sign-preserving zero, so it selects a
+    static inline bool slct_nonneg(float c, bool ftz)
+    {
+        uint32_t u = __builtin_bit_cast(uint32_t, c), m = u & 0x7FFFFFFFu;
+        if (m > 0x7F800000u)
+            return false;
+        return (u >> 31) == 0 || m == 0 || (ftz && m < 0x00800000u);
+    }
 #define SLCT(BITS, T)                                                                                     \
     T FUNC(slct_b##BITS##_s32)(T a, T b, int32_t c) { return c >= 0 ? a : b; }                          \
-    T FUNC(slct_b##BITS##_f32)(T a, T b, float c) { return c >= 0.0f ? a : b; }                         \
-    T FUNC(slct_b##BITS##_f32_ftz)(T a, T b, float c)                                                   \
-    {                                                                                                   \
-        uint32_t u = __builtin_bit_cast(uint32_t, c);                                                   \
-        if (((u >> 23) & 0xFF) == 0)                                                                    \
-            return a; /* +-0 and subnormals (flushed to zero) select a */                               \
-        return c >= 0.0f ? a : b;                                                                       \
-    }
+    T FUNC(slct_b##BITS##_f32)(T a, T b, float c) { return slct_nonneg(c, false) ? a : b; }             \
+    T FUNC(slct_b##BITS##_f32_ftz)(T a, T b, float c) { return slct_nonneg(c, true) ? a : b; }
     SLCT(16, uint16_t)
     SLCT(32, uint32_t)
     SLCT(64, uint64_t)

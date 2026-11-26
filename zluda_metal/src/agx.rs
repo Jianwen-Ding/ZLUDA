@@ -282,9 +282,10 @@ pub fn launch_value(d: u32, kind: u32) -> u32 {
 // Libraries and kernels
 // ---------------------------------------------------------------------------
 pub struct Library {
-    records: HashMap<String, (Record, Vec<u8>)>,
-    /// initial global data (after relocation against `globals_va`)
-    globals: Option<(u64, usize)>,
+    /// kernel -> (record, code, global data buffer of its object)
+    records: HashMap<String, (Record, Vec<u8>, Option<u64>)>,
+    /// global data buffers (one per object), freed with the library
+    globals: Vec<u64>,
 }
 
 pub struct Kernel {
@@ -301,27 +302,44 @@ pub fn mcpu() -> String {
     std::env::var("ZLUDA_AGX_MCPU").unwrap_or_else(|_| "agx-g14c".into())
 }
 
-/// Compiles a metallib with llvm-air2agx; returns the ELF object bytes.
-pub fn compile_metallib(metallib: &[u8]) -> Result<Vec<u8>, String> {
+/// Compiles a metallib with llvm-air2agx; returns one ELF object per AIR module.
+pub fn compile_metallib(metallib: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     let dir = std::env::temp_dir().join(format!(
         "zluda-agx-{}-{}",
         std::process::id(),
         COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let out_dir = dir.join("out");
+    std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
     let lib = dir.join("m.metallib");
-    let obj = dir.join("m.o");
     std::fs::write(&lib, metallib).map_err(|e| e.to_string())?;
     let mut cmd = std::process::Command::new(air2agx());
-    cmd.arg(format!("-mcpu={}", mcpu())).arg(&lib).arg("-o").arg(&obj);
-    if let Ok(extra) = std::env::var("ZLUDA_AGX_FLAGS") {
-        cmd.args(extra.split_whitespace());
-    }
+    cmd.arg(format!("-mcpu={}", mcpu()))
+        .arg(&lib)
+        .arg("--emit=obj")
+        .arg("--output-dir")
+        .arg(&out_dir);
+    // PTX's NaN results are the canonical 0x7fffffff (AGXUsage.rst, canonical-nan)
+    let flags = std::env::var("ZLUDA_AGX_FLAGS").unwrap_or_else(|_| "-mattr=+canonical-nan".into());
+    cmd.args(flags.split_whitespace());
     let out = cmd
         .output()
         .map_err(|e| format!("cannot run {} (set ZLUDA_AGX_AIR2AGX): {e}", air2agx()))?;
     let res = if out.status.success() {
-        std::fs::read(&obj).map_err(|e| e.to_string())
+        let mut objs = vec![];
+        let mut names: Vec<_> = std::fs::read_dir(&out_dir)
+            .map_err(|e| e.to_string())?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .collect();
+        names.sort();
+        for n in names {
+            objs.push(std::fs::read(&n).map_err(|e| e.to_string())?);
+        }
+        if objs.is_empty() {
+            Err("llvm-air2agx wrote no object".to_string())
+        } else {
+            Ok(objs)
+        }
     } else {
         Err(format!(
             "llvm-air2agx failed: {}",
@@ -338,10 +356,17 @@ static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize:
 
 impl Library {
     pub fn new(metallib: &[u8]) -> Result<Self, String> {
-        let obj = compile_metallib(metallib)?;
-        Self::from_object(&obj)
+        let objs = compile_metallib(metallib)?;
+        let mut lib = Library { records: HashMap::new(), globals: vec![] };
+        for o in &objs {
+            let mut l = Self::from_object(o)?;
+            lib.records.extend(std::mem::take(&mut l.records));
+            lib.globals.extend(std::mem::take(&mut l.globals));
+        }
+        Ok(lib)
     }
 
+    /// One AGX object: its kernels see its own global data buffer.
     pub fn from_object(obj: &[u8]) -> Result<Self, String> {
         let elf = Elf::parse(obj)?;
         let text = elf.section(".text").unwrap_or(&[]);
@@ -390,28 +415,28 @@ impl Library {
                 .get(start.1 as usize..)
                 .ok_or("kernel outside .text")?
                 .to_vec();
-            records.insert(r.name.clone(), (r, code));
+            records.insert(r.name.clone(), (r, code, globals.map(|g: (u64, usize)| g.0)));
         }
-        Ok(Library { records, globals })
+        Ok(Library { records, globals: globals.map(|g| vec![g.0]).unwrap_or_default() })
     }
 
     pub fn kernel(&self, name: &str) -> Result<Kernel, String> {
-        let (r, code) = self
+        let (r, code, g) = self
             .records
             .get(name)
             .ok_or_else(|| format!("kernel {name} not found in the AGX object"))?;
         Ok(Kernel {
             record: r.clone(),
             code: Arc::new(code.clone()),
-            globals: self.globals.map(|g| g.0),
+            globals: *g,
         })
     }
 }
 
 impl Drop for Library {
     fn drop(&mut self) {
-        if let Some((va, _)) = self.globals {
-            free(va);
+        for va in &self.globals {
+            free(*va);
         }
     }
 }

@@ -877,6 +877,10 @@ void lowerAtomicLoadStore(Instruction *i)
     }
 }
 
+// Portable AIR for llvm-air2agx: doubles and directed-rounding constrained intrinsics are
+// kept (the AIR target's air-emulate-f64 lowers them), instead of rejected / rounded to nearest.
+static bool g_portable_air = false;
+
 // Maps an LLVM / AMDGPU intrinsic call onto AIR. Returns true when handled.
 bool lowerIntrinsic(CallInst *ci)
 {
@@ -888,6 +892,9 @@ bool lowerIntrinsic(CallInst *ci)
     Type *rt = ci->getType();
     auto arg = [&](unsigned i) { return ci->getArgOperand(i); };
     auto replace = [&](Value *v) {
+        if (auto *vi = dyn_cast_or_null<Instruction>(v))
+            if (MDNode *md = ci->getMetadata("agx.keep-denormals"))
+                vi->setMetadata("agx.keep-denormals", md);
         if (v)
             ci->replaceAllUsesWith(v);
         ci->eraseFromParent();
@@ -933,13 +940,29 @@ bool lowerIntrinsic(CallInst *ci)
     case Intrinsic::sqrt:
         return airMath("sqrt", 1);
     case Intrinsic::minnum:
-    case Intrinsic::minimum:
         return airMath("fmin", 2);
     case Intrinsic::maxnum:
-    case Intrinsic::maximum:
         return airMath("fmax", 2);
+    case Intrinsic::minimum:
+    case Intrinsic::maximum:
+    {
+        // LLVM's minimum / maximum: a NaN operand gives NaN, and -0 < +0. AIR's fmin / fmax are
+        // minnum / maxnum, so the NaN and equal-zero cases are selected explicitly.
+        bool isMax = id == Intrinsic::maximum;
+        Value *a = arg(0), *c = arg(1);
+        Value *m = callAir(b, (std::string(isMax ? "air.fmax." : "air.fmin.") + airTypeSuffix(rt)), rt, {a, c});
+        Type *it = rt->getWithNewType(IntegerType::get(rt->getContext(), rt->getScalarSizeInBits()));
+        Value *ai = b.CreateBitCast(a, it), *ci2 = b.CreateBitCast(c, it);
+        Value *bits = isMax ? b.CreateAnd(ai, ci2) : b.CreateOr(ai, ci2);
+        Value *eq = b.CreateFCmpOEQ(a, c);
+        m = b.CreateSelect(eq, b.CreateBitCast(bits, rt), m);
+        Value *nan = b.CreateFCmpUNO(a, c);
+        m = b.CreateSelect(nan, b.CreateFAdd(a, c), m);
+        return replace(m);
+    }
     case Intrinsic::copysign:
-        return airMath("copysign", 2);
+        // Metal accepts llvm.copysign as it is (there is no air.copysign)
+        return false;
     case Intrinsic::floor:
         return airMath("floor", 1);
     case Intrinsic::ceil:
@@ -987,13 +1010,11 @@ bool lowerIntrinsic(CallInst *ci)
     case Intrinsic::abs:
         return replace(callAir(b, "air.abs." + intSuffix(true), rt, {arg(0)}));
     case Intrinsic::sadd_sat:
-        return replace(callAir(b, "air.add_sat." + intSuffix(true), rt, {arg(0), arg(1)}));
     case Intrinsic::uadd_sat:
-        return replace(callAir(b, "air.add_sat." + intSuffix(false), rt, {arg(0), arg(1)}));
     case Intrinsic::ssub_sat:
-        return replace(callAir(b, "air.sub_sat." + intSuffix(true), rt, {arg(0), arg(1)}));
     case Intrinsic::usub_sat:
-        return replace(callAir(b, "air.sub_sat." + intSuffix(false), rt, {arg(0), arg(1)}));
+        // Metal accepts the saturating integer intrinsics as they are
+        return false;
     case Intrinsic::fshl:
     case Intrinsic::fshr:
     {
@@ -1080,6 +1101,14 @@ bool lowerIntrinsic(CallInst *ci)
     // Metal has a single rounding mode, so we drop the constraints.
     if (auto *cfp = dyn_cast<ConstrainedFPIntrinsic>(ci))
     {
+        // Portable AIR (for llvm-air2agx): directed roundings stay constrained intrinsics,
+        // which the AIR target's air-emulate-f64 computes exactly.
+        if (g_portable_air)
+        {
+            auto rm = cfp->getRoundingMode();
+            if (rm && *rm != RoundingMode::NearestTiesToEven && *rm != RoundingMode::Dynamic)
+                return true;
+        }
         Value *res = nullptr;
         switch (cfp->getIntrinsicID())
         {
@@ -1551,7 +1580,7 @@ void stripTargetAttributes(Module &m)
         AttributeList al = f.getAttributes();
         AttrBuilder ab(m.getContext(), al.getFnAttrs());
         for (const Attribute &a : al.getFnAttrs())
-            if (a.isStringAttribute())
+            if (a.isStringAttribute() && !(g_portable_air && a.getKindAsString().starts_with("denormal-fp-math")))
                 ab.removeAttribute(a.getKindAsString());
         ab.removeAttribute(Attribute::StrictFP);
         f.setAttributes(al.removeFnAttributes(m.getContext()).addFnAttributes(m.getContext(), ab));
@@ -1667,8 +1696,206 @@ static void adaptHelperCalls(Module &m)
     }
 }
 
+
+// ---- Floating point modes for portable AIR ----
+// ZLUDA expresses PTX's per-instruction rounding (.rz, .rm, .rp) and .ftz as AMDGPU mode
+// register writes (llvm.amdgcn.s.setreg of the rounding and denormal fields) around
+// constrained intrinsics with dynamic rounding. AGX has no mode register: a forward dataflow
+// gives each instruction its mode, the constrained intrinsics get static roundings (the AIR
+// target's air-emulate-f64 computes them exactly), every function flushes float denormals,
+// as the hardware does, and the float operations that must keep them carry
+// !agx.keep-denormals (the AGX backend's IEEE lowering, llvm/docs/AGXUsage.rst).
+struct FPMode
+{
+    int r32 = 0, r16 = 0; // AMDGPU rounding field: 0 nearest, 1 +inf, 2 -inf, 3 zero
+    bool ieee32 = true, ieee16 = true;
+    bool operator==(const FPMode &o) const
+    {
+        return r32 == o.r32 && r16 == o.r16 && ieee32 == o.ieee32 && ieee16 == o.ieee16;
+    }
+};
+
+static const char *roundingName(int r)
+{
+    switch (r)
+    {
+    case 1: return "round.upward";
+    case 2: return "round.downward";
+    case 3: return "round.towardzero";
+    default: return "round.tonearest";
+    }
+}
+
+static bool isF32Op(Instruction &i)
+{
+    auto f32 = [](Type *t) { return t->getScalarType()->isFloatTy(); };
+    if (isa<FCmpInst>(i))
+        return f32(i.getOperand(0)->getType());
+    if (!f32(i.getType()))
+        return false;
+    if (i.isBinaryOp() || isa<UnaryOperator>(i))
+        return true;
+    if (auto *ci = dyn_cast<CallInst>(&i))
+        if (Function *f = ci->getCalledFunction())
+        {
+            if (f->getName().starts_with("air."))
+                return true; // AIR math (air.sqrt.f32, air.fma.f32, ...)
+            switch (f->getIntrinsicID())
+            {
+            case Intrinsic::fma:
+            case Intrinsic::fmuladd:
+            case Intrinsic::sqrt:
+            case Intrinsic::minnum:
+            case Intrinsic::maxnum:
+            case Intrinsic::minimum:
+            case Intrinsic::maximum:
+            case Intrinsic::floor:
+            case Intrinsic::ceil:
+            case Intrinsic::trunc:
+            case Intrinsic::rint:
+            case Intrinsic::nearbyint:
+            case Intrinsic::round:
+            case Intrinsic::roundeven:
+            case Intrinsic::canonicalize:
+                return true;
+            default:
+                return isa<ConstrainedFPIntrinsic>(ci);
+            }
+        }
+    return false;
+}
+
+static void resolveFPModes(Function &f)
+{
+    if (f.isDeclaration())
+        return;
+    LLVMContext &c = f.getContext();
+    FPMode entry;
+    if (Attribute a = f.getFnAttribute("denormal-fp-math-f32"); a.isValid())
+        entry.ieee32 = a.getValueAsString().starts_with("ieee");
+    if (Attribute a = f.getFnAttribute("denormal-fp-math"); a.isValid())
+        entry.ieee16 = a.getValueAsString().starts_with("ieee") || a.getValueAsString().starts_with("dynamic");
+    std::map<BasicBlock *, FPMode> in;
+    std::vector<BasicBlock *> work{&f.getEntryBlock()};
+    in[&f.getEntryBlock()] = entry;
+    MDNode *keep = MDNode::get(c, {});
+    std::set<BasicBlock *> done;
+    std::vector<std::pair<Instruction *, Value *>> pendingErase;
+    while (!work.empty())
+    {
+        BasicBlock *bb = work.back();
+        work.pop_back();
+        if (!done.insert(bb).second)
+            continue;
+        FPMode m = in[bb];
+        for (Instruction &i : *bb)
+        {
+            if (auto *ci = dyn_cast<CallInst>(&i))
+            {
+                Function *callee = ci->getCalledFunction();
+                if (callee && callee->getName() == "llvm.amdgcn.s.setreg")
+                {
+                    auto *hw = dyn_cast<ConstantInt>(ci->getArgOperand(0));
+                    auto *v = dyn_cast<ConstantInt>(ci->getArgOperand(1));
+                    if (hw && v)
+                    {
+                        uint64_t val = v->getZExtValue();
+                        if (hw->getZExtValue() == 6145) // rounding field
+                        {
+                            m.r32 = val & 3;
+                            m.r16 = (val >> 2) & 3;
+                        }
+                        else if (hw->getZExtValue() == 6401) // denormal field
+                        {
+                            m.ieee32 = (val & 3) != 0;
+                            m.ieee16 = ((val >> 2) & 3) != 0;
+                        }
+                    }
+                    continue;
+                }
+                if (auto *cfp = dyn_cast<ConstrainedFPIntrinsic>(ci))
+                {
+                    auto rm = cfp->getRoundingMode();
+                    if (rm && *rm == RoundingMode::Dynamic)
+                    {
+                        Type *t = cfp->getType()->getScalarType();
+                        if (cfp->getIntrinsicID() == Intrinsic::experimental_constrained_fcmp ||
+                            cfp->getIntrinsicID() == Intrinsic::experimental_constrained_fcmps)
+                            t = cfp->getArgOperand(0)->getType()->getScalarType();
+                        int r = t->isFloatTy() ? m.r32 : m.r16;
+                        unsigned idx = cfp->arg_size() - 2; // rounding, then exception behaviour
+                        ci->setArgOperand(idx, MetadataAsValue::get(c, MDString::get(c, roundingName(r))));
+                    }
+                }
+            }
+            if (m.ieee32 && isF32Op(i))
+                i.setMetadata("agx.keep-denormals", keep);
+            // plain operations in a directed-rounding region (the helper library's) round in it too
+            if (auto *bo = dyn_cast<BinaryOperator>(&i))
+            {
+                Type *t = bo->getType()->getScalarType();
+                int r = t->isFloatTy() ? m.r32 : m.r16;
+                Intrinsic::ID cid = Intrinsic::not_intrinsic;
+                switch (bo->getOpcode())
+                {
+                case Instruction::FAdd: cid = Intrinsic::experimental_constrained_fadd; break;
+                case Instruction::FSub: cid = Intrinsic::experimental_constrained_fsub; break;
+                case Instruction::FMul: cid = Intrinsic::experimental_constrained_fmul; break;
+                case Instruction::FDiv: cid = Intrinsic::experimental_constrained_fdiv; break;
+                default: break;
+                }
+                if (r != 0 && cid != Intrinsic::not_intrinsic && t->isFloatingPointTy() && !bo->getType()->isVectorTy())
+                {
+                    IRBuilder<> b(bo);
+                    Function *cf = Intrinsic::getDeclaration(f.getParent(), cid, {bo->getType()});
+                    Value *nv = b.CreateCall(cf, {bo->getOperand(0), bo->getOperand(1),
+                                                  MetadataAsValue::get(c, MDString::get(c, roundingName(r))),
+                                                  MetadataAsValue::get(c, MDString::get(c, "fpexcept.ignore"))});
+                    if (MDNode *md = bo->getMetadata("agx.keep-denormals"))
+                        cast<Instruction>(nv)->setMetadata("agx.keep-denormals", md);
+                    pendingErase.push_back({bo, nv});
+                }
+            }
+        }
+        for (BasicBlock *s : successors(bb))
+            if (!in.count(s))
+            {
+                in[s] = m;
+                work.push_back(s);
+            }
+    }
+    for (auto &[old, nv] : pendingErase)
+    {
+        old->replaceAllUsesWith(nv);
+        old->eraseFromParent();
+    }
+}
+
+static void portableFPModes(Module &m)
+{
+    for (Function &f : m)
+    {
+        resolveFPModes(f);
+        // the hardware's float mode; IEEE operations are tagged
+        f.addFnAttr("denormal-fp-math-f32", "preserve-sign,preserve-sign");
+        f.removeFnAttr(Attribute::StrictFP);
+        for (Instruction &i : instructions(f))
+            if (auto *cb = dyn_cast<CallBase>(&i))
+                cb->removeFnAttr(Attribute::StrictFP);
+    }
+}
+
 void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals &globals)
 {
+    // portable AIR: strictfp would keep the helpers from inlining before the modes are resolved
+    if (g_portable_air)
+        for (Function &f : m)
+        {
+            f.removeFnAttr(Attribute::StrictFP);
+            for (Instruction &i : instructions(f))
+                if (auto *cb = dyn_cast<CallBase>(&i))
+                    cb->removeFnAttr(Attribute::StrictFP);
+        }
     // ---- Phase 1: AMDGPU-numbered cleanup ----
     std::vector<Function *> kernelBodies;
     for (Function &f : m)
@@ -1691,8 +1918,10 @@ void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals
     // globals without an initializer value (undef).
     for (GlobalVariable &gv : m.globals())
     {
-        if (gv.getAddressSpace() == amd::Shared && !gv.hasInitializer())
+        if (gv.getAddressSpace() == amd::Shared)
         {
+            // PTX .shared variables have no initial value (the helper library's zero
+            // initializers are only C++ syntax)
             if (auto *at = dyn_cast<ArrayType>(gv.getValueType()); at && at->getNumElements() == 0)
                 continue; // dynamic shared memory, bound as a kernel argument
             gv.setInitializer(UndefValue::get(gv.getValueType()));
@@ -1729,6 +1958,9 @@ void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals
                     fail("generic pointer to non-global memory could not be resolved statically in " + f.getName() +
                          ": " + toString(asc));
             }
+
+    if (g_portable_air)
+        portableFPModes(m);
 
     // ---- Phase 2: AIR address spaces ----
     remapAddressSpaces(m);
@@ -1782,8 +2014,8 @@ void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals
             fail("unresolved external function: " + f.getName());
     for (Function &f : m)
         f.setCallingConv(CallingConv::C);
-    // Metal GPUs have no double precision arithmetic
-    if (!getenv("ZLUDA_METAL_ALLOW_F64"))
+    // Metal GPUs have no double precision arithmetic (portable AIR keeps it: air-emulate-f64)
+    if (!getenv("ZLUDA_METAL_ALLOW_F64") && !g_portable_air)
         for (Function &f : m)
             for (Instruction &i : instructions(f))
             {
@@ -1881,7 +2113,10 @@ extern "C" int zluda_air_lower(const ZludaAirInput *input, ZludaAirOutput *outpu
     try
     {
         LLVMContext ctx;
+        g_portable_air = input->portable_air != 0;
         std::unique_ptr<Module> main = parse(ctx, input->main_bc, input->main_len, "main");
+        if (getenv("ZLUDA_AIR_DEBUG_INPUT"))
+            main->print(errs(), nullptr);
         if (input->attributes_bc)
         {
             auto attrs = parse(ctx, input->attributes_bc, input->attributes_len, "attributes");

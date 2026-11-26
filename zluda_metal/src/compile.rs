@@ -57,6 +57,8 @@ pub struct CompiledModule {
 #[derive(Default, Clone, Copy)]
 pub struct Options {
     pub keep_text: bool,
+    /// keep doubles and directed roundings in the AIR (for llvm-air2agx, which emulates them)
+    pub portable_air: bool,
 }
 
 pub fn compile_ptx(ptx: &str, opts: Options) -> Result<CompiledModule, String> {
@@ -79,7 +81,7 @@ pub fn compile_ptx(ptx: &str, opts: Options) -> Result<CompiledModule, String> {
         .then(|| module.llvm_ir.print_module_to_string().to_str().to_string());
     let main_bc = module.llvm_ir.write_bitcode_to_memory();
     let attributes_bc = module.attributes_ir.write_bitcode_to_memory();
-    let lowered = lower_to_air(&main_bc, &attributes_bc, opts.keep_text)?;
+    let lowered = lower_to_air(&main_bc, &attributes_bc, opts.keep_text, opts.portable_air)?;
     let metallib = write_metallib(&lowered.kernels)?;
     Ok(CompiledModule {
         kernels: lowered.kernels,
@@ -98,7 +100,7 @@ struct Lowered {
     text: Option<String>,
 }
 
-fn lower_to_air(main_bc: &[u8], attributes_bc: &[u8], want_text: bool) -> Result<Lowered, String> {
+fn lower_to_air(main_bc: &[u8], attributes_bc: &[u8], want_text: bool, portable_air: bool) -> Result<Lowered, String> {
     let input = ffi::ZludaAirInput {
         main_bc: main_bc.as_ptr(),
         main_len: main_bc.len(),
@@ -107,6 +109,7 @@ fn lower_to_air(main_bc: &[u8], attributes_bc: &[u8], want_text: bool) -> Result
         impl_bc: ZLUDA_PTX_METAL_IMPL.as_ptr(),
         impl_len: ZLUDA_PTX_METAL_IMPL.len(),
         want_text: want_text as i32,
+        portable_air: portable_air as i32,
     };
     let mut output = ffi::ZludaAirOutput {
         kernels: ptr::null_mut(),

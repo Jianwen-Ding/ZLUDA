@@ -16,6 +16,7 @@ typedef struct ZludaAirInput
     const uint8_t *impl_bc; // zluda_ptx_metal_impl.bc
     size_t impl_len;
     int want_text; // also return the whole AIR module as text
+    int portable_air; // keep doubles and directed roundings (for llvm-air2agx's air-emulate-f64)
 } ZludaAirInput;
 
 typedef struct ZludaAirKernel

@@ -386,6 +386,11 @@ def main():
         sys.stdout.flush()
         os._exit(0)
     env = dict(os.environ, ZLUDA_METAL_BACKEND=a.backend)
+    # a sibling llvm-project checkout's build (the AGX backend's fork)
+    sibling = os.path.normpath(os.path.join(HERE, "..", "..", "..", "..", "llvm-project", "build", "bin",
+                                            "llvm-air2agx"))
+    if "ZLUDA_AGX_AIR2AGX" not in env and os.path.exists(sibling):
+        env["ZLUDA_AGX_AIR2AGX"] = sibling
     files = collect(a.paths, a.k)
     results = {}
     with cf.ThreadPoolExecutor(a.j) as ex:

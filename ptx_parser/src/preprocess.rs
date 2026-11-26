@@ -30,6 +30,7 @@ fn rewrite_all(text: &str) -> String {
     let s = colour_members(&s);
     let s = vector_members_in_lists(&s);
     let s = per_cta_memory(&s);
+    let s = bytes32_globals(&s);
     if super::preprocess_calls::needs_work(&s) {
         super::preprocess_calls::rewrite(&s)
     } else {
@@ -49,6 +50,7 @@ fn needs_work(text: &str) -> bool {
         || text.contains("texmode_")
         || text.contains("compute_")
         || text.contains(".minperctamemory")
+        || text.contains(".address_size 32")
         || text.contains("0b")
         || text.contains('[')
         || b.iter().any(|c| matches!(c, b'*' | b'/' | b'%' | b'&' | b'^' | b'~' | b'?' | b'<' | b'>' | b'(' | b'+' | b'-'))
@@ -1403,4 +1405,131 @@ fn per_cta_memory(t: &str) -> String {
         }
     }
     out
+}
+
+// ------------------------------------------------------------------------------------------------ 32-bit modules
+
+/// `.address_size 32`: the translator keeps module-scope .global / .const variables as byte arrays; a variable of another
+/// type (`.const .u32 cv = 9;`, `.global .f32 x[2] = {1.0, 2.0};`) becomes `.b8 cv[4] = {9, 0, 0, 0};` (little endian)
+fn bytes32_globals(t: &str) -> String {
+    if !t.contains(".address_size 32") {
+        return t.to_string();
+    }
+    let mut out = String::with_capacity(t.len());
+    let mut depth = 0i32;
+    for st in t.split_inclusive(';') {
+        let before = depth;
+        depth += st.matches('{').count() as i32 - st.matches('}').count() as i32;
+        let body0 = st.trim_end_matches(';');
+        // the declaration starts at its last line beginning with a linkage / state-space word (directives without `;`
+        // such as .version precede it in the same piece)
+        let mut dstart = 0;
+        let mut off = 0;
+        for line in body0.split_inclusive('\n') {
+            let w = line.split_whitespace().next().unwrap_or("");
+            if [".global", ".const", ".visible", ".extern", ".weak"].contains(&w) {
+                dstart = off;
+            }
+            off += line.len();
+        }
+        let (prefix, body) = body0.split_at(dstart);
+        let lead = body.len() - body.trim_start().len();
+        let decl = body.trim_start();
+        let ws: Vec<&str> = decl.split_whitespace().collect();
+        let module_scope = before == 0 && !body.contains('{') || before == 0 && body.contains('=');
+        let space = ws.iter().any(|w| *w == ".global" || *w == ".const");
+        let conv = module_scope && space && !ws.iter().any(|w| matches!(*w, ".b8" | ".u8" | ".s8" | ".texref" | ".samplerref" | ".surfref"))
+            && !decl.contains("(") && !ws.contains(&".func") && !ws.contains(&".entry") && st.ends_with(';');
+        let rewritten = conv.then(|| {
+            let (head, init) = match decl.split_once('=') {
+                Some((h, i)) => (h.trim(), Some(i.trim())),
+                None => (decl.trim(), None),
+            };
+            let hw: Vec<&str> = head.split_whitespace().collect();
+            let ty_pos = hw.iter().rposition(|w| w.starts_with('.') && w != &".align")?;
+            let ty = hw[ty_pos];
+            let size: u64 = match ty {
+                ".b16" | ".u16" | ".s16" | ".f16" => 2,
+                ".b32" | ".u32" | ".s32" | ".f32" => 4,
+                ".b64" | ".u64" | ".s64" | ".f64" => 8,
+                _ => return None,
+            };
+            let namepart = hw.get(ty_pos + 1)?;
+            let (name, count) = match namepart.find('[') {
+                Some(b) => {
+                    let n: u64 = namepart[b + 1..].trim_end_matches(']').parse().ok()?;
+                    (&namepart[..b], n)
+                }
+                None => (*namepart, 1),
+            };
+            let vals: Vec<&str> = match init {
+                Some(i) => i.trim_start_matches('{').trim_end_matches('}').split(',').map(|x| x.trim()).filter(|x| !x.is_empty()).collect(),
+                None => Vec::new(),
+            };
+            let count = count.max(vals.len() as u64);
+            let mut bytes: Vec<u64> = Vec::new();
+            for k in 0..count {
+                let v = match vals.get(k as usize) {
+                    None => 0u64,
+                    Some(x) => match parse_num(x.trim_start_matches('-'))? {
+                        Val::I(b, _) => {
+                            if x.starts_with('-') {
+                                b.wrapping_neg()
+                            } else {
+                                b
+                            }
+                        }
+                        Val::F(f) => {
+                            let f = if x.starts_with('-') { -f } else { f };
+                            if size == 4 {
+                                (f as f32).to_bits() as u64
+                            } else {
+                                f.to_bits()
+                            }
+                        }
+                    },
+                };
+                for i in 0..size {
+                    bytes.push((v >> (8 * i)) & 255);
+                }
+            }
+            let mut nh: Vec<String> = hw[..ty_pos].iter().map(|x| x.to_string()).collect();
+            if !nh.iter().any(|w| w == ".align") {
+                nh.push(format!(".align {size}"));
+            }
+            nh.push(".b8".to_string());
+            let init = if init.is_some() {
+                format!(" = {{ {} }}", bytes.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(", "))
+            } else {
+                String::new()
+            };
+            Some(format!("{prefix}{}{} {name}[{}]{init};", &body[..lead], nh.join(" "), count * size))
+        });
+        match rewritten.flatten() {
+            Some(r) => out.push_str(&r),
+            None => out.push_str(&isspacep32(st)),
+        }
+    }
+    out
+}
+
+/// `isspacep.space p, a;` with a 32-bit generic address: the zero-extended 64-bit address
+fn isspacep32(st: &str) -> String {
+    let Some(p) = st.find("isspacep.") else { return st.to_string() };
+    if p > 0 && is_word(st.as_bytes()[p - 1]) {
+        return st.to_string();
+    }
+    let inst = st[p..].trim_end_matches(';');
+    let Some((op, args)) = inst.split_once(char::is_whitespace) else { return st.to_string() };
+    let a: Vec<&str> = args.split(',').map(|x| x.trim()).collect();
+    if a.len() != 2 || !a[1].starts_with('%') {
+        return st.to_string();
+    }
+    let pre = &st[..p];
+    let guard = pre.trim_end().rsplit(char::is_whitespace).next().filter(|g| g.starts_with('@')).unwrap_or("");
+    let pre = if guard.is_empty() { pre } else { &pre[..pre.rfind(guard).unwrap_or(pre.len())] };
+    format!(
+        "{pre}{{ .reg .u64 %__zluda_isp; cvt.u64.u32 %__zluda_isp, {}; {guard} {op} {}, %__zluda_isp; }}",
+        a[1], a[0]
+    )
 }

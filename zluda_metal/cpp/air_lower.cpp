@@ -839,6 +839,11 @@ private:
             return ~1u; // cycle: neutral element
         if (Value *x = identityAnd(v))
             return baseAddressSpace(x, visiting);
+        if (Value *x = addressZExt(v))
+        {
+            unsigned a = baseAddressSpace(x, visiting);
+            return a == amd::Shared || a == amd::Private || a == ~1u ? a : ~0u;
+        }
         if (auto *bo = dyn_cast<BinaryOperator>(v))
         {
             if (bo->getOpcode() == Instruction::Add || bo->getOpcode() == Instruction::Sub ||
@@ -889,6 +894,17 @@ private:
             return a == b ? a : ~0u;
         }
         return ~0u;
+    }
+
+    // `zext i32 x`: threadgroup and thread addresses are 32-bit (PTX's .shared / .local addresses, `mov.u32 %r,
+    // sdata`), widened for a 64-bit inttoptr; on every address in the window the widening is the identity (the
+    // checks of the caller keep it to those address spaces)
+    static Value *addressZExt(Value *v)
+    {
+        auto *z = dyn_cast<ZExtInst>(v);
+        if (!z || z->getSrcTy()->getIntegerBitWidth() != 32)
+            return nullptr;
+        return z->getOperand(0);
     }
 
     // `x & C` that keeps every bit x can have (a 32-bit pointer zero-extended, known alignment): x
@@ -944,6 +960,13 @@ private:
         else if (Value *x = identityAnd(v))
         {
             result = recover(x);
+        }
+        else if (Value *x = addressZExt(v))
+        {
+            SmallPtrSet<Value *, 16> visiting;
+            unsigned as = baseAddressSpace(v, visiting);
+            if (as == amd::Shared || as == amd::Private)
+                result = recover(x);
         }
         else if (auto *bo = dyn_cast<BinaryOperator>(v))
         {

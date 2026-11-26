@@ -553,16 +553,36 @@
     static inline uint64_t d_bits(double d) { return __builtin_bit_cast(uint64_t, d); }
     // 2^k for -1022 <= k <= 1023
     static inline double d_pow2(int k) { return d_from_bits((uint64_t)(k + 1023) << 52); }
-    // e^y for |y| <= 60 (relative error a few units of 2^-53)
+    // 2^(j/32), correctly rounded (bits)
+    static const __attribute__((address_space(4))) uint64_t D_EXP2_32[32] = {
+        0x3ff0000000000000ull, 0x3ff059b0d3158574ull, 0x3ff0b5586cf9890full, 0x3ff11301d0125b51ull,
+        0x3ff172b83c7d517bull, 0x3ff1d4873168b9aaull, 0x3ff2387a6e756238ull, 0x3ff29e9df51fdee1ull,
+        0x3ff306fe0a31b715ull, 0x3ff371a7373aa9cbull, 0x3ff3dea64c123422ull, 0x3ff44e086061892dull,
+        0x3ff4bfdad5362a27ull, 0x3ff5342b569d4f82ull, 0x3ff5ab07dd485429ull, 0x3ff6247eb03a5585ull,
+        0x3ff6a09e667f3bcdull, 0x3ff71f75e8ec5f74ull, 0x3ff7a11473eb0187ull, 0x3ff82589994cce13ull,
+        0x3ff8ace5422aa0dbull, 0x3ff93737b0cdc5e5ull, 0x3ff9c49182a3f090ull, 0x3ffa5503b23e255dull,
+        0x3ffae89f995ad3adull, 0x3ffb7f76f2fb5e47ull, 0x3ffc199bdd85529cull, 0x3ffcb720dcef9069ull,
+        0x3ffd5818dcfba487ull, 0x3ffdfc97337b9b5full, 0x3ffea4afa2a490daull, 0x3fff50765b6e4540ull};
+    // e^y for |y| <= 60 (relative error a few units of 2^-53): e^y = 2^m 2^(j/32) e^r, k = 32 m + j the nearest
+    // integer to 32 y / ln 2 (the 1.5 * 2^52 shift: no conversion), r = y - k ln2/32 (Cody-Waite, ln2/32 = hi + lo,
+    // hi with 40 bits: k hi exact), |r| <= ln2/64 and e^r by Taylor to degree 6 (remainder < 2^-58); 11 soft-f64
+    // operations
     static inline double d_exp(double y)
     {
-        const double inv_ln2 = 1.4426950408889634074, ln2_hi = 6.93147180369123816490e-01, ln2_lo = 1.90821492927058770002e-10;
-        double kf = y * inv_ln2;
-        int k = (int)(kf >= 0 ? kf + 0.5 : kf - 0.5);
-        double r = (y - k * ln2_hi) - k * ln2_lo;
-        // e^r for |r| <= ln2 / 2: Taylor to degree 16 in Horner form (no divisions in soft-f64)
-        double s = 1.0 + r * (1.0 + r * (0.5 + r * (0.16666666666666666 + r * (0.041666666666666664 + r * (0.008333333333333333 + r * (0.001388888888888889 + r * (0.0001984126984126984 + r * (2.48015873015873e-05 + r * (2.7557319223985893e-06 + r * (2.755731922398589e-07 + r * (2.505210838544172e-08 + r * (2.08767569878681e-09 + r * (1.6059043836821613e-10 + r * (1.1470745597729725e-11 + r * (7.647163731819816e-13 + r * (4.779477332387385e-14))))))))))))))));
-        return s * d_pow2(k);
+        const double shift = 0x1.8p52, inv = 0x1.71547652b82fep+5, hi = 0x1.62e42fefa2000p-6,
+                     lo = 0x1.9ef35793c7673p-46;
+        double s = __builtin_fma(y, inv, shift);
+        int k = (int)(uint32_t)d_bits(s);
+        double kf = s - shift;
+        double r = __builtin_fma(-kf, hi, y);
+        r = __builtin_fma(-kf, lo, r);
+        double p = __builtin_fma(r, 1.0 / 720.0, 1.0 / 120.0);
+        p = __builtin_fma(r, p, 1.0 / 24.0);
+        p = __builtin_fma(r, p, 1.0 / 6.0);
+        p = __builtin_fma(r, p, 0.5);
+        p = __builtin_fma(r, p, 1.0);
+        p = __builtin_fma(r, p, 1.0);
+        return (d_from_bits(D_EXP2_32[k & 31]) * p) * d_pow2(k >> 5);
     }
     // e^y - 1 for |y| <= 0.5
     static inline double d_expm1_small(double y)

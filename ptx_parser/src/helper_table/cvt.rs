@@ -220,7 +220,7 @@ fn hop<'i>(op: Op<'i>) -> HOp<'i> {
 /// Should a grammar-parsed `cvt` go through the soft-float helper?  ZLUDA's own lowering is
 /// kept for the forms it computes exactly.
 fn use_helper(rnd: Option<&str>, ftz: bool, sat: bool, dt: &str, st: &str) -> bool {
-    let float = |t: &str| matches!(t, "f16" | "bf16" | "f32" | "f64");
+    let float = |t: &str| !matches!(t, "u8" | "u16" | "u32" | "u64" | "s8" | "s16" | "s32" | "s64");
     let _ = ftz;
     // integer -> f32 / f64 to nearest: exact on the hardware (and soft-f64)
     if !float(st) && matches!(dt, "f32" | "f64") && matches!(rnd, None | Some("rn")) && !sat {
@@ -234,21 +234,21 @@ fn use_helper(rnd: Option<&str>, ftz: bool, sat: bool, dt: &str, st: &str) -> bo
 
 /// Called by the cvt rules of the grammar (lib.rs) with the modifiers as text (`.rn`, `.f32`):
 /// returns the helper instruction for the forms that ZLUDA's lowering does not cover.
-/// `force` always lowers here.
+/// `.satfinite` forms always lower here.
 pub(crate) fn grammar_override<'i, 'e>(
     errors: &mut Vec<PtxError<'e>>,
     rnd: Option<String>,
     ftz: bool,
     sat: bool,
     relu: bool,
-    force: bool,
+    satfinite: bool,
     dt: String,
     st: String,
     ops: Vec<Op<'i>>,
 ) -> Option<ast::Instruction<ParsedOperandStr<'i>>> {
     let strip = |s: &str| s.trim_start_matches('.').to_string();
     let (dt, st, rnd) = (strip(&dt), strip(&st), rnd.map(|r| strip(&r)));
-    if !force && !use_helper(rnd.as_deref(), ftz, sat, &dt, &st) {
+    if !satfinite && !use_helper(rnd.as_deref(), ftz, sat, &dt, &st) {
         return None;
     }
     let mut m: Vec<String> = Vec::new();
@@ -262,7 +262,7 @@ pub(crate) fn grammar_override<'i, 'e>(
     if relu {
         m.push("relu".into());
     }
-    if force {
+    if satfinite {
         m.push("satfinite".into());
     }
     m.push(dt);

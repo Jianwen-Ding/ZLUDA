@@ -2739,10 +2739,12 @@ derive_parser!(
     // cvt.frnd2{.relu}{.satfinite}.f16x2.f32     d, a, b;
     // cvt.frnd2{.relu}{.satfinite}.bf16.f32      d, a;
     cvt.frnd2{.relu}{.satfinite}.x2_to_type.x2_from_type    d, a {, b} => {
-        if satfinite {
-            let mut ops = vec![d, a];
-            ops.extend(b);
-            return crate::helper_table::cvt::grammar_override(&mut state.errors, Some(frnd2.to_string()), false, false, relu, true, x2_to_type.to_string(), x2_from_type.to_string(), ops).unwrap();
+        {
+            let mut ops = vec![d.clone(), a.clone()];
+            ops.extend(b.clone());
+            if let Some(i) = crate::helper_table::cvt::grammar_override(&mut state.errors, Some(frnd2.to_string()), false, false, relu, satfinite, x2_to_type.to_string(), x2_from_type.to_string(), ops) {
+                return i;
+            }
         }
         let data = ast::CvtDetails::new(&mut state.errors, Some(frnd2), false, false, relu, x2_to_type, x2_from_type);
         ast::Instruction::Cvt {
@@ -2754,7 +2756,7 @@ derive_parser!(
     // cvt.frnd2{.relu}.tf32.f32                   d, a;
     cvt.rn.satfinite{.relu}.f8x2type.f32       d, a, b => {
         if relu {
-            return crate::helper_table::cvt::grammar_override(&mut state.errors, Some(".rn".to_string()), false, false, true, true, f8x2type.to_string(), ".f32".to_string(), vec![d, a, b]).unwrap();
+            return crate::helper_table::cvt::grammar_override(&mut state.errors, Some(".rn".to_string()), false, false, true, true, f8x2type.to_string(), ".f32".to_string(), vec![d.clone(), a.clone(), b.clone()]).unwrap();
         }
         let data = ast::CvtDetails::new(&mut state.errors, Some(rn), false, false, false, f8x2type, ScalarType::F32);
         ast::Instruction::Cvt {

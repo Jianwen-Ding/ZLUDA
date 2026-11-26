@@ -35,8 +35,10 @@ DEFAULT_LIB = os.path.join(HERE, "..", "..", "target", "release", "libzluda_meta
 
 HARNESS = ("buffer", "launch", "print", "expect", "patch", "append", "tensormap", "texture", "sampler", "surface",
            "multimem", "fabric", "memmodel", "ub", "occupancy", "cooplaunch", "convergence", "isacheck")
-IGNORED = ("print", "memmodel", "isacheck", "convergence", "occupancy")
-UNSUPPORTED = ("texture", "sampler", "surface", "multimem", "fabric", "ub")
+# .ub strict: the model's undefined-behaviour checking; the programs that enable it expect their normal results (an
+# undefined behaviour the model would report is not detected here)
+IGNORED = ("print", "memmodel", "isacheck", "convergence", "occupancy", "ub")
+UNSUPPORTED = ("texture", "sampler", "surface", "multimem", "fabric")
 
 SIZES = {"u8": 1, "s8": 1, "b8": 1, "u16": 2, "s16": 2, "b16": 2, "f16": 2, "bf16": 2, "u32": 4, "s32": 4,
          "b32": 4, "f32": 4, "u64": 8, "s64": 8, "b64": 8, "f64": 8, "pred": 1, "b128": 16}

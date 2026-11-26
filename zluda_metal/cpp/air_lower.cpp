@@ -2540,6 +2540,8 @@ void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals
     for (Function &f : m)
         if (!f.isDeclaration() && f.getCallingConv() != CallingConv::AMDGPU_KERNEL && !f.use_empty())
             fail("function could not be inlined into its kernel (recursion is not supported): " + f.getName());
+    if (getenv("ZLUDA_AIR_DEBUG_RESOLVED"))
+        m.print(errs(), nullptr);
     for (Function &f : m)
         for (Instruction &i : instructions(f))
             if (auto *asc = dyn_cast<AddrSpaceCastInst>(&i))

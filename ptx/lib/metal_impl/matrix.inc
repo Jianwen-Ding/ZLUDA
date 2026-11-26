@@ -935,10 +935,12 @@ extern "C++"
         default: return row[c];                                                                             \
         }                                                                                                   \
     }                                                                                                       \
-    MX_INL const uint8_t SPACE *mx_addr_##SNAME(PTRBITS a, int lane)                                        \
+    /* the lane's own pointer plus the distance to the other lane's address: the pointer keeps its     */ \
+    /* provenance (a generic address of shared memory stays in the shared window for the AIR lowering) */ \
+    MX_INL const uint8_t SPACE *mx_addr_##SNAME(const uint8_t SPACE *p, PTRBITS a, int lane)                \
     {                                                                                                       \
-        if (sizeof(PTRBITS) == 8) return (const uint8_t SPACE *)(uintptr_t)mx_shfl64((uint64_t)a, lane);   \
-        return (const uint8_t SPACE *)(uintptr_t)mx_shfl((uint32_t)a, lane);                               \
+        if (sizeof(PTRBITS) == 8) return p + (int64_t)(mx_shfl64((uint64_t)a, lane) - (uint64_t)a);       \
+        return p + (int32_t)(mx_shfl((uint32_t)a, lane) - (uint32_t)a);                                    \
     }                                                                                                       \
     MX_INL mx_u32x8 mx_ldmatrix_##SNAME(const uint8_t SPACE *p, uint32_t ctl)                               \
     {                                                                                                       \
@@ -955,7 +957,7 @@ extern "C++"
                 {                                                                                           \
                     int src = tr ? 8 * i + 2 * (l & 3) + h : 8 * i + (l >> 2);                              \
                     int off = tr ? 2 * (l >> 2) : 2 * (2 * (l & 3) + h);                                    \
-                    const uint8_t SPACE *q = mx_addr_##SNAME(me, src) + off;                                \
+                    const uint8_t SPACE *q = mx_addr_##SNAME(p, me, src) + off;                                \
                     v |= ((uint32_t)q[0] | ((uint32_t)q[1] << 8)) << (16 * h);                              \
                 }                                                                                           \
                 d = mx_put8(d, i, v);                                                                       \
@@ -965,7 +967,7 @@ extern "C++"
         {                                                                                                   \
             for (int i = 0; i < n; i++)                                                                     \
             {                                                                                               \
-                const uint8_t SPACE *row = mx_addr_##SNAME(me, 8 * i + (l >> 2));                           \
+                const uint8_t SPACE *row = mx_addr_##SNAME(p, me, 8 * i + (l >> 2));                           \
                 uint32_t v = 0;                                                                             \
                 for (int j = 0; j < 4; j++) v |= mx_ldmEl_##SNAME(row, f, 4 * (l & 3) + j) << (8 * j);      \
                 d = mx_put8(d, i, v);                                                                       \
@@ -978,7 +980,7 @@ extern "C++"
                 uint32_t v0 = 0, v1 = 0;                                                                    \
                 for (int j = 0; j < 4; j++)                                                                 \
                 {                                                                                           \
-                    const uint8_t SPACE *row = mx_addr_##SNAME(me, 16 * i + 4 * (l & 3) + j);               \
+                    const uint8_t SPACE *row = mx_addr_##SNAME(p, me, 16 * i + 4 * (l & 3) + j);               \
                     v0 |= mx_ldmEl_##SNAME(row, f, l >> 2) << (8 * j);                                      \
                     v1 |= mx_ldmEl_##SNAME(row, f, (l >> 2) + 8) << (8 * j);                                \
                 }                                                                                           \

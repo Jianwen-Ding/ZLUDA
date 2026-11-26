@@ -167,6 +167,35 @@ pub(super) fn lower<'i>(_opcode: &str, base: &str, m: &[&str], ops: &[HOp<'i>]) 
                 .imm(kind | ((c.neg as u64) << 4))
                 .build()
         }
+        // ld{.ss}.type.proxy::readonly d, [a];  (PTX ISA 9.4: a hint without effect on the result)
+        "ld" if m.contains(&"proxy::readonly") => {
+            let [d, a] = ops else { return err("ld operands") };
+            if !a.addr {
+                return err("ld address");
+            }
+            let t = m.iter().rev().find_map(|x| scalar(x))?;
+            let ss = if m.contains(&"global") {
+                StateSpace::Global
+            } else if m.contains(&"shared") || m.contains(&"shared::cta") {
+                StateSpace::Shared
+            } else if m.contains(&"local") {
+                StateSpace::Local
+            } else if m.contains(&"const") {
+                StateSpace::Const
+            } else {
+                StateSpace::Generic
+            };
+            Some(Ok(ast::Instruction::Ld {
+                data: ast::LdDetails {
+                    qualifier: ast::LdStQualifier::Weak,
+                    state_space: ss,
+                    caching: ast::LdCacheOperator::Cached,
+                    typ: ast::Type::Scalar(t),
+                    non_coherent: false,
+                },
+                arguments: ast::LdArgs { dst: d.op.clone(), src: a.op.clone() },
+            }))
+        }
         "mov" => {
             if let Some(mut v) = mov_sreg_members(m, ops) {
                 return Some(Ok(v.remove(0)));

@@ -2162,12 +2162,6 @@ extern "C" int zluda_air_lower(const ZludaAirInput *input, ZludaAirOutput *outpu
         LLVMContext ctx;
         g_portable_air = input->portable_air != 0;
         std::unique_ptr<Module> main = parse(ctx, input->main_bc, input->main_len, "main");
-        // a PTX function body may end without ret (falling off the end returns)
-        for (Function &f : *main)
-            if (f.getReturnType()->isVoidTy())
-                for (BasicBlock &bb : f)
-                    if (!bb.getTerminator())
-                        ReturnInst::Create(ctx, &bb);
         if (getenv("ZLUDA_AIR_DEBUG_INPUT"))
             main->print(errs(), nullptr);
         if (input->attributes_bc)

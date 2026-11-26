@@ -335,29 +335,30 @@ def gemm(name, ta, tb, tc, tacc):
 BIG = "1073741824"  # static size of the pointer arguments a reinterpret_cast reads (bare pointers: the size is not used)
 
 
-def gemm_mma(name, ta):
+def gemm_mma(name, ta, rb=2, qb=2):
     """The SIMD-group matrix GEMM (air.simdgroup_matrix_*, AGX's 8 x 8 matrix multiply): C (f32) = alpha op(A)
-    op(B) + beta C for m, n multiples of 16 and k of 8 (src/blas.rs chooses it). One SIMD group (the threadgroup)
-    computes a 16 x 16 tile of C as four 8 x 8 accumulators over k in steps of 8. Matrices cannot be scaled
-    elementwise, so alpha and beta are products with alpha I and beta I (`diag`: a 16 x 8 f32 buffer, rows 0-7
-    alpha I, rows 8-15 beta I); C is not read when beta is 0."""
+    op(B) + beta C for m a multiple of 8 rb, n of 8 qb and k of 8 (src/blas.rs chooses it). One SIMD group (the
+    threadgroup) computes an 8 rb x 8 qb tile of C as rb x qb 8 x 8 accumulators over k in steps of 8. Matrices
+    cannot be scaled elementwise, so alpha and beta are products with alpha I and beta I (`diag`: a 16 x 8 f32
+    buffer, rows 0-7 alpha I, rows 8-15 beta I); C is not read when beta is 0."""
     mt = "memref<?x?x{t}, strided<[?, ?], offset: ?>, 1>"
     am, cm = mt.format(t=ta), mt.format(t="f32")
     dm = "memref<16x8xf32, strided<[8, 1]>, 1>"
     v = "vector<64x%s>" % ta
+    mmt = v + ", vector<64xf32>" if ta != "f32" else "vector<64xf32>"
+    f = "vector<64xf32>"
     w = []
     w.append("""    gpu.func @{n}(%m: i32, %n: i32, %k: i32, %diag: memref<128xf32, 1>, %a: memref<{big}x{ta}, 1>, %ao: i32, %ars: i32, %acs: i32, %sa: i32, %b: memref<{big}x{ta}, 1>, %bo: i32, %brs: i32, %bcs: i32, %sb: i32, %bnz: i32, %c: memref<{big}xf32, 1>, %co: i32, %ldc: i32, %sc: i32) kernel {{
       %bx = gpu.block_id x
       %by = gpu.block_id y
       %bz = gpu.block_id z
       %c8 = arith.constant 8 : index
-      %c16 = arith.constant 16 : index
       %c0 = arith.constant 0 : index
       %c1 = arith.constant 1 : index
-      %i0 = arith.muli %bx, %c16 : index
-      %i1 = arith.addi %i0, %c8 : index
-      %j0 = arith.muli %by, %c16 : index
-      %j1 = arith.addi %j0, %c8 : index
+      %th = arith.constant {th} : index
+      %tw = arith.constant {tw} : index
+      %i0 = arith.muli %bx, %th : index
+      %j0 = arith.muli %by, %tw : index
       %bzi = arith.index_cast %bz : index to i32
       %mi = arith.index_cast %m : i32 to index
       %ni = arith.index_cast %n : i32 to index
@@ -381,35 +382,38 @@ def gemm_mma(name, ta):
       %C = memref.reinterpret_cast %c to offset: [%cbi], sizes: [%mi, %ni], strides: [%c1, %ldci] : memref<{big}xf32, 1> to {cm}
       %D = memref.reinterpret_cast %diag to offset: [0], sizes: [16, 8], strides: [8, 1] : memref<128xf32, 1> to {dm}
       %zf = arith.constant 0.0 : f32
-      %z = air.simdgroup_matrix_fill %zf : vector<64xf32>
-      %r:4 = scf.for %l = %c0 to %ki step %c8 iter_args(%s00 = %z, %s01 = %z, %s10 = %z, %s11 = %z) -> (vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>) {{
-        %a0 = air.simdgroup_matrix_load %A[%i0, %l] : {am} -> {v}
-        %a1 = air.simdgroup_matrix_load %A[%i1, %l] : {am} -> {v}
-        %b0 = air.simdgroup_matrix_load %B[%l, %j0] : {am} -> {v}
-        %b1 = air.simdgroup_matrix_load %B[%l, %j1] : {am} -> {v}
-        %n00 = air.simdgroup_matrix_multiply_accumulate %a0, %b0, %s00 : {mmt}
-        %n01 = air.simdgroup_matrix_multiply_accumulate %a0, %b1, %s01 : {mmt}
-        %n10 = air.simdgroup_matrix_multiply_accumulate %a1, %b0, %s10 : {mmt}
-        %n11 = air.simdgroup_matrix_multiply_accumulate %a1, %b1, %s11 : {mmt}
-        scf.yield %n00, %n01, %n10, %n11 : vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>
-      }}
-      %da = air.simdgroup_matrix_load %D[%c0, %c0] : {dm} -> vector<64xf32>
-      %db = air.simdgroup_matrix_load %D[%c8, %c0] : {dm} -> vector<64xf32>
+      %z = air.simdgroup_matrix_fill %zf : {f}""".format(n=name, ta=ta, big=BIG, am=am, cm=cm, dm=dm, f=f,
+                                                         th=8 * rb, tw=8 * qb))
+    for r in range(rb):
+        w.append("      %%ro%d = arith.constant %d : index\n      %%i%d = arith.addi %%i0, %%ro%d : index" % (r, 8 * r, r + 1, r) if r else "      %i1 = arith.addi %i0, %c0 : index")
+    for q in range(qb):
+        w.append("      %%qo%d = arith.constant %d : index\n      %%j%d = arith.addi %%j0, %%qo%d : index" % (q, 8 * q, q + 1, q) if q else "      %j1 = arith.addi %j0, %c0 : index")
+    tiles = [(r, q) for r in range(rb) for q in range(qb)]
+    w.append("      %%r:%d = scf.for %%l = %%c0 to %%ki step %%c8 iter_args(%s) -> (%s) {" % (
+        len(tiles), ", ".join("%%s%d_%d = %%z" % t for t in tiles), ", ".join([f] * len(tiles))))
+    for r in range(rb):
+        w.append("        %%a%d = air.simdgroup_matrix_load %%A[%%i%d, %%l] : %s -> %s" % (r, r + 1, am, v))
+    for q in range(qb):
+        w.append("        %%b%d = air.simdgroup_matrix_load %%B[%%l, %%j%d] : %s -> %s" % (q, q + 1, am, v))
+    for r, q in tiles:
+        w.append("        %%n%d_%d = air.simdgroup_matrix_multiply_accumulate %%a%d, %%b%d, %%s%d_%d : %s" % (r, q, r, q, r, q, mmt))
+    w.append("        scf.yield %s : %s\n      }" % (", ".join("%%n%d_%d" % t for t in tiles), ", ".join([f] * len(tiles))))
+    w.append("""      %da = air.simdgroup_matrix_load %D[%c0, %c0] : {dm} -> {f}
+      %db = air.simdgroup_matrix_load %D[%c8, %c0] : {dm} -> {f}
       %c0i = arith.constant 0 : i32
-      %withc = arith.cmpi ne, %bnz, %c0i : i32""".format(n=name, ta=ta, big=BIG, am=am, cm=cm, dm=dm, v=v,
-                                                        mmt=v + ", vector<64xf32>" if ta != "f32" else "vector<64xf32>"))
-    tiles = [("00", "i0", "j0", 0), ("01", "i0", "j1", 1), ("10", "i1", "j0", 2), ("11", "i1", "j1", 3)]
+      %withc = arith.cmpi ne, %bnz, %c0i : i32""".format(dm=dm, f=f))
     for withc in (True, False):
         w.append("      scf.if %withc {" if withc else "      } else {")
-        for t, i, j, idx in tiles:
+        for idx, (r, q) in enumerate(tiles):
+            t = "%d_%d" % (r, q)
             sfx = "c" if withc else "n"
-            w.append("        %%x%s%s = air.simdgroup_matrix_multiply_accumulate %%r#%d, %%da, %%z : vector<64xf32>" % (t, sfx, idx))
+            w.append("        %%x%s%s = air.simdgroup_matrix_multiply_accumulate %%r#%d, %%da, %%z : %s" % (t, sfx, idx, f))
             if withc:
-                w.append("        %%o%s = air.simdgroup_matrix_load %%C[%%%s, %%%s] : %s -> vector<64xf32>" % (t, i, j, cm))
-                w.append("        %%y%s = air.simdgroup_matrix_multiply_accumulate %%o%s, %%db, %%x%sc : vector<64xf32>" % (t, t, t))
-                w.append("        air.simdgroup_matrix_store %%y%s, %%C[%%%s, %%%s] : vector<64xf32> -> %s" % (t, i, j, cm))
+                w.append("        %%o%s = air.simdgroup_matrix_load %%C[%%i%d, %%j%d] : %s -> %s" % (t, r + 1, q + 1, cm, f))
+                w.append("        %%y%s = air.simdgroup_matrix_multiply_accumulate %%o%s, %%db, %%x%sc : %s" % (t, t, t, f))
+                w.append("        air.simdgroup_matrix_store %%y%s, %%C[%%i%d, %%j%d] : %s -> %s" % (t, r + 1, q + 1, f, cm))
             else:
-                w.append("        air.simdgroup_matrix_store %%x%sn, %%C[%%%s, %%%s] : vector<64xf32> -> %s" % (t, i, j, cm))
+                w.append("        air.simdgroup_matrix_store %%x%sn, %%C[%%i%d, %%j%d] : %s -> %s" % (t, r + 1, q + 1, f, cm))
     w.append("      }\n      gpu.return\n    }\n")
     return "\n".join(w)
 
@@ -426,6 +430,7 @@ def main():
             out.append(gemm("gemm_%s_%s" % (a, c), a, a, c, "f32"))
     for a in ("f32", "f16", "bf16"):
         out.append(gemm_mma("gemm_mma_%s" % a, a))
+        out.append(gemm_mma("gemm_mma32_%s" % a, a, 4, 4))
     out.append(ftr())
     print("".join(out))
 

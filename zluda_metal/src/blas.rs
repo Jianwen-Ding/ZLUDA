@@ -375,7 +375,19 @@ unsafe fn gemm_launch(name: &str, ta: c_int, tb: c_int, m: c_int, n: c_int, k: c
         let d = Tmp::new(512)?;
         let (p, _) = agx::host_pointer(d.0).ok_or(CUBLAS_STATUS_INTERNAL_ERROR)?;
         std::ptr::copy_nonoverlapping(diag.as_ptr() as *const u8, p, 512);
-        return launch(mk, [m as u32 / 16, n as u32 / 16, batch as u32], [32, 1, 1], &[
+        // 32 x 32 tiles (twice the reuse of each loaded block) where they divide C and still give at least 256
+        // SIMD groups (simulated M2 Max: 256^3 17.3 us with 16 x 16 tiles, 22.3 us with 32 x 32; 512^3 60.1 us /
+        // 46.4 us), else 16 x 16; ZLUDA_BLAS_MMA_TILE=16 / 32 overrides
+        let fits32 = m % 32 == 0 && n % 32 == 0;
+        let tile = match std::env::var("ZLUDA_BLAS_MMA_TILE").as_deref() {
+            Ok("16") => 16,
+            Ok("32") if fits32 => 32,
+            Ok(_) => 16,
+            Err(_) if fits32 && (m as i64 / 32) * (n as i64 / 32) * batch as i64 >= 256 => 32,
+            Err(_) => 16,
+        };
+        let mk = if tile == 32 { mk.replace("gemm_mma_", "gemm_mma32_") } else { mk.to_string() };
+        return launch(&mk, [(m / tile) as u32, (n / tile) as u32, batch as u32], [32, 1, 1], &[
             i32v(m), i32v(n), i32v(k), Arg::Addr(d.0), Arg::Addr(a), i32v(0), i32v(ars), i32v(acs), i32v(sa as i32),
             Arg::Addr(b), i32v(0), i32v(brs), i32v(bcs), i32v(sb as i32), i32v((be != 0.0) as i32), Arg::Addr(c),
             i32v(0), i32v(ldc), i32v(sc as i32),

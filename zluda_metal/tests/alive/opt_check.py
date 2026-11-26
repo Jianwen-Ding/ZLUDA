@@ -3,7 +3,8 @@
 
 For each PTX program (PTX-formalization's harness programs: the module part only), ZLUDA compiles it to portable
 AIR (ptx2metallib, ZLUDA_PORTABLE_AIR=1); llvm-air2agx lowers the AIR to AGX IR at -O0 (agx-lower-air alone) and
--O3 (the whole optimization pipeline); alive-tv checks that every kernel at -O3 refines the same kernel at -O0.
+-O3 (the whole optimization pipeline); alive-tv checks that every kernel at -O3 refines the same kernel at -O0, or
+with --src air that it refines ZLUDA's AIR itself (alive2's GPU semantics gives AIR and AGX IR one meaning).
 
   opt_check.py [--alive-tv PATH] [--air2agx PATH] [--ptx2metallib PATH] [--timeout S] [-j N] [--json OUT]
                [--exact] FILE_OR_DIR...
@@ -52,7 +53,9 @@ def check_program(path, a):
         open(ptx, "w").write(module)
         lib = os.path.join(t, "m.metallib")
         env = dict(os.environ, ZLUDA_PORTABLE_AIR="1")
-        r = subprocess.run([a.ptx2metallib, ptx, "-o", lib], capture_output=True, text=True, env=env, timeout=600)
+        air_dir = os.path.join(t, "air")
+        r = subprocess.run([a.ptx2metallib, ptx, "-o", lib, "--emit-air", air_dir], capture_output=True, text=True,
+                           env=env, timeout=600)
         if r.returncode:
             return [{"program": path, "kernel": "*", "status": "skip", "detail": "front end: " + r.stderr[-200:]}]
         ll = {}
@@ -71,11 +74,21 @@ def check_program(path, a):
                 text = re.sub(r"\bmemory\([^)]*\)", "", text)
                 ll[lvl][f] = text
                 open(os.path.join(d, f), "w").write(text)
+        if a.src == "air":
+            # ZLUDA's AIR itself (alive2's GPU semantics compares AIR with AGX IR): agx-lower-air and the
+            # optimizer together
+            dis = os.path.join(os.path.dirname(a.air2agx), "llvm-dis")
+            for f in ll["3"]:
+                ks = kernels_of(ll["3"][f])
+                for k in ks:
+                    air = os.path.join(air_dir, k + ".air")
+                    if os.path.exists(air):
+                        subprocess.run([dis, air, "-o", os.path.join(t, "O0", f)], check=True)
         for f in ll["0"]:
             src, tgt = os.path.join(t, "O0", f), os.path.join(t, "O3", f)
             if f not in ll["3"]:
                 continue
-            for k in kernels_of(ll["0"][f]):
+            for k in kernels_of(ll["3"][f] if a.src == "air" else ll["0"][f]):
                 cmd = [a.alive_tv, "--smt-to=%d" % (a.timeout * 1000), "--src-fn=" + k, "--tgt-fn=" + k, src, tgt]
                 if not a.exact:
                     cmd.insert(1, "--fp-uf")
@@ -118,6 +131,8 @@ def main():
     ap.add_argument("-j", type=int, default=2)
     ap.add_argument("-k", action="append")
     ap.add_argument("--exact", action="store_true")
+    ap.add_argument("--src", choices=["o0", "air"], default="o0",
+                    help="the source: AGX IR at -O0 (checks the optimizer) or ZLUDA's AIR (agx-lower-air too)")
     ap.add_argument("--keep", help="directory for the IR and alive2 output of INCORRECT kernels")
     ap.add_argument("--json")
     a = ap.parse_args()

@@ -1052,3 +1052,4 @@
     ATOMV_IMPL(2, f, )
     ATOMV_IMPL(4, f, )
     ATOMV_IMPL(8, f, )
+    uint64_t FUNC(mem_zero64)() { return 0; }

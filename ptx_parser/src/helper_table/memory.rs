@@ -571,6 +571,39 @@ pub(super) fn lower<'i>(opcode: &str, base: &str, m: &[&str], ops: &[HOp<'i>]) -
         "cp" => cp(m, ops),
         "tensormap" => tensormap(m, ops),
         "atom" | "red" => atom_red(base, m, ops),
+        // cache control: no effect on the results (discard "behaves like a weak write of an unstable indeterminate
+        // value": the model leaves memory as it is)
+        "prefetch" | "prefetchu" | "discard" | "applypriority" => Call::new("mem_nop").build(),
+        // createpolicy: the model's cache policy is 0
+        "createpolicy" => {
+            let Some(d) = ops.first() else { return err("createpolicy operands") };
+            Call::new("mem_zero64").dst(d.op.clone(), ScalarType::B64).build()
+        }
+        // ldu: ld (the model executes it as ld)
+        "ldu" => {
+            let [d, a] = ops else { return err("ldu operands") };
+            let Some(a) = addr(a) else { return err("ldu address") };
+            let t = m.iter().rev().find_map(|x| scalar(x))?;
+            let vec = m.iter().find_map(|x| match *x {
+                "v2" => Some(2u8),
+                "v4" => Some(4),
+                _ => None,
+            });
+            let space = if has(m, "global") { StateSpace::Global } else { StateSpace::Generic };
+            Some(Ok(ast::Instruction::Ld {
+                data: ast::LdDetails {
+                    qualifier: ast::LdStQualifier::Weak,
+                    state_space: space,
+                    caching: ast::LdCacheOperator::Cached,
+                    typ: match vec {
+                        Some(n) => ast::Type::Vector(n, t),
+                        None => ast::Type::Scalar(t),
+                    },
+                    non_coherent: false,
+                },
+                arguments: ast::LdArgs { dst: d.op.clone(), src: a },
+            }))
+        }
         // fence.proxy.* (asynchronous operations complete at issue), and the fence forms the grammar lacks: a
         // SIMD group runs until a barrier, so no reordering is observable
         "fence" if ops.len() <= 2 => Call::new("mem_fence").build(),

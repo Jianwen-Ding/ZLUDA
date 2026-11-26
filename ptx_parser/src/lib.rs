@@ -2310,7 +2310,7 @@ derive_parser!(
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-st
     st{.weak}{.ss}{.cop}{.level::eviction_priority}{.level::cache_hint}{.vec}.type  [a], b{, cache_policy} => {
         if level_eviction_priority.is_some() || level_cache_hint || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("st instruction with cache policy/eviction priority/cache hints".to_string()));
+            // (st instruction with cache policy/eviction priority/cache hints): cache hints, eviction priorities and MMIO do not change the result; ignored
         }
         Instruction::St {
             data: StData {
@@ -2335,7 +2335,7 @@ derive_parser!(
     }
     st.relaxed.scope{.ss}{.level::eviction_priority}{.level::cache_hint}{.vec}.type [a], b{, cache_policy} => {
         if level_eviction_priority.is_some() || level_cache_hint || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("st.relaxed instruction with cache policy/eviction priority/cache hints".to_string()));
+            // (st.relaxed instruction with cache policy/eviction priority/cache hints): cache hints, eviction priorities and MMIO do not change the result; ignored
         }
         Instruction::St {
             data: StData {
@@ -2349,7 +2349,7 @@ derive_parser!(
     }
     st.release.scope{.ss}{.level::eviction_priority}{.level::cache_hint}{.vec}.type [a], b{, cache_policy} => {
         if level_eviction_priority.is_some() || level_cache_hint || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("st.release instruction with cache policy/eviction priority/cache hints".to_string()));
+            // (st.release instruction with cache policy/eviction priority/cache hints): cache hints, eviction priorities and MMIO do not change the result; ignored
         }
         Instruction::St {
             data: StData {
@@ -2362,7 +2362,7 @@ derive_parser!(
         }
     }
     st.mmio.relaxed.sys{.global}.type                                               [a], b => {
-        state.errors.push(PtxError::Todo("st.mmio.relaxed.sys instruction (MMIO store operations)".to_string()));
+        // (st.mmio.relaxed.sys instruction (MMIO store operations)): cache hints, eviction priorities and MMIO do not change the result; ignored
         Instruction::St {
             data: ast::StData {
                 qualifier: ast::LdStQualifier::Relaxed(MemScope::Sys),
@@ -2391,7 +2391,7 @@ derive_parser!(
     ld{.weak}{.ss}{.cop}{.level::eviction_priority}{.level::cache_hint}{.level::prefetch_size}{.vec}.type   d, [a]{.unified}{, cache_policy} => {
         let (a, unified) = a;
         if level_eviction_priority.is_some() || level_cache_hint || level_prefetch_size.is_some() || unified || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("ld instruction with cache policy/eviction priority/cache hints/prefetch size".to_string()));
+            // (ld instruction with cache policy/eviction priority/cache hints/prefetch size): cache hints, eviction priorities and MMIO do not change the result; ignored
         }
         Instruction::Ld {
             data: LdDetails {
@@ -2406,7 +2406,7 @@ derive_parser!(
     }
     ld.volatile{.ss}{.level::prefetch_size}{.vec}.type                                                      d, [a] => {
         if level_prefetch_size.is_some() {
-            state.errors.push(PtxError::Todo("ld.volatile instruction with prefetch size".to_string()));
+            // (ld.volatile instruction with prefetch size): cache hints, eviction priorities and MMIO do not change the result; ignored
         }
         Instruction::Ld {
             data: LdDetails {
@@ -2421,7 +2421,7 @@ derive_parser!(
     }
     ld.relaxed.scope{.ss}{.level::eviction_priority}{.level::cache_hint}{.level::prefetch_size}{.vec}.type  d, [a]{, cache_policy} => {
         if level_eviction_priority.is_some() || level_cache_hint || level_prefetch_size.is_some() || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("ld.relaxed instruction with cache policy/eviction priority/cache hints/prefetch size".to_string()));
+            // (ld.relaxed instruction with cache policy/eviction priority/cache hints/prefetch size): cache hints, eviction priorities and MMIO do not change the result; ignored
         }
         Instruction::Ld {
             data: LdDetails {
@@ -2436,7 +2436,7 @@ derive_parser!(
     }
     ld.acquire.scope{.ss}{.level::eviction_priority}{.level::cache_hint}{.level::prefetch_size}{.vec}.type  d, [a]{, cache_policy} => {
         if level_eviction_priority.is_some() || level_cache_hint || level_prefetch_size.is_some() || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("ld.acquire instruction with cache policy/eviction priority/cache hints/prefetch size".to_string()));
+            // (ld.acquire instruction with cache policy/eviction priority/cache hints/prefetch size): cache hints, eviction priorities and MMIO do not change the result; ignored
         }
         Instruction::Ld {
             data: LdDetails {
@@ -2450,7 +2450,7 @@ derive_parser!(
         }
     }
     ld.mmio.relaxed.sys{.global}.type                                                                       d, [a] => {
-        state.errors.push(PtxError::Todo("ld.mmio.relaxed.sys instruction (MMIO load operations)".to_string()));
+        // (ld.mmio.relaxed.sys instruction (MMIO load operations)): cache hints, eviction priorities and MMIO do not change the result; ignored
         Instruction::Ld {
             data: LdDetails {
                 qualifier: ast::LdStQualifier::Relaxed(MemScope::Sys),
@@ -2485,7 +2485,7 @@ derive_parser!(
             }
         }
         if level_eviction_priority.is_some() || level_cache_hint || level_prefetch_size.is_some() || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("ld.global.nc instruction with cache policy/eviction priority/cache hints/prefetch size".to_string()));
+            // (ld.global.nc instruction with cache policy/eviction priority/cache hints/prefetch size): cache hints, eviction priorities and MMIO do not change the result; ignored
         }
         Instruction::Ld {
             data: LdDetails {
@@ -2504,7 +2504,7 @@ derive_parser!(
                                               .L1::evict_first, .L1::evict_last, .L1::no_allocate};
     .level::cache_hint =                    { .L2::cache_hint };
     .level::prefetch_size: PrefetchSize =   { .L2::64B, .L2::128B, .L2::256B };
-    .vec: VectorPrefix  =                   { .v2, .v4 };
+    .vec: VectorPrefix  =                   { .v2, .v4, .v8 };
     .type: ScalarType =                     { .b8, .b16, .b32, .b64, .b128,
                                               .u8, .u16, .u32, .u64,
                                               .s8, .s16, .s32, .s64,
@@ -4428,10 +4428,11 @@ derive_parser!(
     .type: ScalarType = { .f32, .f64 };
 
     prefetch{.space}.level [a] => {
-        let space = space.unwrap_or(StateSpace::Generic);
-        ast::Instruction::Prefetch {
-            data: PrefetchData { space, level, },
-            arguments: PrefetchArgs { src: a }
+        // a cache hint without effect on the results: a no-op helper (helper_table/memory.rs)
+        let _ = (space, level, a);
+        ast::Instruction::Helper {
+            data: ast::HelperData::new("mem_nop"),
+            arguments: ast::HelperArgs { dst: None, dst2: None, src1: None, src2: None, src3: None, src4: None, src5: None, src6: None },
         }
     }
 

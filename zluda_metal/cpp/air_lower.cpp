@@ -1644,6 +1644,10 @@ bool lowerIntrinsic(CallInst *ci)
         fail("unsupported AMDGPU intrinsic in Metal backend: " + name);
     }
     // Newer LLVM intrinsics the emitter may name that LLVM 18 does not know
+    // portable AIR: llvm-air2agx implements minimumnum / maximumnum exactly (-0 < +0, NaN ignored,
+    // subnormals with !agx.keep-denormals)
+    if (g_portable_air && (name.starts_with("llvm.minimumnum.") || name.starts_with("llvm.maximumnum.")))
+        return false;
     if (name.starts_with("llvm.minimumnum."))
         return airMath("fmin", 2);
     if (name.starts_with("llvm.maximumnum."))
@@ -2223,8 +2227,9 @@ static bool isF32Op(Instruction &i)
     if (auto *ci = dyn_cast<CallInst>(&i))
         if (Function *f = ci->getCalledFunction())
         {
-            if (f->getName().starts_with("air."))
-                return true; // AIR math (air.sqrt.f32, air.fma.f32, ...)
+            if (f->getName().starts_with("air.") || f->getName().starts_with("llvm.minimumnum.") ||
+                f->getName().starts_with("llvm.maximumnum."))
+                return true; // AIR math (air.sqrt.f32, air.fma.f32, ...), intrinsics LLVM 18 does not know
             switch (f->getIntrinsicID())
             {
             case Intrinsic::fma:

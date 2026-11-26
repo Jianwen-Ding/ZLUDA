@@ -1053,3 +1053,6 @@
     ATOMV_IMPL(4, f, )
     ATOMV_IMPL(8, f, )
     uint64_t FUNC(mem_zero64)() { return 0; }
+    unsigned __int128 FUNC(mov_b128_pack)(uint64_t lo, uint64_t hi) { return ((unsigned __int128)hi << 64) | lo; }
+    typedef uint64_t U64x2 __attribute__((ext_vector_type(2)));
+    U64x2 FUNC(mov_b128_unpack)(unsigned __int128 q) { return U64x2{(uint64_t)q, (uint64_t)(q >> 64)}; }

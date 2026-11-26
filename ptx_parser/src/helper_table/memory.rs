@@ -580,6 +580,34 @@ pub(super) fn lower<'i>(opcode: &str, base: &str, m: &[&str], ops: &[HOp<'i>]) -
             Call::new("mem_zero64").dst(d.op.clone(), ScalarType::B64).build()
         }
         // ldu: ld (the model executes it as ld)
+        // mov.b128 q, {lo, hi};  mov.b128 {lo, hi}, q;
+        "mov" if m == ["b128"] => {
+            let [d, a] = ops else { return err("mov.b128 operands") };
+            let pair = |o: &Op<'i>| match o {
+                ast::ParsedOperand::VecPack(v) if v.len() == 2 => match (&v[0], &v[1]) {
+                    (Some(ast::RegOrImmediate::Reg(x)), Some(ast::RegOrImmediate::Reg(y))) => {
+                        Some((ast::ParsedOperand::Reg(*x), ast::ParsedOperand::Reg(*y)))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some((lo, hi)) = pair(&a.op) {
+                return Call::new("mov_b128_pack")
+                    .dst(d.op.clone(), ScalarType::B128)
+                    .src(lo, ScalarType::B64)
+                    .src(hi, ScalarType::B64)
+                    .build();
+            }
+            if let Some((lo, hi)) = pair(&d.op) {
+                return Call::new("mov_b128_unpack")
+                    .dst(lo, ScalarType::B64)
+                    .dst2(hi, ScalarType::B64)
+                    .src(a.op.clone(), ScalarType::B128)
+                    .build();
+            }
+            err("mov.b128 form")
+        }
         "ldu" => {
             let [d, a] = ops else { return err("ldu operands") };
             let Some(a) = addr(a) else { return err("ldu address") };

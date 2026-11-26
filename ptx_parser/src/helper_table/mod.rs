@@ -13,6 +13,8 @@ mod memory;
 mod misc;
 mod video;
 
+pub(crate) use memory::cp_async;
+
 pub(crate) type Op<'i> = ast::ParsedOperand<&'i str>;
 pub(crate) type R<'i> = Option<Result<ast::Instruction<ParsedOperandStr<'i>>, String>>;
 

@@ -109,38 +109,101 @@ fn mbarrier<'i>(m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
         let (st_ty, p) = if has(m, "parity") { (ScalarType::B32, "p") } else { (ScalarType::B64, "") };
         // d, [a], state{, suspendTimeHint}  or  d, reportPredicate, [a], state{, hint} (.phase_type::primary)
         let ai = ops.iter().position(|o| o.addr);
-        match ai {
-            Some(1) => {
-                let s = ops.get(2)?;
-                let Some(a) = addr(&ops[1]) else { return err("mbarrier wait address") };
-                return Call::new(format!("mbar_wait{p}{sfx}"))
-                    .dst(ops[0].op.clone(), ScalarType::Pred)
-                    .src_space(a, ScalarType::B64, sp)
-                    .src(s.op.clone(), st_ty)
-                    .imm(ctrl)
-                    .build();
-            }
-            Some(2) => {
-                let s = ops.get(3)?;
-                let Some(a) = addr(&ops[2]) else { return err("mbarrier wait address") };
-                return Call::new(format!("mbar_wait2{p}{sfx}"))
-                    .dst(ops[0].op.clone(), ScalarType::Pred)
-                    .dst2(ops[1].op.clone(), ScalarType::Pred)
-                    .src_space(a, ScalarType::B64, sp)
-                    .src(s.op.clone(), st_ty)
-                    .imm(ctrl)
-                    .build();
-            }
-            _ => return err("mbarrier wait operands"),
+        // reportValue (the operand before the address in the 4-operand form) is always 0 in the model; it is
+        // not written here (one helper call has at most two destinations)
+        let Some(ai) = ai else { return err("mbarrier wait operands") };
+        if ai != 1 && ai != 2 {
+            return err("mbarrier wait operands");
         }
+        let s = ops.get(ai + 1)?;
+        let Some(a) = addr(&ops[ai]) else { return err("mbarrier wait address") };
+        return match &ops[0].pair {
+            None => Call::new(format!("mbar_wait{p}{sfx}"))
+                .dst(ops[0].op.clone(), ScalarType::Pred)
+                .src_space(a, ScalarType::B64, sp)
+                .src(s.op.clone(), st_ty)
+                .imm(ctrl)
+                .build(),
+            Some(rp) => {
+                let c = if ops[0].sink { Call::new(format!("mbar_wait2{p}{sfx}")) } else {
+                    Call::new(format!("mbar_wait2{p}{sfx}")).dst(ops[0].op.clone(), ScalarType::Pred)
+                };
+                c.dst2(rp.clone(), ScalarType::Pred)
+                    .src_space(a, ScalarType::B64, sp)
+                    .src(s.op.clone(), st_ty)
+                    .imm(ctrl)
+                    .build()
+            }
+        };
     }
     err("mbarrier form")
+}
+
+/// cp.async.{ca,cg}.shared{::cta}.global [dst], [src], cp-size{, src-size | ignore-src}{, cache-policy} (from the
+/// grammar rule of lib.rs). With .L2::cache_hint a single optional operand is the cache policy.
+pub(crate) fn cp_async<'i>(
+    dst: Op<'i>,
+    src: Op<'i>,
+    cp_size: Op<'i>,
+    src_size: Option<Op<'i>>,
+    hint: bool,
+    cache_policy: Option<Op<'i>>,
+    pred: bool,
+) -> Result<ast::Instruction<ParsedOperandStr<'i>>, String> {
+    let n = match &cp_size {
+        ast::ParsedOperand::Imm(i) => i.as_u64().filter(|n| [4, 8, 16].contains(n)),
+        _ => None,
+    }
+    .ok_or_else(|| "cp.async cp-size".to_string())?;
+    let src_size = if hint && cache_policy.is_none() { None } else { src_size };
+    let c = match src_size {
+        Some(ss) if pred => Call::new("cp_async_ig")
+            .src_space(dst, ScalarType::B8, StateSpace::Shared)
+            .src_space(src, ScalarType::B8, StateSpace::Global)
+            .imm(n)
+            .src(ss, ScalarType::Pred),
+        Some(ss) => Call::new("cp_async")
+            .src_space(dst, ScalarType::B8, StateSpace::Shared)
+            .src_space(src, ScalarType::B8, StateSpace::Global)
+            .imm(n)
+            .src(ss, ScalarType::U32),
+        None => Call::new("cp_async")
+            .src_space(dst, ScalarType::B8, StateSpace::Shared)
+            .src_space(src, ScalarType::B8, StateSpace::Global)
+            .imm(n)
+            .imm(n),
+    };
+    c.build().unwrap()
+}
+
+fn cp<'i>(m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
+    if !has(m, "async") {
+        return None;
+    }
+    // cp.async.mbarrier.arrive{.noinc}{.shared{::cta}}.b64 [addr]: without .noinc the pending count is
+    // incremented, then the arrive-on of the (already complete) copies decrements it: no change
+    if has(m, "mbarrier") && has(m, "arrive") {
+        let [a] = ops else { return err("cp.async.mbarrier.arrive operands") };
+        let Some(a) = addr(a) else { return err("cp.async.mbarrier.arrive address") };
+        if !has(m, "noinc") {
+            return Call::new("mem_nop").build();
+        }
+        let sp = shared_or_generic(m);
+        return Call::new(format!("mbar_arrive_nd{}", suffix(sp)))
+            .src_space(a, ScalarType::B64, sp)
+            .imm(1)
+            .imm(0)
+            .imm(0)
+            .build();
+    }
+    None
 }
 
 #[allow(unused_variables)]
 pub(super) fn lower<'i>(opcode: &str, base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
     match base {
         "mbarrier" => mbarrier(m, ops),
+        "cp" => cp(m, ops),
         _ => None,
     }
 }

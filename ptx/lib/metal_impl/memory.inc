@@ -214,3 +214,19 @@
     MbWait FUNC(mbar_wait2_g)(uint64_t *a, uint64_t v, uint32_t c) { return __zluda_ptx_impl_mbar_wait2(MB_G(a), v, c); }
     MbWait FUNC(mbar_wait2p_g)(uint64_t *a, uint32_t v, uint32_t c) { return __zluda_ptx_impl_mbar_wait2(MB_G(a), v, c); }
     bool FUNC(mbar_check_layout_g)(uint64_t *a, uint32_t l) { return __zluda_ptx_impl_mbar_check_layout(MB_G(a), l); }
+
+    void FUNC(mem_nop)() {}
+
+    // ---------------------------------------------------------------- cp.async (completed at issue)
+    // cp-size bytes at dst: the first src-size bytes from src, then zeros (cpSrcN: min(src-size, cp-size))
+    void FUNC(cp_async)(SHARED_SPACE uint8_t *d, __attribute__((address_space(1))) uint8_t *s, uint32_t n, uint32_t k)
+    {
+        if (k > n)
+            k = n;
+        for (uint32_t i = 0; i < n; i++)
+            d[i] = i < k ? s[i] : 0;
+    }
+    void FUNC(cp_async_ig)(SHARED_SPACE uint8_t *d, __attribute__((address_space(1))) uint8_t *s, uint32_t n, bool ig)
+    {
+        __zluda_ptx_impl_cp_async(d, s, n, ig ? 0u : n);
+    }

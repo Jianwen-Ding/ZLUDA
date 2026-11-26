@@ -530,6 +530,12 @@ fn get_input_argument_type(
             Ok(unsafe { LLVMPointerTypeInContext(context, get_state_space(state_space)?) })
         }
         ast::StateSpace::Reg => get_type(context, v_type),
+        // pointer arguments of helper functions (ast::Instruction::Helper memory operands)
+        ast::StateSpace::Global | ast::StateSpace::Generic | ast::StateSpace::Local
+            if !matches!(v_type, ast::Type::Texref | ast::Type::Surfref) =>
+        {
+            Ok(unsafe { LLVMPointerTypeInContext(context, get_state_space(state_space)?) })
+        }
         ast::StateSpace::Global | ast::StateSpace::Const
             if matches!(v_type, ast::Type::Texref | ast::Type::Surfref) =>
         {

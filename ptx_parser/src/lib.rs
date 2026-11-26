@@ -113,6 +113,9 @@ struct PtxParserState<'a, 'input> {
     errors: &'a mut Vec<PtxError<'input>>,
     function_declarations:
         FxHashMap<&'input str, (Vec<(ast::Type, StateSpace)>, Vec<(ast::Type, StateSpace)>)>,
+    /// names of the `.reg .pred` variables declared so far (instructions whose operand may be a predicate or an
+    /// integer, such as cp.async's ignore-src / src-size)
+    pred_regs: rustc_hash::FxHashSet<&'input str>,
 }
 
 impl<'a, 'input> PtxParserState<'a, 'input> {
@@ -121,6 +124,25 @@ impl<'a, 'input> PtxParserState<'a, 'input> {
             text,
             errors,
             function_declarations: FxHashMap::default(),
+            pred_regs: Default::default(),
+        }
+    }
+
+    fn record_preds(&mut self, var: &MultiVariable<&'input str>) {
+        match var {
+            MultiVariable::List(items) => items.iter().for_each(|v| self.record_preds(v)),
+            MultiVariable::Names { info, names } => {
+                if info.v_type == ast::Type::Scalar(ScalarType::Pred) {
+                    self.pred_regs.extend(names.iter().copied());
+                }
+            }
+            MultiVariable::Parameterized { info, name, count } => {
+                if info.v_type == ast::Type::Scalar(ScalarType::Pred) {
+                    for i in 0..*count {
+                        self.pred_regs.insert(&*Box::leak(format!("{name}{i}").into_boxed_str()));
+                    }
+                }
+            }
         }
     }
 
@@ -878,9 +900,7 @@ fn statement<'a, 'input>(
             label.map(Some),
             debug_directive.map(|_| None),
             terminated(
-                method_space
-                    .flat_map(|space| multi_variable(false, space))
-                    .map(|var| Some(Statement::Variable(var))),
+                variable_statement,
                 Token::Semicolon,
             ),
             predicated_instruction.map(Some),
@@ -895,6 +915,16 @@ fn statement<'a, 'input>(
     )
     .map(Option::flatten)
     .parse_next(stream)
+}
+
+fn variable_statement<'a, 'input>(
+    stream: &mut PtxParser<'a, 'input>,
+) -> PResult<Option<Statement<ParsedOperandStr<'input>>>> {
+    let var = method_space
+        .flat_map(|space| multi_variable(false, space))
+        .parse_next(stream)?;
+    stream.state.record_preds(&var);
+    Ok(Some(Statement::Variable(var)))
 }
 
 fn take_till_end_of_statement<
@@ -4173,34 +4203,14 @@ derive_parser!(
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async
     cp.async.cop.space.global{.level::cache_hint}{.level::prefetch_size}
                              [dst], [src], cp-size{, src-size}{, cache-policy} => {
-        // TODO: handle cache hints and cache policies
-        let _ = level_cache_hint;
-        let _ = level_prefetch_size;
-        let _ = cache_policy;
-
-        let cp_size = cp_size
-            .as_immediate()
-            .and_then(|imm| imm.as_u64())
-            .and_then(|n| CpAsyncCpSize::from_u64(n))
-            .unwrap_or_else(|| {
-                state.errors.push(PtxError::SyntaxError(format!("invalid cp.async cp-size {} in {:?}", cp_size, state.text)));
-                CpAsyncCpSize::Bytes4
-            });
-
-        let src_size = src_size
-            .and_then(|op| op.as_immediate())
-            .and_then(|imm| imm.as_u64());
-
-        Instruction::CpAsync {
-            data: CpAsyncDetails {
-                caching: cop.into(),
-                space,
-                cp_size,
-                src_size,
-            },
-            arguments: CpAsyncArgs {
-                src_to: dst,
-                src_from: src,
+        // a helper (helper_table/memory.rs): src-size may be a register, or an ignore-src predicate
+        let _ = (level_prefetch_size, cop, space);
+        let pred = matches!(src_size, Some(ast::ParsedOperand::Reg(r)) if state.pred_regs.contains(r));
+        match crate::helper_table::cp_async(dst, src, cp_size, src_size, level_cache_hint, cache_policy, pred) {
+            Ok(i) => i,
+            Err(e) => {
+                state.errors.push(PtxError::Todo(e));
+                Instruction::CpAsyncCommitGroup {}
             }
         }
     }

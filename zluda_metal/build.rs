@@ -13,6 +13,7 @@ fn main() {
     // 1. The Metal flavour of the PTX helper library, compiled with upstream clang
     let impl_src = "../ptx/lib/zluda_ptx_metal_impl.cpp";
     println!("cargo:rerun-if-changed={impl_src}");
+    println!("cargo:rerun-if-changed=../ptx/lib/metal_impl");
     let impl_bc = out.join("zluda_ptx_metal_impl.bc");
     let status = Command::new(&clang)
         .args([

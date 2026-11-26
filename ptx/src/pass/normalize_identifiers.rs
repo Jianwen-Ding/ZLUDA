@@ -153,15 +153,66 @@ fn run_instruction<'input, 'b>(
     resolver: &mut ScopedResolver<'input, 'b>,
     instruction: ast::Instruction<ast::ParsedOperand<&'input str>>,
 ) -> Result<ast::Instruction<ast::ParsedOperand<SpirvWord>>, TranslateError> {
-    ast::visit_map(instruction, &mut |name: &'input str,
-                                      _: Option<(
-        &ast::Type,
-        ast::StateSpace,
-    )>,
-                                      _,
-                                      _| {
-        resolver.get(&name)
-    })
+    ast::visit_map(instruction, &mut ResolveOperands(resolver))
+}
+
+/// Resolves operand names. `%tid.x` where a scalar register named `%tid` shadows the special
+/// register (PTX-formalization's tests declare `.reg .b32 %tid`) names the special register.
+struct ResolveOperands<'r, 'input, 'b>(&'r mut ScopedResolver<'input, 'b>);
+
+impl<'r, 'input, 'b> ResolveOperands<'r, 'input, 'b> {
+    fn shadowed_sreg(&self, name: &str) -> Option<SpirvWord> {
+        if self.0.scopes.len() < 2 {
+            return None;
+        }
+        let inner = self
+            .0
+            .scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.name_to_ident.get(name).map(|id| (scope, *id)))?;
+        let outer = *self.0.scopes[0].name_to_ident.get(name)?;
+        if inner.1 == outer {
+            return None;
+        }
+        let inner_type = &inner.0.ident_map.get(&inner.1)?.type_space;
+        let outer_type = &self.0.scopes[0].ident_map.get(&outer)?.type_space;
+        match (inner_type, outer_type) {
+            (Some((ast::Type::Scalar(_), _)), Some((ast::Type::Vector(..), _))) => Some(outer),
+            _ => None,
+        }
+    }
+}
+
+impl<'r, 'input, 'b> ast::VisitorMap<ast::ParsedOperand<&'input str>, ast::ParsedOperand<SpirvWord>, TranslateError>
+    for ResolveOperands<'r, 'input, 'b>
+{
+    fn visit(
+        &mut self,
+        args: ast::ParsedOperand<&'input str>,
+        type_space: Option<(&ast::Type, ast::StateSpace)>,
+        is_dst: bool,
+        relaxed_type_check: bool,
+    ) -> Result<ast::ParsedOperand<SpirvWord>, TranslateError> {
+        if let ast::ParsedOperand::VecMember(name, index) = args {
+            if let Some(sreg) = self.shadowed_sreg(name) {
+                return Ok(ast::ParsedOperand::VecMember(sreg, index));
+            }
+        }
+        let resolver = &mut *self.0;
+        let mut f = |name: &'input str, _: Option<(&ast::Type, ast::StateSpace)>, _, _| resolver.get(name);
+        ast::VisitorMap::visit(&mut f, args, type_space, is_dst, relaxed_type_check)
+    }
+
+    fn visit_ident(
+        &mut self,
+        args: &'input str,
+        _type_space: Option<(&ast::Type, ast::StateSpace)>,
+        _is_dst: bool,
+        _relaxed_type_check: bool,
+    ) -> Result<SpirvWord, TranslateError> {
+        self.0.get(args)
+    }
 }
 
 fn run_multivariable<'input, 'b>(

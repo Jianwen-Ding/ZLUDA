@@ -673,17 +673,17 @@ fn run_instruction<'input>(
         i @ ptx_parser::Instruction::LdMatrix { data, .. } => {
             let shape = match data.shape {
                 ptx_parser::MatrixShape::M8n8 => "m8n8",
-                ptx_parser::MatrixShape::M16n16 => return Err(error_todo()),
+                ptx_parser::MatrixShape::M16n16 => "m16n16",
             };
             let number = match data.number {
                 ptx_parser::MatrixNumber::X2 => "x2",
                 ptx_parser::MatrixNumber::X4 => "x4",
-                ptx_parser::MatrixNumber::X1 => return Err(error_todo()),
+                ptx_parser::MatrixNumber::X1 => "x1",
             };
             let trans = if data.transpose { "_trans" } else { "" };
             let type_str = match data.type_ {
                 ptx_parser::ScalarType::B16 => "b16",
-                ptx_parser::ScalarType::B8 => return Err(error_todo()),
+                ptx_parser::ScalarType::B8 => "b8",
                 _ => return Err(error_unreachable()),
             };
 

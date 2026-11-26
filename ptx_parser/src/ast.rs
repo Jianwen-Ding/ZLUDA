@@ -2019,7 +2019,8 @@ impl LdMatrixDetails {
         }
     }
     pub fn get_loaded_type(&self) -> Type {
-        let count = self.number.get();
+        // an m16n16 matrix is two registers per thread
+        let count = self.number.get() * if matches!(self.shape, MatrixShape::M16n16) { 2 } else { 1 };
         Type::Vector(count, ScalarType::B32)
     }
 }

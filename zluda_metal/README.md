@@ -174,8 +174,9 @@ numpy (transposes, leading dimensions, negative increments, batches, both pointe
 | `strict` | Bit for bit the formal model: IEEE binary32 with denormals (`!agx.keep-denormals`), the model's transcendentals (`sin`, `cos`, `ex2`, `lg2`, `tanh` correctly rounded, `rsqrt` as two roundings, `sqrt.approx` correctly rounded), canonical NaN (`-mattr=+canonical-nan`). |
 
 In strict mode the binary32 `tanh`, `sin` / `cos` (|x| < 200), `ex2` and `lg2` are evaluated in float-float
-arithmetic (`float.inc` `f_exp_pm`, `f_sincos_fast`, `f_exp2_fast`, `f_lg2_fast`) and returned when both ends of
-the result's error interval round alike, otherwise by the exact path; their operations never see a subnormal and are
+arithmetic (`float.inc` `f_exp_pm`, `f_sincos_fast`, `f_exp2_all`, `f_lg2_fast`). `sin` / `cos` / `lg2` return it when
+both ends of the result's error interval round alike, otherwise take the exact path; `tanh` and `ex2` always round it,
+with a 64-slot table of the 23 operands each where that rounding differs from the model (found exhaustively); their operations never see a subnormal and are
 emitted without `!agx.keep-denormals` (`__zluda_nd_*`). `tests/stress/exhaustive/fastpath.cpp` checks each fast path
 against the exact path, and `ex2` / `lg2` / `rsqrt` against binary128 references of the model, for all 2^32 operands.
 `air_lower.cpp` also leaves `!agx.keep-denormals` off binary32 operations that provably cannot meet a subnormal

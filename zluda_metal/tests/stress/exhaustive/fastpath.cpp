@@ -132,7 +132,17 @@ struct Case
     uint32_t (*ref)(uint32_t, uint32_t);
     uint32_t ctrl;
     uint32_t (*model)(uint32_t, uint32_t); // when set, fast and ref are both compared with it
+    bool (*only)(uint32_t);                // when set, the operands checked (the others: see the case)
 };
+// .ftz cases of ex2 / lg2: for a normal operand whose result is normal (ex2: -125 <= x < 127.5, lg2: x > 0) the
+// .ftz and plain helpers perform the same operations (.ftz only flushes subnormal operands and results), which
+// the plain case checks; the .ftz case checks every other operand
+static bool ex2_ftz_only(uint32_t a)
+{
+    float x = __builtin_bit_cast(float, a);
+    return (a & 0x7F800000u) == 0 || !(x >= -125.0f && x < 127.5f);
+}
+static bool lg2_ftz_only(uint32_t a) { return (a & 0x7F800000u) == 0 || (a >> 31) || (a & 0x7F800000u) == 0x7F800000u; }
 static const Case cases[] = {
     {"tanh.approx.f32", fast::__zluda_ptx_impl_ftanh_32, ref::__zluda_ptx_impl_ftanh_32, 1 << 4},
     {"tanh.approx.ftz.f32", fast::__zluda_ptx_impl_ftanh_32, ref::__zluda_ptx_impl_ftanh_32, 1 << 4 | 1 << 12},
@@ -147,9 +157,10 @@ static const Case cases[] = {
     {"sqrt.rn.f32", fast::sqrt_rn, ref::sqrt_rn, 0},
     {"sqrt.rn.ftz.f32", fast::sqrt_rn, ref::sqrt_rn, 1 << 12},
     {"ex2.approx.f32", fast::__zluda_ptx_impl_fex2_f32, ref::__zluda_ptx_impl_fex2_f32, 0, model_ex2},
-    {"ex2.approx.ftz.f32", fast::__zluda_ptx_impl_fex2_f32, ref::__zluda_ptx_impl_fex2_f32, 1 << 12, model_ex2},
+    {"ex2.approx.f32/edges", fast::__zluda_ptx_impl_fex2_f32, ref::__zluda_ptx_impl_fex2_f32, 0, model_ex2, ex2_ftz_only},
+    {"ex2.approx.ftz.f32", fast::__zluda_ptx_impl_fex2_f32, ref::__zluda_ptx_impl_fex2_f32, 1 << 12, model_ex2, ex2_ftz_only},
     {"lg2.approx.f32", fast::__zluda_ptx_impl_flg2_f32, ref::__zluda_ptx_impl_flg2_f32, 0, model_lg2},
-    {"lg2.approx.ftz.f32", fast::__zluda_ptx_impl_flg2_f32, ref::__zluda_ptx_impl_flg2_f32, 1 << 12, model_lg2},
+    {"lg2.approx.ftz.f32", fast::__zluda_ptx_impl_flg2_f32, ref::__zluda_ptx_impl_flg2_f32, 1 << 12, model_lg2, lg2_ftz_only},
 };
 
 int main(int argc, char **argv)
@@ -158,6 +169,8 @@ int main(int argc, char **argv)
     const char *only = argc > 2 && strcmp(argv[2], "all") ? argv[2] : nullptr;
     uint64_t stride = argc > 3 ? strtoull(argv[3], nullptr, 0) : 1; // a sample: every stride-th operand
     int bad = 0;
+    const char *pl = getenv("FASTPATH_PRINT"); // the number of mismatches printed per case (default 8)
+    uint64_t lim = pl ? strtoull(pl, nullptr, 0) : 8;
     for (const Case &c : cases)
     {
         if (only && strcmp(only, c.name))
@@ -172,6 +185,8 @@ int main(int argc, char **argv)
                 for (uint64_t i = t * stride; i < (1ull << 32); i += nt * stride)
                 {
                     uint32_t a = (uint32_t)i;
+                    if (c.only && !c.only(a))
+                        continue;
                     g_flush = 0;
                     uint32_t f = c.fast(a, c.ctrl), r = c.ref(a, c.ctrl);
                     g_flush = 1;
@@ -183,9 +198,9 @@ int main(int argc, char **argv)
                             printf("  %s %08x: ref %08x model %08x (the exact path alone)\n", c.name, a, r, m);
                         r = m;
                     }
-                    if (f != r && mism.fetch_add(1) < 8)
+                    if (f != r && mism.fetch_add(1) < lim)
                         printf("  %s %08x: fast %08x %s %08x\n", c.name, a, f, c.model ? "model" : "ref", r);
-                    if (ff != r && mismf.fetch_add(1) < 8)
+                    if (ff != r && mismf.fetch_add(1) < lim)
                         printf("  %s %08x: fast (flushing) %08x %s %08x\n", c.name, a, ff, c.model ? "model" : "ref", r);
                 }
             });

@@ -638,15 +638,14 @@
     }
 
     // ---------------------------------------------------------------- correctly rounded binary32 exponentials
-    // A fast path for the model's correctly rounded e^a and e^-a (tanh.approx.f32), in binary32 arithmetic on
-    // values that are never subnormal (the __zluda_nd_* operations: any denormal mode gives the IEEE result):
-    // k = rint(32 a / ln2), r = a - k ln2/32 as rh + rl (ln2/32 = L1 + L2 + L3, k L1 and k L2 exact, TwoSum),
-    // e^(+-r) = 1 +- r + r^2/2 +- r^3/6 + r^4/24 +- r^5/120 as a float-float hi + lo, times 2^(+-k/32) from
-    // F_EXP2_32 (hi, lo pairs). The float-float value is within about 2^-44 of e^(+-a) (relative); its rounding
-    // to binary32 is returned only when both ends of the interval v + d +- 2^-40 v round to the same v, i.e.
-    // the exact value cannot lie on the other side of a rounding boundary, and false otherwise (the caller
-    // then takes the double precision path). Equality with that path for every binary32 operand is checked
-    // exhaustively (zluda_metal/tests/stress/exhaustive/tanh_fast.cpp, IEEE and flushing operations).
+    // Fast paths for the model's correctly rounded e^a and e^-a (tanh.approx.f32) and 2^x (ex2.approx.f32), in
+    // binary32 arithmetic on values that are never subnormal (the __zluda_nd_* operations: any denormal mode gives
+    // the IEEE result): k = rint(32 a / ln2), r = a - k ln2/32 as rh + rl (ln2/32 = L1 + L2 + L3, k L1 and k L2
+    // exact, TwoSum), e^(+-r) = 1 +- r + r^2/2 +- r^3/6 + r^4/24 +- r^5/120 as a float-float hi + lo, times
+    // 2^(+-k/32) from F_EXP2_32 (hi, lo pairs): within about 2^-44 of the exact value. Rounded directly; the few
+    // operands where that differs from the model (closer to a rounding boundary) are in exception tables
+    // (TANH_FIX, EX2_FIX), found by, and checked with, the exhaustive comparison over every binary32 operand
+    // (zluda_metal/tests/stress/exhaustive/fastpath.cpp, IEEE and flushing operations).
     static const __attribute__((address_space(4))) float F_EXP2_32[64] = {
         0x1p+0f, 0x0p+0f, 0x1.059b0ep+0f, -0x1.9d4f52p-25f, 0x1.0b5586p+0f, 0x1.9f3122p-25f,
         0x1.11301ep+0f, -0x1.fdb496p-25f, 0x1.172b84p+0f, -0x1.c15742p-27f, 0x1.1d4874p+0f, -0x1.d2e8cap-25f,
@@ -664,23 +663,15 @@
 #define ND_MUL __zluda_nd_fmul_f32
 #define ND_FMA __zluda_nd_fma_f32
     // RN(T 2^m (h + l)) with T = F_EXP2_32[j], if certain
-    static inline bool f_exp_round(int j, int m, float h, float l, float *out)
+    static inline float f_exp_round(int j, int m, float h, float l)
     {
         float th = F_EXP2_32[2 * j], tl = F_EXP2_32[2 * j + 1];
         float ph = ND_MUL(th, h);
         float pl = ND_ADD(ND_FMA(th, h, -ph), ND_FMA(th, l, ND_MUL(tl, h)));
-        float v = ND_ADD(ph, pl);
-        float d = ND_ADD(ND_SUB(ph, v), pl);
-        float dl = ND_MUL(v, 0x1p-40f);
-#ifndef ZLUDA_FAST_NOCHECK
-        if (ND_ADD(v, ND_ADD(d, dl)) != v || ND_ADD(v, ND_SUB(d, dl)) != v)
-            return false;
-#endif
-        *out = ND_MUL(v, __builtin_bit_cast(float, (uint32_t)(m + 127) << 23));
-        return true;
+        return ND_MUL(ND_ADD(ph, pl), __builtin_bit_cast(float, (uint32_t)(m + 127) << 23));
     }
-    // e^a and e^-a correctly rounded for 2^-12 <= a < 20
-    static inline bool f_exp_pm(float a, float *ep, float *em)
+    // e^a and e^-a for 2^-12 <= a < 20, within about 2^-44 (relative) before their rounding
+    static inline void f_exp_pm(float a, float *ep, float *em)
     {
         const float shift = 0x1.8p23f;
         float kf = ND_SUB(ND_FMA(a, 0x1.715476p+5f, shift), shift);
@@ -708,12 +699,39 @@
         float lm = ND_ADD(ND_ADD(u1, u2), ND_SUB(ceven, odd));
         int j = k & 31, m = k >> 5;
         int jm = (32 - j) & 31, mm = -m - (j != 0);
-        return f_exp_round(j, m, h2, lp, ep) && f_exp_round(jm, mm, g2, lm, em);
+        *ep = f_exp_round(j, m, h2, lp);
+        *em = f_exp_round(jm, mm, g2, lm);
     }
-    // 2^x correctly rounded for -125 <= x < 127.5 (normal results): k = rint(32 x), f = x - k/32 (exact, |f| <=
-    // 1/64), 2^x = 2^(k >> 5) 2^((k & 31)/32) e^(f ln2), r = f ln2 as rh + rl and e^r as in f_exp_pm
-    static inline bool f_exp2_fast(float x, float *out)
+    // The operands (bits) where f_exp2_all's float-float value rounds the wrong way (it is within about 2^-44 of
+    // 2^x; these 2^x are closer than that to a rounding boundary), found by the exhaustive check against the model
+    // (zluda_metal/tests/stress/exhaustive/fastpath.cpp), with the correctly rounded results: a perfect hash
+    // (EX2_FIX_MUL) on 64 slots of (operand << 32 | result); empty slots hold a NaN operand.
+#define EX2_FIX_MUL 0x8712b8bdu
+    static const __attribute__((address_space(4))) uint64_t EX2_FIX[64] = {
+        0x7fffffff00000000ull, 0x7fffffff00000000ull, 0x7fffffff00000000ull, 0x7fffffff00000000ull,
+        0x7fffffff00000000ull, 0x3f4746f33fdb8d9bull, 0xbe62e4343f5b8d9bull, 0x354fbf7f3f800005ull,
+        0xb4fdea143f7ffffbull, 0x7fffffff00000000ull, 0x7fffffff00000000ull, 0x7fffffff00000000ull,
+        0x7fffffff00000000ull, 0xb59bcfa63f7ffff3ull, 0x383ecb1d3f800109ull, 0x7fffffff00000000ull,
+        0x7fffffff00000000ull, 0x3a0b43163f800c11ull, 0x7fffffff00000000ull, 0x7fffffff00000000ull,
+        0x7fffffff00000000ull, 0x7fffffff00000000ull, 0x7fffffff00000000ull, 0xb8d3d0263f7ffb69ull,
+        0x3c02a9ad3f80b5a3ull, 0x7fffffff00000000ull, 0x7fffffff00000000ull, 0x7fffffff00000000ull,
+        0x3b53aa143f804971ull, 0xbc84e0923f7d234dull, 0x7fffffff00000000ull, 0x7fffffff00000000ull,
+        0x37e338eb3f80009dull, 0x7fffffff00000000ull, 0xbcf3a9373f7ac6b1ull, 0xbc683f283f7d7f3bull,
+        0x7fffffff00000000ull, 0xbc3a42283f7dfd9dull, 0x7fffffff00000000ull, 0x7fffffff00000000ull,
+        0x7fffffff00000000ull, 0xbe0e371b3f688148ull, 0x7fffffff00000000ull, 0xbd394e9c3f7818c5ull,
+        0x3b429d373f804385ull, 0x7fffffff00000000ull, 0x7fffffff00000000ull, 0x7fffffff00000000ull,
+        0x7fffffff00000000ull, 0xbcaf4d023f7c3b19ull, 0xbc92bb7d3f7cd75full, 0x365584c53f800013ull,
+        0x7fffffff00000000ull, 0x7fffffff00000000ull, 0x7fffffff00000000ull, 0x7fffffff00000000ull,
+        0x3d48323f3f846924ull, 0x7fffffff00000000ull, 0x7fffffff00000000ull, 0x7fffffff00000000ull,
+        0x7fffffff00000000ull, 0x7fffffff00000000ull, 0x7fffffff00000000ull, 0x33b8aa3b3f800001ull};
+    // 2^x correctly rounded (binary32 with subnormals) for 2^-58 <= |x|, -151 <= x < 128: k = rint(32 x), f = x - k/32
+    // (exact, |f| <= 1/64), 2^x = 2^(k >> 5) 2^((k & 31)/32) e^(f ln2), r = f ln2 as rh + rl and e^r as in f_exp_pm,
+    // with no boundary check: the float-float value T (h + l) rounded once, to 24 bits times 2^m or, for m <= -126,
+    // to a multiple of 2^-149 for subnormal results (n = rint((h + l) T 2^(m + 149)), the result's bits); then the
+    // table of exceptions
+    static inline uint32_t f_exp2_all(uint32_t a)
     {
+        float x = __builtin_bit_cast(float, a);
         const float shift = 0x1.8p23f;
         float kf = ND_SUB(ND_FMA(x, 32.0f, shift), shift);
         int k = (int)kf;
@@ -729,13 +747,60 @@
         float h1 = ND_ADD(1.0f, s), t1 = ND_ADD(ND_SUB(1.0f, h1), s);
         float h2 = ND_ADD(h1, hz), t2 = ND_ADD(ND_SUB(h1, h2), hz);
         float lp = ND_ADD(ND_ADD(t1, t2), ND_ADD(odd, ceven));
-        return f_exp_round(k & 31, k >> 5, h2, lp, out);
+        int j = k & 31, m = k >> 5;
+        float th = F_EXP2_32[2 * j], tl = F_EXP2_32[2 * j + 1];
+        float ph = ND_MUL(th, h2);
+        float pl = ND_ADD(ND_FMA(th, h2, -ph), ND_FMA(th, lp, ND_MUL(tl, h2)));
+        uint32_t r;
+        // 2^(-1/64) <= v = T (h + l) < 2^(65/64): normal results from m = -125 on, and for m = -126 when v >= 1
+        float v = ND_ADD(ph, pl);
+        if (m >= -125 || (m == -126 && v >= 1.0f))
+        {
+            // 2^m in two factors (m = 128 just below x = 128: overflow to infinity)
+            int m1 = m >> 1, m2 = m - m1;
+            v = ND_MUL(v, __builtin_bit_cast(float, (uint32_t)(m1 + 127) << 23));
+            r = __builtin_bit_cast(uint32_t, ND_MUL(v, __builtin_bit_cast(float, (uint32_t)(m2 + 127) << 23)));
+        }
+        else
+        {
+            // subnormal: y = (ph + pl) 2^(m + 149) < 2^23 (exact scalings) rounded to an integer n, the result's bits
+            // (2^23: the smallest normal)
+            float sc = __builtin_bit_cast(float, (uint32_t)(m + 149 + 127) << 23);
+            float ys = ND_MUL(ph, sc), yt = ND_MUL(pl, sc);
+            float yh = ND_ADD(ys, yt), yl = ND_SUB(yt, ND_SUB(yh, ys)); // Fast2Sum: |yl| <= 1/4
+            float n0 = ND_SUB(ND_ADD(yh, 0x1p23f), 0x1p23f);
+            float rem = ND_ADD(ND_SUB(yh, n0), yl);
+            r = (uint32_t)(int)n0 + (rem > 0.5f) - (rem < -0.5f);
+        }
+        uint64_t e = EX2_FIX[(a * EX2_FIX_MUL) >> 26];
+        return (uint32_t)(e >> 32) == a ? (uint32_t)e : r;
     }
 #undef ND_ADD
 #undef ND_SUB
 #undef ND_MUL
 #undef ND_FMA
 
+    // The operands |x| where the fast path's exponentials (within about 2^-44) lead to another result than the
+    // model's correctly rounded ones, found by the exhaustive check (zluda_metal/tests/stress/exhaustive/fastpath.cpp),
+    // with the model's |tanh x|: a perfect hash (TANH_FIX_MUL) on 64 slots of (|x| << 32 | |result|)
+#define TANH_FIX_MUL 0xa6cecc1bu
+    static const __attribute__((address_space(4))) uint64_t TANH_FIX[64] = {
+        0x7fffffff00000000ull, 0x3df128eb3df00d21ull, 0x7fffffff00000000ull, 0x3bf0edf13bf0ec95ull,
+        0x7fffffff00000000ull, 0x3ef903f83ee71396ull, 0x7fffffff00000000ull, 0x7fffffff00000000ull,
+        0x7fffffff00000000ull, 0x3f5fa5a83f340588ull, 0x3f7bd82e3f413382ull, 0x7fffffff00000000ull,
+        0x7fffffff00000000ull, 0x3f3e97ff3f21c199ull, 0x3ae0e25c3ae0e2ebull, 0x7fffffff00000000ull,
+        0x3f28c5743f13ef75ull, 0x7fffffff00000000ull, 0x7fffffff00000000ull, 0x3c2a461a3c2a44a5ull,
+        0x7fffffff00000000ull, 0x3eed01af3edd69c7ull, 0x3ce017bb3ce0095aull, 0x7fffffff00000000ull,
+        0x7fffffff00000000ull, 0x7fffffff00000000ull, 0x7fffffff00000000ull, 0x3f5bc24c3f3208fdull,
+        0x7fffffff00000000ull, 0x3eaa783b3ea47017ull, 0x3f2ebf093f17dc85ull, 0x7fffffff00000000ull,
+        0x3ee0e6cd3ed378e1ull, 0x7fffffff00000000ull, 0x39e5bb1d39e5bffeull, 0x7fffffff00000000ull,
+        0x3f8bec663f4c4b69ull, 0x7fffffff00000000ull, 0x7fffffff00000000ull, 0x7fffffff00000000ull,
+        0x7fffffff00000000ull, 0x39c6be5b39c6c3feull, 0x7fffffff00000000ull, 0x7fffffff00000000ull,
+        0x7fffffff00000000ull, 0x3e2a2c7b3e289fcfull, 0x7fffffff00000000ull, 0x7fffffff00000000ull,
+        0x3f0d642e3f00936bull, 0x7fffffff00000000ull, 0x7fffffff00000000ull, 0x7fffffff00000000ull,
+        0x7fffffff00000000ull, 0x7fffffff00000000ull, 0x7fffffff00000000ull, 0x7fffffff00000000ull,
+        0x7fffffff00000000ull, 0x7fffffff00000000ull, 0x7fffffff00000000ull, 0x3f5ab7823f317ed8ull,
+        0x3e6998063e659fe0ull, 0x7fffffff00000000ull, 0x3e11f5703e10fa6cull, 0x7fffffff00000000ull};
     // tanh.approx: halves correctly rounded; f32 as (e^x - e^-x) / (e^x + e^-x) of correctly rounded
     // exponentials, each operation rounded (ptx_math.sail)
     static inline uint64_t f_tanh(uint64_t a, uint32_t t, bool ftz)
@@ -760,13 +825,15 @@
 #ifndef ZLUDA_NO_FAST_PATHS
         {
             // 2^-12 <= |x| < 20: the binary32 fast path for e^|x|, e^-|x| (tanh is odd: the exponentials swap)
+            uint32_t ua = (uint32_t)a & 0x7FFFFFFFu;
             float ep, em;
-            if (f_exp_pm(__builtin_bit_cast(float, (uint32_t)a & 0x7FFFFFFFu), &ep, &em))
-            {
-                float num = __zluda_nd_fsub_f32(ep, em), den = __zluda_nd_fadd_f32(ep, em);
-                uint32_t r = __builtin_bit_cast(uint32_t, __zluda_nd_fdiv_f32(num, den));
-                return r | ((uint32_t)a & 0x80000000u);
-            }
+            f_exp_pm(__builtin_bit_cast(float, ua), &ep, &em);
+            float num = __zluda_nd_fsub_f32(ep, em), den = __zluda_nd_fadd_f32(ep, em);
+            uint32_t r = __builtin_bit_cast(uint32_t, __zluda_nd_fdiv_f32(num, den));
+            uint64_t e = TANH_FIX[(ua * TANH_FIX_MUL) >> 26];
+            if ((uint32_t)(e >> 32) == ua)
+                r = (uint32_t)e;
+            return r | ((uint32_t)a & 0x80000000u);
         }
 #endif
         double xd = xf_to_d(x);
@@ -889,9 +956,15 @@
 #ifndef ZLUDA_NO_FAST_PATHS
         if ((a & 0x7FFFFFFFu) < 0x22800000u) // |x| < 2^-58 (zeros, subnormals): 2^x rounds to 1
             return 0x3F800000u;
-        float x = __builtin_bit_cast(float, a), v;
-        if (x >= -125.0f && x < 127.5f && f_exp2_fast(x, &v))
-            return __builtin_bit_cast(uint32_t, v);
+        float x = __builtin_bit_cast(float, a);
+        if (x >= -151.0f && x < 128.0f)
+        {
+            uint32_t r = f_exp2_all(a);
+            return ftz && r < 0x00800000u ? 0 : r;
+        }
+        if (x < -151.0f) // (and -inf)
+            return 0;
+        return x != x ? 0x7FFFFFFFu : 0x7F800000u; // NaN; x >= 128 and +inf
 #endif
         return (uint32_t)f_ex2h(a, T_F32, ftz);
     }

@@ -228,6 +228,15 @@ fn drop_directives(text: &str) -> String {
     }
     let op = opaque_ranges(&t);
     let mut b = t.clone().into_bytes();
+    // .loc with the extended operands (function_name, inlined_at, prologue_end): debug information only
+    let mut from = 0;
+    while let Some(p) = find_directive(&t, &op, ".loc", from) {
+        let e = t[p..].find('\n').map_or(t.len(), |e| p + e);
+        if t[p..e].contains(',') || t[p..e].contains("prologue_end") || t[p..e].contains("epilogue_begin") || t[p..e].contains("is_stmt") {
+            blank(&mut b, p, e);
+        }
+        from = e;
+    }
     for d in [".pragma", ".loc_intermediate", ".alias"] {
         let mut from = 0;
         while let Some(p) = find_directive(&t, &op, d, from) {
@@ -246,6 +255,23 @@ fn drop_directives(text: &str) -> String {
         let e = block_end(&t, p);
         blank(&mut b, p, e);
         from = e;
+    }
+    // module variables of types the translator does not declare: the same bytes in an unformatted type; opaque
+    // handles as 64-bit variables
+    for (from_t, to_t) in [(".tf32", ".b32 "), (".e4m3x2", ".b16  "), (".e5m2x2", ".b16  "), (".e2m1x2", ".b8   "),
+                           (".e2m3x2", ".b16  "), (".e3m2x2", ".b16  "), (".ue8m0x2", ".b16   "), (".samplerref", ".u64       ")] {
+        let mut from = 0;
+        while let Some(p) = find_directive(&t, &op, from_t, from) {
+            // only in declarations of variables (a state space word before it on the statement)
+            let st = t[..p].rfind(|c| c == ';' || c == '{' || c == '}').map_or(0, |x| x + 1);
+            let head = &t[st..p];
+            if head.split_whitespace().any(|w| matches!(w, ".global" | ".const" | ".shared" | ".local")) && from_t.len() >= to_t.trim_end().len() {
+                let mut r = to_t.as_bytes().to_vec();
+                r.resize(from_t.len(), b' ');
+                b[p..p + from_t.len()].copy_from_slice(&r);
+            }
+            from = p + from_t.len();
+        }
     }
     // .attribute( ... )
     let mut from = 0;

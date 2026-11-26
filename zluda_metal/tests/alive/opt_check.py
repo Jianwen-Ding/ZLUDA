@@ -50,6 +50,9 @@ def kernels_of(ll):
     return re.findall(r"^define agx_kernel [^@]*@([\w.$]+)\(", ll, re.M)
 
 
+PASSES = []  # per-pass results (--per-pass)
+
+
 def alive(a, k, src, tgt):
     """alive-tv on kernel k: (status, detail, output)"""
     cmd = [a.alive_tv, "--smt-to=%d" % (a.timeout * 1000), "--src-fn=" + k, "--tgt-fn=" + k, src, tgt]
@@ -115,6 +118,9 @@ def check_per_pass(path, a, lib, t):
                 if k not in kernels_of(chain[j][1]):
                     continue
                 st, detail, txt = alive(a, k, src, tgt)
+                PASSES.append({"program": path, "kernel": k, "pass": pname, "status": st, "detail": detail[:200]})
+                if a.v:
+                    print("  %-9s %s %s %s  %s" % (st, os.path.basename(path), k, pname, detail[:120]), flush=True)
                 rank = {"correct": 0, "error": 1, "unknown": 2, "INCORRECT": 3}
                 if rank[st] > rank[worst[k][0]]:
                     worst[k] = (st, pname + ": " + detail)
@@ -199,6 +205,7 @@ def main():
     ap.add_argument("--exact", action="store_true")
     ap.add_argument("--per-pass", dest="per_pass", action="store_true")
     ap.add_argument("--unroll", type=int, default=0)
+    ap.add_argument("-v", action="store_true", help="print every per-pass result")
     ap.add_argument("--src", choices=["o0", "air"], default="o0",
                     help="the source: AGX IR at -O0 (checks the optimizer) or ZLUDA's AIR (agx-lower-air too)")
     ap.add_argument("--keep", help="directory for the IR and alive2 output of INCORRECT kernels")
@@ -217,8 +224,13 @@ def main():
     for r in res:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
     print("----", ", ".join("%s %d" % kv for kv in sorted(counts.items())), "kernels of", len(files), "programs")
+    if PASSES:
+        pc = {}
+        for r in PASSES:
+            pc[r["status"]] = pc.get(r["status"], 0) + 1
+        print("---- per pass:", ", ".join("%s %d" % kv for kv in sorted(pc.items())), "pass checks")
     if a.json:
-        json.dump(res, open(a.json, "w"), indent=1)
+        json.dump({"kernels": res, "passes": PASSES}, open(a.json, "w"), indent=1)
 
 
 if __name__ == "__main__":

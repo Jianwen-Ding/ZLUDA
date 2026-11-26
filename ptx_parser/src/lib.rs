@@ -2019,7 +2019,7 @@ derive_parser!(
         F64Hex(&'input str),
         #[regex(r"0[xX][0-9a-zA-Z]+U?", |lex| lex.slice())]
         Hex(&'input str),
-        #[regex(r"[0-9]*\.[0-9]+([eE][-+]?[0-9]+)?", |lex| lex.slice())]
+        #[regex(r"[0-9]*\.[0-9]+([eE][-+]?[0-9]+)?|[0-9]+[eE][-+]?[0-9]+", |lex| lex.slice())]
         F64(&'input str),
         #[regex(r"[0-9]+U?", |lex| lex.slice())]
         Decimal(&'input str),
@@ -2726,6 +2726,9 @@ derive_parser!(
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cvt
     cvt{.ifrnd}{.ftz}{.sat}.dtype.atype         d, a => {
+        if let Some(i) = crate::helper_table::cvt::grammar_override(&mut state.errors, ifrnd.map(|r| r.to_string()), ftz, sat, false, false, dtype.to_string(), atype.to_string(), vec![d.clone(), a.clone()]) {
+            return i;
+        }
         let data = ast::CvtDetails::new(&mut state.errors, ifrnd, ftz, sat, false, dtype, atype);
         let arguments = ast::CvtArgs { dst: d, src: a, src2: None };
         ast::Instruction::Cvt {
@@ -2737,7 +2740,9 @@ derive_parser!(
     // cvt.frnd2{.relu}{.satfinite}.bf16.f32      d, a;
     cvt.frnd2{.relu}{.satfinite}.x2_to_type.x2_from_type    d, a {, b} => {
         if satfinite {
-            state.errors.push(PtxError::Todo("cvt.frnd2 instruction with satfinite modifier".to_string()));
+            let mut ops = vec![d, a];
+            ops.extend(b);
+            return crate::helper_table::cvt::grammar_override(&mut state.errors, Some(frnd2.to_string()), false, false, relu, true, x2_to_type.to_string(), x2_from_type.to_string(), ops).unwrap();
         }
         let data = ast::CvtDetails::new(&mut state.errors, Some(frnd2), false, false, relu, x2_to_type, x2_from_type);
         ast::Instruction::Cvt {
@@ -2749,7 +2754,7 @@ derive_parser!(
     // cvt.frnd2{.relu}.tf32.f32                   d, a;
     cvt.rn.satfinite{.relu}.f8x2type.f32       d, a, b => {
         if relu {
-            state.errors.push(PtxError::Todo("cvt.rn.satfinite.f8x2 instruction with relu modifier".to_string()));
+            return crate::helper_table::cvt::grammar_override(&mut state.errors, Some(".rn".to_string()), false, false, true, true, f8x2type.to_string(), ".f32".to_string(), vec![d, a, b]).unwrap();
         }
         let data = ast::CvtDetails::new(&mut state.errors, Some(rn), false, false, false, f8x2type, ScalarType::F32);
         ast::Instruction::Cvt {

@@ -6,7 +6,7 @@
 use super::*;
 pub(crate) use crate::helpers::HOp;
 
-mod cvt;
+pub(crate) mod cvt;
 mod float;
 mod matrix;
 mod memory;

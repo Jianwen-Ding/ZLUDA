@@ -473,6 +473,129 @@ static void resolveLocalStack(Module &m)
     }
 }
 
+// Generic addresses that stay unresolved (PTX ISA 6.4.1.1 generic windows): a cvta of a .shared or .local address whose
+// generic value escapes static resolution (it goes through memory, or through integer arithmetic PointerRecovery
+// cannot follow) is the object's 32-bit address in a window of the generic address space, and the generic loads and
+// stores of the function then test the windows at run time. Only functions with such an escaping address pay for the
+// test; ordinary global-memory code is unchanged. A local window access is relative to one private object of the
+// function (the one whose address escapes).
+static const uint64_t GW_SHARED = 0x01000000, GW_LOCAL = 0x02000000, GW_SIZE = 0x01000000;
+static std::set<Function *> g_windowed;
+static void scanGenericWindows(Module &m)
+{
+    g_windowed.clear();
+    for (Function &f : m)
+        for (Instruction &i : instructions(f))
+            if (auto *asc = dyn_cast<AddrSpaceCastInst>(&i))
+                if (asc->getDestAddressSpace() == amd::Flat &&
+                    (asc->getSrcAddressSpace() == amd::Shared || asc->getSrcAddressSpace() == amd::Private))
+                    g_windowed.insert(&f);
+}
+static void resolveGenericWindows(Module &m)
+{
+    LLVMContext &c = m.getContext();
+    Type *i64 = Type::getInt64Ty(c), *i32 = Type::getInt32Ty(c), *i8 = Type::getInt8Ty(c);
+    for (Function *f : g_windowed)
+    {
+        Value *shBase = nullptr, *loBase = nullptr;
+        SmallVector<AddrSpaceCastInst *, 8> casts;
+        for (Instruction &i : instructions(*f))
+            if (auto *asc = dyn_cast<AddrSpaceCastInst>(&i))
+                if (asc->getDestAddressSpace() == amd::Flat &&
+                    (asc->getSrcAddressSpace() == amd::Shared || asc->getSrcAddressSpace() == amd::Private))
+                    casts.push_back(asc);
+        for (AddrSpaceCastInst *asc : casts)
+        {
+            Value *src = asc->getPointerOperand();
+            bool sh = asc->getSrcAddressSpace() == amd::Shared;
+            Value *obj = getUnderlyingObject(src);
+            if (sh && !shBase)
+                shBase = obj;
+            if (!sh && !loBase)
+                loBase = obj;
+            IRBuilder<> b(asc);
+            Value *off = b.CreateZExt(b.CreatePtrToInt(src, i32), i64);
+            Value *g = b.CreateIntToPtr(b.CreateAdd(off, ConstantInt::get(i64, sh ? GW_SHARED : GW_LOCAL)), asc->getType());
+            asc->replaceAllUsesWith(g);
+            asc->eraseFromParent();
+        }
+        // the generic accesses: the window of the address at run time
+        SmallVector<Instruction *, 16> acc;
+        for (Instruction &i : instructions(*f))
+        {
+            Value *p = nullptr;
+            if (auto *ld = dyn_cast<LoadInst>(&i))
+                p = ld->getPointerOperand();
+            else if (auto *st = dyn_cast<StoreInst>(&i))
+                p = st->getPointerOperand();
+            else if (auto *rmw = dyn_cast<AtomicRMWInst>(&i))
+                p = rmw->getPointerOperand();
+            else if (auto *cx = dyn_cast<AtomicCmpXchgInst>(&i))
+                p = cx->getPointerOperand();
+            if (p && p->getType()->getPointerAddressSpace() == amd::Flat)
+                acc.push_back(&i);
+        }
+        for (Instruction *i : acc)
+        {
+            unsigned opIdx = isa<StoreInst>(i) ? 1 : 0;
+            Value *p = i->getOperand(opIdx);
+            BasicBlock *bb = i->getParent();
+            BasicBlock *join = bb->splitBasicBlock(i, "gw.join");
+            bb->getTerminator()->eraseFromParent();
+            IRBuilder<> b(bb);
+            Value *x = b.CreatePtrToInt(p, i64);
+            // the global access stays the original instruction (moved into its own block)
+            BasicBlock *glBB = BasicBlock::Create(c, "gw.global", f, join);
+            i->removeFromParent();
+            i->insertInto(glBB, glBB->end());
+            BranchInst::Create(join, glBB);
+            SmallVector<std::pair<Value *, BasicBlock *>, 3> results;
+            if (!i->getType()->isVoidTy())
+                results.push_back({i, glBB});
+            BasicBlock *next = glBB;
+            for (int w = 0; w < 2; w++)
+            {
+                Value *base = w == 0 ? loBase : shBase;
+                if (!base)
+                    continue;
+                uint64_t wb = w == 0 ? GW_LOCAL : GW_SHARED;
+                unsigned as = w == 0 ? amd::Private : amd::Shared;
+                BasicBlock *test = BasicBlock::Create(c, "gw.test", f, next);
+                BasicBlock *hit = BasicBlock::Create(c, w == 0 ? "gw.local" : "gw.shared", f, next);
+                IRBuilder<> tb(test);
+                Value *rel = tb.CreateSub(x, ConstantInt::get(i64, wb));
+                tb.CreateCondBr(tb.CreateICmpULT(rel, ConstantInt::get(i64, GW_SIZE)), hit, next);
+                IRBuilder<> hb(hit);
+                Value *boff = hb.CreateSub(hb.CreateTrunc(rel, i32), hb.CreatePtrToInt(base, i32));
+                Value *q = hb.CreateGEP(i8, base, hb.CreateSExt(boff, i64));
+                if (q->getType()->getPointerAddressSpace() != as)
+                    q = hb.CreateAddrSpaceCast(q, PointerType::get(c, as));
+                Instruction *cl = i->clone();
+                cl->setOperand(opIdx, q);
+                hb.Insert(cl);
+                hb.CreateBr(join);
+                if (!i->getType()->isVoidTy())
+                    results.push_back({cl, hit});
+                next = test;
+            }
+            BranchInst::Create(next, bb);
+            if (!i->getType()->isVoidTy())
+            {
+                IRBuilder<> jb(&*join->getFirstInsertionPt());
+                PHINode *phi = jb.CreatePHI(i->getType(), results.size());
+                SmallVector<Use *, 8> uses;
+                for (Use &u : i->uses())
+                    uses.push_back(&u);
+                for (auto &[v, from] : results)
+                    phi->addIncoming(v, from);
+                for (Use *u : uses)
+                    if (u->getUser() != phi)
+                        u->set(phi);
+            }
+        }
+    }
+}
+
 // isspacep (ptx/lib/metal_impl/memory.inc): `__zluda_metal_isspacep(generic pointer, kind)` is decided from the
 // pointer's provenance after PointerRecovery (AGX has no generic addressing: every generic access must resolve
 // statically anyway). kind: 0 global, 1 shared::cta, 2 local, 3 const, 4 param, 5 shared::cluster. A pointer
@@ -508,6 +631,19 @@ static void resolveIsSpacep(Module &m)
         uint64_t kind = cast<ConstantInt>(ci->getArgOperand(1))->getZExtValue();
         bool r = kind == 5 ? space == 1 : (uint64_t)space == kind;
         Value *arg = ci->getArgOperand(0);
+        if (space == 0 && !isa<GlobalValue>(p) && !isa<Argument>(p) && g_windowed.count(ci->getFunction()) && kind <= 2)
+        {
+            // an address of unknown origin in a function with generic windows: test the windows
+            IRBuilder<> b(ci);
+            Value *x = b.CreatePtrToInt(arg, b.getInt64Ty());
+            auto in = [&](uint64_t base) {
+                return b.CreateICmpULT(b.CreateSub(x, b.getInt64(base)), b.getInt64(GW_SIZE));
+            };
+            Value *v = kind == 1 ? in(GW_SHARED) : kind == 2 ? in(GW_LOCAL) : b.CreateNot(b.CreateOr(in(GW_SHARED), in(GW_LOCAL)));
+            ci->replaceAllUsesWith(b.CreateZExt(v, ci->getType()));
+            ci->eraseFromParent();
+            continue;
+        }
         GlobalVariable *block = m.getGlobalVariable("__zluda_cta_shared", true);
         MDNode *md = block ? block->getMetadata("zluda.cluster") : nullptr;
         Value *repl = ConstantInt::get(ci->getType(), r);
@@ -2567,7 +2703,9 @@ void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals
     canonicalizeFoldedNaNs(m);
     if (getenv("ZLUDA_AIR_DEBUG_RECOVERED"))
         m.print(errs(), nullptr);
+    scanGenericWindows(m);
     resolveIsSpacep(m);
+    resolveGenericWindows(m);
     for (Function &f : m)
         if (!f.isDeclaration() && f.getCallingConv() != CallingConv::AMDGPU_KERNEL && !f.use_empty())
             fail("function could not be inlined into its kernel (recursion is not supported): " + f.getName());

@@ -55,6 +55,10 @@ members = [
     "zluda64_server",
 ]
 
+# The Metal backend builds against a system LLVM and metal-cpp, so it is a
+# separate workspace (see zluda_metal/README.md)
+exclude = ["zluda_metal"]
+
 default-members = ["zluda", "zluda_ml", "zluda_inject", "zluda_redirect", "compiler"]
 
 [profile.release-lto]

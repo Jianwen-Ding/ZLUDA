@@ -817,3 +817,8 @@
         }
         return r;
     }
+    int32_t FUNC(iminmax_relu_s32)(int32_t a, int32_t b, uint32_t isMax)
+    {
+        int32_t v = isMax ? (a > b ? a : b) : (a < b ? a : b);
+        return v < 0 ? 0 : v;
+    }

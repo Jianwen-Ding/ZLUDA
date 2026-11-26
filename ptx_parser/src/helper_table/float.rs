@@ -385,6 +385,15 @@ pub(super) fn lower<'i>(_opcode: &str, base: &str, m: &[&str], ops: &[HOp<'i>]) 
     if m.iter().any(|x| matches!(*x, "u8x4" | "s8x4" | "u16x2" | "s16x2")) {
         return ipack(base, m, ops);
     }
+    if (base == "min" || base == "max") && m == ["relu", "s32"] && ops.len() == 3 {
+        // min / max.relu.s32: negative results clamp to 0
+        return Call::new("iminmax_relu_s32")
+            .dst(ops[0].op.clone(), ScalarType::S32)
+            .src(ops[1].op.clone(), ScalarType::S32)
+            .src(ops[2].op.clone(), ScalarType::S32)
+            .imm((base == "max") as u64)
+            .build();
+    }
     match base {
         "add" | "sub" | "mul" | "fma" | "min" | "max" => arith(base, m, ops),
         "set" | "setp" => compare(base, m, ops),

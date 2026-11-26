@@ -38,7 +38,7 @@ HARNESS = ("buffer", "launch", "print", "expect", "patch", "append", "tensormap"
 # .ub strict: the model's undefined-behaviour checking; the programs that enable it expect their normal results (an
 # undefined behaviour the model would report is not detected here)
 IGNORED = ("print", "memmodel", "isacheck", "convergence", "occupancy", "ub")
-UNSUPPORTED = ("multimem", "fabric")
+UNSUPPORTED = ("fabric",)
 
 SIZES = {"u8": 1, "s8": 1, "b8": 1, "u16": 2, "s16": 2, "b16": 2, "f16": 2, "bf16": 2, "u32": 4, "s32": 4,
          "b32": 4, "f32": 4, "u64": 8, "s64": 8, "b64": 8, "f64": 8, "pred": 1, "b128": 16}
@@ -295,6 +295,17 @@ def object_words(kind, ty, addr, ds, as_):
     return [x & (2 ** 64 - 1) for x in w]
 
 
+# .multimem MM .size N { B0, B1, ... };  a window of N bytes whose addresses stand for the same offsets in each buffer
+# (sail/ptx/ptx_mm.sail harness_mm).  Multimem addresses are only accessed by multimem.* (ptx/lib/metal_impl/
+# multimem.inc), so the window holds its own description, at the start of every 4 KiB page (allocations are page
+# aligned): u64 words 0 magic, 1 window address, 2 size, 3 buffer count, 4.. buffer addresses.
+MM_MAGIC = 0x4D4D57494E444F57
+
+
+def multimem_words(base, page, size, addrs):
+    return [MM_MAGIC, base, size, len(addrs)] + list(addrs)
+
+
 def pack_vals(vals, ty):
     size = SIZES[ty]
     return b"".join(v.to_bytes(size, "little") for v in vals)
@@ -356,6 +367,25 @@ def run_program(path, lib):
                     ds = [int(x, 0) for x in split_list(m.group(4))]
                     as_ = [int(x, 0) for x in split_list(m.group(5))]
                 bufs[name] = last = Buffer(name, "u64", pack_vals(object_words(d, ty, addr, ds, as_), "u64"))
+            elif d == "multimem":
+                m = re.match(r"(\w+)\s+\.size\s+(\w+)\s*\{([^}]*)\}\s*$", body, re.S)
+                if not m:
+                    raise Unsupported("multimem syntax")
+                name, size, members = m.group(1), int(m.group(2), 0), split_list(m.group(3))
+                addrs = []
+                for bn in members:
+                    b = bufs[bn]
+                    if b.ptr is None:
+                        b.ptr = cuda.alloc(bytes(b.data))
+                    addrs.append(b.ptr)
+                total = max(4096, (size + 4095) // 4096 * 4096)
+                w = Buffer(name, "u8", bytes(total))
+                w.ptr = cuda.alloc(bytes(total))
+                img = bytearray(total)
+                for pg in range(0, total, 4096):
+                    img[pg:pg + 8 * (4 + len(addrs))] = pack_vals(multimem_words(w.ptr, pg, size, addrs), "u64")
+                cuda.check(cuda.cuMemcpyHtoD_v2(w.ptr, bytes(img), total), "multimem")
+                bufs[name] = last = w
             elif d == "append":
                 m = re.match(r"(\w+)\s+\.(\w+)\s*=\s*(\{.*\})\s*$", body, re.S)
                 b = bufs[m.group(1)]

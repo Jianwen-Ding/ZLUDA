@@ -403,4 +403,5 @@ extern "C"
 #include "metal_impl/warp.inc"
 #include "metal_impl/sreg.inc"
 #include "metal_impl/texture.inc"
+#include "metal_impl/multimem.inc"
 }

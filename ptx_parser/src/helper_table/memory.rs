@@ -253,7 +253,37 @@ fn tensor<'i>(m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
         return err("cp.async.bulk.tensor .multicast::cluster / .cta_group need thread-block clusters");
     }
     if has(m, "override::global_dim") || has(m, "override::global_dim_stride") {
-        return err("cp.async.bulk.tensor .override::global_dim(_stride)");
+        // [dst], [tmap, gaddr, {dims}, {lower strides}, upper, {coords}], [mbar]: coordinates, dims and strides go in
+        // one vector (rank n: n + n + n - 1 <= 8)
+        let [g, ds, rest @ ..] = &ops.get(1).map(|o| &o.items[..]).unwrap_or(&[])[..] else {
+            return err("override::global_dim operands");
+        };
+        let (ls, up, cs) = match rest {
+            [ls, up, cs] => (Some(ls), up.clone(), cs),
+            [cs] => (None, imm(0), cs),
+            _ => return err("override::global_dim operands"),
+        };
+        let elems = |o: &Op<'i>| match o {
+            ast::ParsedOperand::VecPack(v) => v.clone(),
+            _ => Vec::new(),
+        };
+        let n = elems(cs).len();
+        let mut all = elems(cs);
+        all.extend(elems(ds));
+        if let Some(ls) = ls {
+            all.extend(elems(ls));
+        }
+        if n == 0 || n > 3 || all.len() > 8 || ops.len() < 3 {
+            return err("override::global_dim rank");
+        }
+        return Call::new(format!("tma_load_ov{n}"))
+            .src_space(ops[0].op.clone(), ScalarType::B8, StateSpace::Shared)
+            .src(ops[1].op.clone(), ScalarType::U64)
+            .src(g.clone(), ScalarType::U64)
+            .src_vec(ast::ParsedOperand::VecPack(all), 8, ScalarType::B32)
+            .src_space(ops[2].op.clone(), ScalarType::B64, StateSpace::Shared)
+            .src(up, ScalarType::B16)
+            .build();
     }
     if to_shared(m) {
         // [dst], [tmap, {coords}], [mbar]{, im2colInfo}{, cache-policy}

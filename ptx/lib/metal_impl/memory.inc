@@ -676,6 +676,58 @@
         uint32_t md = tm_effmode(t);
         uint64_t fill = tm_fill(t);
         uint32_t A = (uint32_t)(uintptr_t)dst;
+        if (tm_etc(t) >= 13 && !i2c)
+        {
+            // packed sub-byte types: groups of 16 elements, GB global bytes into SB shared bytes (zero padding)
+            uint32_t etc = tm_etc(t);
+            int64_t gb = etc == 15 ? 12 : 8, sb = etc == 13 ? 8 : 16, nb = etc == 15 ? 6 : 4;
+            int64_t gpr = tm_box(t, 0) / 16, vol = 1;
+            _Pragma("clang loop unroll(full)") for (uint32_t i = 1; i < 5; i++) if (i < tm_rank(t)) vol *= tm_n(t, i);
+            int64_t groups = gpr * vol;
+            for (int64_t k = 0; k * 16 < groups * sb; k++)
+            {
+                uint32_t a = A + 16 * (uint32_t)k;
+                uint32_t a2 = md == 5 ? tm_swizzle(4, a) : tm_swizzle(md, a);
+                uint32_t flip = (md == 5 && ((a >> 7) & 1)) ? 8 : 0;
+                for (int64_t h = 0; h < 16 / sb; h++)
+                {
+                    int64_t q0 = sb == 16 ? k : 2 * k + h;
+                    int64_t ga = -1;
+                    if (q0 < groups && gpr > 0)
+                    {
+                        int64_t c0 = (int64_t)cs[0] + (q0 % gpr) * 16;
+                        if (c0 >= 0 && c0 < tm_dim(t, 0))
+                        {
+                            int64_t q = q0 / gpr, acc = (int64_t)t->w[3] + c0 * nb / 8;
+                            bool bad = false;
+                            _Pragma("clang loop unroll(full)") for (uint32_t i = 1; i < 5; i++)
+                            {
+                                if (i >= tm_rank(t) || bad)
+                                    continue;
+                                int64_t v = (int64_t)cs[i] + tmod(q, tm_n(t, i)) * tm_est(t, i);
+                                if (v < 0 || v >= tm_dim(t, i))
+                                    bad = true;
+                                else
+                                {
+                                    acc += v * tm_stride(t, i);
+                                    q = tdiv(q, tm_n(t, i));
+                                }
+                            }
+                            if (!bad)
+                                ga = acc;
+                        }
+                    }
+                    for (int64_t j = 0; j < sb; j++)
+                    {
+                        uint8_t v = (ga >= 0 && j < gb) ? ((volatile GLOBAL_SPACE uint8_t *)ga)[j] : 0;
+                        uint32_t within = ((uint32_t)(h * 8 + j)) ^ flip;
+                        ((volatile SHARED_SPACE uint8_t *)(dst + (int32_t)(a2 - A)))[within] = v;
+                    }
+                }
+            }
+            __zluda_ptx_impl_mbar_tx(mb, (uint32_t)(groups * sb), 1);
+            return;
+        }
         int64_t cnt = i2c ? tm_pix(t, inf, (int)imd) * tm_box(t, 0) : tm_count(t, g);
         int64_t per = 16 / eb;
         bool hit = false;
@@ -907,3 +959,28 @@
         })
     }
     void FUNC(mem_fence)() {}
+
+    // .override::global_address.override::global_dim{_stride} (tmOv of ptx_tma.sail): v holds the n coordinates, the
+    // n dims, then the n - 1 lower strides; stride = (lower + ((upper >> 4i) & 15) << 32) << 4
+    static inline void tma_load_ov(SHARED_SPACE uint8_t *dst, uint64_t tmap, uint64_t ga, I32x8 v, SHARED_SPACE uint64_t *mb,
+                                   uint16_t up, int n)
+    {
+        MEM_SERIAL({
+            Tm t;
+            tm_read(tmap, &t);
+            t.w[3] = ga;
+            I32x8 cs = {0, 0, 0, 0, 0, 0, 0, 0};
+            _Pragma("clang loop unroll(full)") for (int i = 0; i < 3; i++) if (i < n)
+            {
+                cs[i] = v[i];
+                t.w[4 + i] = (uint32_t)v[n + i];
+            }
+            _Pragma("clang loop unroll(full)") for (int i = 0; i < 2; i++) if (i < n - 1)
+                t.w[9 + i] = ((uint64_t)(uint32_t)v[2 * n + i] + ((uint64_t)((up >> (4 * i)) & 15) << 32)) << 4;
+            I32x8 inf = {0, 0, 0, 0, 0, 0, 0, 0};
+            tma_load_impl(dst, &t, cs, mb, inf, 0);
+        })
+    }
+    void FUNC(tma_load_ov1)(SHARED_SPACE uint8_t *d, uint64_t t, uint64_t g, I32x8 v, SHARED_SPACE uint64_t *mb, uint16_t up) { tma_load_ov(d, t, g, v, mb, up, 1); }
+    void FUNC(tma_load_ov2)(SHARED_SPACE uint8_t *d, uint64_t t, uint64_t g, I32x8 v, SHARED_SPACE uint64_t *mb, uint16_t up) { tma_load_ov(d, t, g, v, mb, up, 2); }
+    void FUNC(tma_load_ov3)(SHARED_SPACE uint8_t *d, uint64_t t, uint64_t g, I32x8 v, SHARED_SPACE uint64_t *mb, uint16_t up) { tma_load_ov(d, t, g, v, mb, up, 3); }

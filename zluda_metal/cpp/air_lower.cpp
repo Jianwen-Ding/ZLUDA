@@ -48,6 +48,7 @@
 #include <llvm/Transforms/Scalar/InferAddressSpaces.h>
 #include <llvm/Transforms/Scalar/SROA.h>
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
+#include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Utils/Local.h>
 #include <llvm/Transforms/Utils/ValueMapper.h>
@@ -3119,6 +3120,67 @@ static void lowerIEEEHelperCalls(Module &m)
     }
 }
 
+// CUDA's device faults (src/cuda.rs, sticky context errors): a `trap` (llvm.trap; the AGX trap instruction does
+// nothing, ptx-re-blockers B21) and a failed device assert (__assertfail) record themselves in the module variable
+// __zluda_fault ([8 x i32]: 0 flags, bit 0 trap, bit 1 assert; 1 line; 2-3 message, 4-5 file, 6-7 function, as
+// 64-bit generic addresses of the first assert to store them), which the host reads after each launch. The thread
+// then returns (agx-codegen-prepare: an unreachable after llvm.trap returns), as on the formal model's fault.
+static void faultReporting(Module &m)
+{
+    std::vector<CallInst *> traps, asserts;
+    for (Function &f : m)
+        for (Instruction &i : instructions(f))
+            if (auto *ci = dyn_cast<CallInst>(&i))
+                if (auto *callee = dyn_cast<Function>(ci->getCalledOperand()->stripPointerCasts()))
+                {
+                    if (callee->getIntrinsicID() == Intrinsic::trap)
+                        traps.push_back(ci);
+                    else if (callee->getName() == "__zluda_ptx_impl___assertfail")
+                        asserts.push_back(ci);
+                }
+    if (traps.empty() && asserts.empty())
+        return;
+    LLVMContext &c = m.getContext();
+    Type *i32 = Type::getInt32Ty(c), *i64 = Type::getInt64Ty(c), *i8 = Type::getInt8Ty(c);
+    auto *ty = ArrayType::get(i32, 8);
+    auto *fw = new GlobalVariable(m, ty, false, GlobalValue::ExternalLinkage, ConstantAggregateZero::get(ty),
+                                  "__zluda_fault", nullptr, GlobalValue::NotThreadLocal, amd::Global);
+    fw->setAlignment(Align(16));
+    auto flag = [&](IRBuilder<> &b, uint32_t bit) {
+        b.CreateAtomicRMW(AtomicRMWInst::Or, fw, b.getInt32(bit), MaybeAlign(4), AtomicOrdering::Monotonic);
+    };
+    auto as64 = [&](IRBuilder<> &b, Value *v) -> Value * {
+        if (v->getType()->isPointerTy())
+            return b.CreatePtrToInt(v, i64);
+        return b.CreateZExtOrTrunc(v, i64);
+    };
+    for (CallInst *ci : traps)
+    {
+        IRBuilder<> b(ci);
+        flag(b, 1);
+    }
+    for (CallInst *ci : asserts)
+    {
+        IRBuilder<> b(ci);
+        // the first assert's arguments: the flag word's previous value tells whether another was first
+        Value *old = b.CreateAtomicRMW(AtomicRMWInst::Or, fw, b.getInt32(2), MaybeAlign(4), AtomicOrdering::Monotonic);
+        Value *first = b.CreateICmpEQ(b.CreateAnd(old, 2), b.getInt32(0));
+        Instruction *t = SplitBlockAndInsertIfThen(first, ci->getIterator(), false);
+        IRBuilder<> s(t);
+        auto at = [&](uint64_t off) { return s.CreateConstInBoundsGEP1_64(i8, fw, off); };
+        if (ci->arg_size() >= 4)
+        {
+            s.CreateStore(s.CreateZExtOrTrunc(ci->getArgOperand(2)->getType()->isPointerTy()
+                                                  ? s.CreatePtrToInt(ci->getArgOperand(2), i32)
+                                                  : ci->getArgOperand(2), i32),
+                          at(4), true);
+            s.CreateStore(as64(s, ci->getArgOperand(0)), at(8), true);
+            s.CreateStore(as64(s, ci->getArgOperand(1)), at(16), true);
+            s.CreateStore(as64(s, ci->getArgOperand(3)), at(24), true);
+        }
+    }
+}
+
 void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals &globals)
 {
     lowerIEEEHelperCalls(m);
@@ -3417,6 +3479,7 @@ extern "C" int zluda_air_lower(const ZludaAirInput *input, ZludaAirOutput *outpu
         if (Linker::linkModules(*main, std::move(impl), Linker::LinkOnlyNeeded))
             fail("failed to link Metal implementation library");
         adaptHelperCalls(*main);
+        faultReporting(*main);
         if (g_fp_fast)
             fastFPHelpers(*main);
         if (getenv("ZLUDA_AIR_DEBUG"))

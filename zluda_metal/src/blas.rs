@@ -87,9 +87,16 @@ fn launch(name: &str, grid: [u32; 3], block: [u32; 3], args: &[Arg]) -> R {
     if !crate::backend::use_agx() {
         return Err(fail("cuBLAS needs ZLUDA_METAL_BACKEND=agx", CUBLAS_STATUS_NOT_SUPPORTED));
     }
-    kernel(name)?
-        .launch_args(grid, block, args, 0)
-        .map_err(|e| fail(format!("{name}: {e}"), CUBLAS_STATUS_EXECUTION_FAILED))
+    // a context a kernel faulted in (src/cuda.rs, sticky errors) runs nothing more
+    if crate::cuda::current_sticky() != 0 {
+        return Err(CUBLAS_STATUS_EXECUTION_FAILED);
+    }
+    // a fault of the kernel is the context's sticky error, reported by the next CUDA call (as an asynchronous
+    // cuBLAS launch); an error of the launch itself fails this call
+    match crate::cuda::launch_result(kernel(name)?.launch_args(grid, block, args, 0)) {
+        0 => Ok(()),
+        e => Err(fail(format!("{name}: launch failed ({e})"), CUBLAS_STATUS_EXECUTION_FAILED)),
+    }
 }
 
 fn i32v(v: i32) -> Arg<'static> {

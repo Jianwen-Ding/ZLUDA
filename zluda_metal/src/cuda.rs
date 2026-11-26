@@ -35,6 +35,12 @@ pub const CUDA_ERROR_NOT_FOUND: CUresult = 500;
 pub const CUDA_ERROR_NOT_READY: CUresult = 600;
 pub const CUDA_ERROR_ILLEGAL_ADDRESS: CUresult = 700;
 pub const CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES: CUresult = 701;
+pub const CUDA_ERROR_LAUNCH_TIMEOUT: CUresult = 702;
+pub const CUDA_ERROR_ASSERT: CUresult = 710;
+pub const CUDA_ERROR_HARDWARE_STACK_ERROR: CUresult = 714;
+pub const CUDA_ERROR_ILLEGAL_INSTRUCTION: CUresult = 715;
+pub const CUDA_ERROR_MISALIGNED_ADDRESS: CUresult = 716;
+pub const CUDA_ERROR_INVALID_PC: CUresult = 718;
 pub const CUDA_ERROR_LAUNCH_FAILED: CUresult = 719;
 pub const CUDA_ERROR_NOT_SUPPORTED: CUresult = 801;
 pub const CUDA_ERROR_UNKNOWN: CUresult = 999;
@@ -47,8 +53,18 @@ const DRIVER_VERSION: c_int = 12080;
 // ---------------------------------------------------------------------------
 // Global state
 // ---------------------------------------------------------------------------
+/// A context. A fault of a kernel run in it (an illegal address, a trap, a failed assert, a hang) is sticky, as in
+/// CUDA: the launch itself returns success (launches are asynchronous in CUDA), and from then on every call that
+/// uses the context returns that error, until the context is destroyed (cuCtxDestroy) or, for the primary
+/// context, reset (cuDevicePrimaryCtxReset).
 pub struct Context {
-    _private: u8,
+    sticky: std::sync::atomic::AtomicU32,
+}
+
+impl Context {
+    fn new() -> Context {
+        Context { sticky: std::sync::atomic::AtomicU32::new(0) }
+    }
 }
 pub struct Stream {
     _private: u8,
@@ -75,6 +91,8 @@ pub struct Function {
     info: compile::Kernel,
     kernel: backend::Kernel,
     globals: CUdeviceptr,
+    /// the module's trap / assert record (__zluda_fault), if a kernel can trap
+    fault: Option<CUdeviceptr>,
 }
 
 struct Global {
@@ -118,13 +136,107 @@ macro_rules! tri {
 
 fn ensure_current() -> Result<&'static Global, CUresult> {
     let g = global()?;
-    CURRENT.with(|c| {
+    let ctx = CURRENT.with(|c| {
         if c.get().is_null() {
             // the runtime API makes the primary context current implicitly
             c.set(&*g.primary as *const Context as *mut Context);
         }
+        c.get()
     });
-    Ok(g)
+    // a context a kernel faulted in fails every call with that fault
+    match unsafe { (*ctx).sticky.load(std::sync::atomic::Ordering::Acquire) } {
+        0 => Ok(g),
+        code => Err(code),
+    }
+}
+
+/// A fault of a kernel: the current context's sticky error (the first fault's code stays), and the message
+fn device_fault(msg: String, code: CUresult) {
+    let ctx = CURRENT.with(|c| c.get());
+    if !ctx.is_null() {
+        let _ = unsafe { &*ctx }.sticky.compare_exchange(0, code, std::sync::atomic::Ordering::AcqRel,
+                                                          std::sync::atomic::Ordering::Acquire);
+    }
+    eprintln!("[zluda metal] {msg}");
+    report(msg, code);
+}
+
+/// The CUDA error of a fault message of the functional model (agx::DEVICE_FAULT)
+fn fault_code(msg: &str) -> CUresult {
+    if msg.contains("unmapped") || msg.contains("outside the declared memory") || msg.contains("wraps the address") {
+        CUDA_ERROR_ILLEGAL_ADDRESS
+    } else if msg.contains("step limit") {
+        CUDA_ERROR_LAUNCH_TIMEOUT
+    } else if msg.contains("stack access beyond") {
+        CUDA_ERROR_HARDWARE_STACK_ERROR
+    } else if msg.contains("outside the program") || msg.contains("unaligned instruction") {
+        CUDA_ERROR_INVALID_PC
+    } else if msg.contains("misaligned") {
+        CUDA_ERROR_MISALIGNED_ADDRESS
+    } else {
+        CUDA_ERROR_LAUNCH_FAILED
+    }
+}
+
+/// A launch's result: a fault of the kernel becomes the context's sticky error (the launch itself succeeds, as an
+/// asynchronous CUDA launch does), any other error is the launch's own
+pub(crate) fn launch_result(r: Result<(), String>) -> CUresult {
+    match r {
+        Ok(()) => CUDA_SUCCESS,
+        Err(e) => match e.strip_prefix(crate::agx::DEVICE_FAULT) {
+            Some(f) => {
+                device_fault(format!("kernel fault: {f}"), fault_code(f));
+                CUDA_SUCCESS
+            }
+            None => report(e, CUDA_ERROR_LAUNCH_FAILED),
+        },
+    }
+}
+
+/// Whether the current context has a sticky error (cuBLAS fails its calls then)
+pub(crate) fn current_sticky() -> CUresult {
+    let ctx = CURRENT.with(|c| c.get());
+    if ctx.is_null() {
+        0
+    } else {
+        unsafe { &*ctx }.sticky.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// A NUL-terminated string at a device (generic) address, at most 512 bytes
+fn device_string(addr: u64) -> String {
+    match backend::host_pointer(addr) {
+        Some((p, n)) => {
+            let b = unsafe { std::slice::from_raw_parts(p, (n as usize).min(512)) };
+            let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+            String::from_utf8_lossy(&b[..end]).into_owned()
+        }
+        None => format!("<0x{addr:x}>"),
+    }
+}
+
+/// After a launch: the kernel's trap / assert record (__zluda_fault, air_lower.cpp faultReporting), read and cleared
+fn check_fault_record(addr: Option<CUdeviceptr>, kernel: &str) {
+    let Some(a) = addr else { return };
+    let Some((p, n)) = backend::host_pointer(a) else { return };
+    if n < 32 {
+        return;
+    }
+    let w = unsafe { std::slice::from_raw_parts_mut(p as *mut u32, 8) };
+    let flags = w[0];
+    if flags == 0 {
+        return;
+    }
+    let q = |i: usize| w[i] as u64 | (w[i + 1] as u64) << 32;
+    let (line, msg, file, func) = (w[1], q(2), q(4), q(6));
+    w.fill(0);
+    if flags & 2 != 0 {
+        // as CUDA's device assert prints it
+        device_fault(format!("{}:{}: {}: Assertion `{}` failed. (kernel {kernel})", device_string(file), line,
+                             device_string(func), device_string(msg)), CUDA_ERROR_ASSERT);
+    } else {
+        device_fault(format!("kernel {kernel} executed trap"), CUDA_ERROR_LAUNCH_FAILED);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -135,7 +247,7 @@ pub unsafe extern "system" fn cuInit(_flags: c_uint) -> CUresult {
     let g = GLOBAL.get_or_init(|| {
         backend::init().map(|device| Global {
             device,
-            primary: Box::new(Context { _private: 0 }),
+            primary: Box::new(Context::new()),
             last_error: Mutex::new(String::new()),
         })
     });
@@ -331,7 +443,7 @@ pub unsafe extern "system" fn cuCtxCreate_v2(
     if dev != 0 {
         return CUDA_ERROR_INVALID_DEVICE;
     }
-    let c = Box::into_raw(Box::new(Context { _private: 0 }));
+    let c = Box::into_raw(Box::new(Context::new()));
     *ctx = c;
     CURRENT.with(|cur| cur.set(c));
     CUDA_SUCCESS
@@ -351,8 +463,28 @@ pub unsafe extern "system" fn cuCtxDestroy_v2(ctx: *mut Context) -> CUresult {
     });
     if ctx != &*g.primary as *const Context as *mut Context {
         drop(Box::from_raw(ctx));
+    } else {
+        g.primary.sticky.store(0, std::sync::atomic::Ordering::Release);
     }
     CUDA_SUCCESS
+}
+
+/// cudaDeviceReset: the primary context's sticky error is cleared (its allocations and modules are not freed:
+/// ZLUDA's are process-wide)
+#[no_mangle]
+pub unsafe extern "system" fn cuDevicePrimaryCtxReset_v2(dev: CUdevice) -> CUresult {
+    let g = tri!(global());
+    if dev != 0 {
+        return CUDA_ERROR_INVALID_DEVICE;
+    }
+    let _ = backend::synchronize();
+    g.primary.sticky.store(0, std::sync::atomic::Ordering::Release);
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn cuDevicePrimaryCtxReset(dev: CUdevice) -> CUresult {
+    cuDevicePrimaryCtxReset_v2(dev)
 }
 
 #[no_mangle]
@@ -396,7 +528,11 @@ pub unsafe extern "system" fn cuCtxSynchronize() -> CUresult {
     tri!(ensure_current());
     match backend::synchronize() {
         Ok(()) => CUDA_SUCCESS,
-        Err(e) => report(e, CUDA_ERROR_LAUNCH_FAILED),
+        Err(e) => {
+            // an asynchronous kernel failed (the Metal backend)
+            device_fault(e, CUDA_ERROR_LAUNCH_FAILED);
+            CUDA_ERROR_LAUNCH_FAILED
+        }
     }
 }
 
@@ -505,7 +641,10 @@ unsafe fn device_slice(ptr: CUdeviceptr, len: usize) -> Result<*mut u8, CUresult
 }
 
 fn sync_for_host_access() -> Result<(), CUresult> {
-    backend::synchronize().map_err(|e| report(e, CUDA_ERROR_LAUNCH_FAILED))
+    backend::synchronize().map_err(|e| {
+        device_fault(e, CUDA_ERROR_LAUNCH_FAILED);
+        CUDA_ERROR_LAUNCH_FAILED
+    })
 }
 
 #[no_mangle]
@@ -860,6 +999,7 @@ pub unsafe extern "system" fn cuModuleGetFunction(
         info: info.clone(),
         kernel,
         globals: m.globals,
+        fault: m.compiled.globals.iter().find(|g| g.name == "__zluda_fault").map(|g| m.globals + g.offset),
     });
     *func = &*f as *const Function as *mut Function;
     functions.insert(name, f);
@@ -1041,15 +1181,14 @@ pub unsafe extern "system" fn cuLaunchKernel(
     } else {
         0
     };
-    match f.kernel.launch(
+    let r = launch_result(f.kernel.launch(
         [grid_x, grid_y, grid_z],
         [block_x, block_y, block_z],
         &params,
         dynamic_shared,
-    ) {
-        Ok(()) => CUDA_SUCCESS,
-        Err(e) => report(e, CUDA_ERROR_LAUNCH_FAILED),
-    }
+    ));
+    check_fault_record(f.fault, &f.info.name);
+    r
 }
 
 // ---------------------------------------------------------------------------
@@ -1180,6 +1319,12 @@ fn error_name(e: CUresult) -> Option<&'static CStr> {
         CUDA_ERROR_NOT_READY => c"CUDA_ERROR_NOT_READY",
         CUDA_ERROR_ILLEGAL_ADDRESS => c"CUDA_ERROR_ILLEGAL_ADDRESS",
         CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES => c"CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES",
+        CUDA_ERROR_LAUNCH_TIMEOUT => c"CUDA_ERROR_LAUNCH_TIMEOUT",
+        CUDA_ERROR_ASSERT => c"CUDA_ERROR_ASSERT",
+        CUDA_ERROR_HARDWARE_STACK_ERROR => c"CUDA_ERROR_HARDWARE_STACK_ERROR",
+        CUDA_ERROR_ILLEGAL_INSTRUCTION => c"CUDA_ERROR_ILLEGAL_INSTRUCTION",
+        CUDA_ERROR_MISALIGNED_ADDRESS => c"CUDA_ERROR_MISALIGNED_ADDRESS",
+        CUDA_ERROR_INVALID_PC => c"CUDA_ERROR_INVALID_PC",
         CUDA_ERROR_LAUNCH_FAILED => c"CUDA_ERROR_LAUNCH_FAILED",
         CUDA_ERROR_NOT_SUPPORTED => c"CUDA_ERROR_NOT_SUPPORTED",
         CUDA_ERROR_UNKNOWN => c"CUDA_ERROR_UNKNOWN",

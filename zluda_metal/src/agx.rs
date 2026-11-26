@@ -282,6 +282,10 @@ pub fn launch_value(d: u32, kind: u32) -> u32 {
 // ---------------------------------------------------------------------------
 // Libraries and kernels
 // ---------------------------------------------------------------------------
+/// The prefix of a launch error that is a fault of the running kernel (an unmapped access, a step limit, ...),
+/// not of the launch itself
+pub const DEVICE_FAULT: &str = "device fault: ";
+
 /// A kernel argument of [`Kernel::launch_args`]: bytes copied into a temporary buffer (whose address is the
 /// argument), a device address, or a value (the argument's own bytes: a scalar of an MLIR kernel)
 pub enum Arg<'a> {
@@ -670,7 +674,8 @@ impl Kernel {
         for t in temps {
             free(t);
         }
-        let st = res?;
+        // an error of the functional model is the kernel's own fault (src/cuda.rs: a sticky context error)
+        let st = res.map_err(|e| format!("{DEVICE_FAULT}{e}"))?;
         last_stats().lock().unwrap().push((r.name.clone(), st.instructions));
         if let Some(path) = std::env::var_os("ZLUDA_AGX_STATS") {
             use std::io::Write;

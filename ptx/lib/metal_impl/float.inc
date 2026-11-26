@@ -496,8 +496,10 @@
     static inline uint64_t f_negabs(uint64_t a, uint32_t ctrl)
     {
         uint32_t t = (ctrl >> 4) & 15;
-        if (ctrl & F_FTZ)
+        if ((ctrl & F_FTZ) && t != T_F64)
             a = flush_bits(a, t);
+        if (t == T_F64 && bits_nan(a, t))
+            return a;
         return (ctrl & 1) ? a & (t_signbit(t) - 1) : a ^ t_signbit(t);
     }
     static inline uint64_t f_negabs_v(uint64_t a, uint32_t ctrl)
@@ -508,6 +510,7 @@
     }
     uint16_t FUNC(fnegabs_16)(uint16_t a, uint32_t ctrl) { return (uint16_t)f_negabs_v(a, ctrl); }
     uint32_t FUNC(fnegabs_32)(uint32_t a, uint32_t ctrl) { return (uint32_t)f_negabs_v(a, ctrl); }
+    uint64_t FUNC(fnegabs_64)(uint64_t a, uint32_t ctrl) { return f_negabs(a, ctrl); }
 
     // ---------------------------------------------------------------- transcendental helpers in double
     // (soft-f64 on AGX: correctly rounded IEEE operations)

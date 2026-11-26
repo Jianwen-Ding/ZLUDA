@@ -340,7 +340,7 @@ fn approx<'i>(base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
 /// neg / abs{.ftz}.{f32,f16,bf16,f16x2,bf16x2}: flush, then the sign bit
 fn negabs<'i>(base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
     let (code, pk, w) = ftype(m.last()?)?;
-    if code == 0 || ops.len() != 2 || m.iter().any(|x| *x != "ftz" && ftype(x).is_none()) {
+    if (code == 0 && base != "abs") || ops.len() != 2 || m.iter().any(|x| *x != "ftz" && ftype(x).is_none()) {
         return None;
     }
     let ctrl = (base == "abs") as u64 | code << 4 | (pk as u64) << 8 | (m.contains(&"ftz") as u64) << 12;
@@ -418,7 +418,8 @@ pub(super) fn preempts(_opcode: &str, base: &str, m: &[&str]) -> bool {
         "rcp" | "rsqrt" if m == ["approx", "f64"] || m == ["approx", "ftz", "f64"] => true,
         "div" if m == ["approx", "f32"] || m == ["approx", "ftz", "f32"] => true,
         // neg / abs .ftz (llvm.canonicalize is not available)
-        "neg" | "abs" => m.contains(&"ftz"),
+        // (abs.f64: "NaN input is passed through unchanged")
+        "neg" | "abs" => m.contains(&"ftz") || (base == "abs" && m == ["f64"]),
         // f32 division and square root with a directed rounding or .ftz (exact, with subnormals)
         "div" | "sqrt" | "rcp" => {
             m.last() == Some(&"f32") && !any(&["approx", "full"]) && any(&["rz", "rm", "rp", "ftz", "sat"])

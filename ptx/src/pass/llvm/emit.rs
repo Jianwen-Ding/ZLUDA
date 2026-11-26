@@ -174,6 +174,16 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                 }
             }
             unsafe { LLVMSetValueName2(value, name.as_ptr().cast(), name.len()) };
+            // the hidden address arguments of .const variables in 32-bit modules are marked (isspacep.const)
+            if let Some(n) = self.id_defs.ident_map.get(&param.name).and_then(|e| e.name.as_deref()) {
+                if n.starts_with("__zluda_const32_") {
+                    let key = "zluda-const32";
+                    let attr = unsafe {
+                        LLVMCreateStringAttribute(self.context, key.as_ptr().cast(), key.len() as u32, ptr::null(), 0)
+                    };
+                    unsafe { LLVMAddAttributeAtIndex(fn_, i as u32 + 1, attr) };
+                }
+            }
             self.resolver.register(param.name, value);
             if method.is_kernel() {
                 let attr_kind = unsafe {

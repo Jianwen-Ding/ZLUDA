@@ -31,6 +31,18 @@ pub(super) fn run<'input>(
     TranslateError,
 > {
     let (global_ids, globals) = collect_globals(resolver, &directives)?;
+    // the hidden arguments of .const variables are named __zluda_const32_*: isspacep.const of their addresses
+    // (zluda_metal/cpp/air_lower.cpp resolveIsSpacep)
+    let const_names = directives
+        .iter()
+        .filter_map(|d| match d {
+            Directive2::Variable(_, var) if var.info.state_space == ast::StateSpace::Const => {
+                let name = resolver.ident_map.get(&var.name)?.name.as_ref()?;
+                Some((var.name, format!("__zluda_const32_{name}")))
+            }
+            _ => None,
+        })
+        .collect::<FxHashMap<_, _>>();
     let mut explicit_args_size_align = Vec::new();
     let directives = directives
         .into_iter()
@@ -39,6 +51,7 @@ pub(super) fn run<'input>(
                 resolver,
                 directive,
                 &global_ids,
+                &const_names,
                 &mut explicit_args_size_align,
             )
             .transpose()
@@ -142,6 +155,7 @@ fn run_directive<'input>(
     resolver: &mut GlobalStringIdentResolver2<'input>,
     directive: Directive2<ast::Instruction<SpirvWord>, SpirvWord>,
     globals_ids: &[SpirvWord],
+    const_names: &FxHashMap<SpirvWord, String>,
     explicit_args_size_align: &mut Vec<(String, Vec<(u32, u32)>)>,
 ) -> Result<Option<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>, TranslateError> {
     Ok(match directive {
@@ -152,6 +166,7 @@ fn run_directive<'input>(
             resolver,
             method,
             globals_ids,
+            const_names,
             explicit_args_size_align,
         )?)),
         _ => None,
@@ -162,6 +177,7 @@ fn run_method<'input>(
     resolver: &mut GlobalStringIdentResolver2<'input>,
     mut method: Function<ast::Instruction<SpirvWord>, SpirvWord>,
     globals_ids: &[SpirvWord],
+    const_names: &FxHashMap<SpirvWord, String>,
     explicit_args_size_align: &mut Vec<(String, Vec<(u32, u32)>)>,
 ) -> Result<Function<ast::Instruction<SpirvWord>, SpirvWord>, TranslateError> {
     let is_kernel = method.is_kernel();
@@ -200,6 +216,7 @@ fn run_method<'input>(
         explicit_args_size_align.push((text_name, argument_sizes));
         let implicit_memory_ptr = add_hidden_argument(
             resolver,
+            None,
             ast::ScalarType::B64,
             &mut method.input_arguments,
             &mut result,
@@ -211,6 +228,7 @@ fn run_method<'input>(
                     id,
                     add_hidden_argument(
                         resolver,
+                        const_names.get(&id).cloned(),
                         ast::ScalarType::B32,
                         &mut method.input_arguments,
                         &mut result,
@@ -250,14 +268,16 @@ fn run_statement<'input>(
 
 fn add_hidden_argument<'input>(
     resolver: &mut GlobalStringIdentResolver2<'input>,
+    name: Option<String>,
     type_: ast::ScalarType,
     input_arguments: &mut Vec<ast::Variable<SpirvWord>>,
     body: &mut Vec<Statement<ast::Instruction<SpirvWord>, SpirvWord>>,
 ) -> SpirvWord {
-    let implicit_argument_param = resolver.register_unnamed(Some((
-        ast::Type::Scalar(type_),
-        ast::StateSpace::ParamEntry,
-    )));
+    let type_space = Some((ast::Type::Scalar(type_), ast::StateSpace::ParamEntry));
+    let implicit_argument_param = match name {
+        Some(n) => resolver.register_named(std::borrow::Cow::Owned(n), type_space),
+        None => resolver.register_unnamed(type_space),
+    };
     input_arguments.push(ast::Variable {
         name: implicit_argument_param,
         info: ast::VariableInfo {

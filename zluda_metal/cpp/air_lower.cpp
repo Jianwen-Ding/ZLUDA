@@ -635,11 +635,40 @@ static void resolveIsSpacep(Module &m)
             space = 2;
         else if (as == amd::Constant || as == amd::Constant32)
             space = isa<Argument>(p) ? 4 : 3;
+        if (space == 0 && !isa<GlobalValue>(p) && !isa<Argument>(p))
+        {
+            // .address_size 32: a .const variable's address is the value of its hidden kernel argument
+            // (ptx/src/pass/convert_32bit_to_64bit.rs: parameter attribute "zluda-const32"), plus offsets
+            Value *v = p;
+            for (int guard = 0; guard < 64; guard++)
+            {
+                if (auto *o = dyn_cast<Operator>(v); o && (o->getOpcode() == Instruction::IntToPtr ||
+                                                           o->getOpcode() == Instruction::PtrToInt ||
+                                                           o->getOpcode() == Instruction::ZExt ||
+                                                           o->getOpcode() == Instruction::Trunc ||
+                                                           o->getOpcode() == Instruction::BitCast))
+                    v = o->getOperand(0);
+                else if (auto *bo = dyn_cast<BinaryOperator>(v);
+                         bo && (bo->getOpcode() == Instruction::Add || bo->getOpcode() == Instruction::Sub) &&
+                         isa<ConstantInt>(bo->getOperand(1)))
+                    v = bo->getOperand(0);
+                else if (auto *g = dyn_cast<GEPOperator>(v))
+                    v = g->getPointerOperand();
+                else
+                    break;
+            }
+            if (auto *ld = dyn_cast<LoadInst>(v))
+                if (auto *a = dyn_cast<Argument>(ld->getPointerOperand()->stripPointerCasts());
+                    a && a->getParent()->getAttributes().hasParamAttr(a->getArgNo(), "zluda-const32"))
+                    space = 3;
+        }
         uint64_t kind = cast<ConstantInt>(ci->getArgOperand(1))->getZExtValue();
         // the kernel-parameter window lies inside the .global window (PTX ISA 6.4.1.1)
         bool r = kind == 5 ? space == 1 : kind == 0 ? space == 0 || space == 4 : (uint64_t)space == kind;
         Value *arg = ci->getArgOperand(0);
         bool unknown = space == 0 && !isa<GlobalValue>(p) && !isa<Argument>(p);
+        if (space == 3)
+            r = kind == 3;
         if (unknown && hasConst && (kind == 0 || kind == 3))
         {
             // an address of unknown origin: the module's .const variables are a range of the device-globals buffer

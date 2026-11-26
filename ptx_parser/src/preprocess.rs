@@ -29,6 +29,7 @@ fn rewrite_all(text: &str) -> String {
     let s = array_operands(&s);
     let s = colour_members(&s);
     let s = vector_members_in_lists(&s);
+    let s = per_cta_memory(&s);
     if super::preprocess_calls::needs_work(&s) {
         super::preprocess_calls::rewrite(&s)
     } else {
@@ -47,6 +48,7 @@ fn needs_work(text: &str) -> bool {
         || text.contains("generic(")
         || text.contains("texmode_")
         || text.contains("compute_")
+        || text.contains(".minperctamemory")
         || text.contains("0b")
         || text.contains('[')
         || b.iter().any(|c| matches!(c, b'*' | b'/' | b'%' | b'&' | b'^' | b'~' | b'?' | b'<' | b'>' | b'(' | b'+' | b'-'))
@@ -1330,6 +1332,74 @@ fn vector_members_in_lists(t: &str) -> String {
             out.push_str(&format!("{{ {} {}; {} }}", decls.join(" "), inst_new.trim(), moves.join(" ")));
         } else {
             out.push_str(&format!("{{ {} {} {}; }}", decls.join(" "), moves.join(" "), inst_new.trim()));
+        }
+    }
+    out
+}
+
+// ------------------------------------------------------------------------------------------------ per-CTA memory
+
+/// CTAs of a launch that `.minperctamemory` provides slices for
+const PCM_CTAS: u64 = 256;
+
+/// `.minperctamemory N` (PTX ISA 9.4 11.4.10, 10.34-10.35): every CTA gets a slice of %perctamemorysize bytes (N rounded
+/// up to a multiple of 1024) at %perctamemoryoffset, the slices in CTA order: a module variable of PCM_CTAS slices per
+/// kernel, %perctamemorysize its constant, `mov.u64 d, %perctamemoryoffset` the address of the CTA's slice
+fn per_cta_memory(t: &str) -> String {
+    let Some(mut p) = t.find(".minperctamemory") else { return t.to_string() };
+    let mut out = t.to_string();
+    let mut n = 0;
+    loop {
+        // the kernel: the last `.entry NAME` before the directive, its body the next `{ ... }`
+        let Some(ep) = out[..p].rfind(".entry") else { break };
+        let name: String = out[ep + 6..].trim_start().bytes().take_while(|c| is_word(*c) && *c != b'.').map(|c| c as char).collect();
+        let num_s = out[p + ".minperctamemory".len()..].trim_start();
+        let digits: String = num_s.bytes().take_while(|c| c.is_ascii_alphanumeric()).map(|c| c as char).collect();
+        let Some(v) = parse_num(&digits).and_then(|v| if let Val::I(x, _) = v { Some(x) } else { None }) else { break };
+        let size = v.max(1).div_ceil(1024) * 1024;
+        let dir_end = p + ".minperctamemory".len() + (out[p + ".minperctamemory".len()..].len() - num_s.len()) + digits.len();
+        out.replace_range(p..dir_end, "");
+        let line_start = out[..ep].rfind('\n').map_or(0, |x| x + 1);
+        let var = format!("__zluda_pcm_{name}");
+        let decl = format!(".global .align 1024 .b8 {var}[{}];\n", size * PCM_CTAS);
+        out.insert_str(line_start, &decl);
+        let body_start = out[line_start + decl.len()..].find('{').map(|x| x + line_start + decl.len());
+        if let Some(bs) = body_start {
+            let be = block_end(&out, bs);
+            let body = out[bs..be].to_string();
+            let mut nb = String::new();
+            for st in body.split_inclusive(';') {
+                let trimmed = st.trim_start_matches(|c: char| c != 'm' && c.is_whitespace());
+                let movp = st.find("mov.");
+                if let (Some(mp), true) = (movp, st.contains("%perctamemoryoffset")) {
+                    let ins = &st[mp..];
+                    let parts: Vec<&str> = ins.trim_end_matches(';').splitn(2, char::is_whitespace).collect();
+                    if parts.len() == 2 && parts[0].ends_with("64") {
+                        let ops: Vec<&str> = parts[1].split(',').map(|x| x.trim()).collect();
+                        if ops.len() == 2 && ops[1] == "%perctamemoryoffset" {
+                            let d = ops[0];
+                            let a = format!("%__zluda_pcm_a{n}");
+                            let b = format!("%__zluda_pcm_b{n}");
+                            n += 1;
+                            nb.push_str(&st[..mp]);
+                            nb.push_str(&format!(
+                                "{{ .reg .u32 {a}, {b}; mov.u32 {a}, %ctaid.z; mov.u32 {b}, %nctaid.y; mul.lo.u32 {a}, {a}, {b}; \
+                                 mov.u32 {b}, %ctaid.y; add.u32 {a}, {a}, {b}; mov.u32 {b}, %nctaid.x; mul.lo.u32 {a}, {a}, {b}; \
+                                 mov.u32 {b}, %ctaid.x; add.u32 {a}, {a}, {b}; mov.u64 {d}, {var}; mad.wide.u32 {d}, {a}, {size}, {d}; }}"
+                            ));
+                            continue;
+                        }
+                    }
+                }
+                let _ = trimmed;
+                nb.push_str(&st.replace("%perctamemorysize", &size.to_string()));
+            }
+            // the `;` after a rewritten statement was consumed with it
+            out.replace_range(bs..be, &nb);
+        }
+        match out.find(".minperctamemory") {
+            Some(q) => p = q,
+            None => break,
         }
     }
     out

@@ -40,7 +40,8 @@ static inline float ndi(float x) { return g_flush ? fl(x) : x; }
     static inline float __zluda_nd_fsub_f32(float a, float b) { return ndr(ndi(a) - ndi(b)); }                 \
     static inline float __zluda_nd_fmul_f32(float a, float b) { return ndr(ndi(a) * ndi(b)); }                 \
     static inline float __zluda_nd_fdiv_f32(float a, float b) { return ndr(ndi(a) / ndi(b)); }                 \
-    static inline float __zluda_nd_fma_f32(float a, float b, float c) { return ndr(__builtin_fmaf(ndi(a), ndi(b), ndi(c))); }
+    static inline float __zluda_nd_fma_f32(float a, float b, float c) { return ndr(__builtin_fmaf(ndi(a), ndi(b), ndi(c))); } \
+    static inline float __zluda_nd_sqrt_f32(float a) { return ndr(__builtin_sqrtf(ndi(a))); }                     
 
 #define FUNC(N) __zluda_ptx_impl_##N
 
@@ -50,6 +51,7 @@ ND_PRELUDE
 #include "fallback_core.inc"
 #include "cvt.inc"
 #include "float.inc"
+static uint32_t sqrt_rn(uint32_t a, uint32_t ctrl) { return __zluda_ptx_impl_fdivsqrt_f32(a, 0, ctrl | 1); }
 } // namespace fast
 #define ZLUDA_NO_FAST_PATHS
 namespace ref
@@ -58,6 +60,7 @@ ND_PRELUDE
 #include "fallback_core.inc"
 #include "cvt.inc"
 #include "float.inc"
+static uint32_t sqrt_rn(uint32_t a, uint32_t ctrl) { return __zluda_ptx_impl_fdivsqrt_f32(a, 0, ctrl | 1); }
 } // namespace ref
 
 // The model's correctly rounded definitions (ptx_math.sail), from binary128 (libquadmath, within an ulp of 2^-112):
@@ -141,6 +144,8 @@ static const Case cases[] = {
     {"rsqrt.approx.ftz.f32", fast::__zluda_ptx_impl_frsqrt_f32, ref::__zluda_ptx_impl_frsqrt_f32, 1 << 12},
     {"rsqrt.approx.f32/model", fast::__zluda_ptx_impl_frsqrt_f32, ref::__zluda_ptx_impl_frsqrt_f32, 0, model_rsqrt},
     {"rsqrt.approx.ftz.f32/model", fast::__zluda_ptx_impl_frsqrt_f32, ref::__zluda_ptx_impl_frsqrt_f32, 1 << 12, model_rsqrt},
+    {"sqrt.rn.f32", fast::sqrt_rn, ref::sqrt_rn, 0},
+    {"sqrt.rn.ftz.f32", fast::sqrt_rn, ref::sqrt_rn, 1 << 12},
     {"ex2.approx.f32", fast::__zluda_ptx_impl_fex2_f32, ref::__zluda_ptx_impl_fex2_f32, 0, model_ex2},
     {"ex2.approx.ftz.f32", fast::__zluda_ptx_impl_fex2_f32, ref::__zluda_ptx_impl_fex2_f32, 1 << 12, model_ex2},
     {"lg2.approx.f32", fast::__zluda_ptx_impl_flg2_f32, ref::__zluda_ptx_impl_flg2_f32, 0, model_lg2},

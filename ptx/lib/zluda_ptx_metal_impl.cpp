@@ -67,12 +67,14 @@ extern "C"
 
     // Binary32 operations whose operands and results are never subnormal (proven, or checked exhaustively, by
     // the helper using them): every denormal mode gives the IEEE result, so air_lower.cpp
-    // (lowerNoDenormalHelperCalls) emits the plain operation, rounding to nearest, without !agx.keep-denormals
+    // (lowerNoDenormalHelperCalls) emits the plain operation (llvm.sqrt for the root), rounding to nearest, without
+    // !agx.keep-denormals
     __attribute__((const)) float __zluda_nd_fadd_f32(float, float);
     __attribute__((const)) float __zluda_nd_fsub_f32(float, float);
     __attribute__((const)) float __zluda_nd_fmul_f32(float, float);
     __attribute__((const)) float __zluda_nd_fdiv_f32(float, float);
     __attribute__((const)) float __zluda_nd_fma_f32(float, float, float);
+    __attribute__((const)) float __zluda_nd_sqrt_f32(float);
 
     // ---------------------------------------------------------------------
     // Special registers

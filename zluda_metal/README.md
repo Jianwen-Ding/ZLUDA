@@ -137,6 +137,8 @@ PTX ──ZLUDA──▶ portable AIR (.metallib) ──llvm-air2agx──▶ AG
 * Instructions outside ZLUDA's grammar are lowered by `ptx_parser/src/helpers.rs` and
   `helper_table/` (one module per family: video, misc, cvt, float, matrix, tensor, memory) to calls of
   helpers in `ptx/lib/metal_impl/*.inc`, written from PTX-formalization's Sail model.
+* `ZLUDA_COMPILE_TIMES=1` prints the time of each compilation phase (PTX parse, translation, each step of
+  `air_lower.cpp`). The helper library is read lazily and only the helpers a module calls are linked.
 * `ZLUDA_AGX_STATS=FILE` appends each launch's dynamic instructions and the simulator's predicted time
   (dispatch model, M2 Max, CUDA-runtime launch profile) as JSON lines.
 
@@ -169,7 +171,16 @@ numpy (transposes, leading dimensions, negative increments, batches, both pointe
 | --- | --- |
 | `fast` (default) | Results within a few ulp of PTX's. The `.approx` transcendentals (`sin`, `cos`, `ex2`, `rsqrt` and the half forms of `ex2` / `tanh`) are the hardware's approximations, `tanh.approx` a short float evaluation (about 2 ulp of the true tanh), NaN results keep the hardware's bit patterns. Denormals are IEEE (as CUDA's default `-ftz=false`); `div`, `sqrt` (correctly rounded), directed roundings and double precision (software) are exact. |
 | `fast-ftz` | `fast` with binary32 denormal operands and results flushed to zero, as `-ftz=true` / `--use_fast_math`: the hardware's own arithmetic. |
-| `strict` | Bit for bit the formal model: IEEE binary32 with denormals (`!agx.keep-denormals`), the model's transcendentals, canonical NaN (`-mattr=+canonical-nan`). |
+| `strict` | Bit for bit the formal model: IEEE binary32 with denormals (`!agx.keep-denormals`), the model's transcendentals (`sin`, `cos`, `ex2`, `lg2`, `tanh` correctly rounded, `rsqrt` as two roundings, `sqrt.approx` correctly rounded), canonical NaN (`-mattr=+canonical-nan`). |
+
+In strict mode the binary32 `tanh`, `sin` / `cos` (|x| < 200), `ex2` and `lg2` are evaluated in float-float
+arithmetic (`float.inc` `f_exp_pm`, `f_sincos_fast`, `f_exp2_fast`, `f_lg2_fast`) and returned when both ends of
+the result's error interval round alike, otherwise by the exact path; their operations never see a subnormal and are
+emitted without `!agx.keep-denormals` (`__zluda_nd_*`). `tests/stress/exhaustive/fastpath.cpp` checks each fast path
+against the exact path, and `ex2` / `lg2` / `rsqrt` against binary128 references of the model, for all 2^32 operands.
+`air_lower.cpp` also leaves `!agx.keep-denormals` off binary32 operations that provably cannot meet a subnormal
+(`FRangeAnalysis`: magnitude bounds and granularity from constants and integer or half conversions;
+`ZLUDA_AGX_NO_FRANGE=1` tags them all).
 
 Division and square root are not relaxed in any mode: a reciprocal-based division is wrong by far more
 than a few ulp for divisors beyond 2^126 (as CUDA's `__fdividef`). Note that the model's own `.approx`
@@ -184,7 +195,8 @@ Tests and tools (no NVIDIA or Apple tool anywhere: PTX is hand written or from c
 | Tool | What |
 | --- | --- |
 | `tests/ptxconf/ptxconf.py` | PTX-formalization's harness programs (`.buffer`/`.launch`/`.expect`, `.tensormap`), every `.expect` checked bit for bit; `triage.py` ranks blockers |
-| `tests/stress/gen.sh OUT` | a large generated suite (the formalization's ISA generators with new seeds, 512 cases per launch, ~570 programs); `stress/gen/gen_tanh.py` adds exact `tanh.approx` cases |
+| `tests/stress/gen.sh OUT` | a large generated suite (the formalization's ISA generators with new seeds, 512 cases per launch, ~880 programs, with `stress/gen/gen_sincos.py` and `gen_transc.py`: `sin` / `cos` / `ex2` / `lg2` / `rsqrt` / `sqrt` / `rcp` `.approx` against the model, where the hardware's approximations differ); `stress/gen/gen_tanh.py` adds exact `tanh.approx` cases |
+| `tests/stress/exhaustive/fastpath.cpp` | the helper library's binary32 fast paths against its exact paths and the model, for every operand, on the host |
 | `tests/alive/opt_check.py` | alive2 (`alive-tv --fp-uf`, the fork in `../../alive2`) proves that each kernel's AGX IR at -O3 refines -O0 |
 | `tests/bench/bench.py`, `cuda_bench.py` | predicted time of the conformance corpus, and of the LLVM fork's agx-bench CUDA kernels at realistic sizes (outputs hashed against `bench_ref.json`) |
 

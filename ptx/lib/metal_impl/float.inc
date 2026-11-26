@@ -502,6 +502,26 @@
     FSET(16, uint16_t, 32, uint32_t)
     FSET(32, uint32_t, 32, uint32_t)
 
+    // RN(sqrt x) of a binary32 x with IEEE subnormals: a subnormal m 2^-149 = 2m 2^-150 has the root
+    // RN(sqrt(2m)) 2^-75 (2m < 2^24 converts exactly; the scaling is exact, the root normal), so the root itself
+    // never meets a subnormal (__zluda_nd_sqrt_f32: the hardware's correctly rounded root)
+    static inline float f_sqrt_rn(float x)
+    {
+        uint32_t u = __builtin_bit_cast(uint32_t, x);
+        // (a nonzero subnormal: 0 < 2u < 2^24, tested without masks, which LLVM would turn into a comparison of
+        // fabs x with 0, false for a subnormal in a flushing kernel)
+        bool sub = (u << 1) - 1u < 0x00FFFFFFu;
+        float xs = sub ? (float)(int)((u & 0x7FFFFFu) << 1) : x;
+        float r = __zluda_nd_sqrt_f32(xs);
+        if (sub)
+        {
+            r = __zluda_nd_fmul_f32(r, 0x1p-75f);
+            if (u >> 31)
+                r = __builtin_bit_cast(float, 0x7FFFFFFFu); // the root of a negative subnormal: NaN
+        }
+        return r;
+    }
+
     // ---------------------------------------------------------------- f32 div / sqrt / rcp, exact
     // ctrl: 0-1 op (0 div 1 sqrt 2 rcp), 9-11 rounding, 12 .ftz, 13 .sat
     uint32_t FUNC(fdivsqrt_f32)(uint32_t a, uint32_t b, uint32_t ctrl)
@@ -516,7 +536,11 @@
             auto fl = [&](uint32_t u) { return (ftz && (u & 0x7F800000u) == 0) ? (u & 0x80000000u) : u; };
             float fx = __builtin_bit_cast(float, op == 2 ? 0x3F800000u : fl(a));
             float fy = __builtin_bit_cast(float, op == 2 ? fl(a) : fl(b));
+#ifndef ZLUDA_NO_FAST_PATHS
+            float fr = op == 1 ? f_sqrt_rn(fx) : __zluda_ieee_fdiv_f32(fx, fy);
+#else
             float fr = op == 1 ? __zluda_ieee_sqrt_f32(fx) : __zluda_ieee_fdiv_f32(fx, fy);
+#endif
             uint32_t r = __builtin_bit_cast(uint32_t, fr);
             if ((r & 0x7FFFFFFFu) > 0x7F800000u)
                 return 0x7FFFFFFFu;
@@ -805,12 +829,13 @@
             // RN(1 / RN(sqrt x)): two correctly rounded IEEE operations of the backend (subnormals kept;
             // .ftz flushes the operand and the result), canonical NaN
             auto fl = [&](uint32_t u) { return (ftz && (u & 0x7F800000u) == 0) ? (u & 0x80000000u) : u; };
-            float s = __zluda_ieee_sqrt_f32(__builtin_bit_cast(float, fl(a)));
 #ifndef ZLUDA_NO_FAST_PATHS
             // the root of a binary32 value is never subnormal (2^-74.5 <= s < 2^64, or 0, inf, NaN), nor is 1 / s:
-            // the division needs no subnormal handling
+            // the division needs no subnormal handling, and the root none either once a subnormal operand is scaled
+            float s = f_sqrt_rn(__builtin_bit_cast(float, fl(a)));
             uint32_t r = __builtin_bit_cast(uint32_t, __zluda_nd_fdiv_f32(1.0f, s));
 #else
+            float s = __zluda_ieee_sqrt_f32(__builtin_bit_cast(float, fl(a)));
             uint32_t r = __builtin_bit_cast(uint32_t, __zluda_ieee_fdiv_f32(1.0f, s));
 #endif
             if ((r & 0x7FFFFFFFu) > 0x7F800000u)

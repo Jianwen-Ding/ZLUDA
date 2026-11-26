@@ -3496,7 +3496,7 @@ static void lowerIEEEHelperCalls(Module &m)
     }
 }
 
-// __zluda_nd_{fadd,fsub,fmul,fdiv,fma}_f32 (zluda_ptx_metal_impl.cpp): binary32 operations of the helper library
+// __zluda_nd_{fadd,fsub,fmul,fdiv,fma,sqrt}_f32 (zluda_ptx_metal_impl.cpp): binary32 operations of the helper library
 // whose operands and results are never subnormal, so that the hardware's flushing operation is the IEEE one. They
 // become the plain LLVM operation after the floating point modes are resolved: rounding to nearest, without
 // !agx.keep-denormals.
@@ -3524,6 +3524,8 @@ static void lowerNoDenormalHelperCalls(Module &m)
             r = b.CreateFDiv(a0, ci->getArgOperand(1));
         else if (n == "fma_f32")
             r = b.CreateIntrinsic(Intrinsic::fma, {a0->getType()}, {a0, ci->getArgOperand(1), ci->getArgOperand(2)});
+        else if (n == "sqrt_f32")
+            r = b.CreateUnaryIntrinsic(Intrinsic::sqrt, a0);
         else
             fail("unknown no-denormal helper operation " + n.str());
         ci->replaceAllUsesWith(r);

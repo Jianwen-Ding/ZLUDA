@@ -2239,11 +2239,11 @@ impl SetpData {
     ) -> Self {
         let flush_to_zero = match (ftz, type_) {
             (_, ScalarType::F32) => Some(ftz),
-            (true, _) => {
-                state.errors.push(PtxError::NonF32Ftz);
+            // ".ftz applies only to .f32 comparisons": accepted and ignored for other types
+            _ => {
+                let _ = &state;
                 None
             }
-            _ => None,
         };
         let type_kind = type_.kind();
         let cmp_op = if type_kind == ScalarKind::Float {

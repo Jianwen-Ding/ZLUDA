@@ -3,7 +3,12 @@ use super::*;
 
 /// tried before the grammar: `mov` of special registers the grammar's types reject
 pub(super) fn preempts(_opcode: &str, base: &str, m: &[&str]) -> bool {
-    (base == "bar" || base == "barrier") && m.contains(&"red")
+    base == "bmsk"
+        // packed integer lanes (float.rs ipack): the grammar's lowering is a 32-bit operation
+        || matches!(base, "add" | "sub" | "min" | "max" | "neg" | "abs")
+            && m.iter().any(|x| matches!(*x, "u8x4" | "s8x4" | "u16x2" | "s16x2"))
+        || base == "dp4a" && m.len() == 2 && m[0] != m[1]
+        || (base == "bar" || base == "barrier") && m.contains(&"red")
         || base == "mov" && (m.contains(&"v4") || m.contains(&"v2") || m == ["u32"] || m == ["b32"] || m == ["s32"])
 }
 
@@ -50,6 +55,99 @@ pub(super) fn mov_sreg_members<'i>(m: &[&str], ops: &[HOp<'i>]) -> Option<Vec<as
 
 pub(super) fn lower<'i>(_opcode: &str, base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
     match base {
+        "bfind" => {
+            // bfind{.shiftamt}.type d, a;
+            let t = *m.last()?;
+            let [d, a] = ops else { return err("bfind operands") };
+            let wide = t.ends_with("64");
+            let ctrl = (is_signed(t) as u64) | ((m.contains(&"shiftamt") as u64) << 1);
+            Call::new(if wide { "bfind_64" } else { "bfind_32" })
+                .dst(d.op.clone(), ScalarType::U32)
+                .src(a.op.clone(), if wide { ScalarType::B64 } else { ScalarType::B32 })
+                .imm(ctrl)
+                .build()
+        }
+        "fns" => {
+            let [d, mk, b, o] = ops else { return err("fns operands") };
+            Call::new("fns_b32")
+                .dst(d.op.clone(), ScalarType::B32)
+                .src(mk.op.clone(), ScalarType::B32)
+                .src(b.op.clone(), ScalarType::U32)
+                .src(o.op.clone(), ScalarType::S32)
+                .build()
+        }
+        "bmsk" => {
+            let [d, a, b] = ops else { return err("bmsk operands") };
+            Call::new("bmsk_b32")
+                .dst(d.op.clone(), ScalarType::B32)
+                .src(a.op.clone(), ScalarType::U32)
+                .src(b.op.clone(), ScalarType::U32)
+                .imm(m.contains(&"clamp") as u64)
+                .build()
+        }
+        "szext" => {
+            let t = *m.last()?;
+            let [d, a, b] = ops else { return err("szext operands") };
+            Call::new("szext_32")
+                .dst(d.op.clone(), ScalarType::B32)
+                .src(a.op.clone(), ScalarType::B32)
+                .src(b.op.clone(), ScalarType::U32)
+                .imm((m.contains(&"clamp") as u64) | ((is_signed(t) as u64) << 1))
+                .build()
+        }
+        "prmt" => {
+            let mode = ["f4e", "b4e", "rc8", "ecl", "ecr", "rc16"].iter().position(|x| m.contains(x))? as u64 + 1;
+            let [d, a, b, c] = ops else { return err("prmt operands") };
+            Call::new("prmt_mode")
+                .dst(d.op.clone(), ScalarType::B32)
+                .src(a.op.clone(), ScalarType::B32)
+                .src(b.op.clone(), ScalarType::B32)
+                .src(c.op.clone(), ScalarType::B32)
+                .imm(mode)
+                .build()
+        }
+        "mad24" | "mul24" => {
+            // mad24.mode{.sat}.type d, a, b, c;  mul24.mode.type d, a, b;
+            let t = *m.last()?;
+            let (d, a, b, c) = match ops {
+                [d, a, b, c] if base == "mad24" => (d, a, b, Some(c)),
+                [d, a, b] if base == "mul24" => (d, a, b, None),
+                _ => return err("mad24 operands"),
+            };
+            let ctrl = (is_signed(t) as u64) | ((m.contains(&"hi") as u64) << 1) | ((m.contains(&"sat") as u64) << 2);
+            Call::new("mad24")
+                .dst(d.op.clone(), ScalarType::B32)
+                .src(a.op.clone(), ScalarType::B32)
+                .src(b.op.clone(), ScalarType::B32)
+                .src(c.map_or(imm(0), |c| c.op.clone()), ScalarType::B32)
+                .imm(ctrl)
+                .build()
+        }
+        "dp4a" => {
+            // dp4a.atype.btype d, a, b, c;
+            let [d, a, b, c] = ops else { return err("dp4a operands") };
+            if m.len() != 2 {
+                return None;
+            }
+            let ctrl = (is_signed(m[0]) as u64) | ((is_signed(m[1]) as u64) << 1);
+            Call::new("dp4a_mixed")
+                .dst(d.op.clone(), ScalarType::B32)
+                .src(a.op.clone(), ScalarType::B32)
+                .src(b.op.clone(), ScalarType::B32)
+                .src(c.op.clone(), ScalarType::B32)
+                .imm(ctrl)
+                .build()
+        }
+        "clmad" => {
+            let [d, a, b, c] = ops else { return err("clmad operands") };
+            Call::new("clmad")
+                .dst(d.op.clone(), ScalarType::B64)
+                .src(a.op.clone(), ScalarType::B64)
+                .src(b.op.clone(), ScalarType::B64)
+                .src(c.op.clone(), ScalarType::B64)
+                .imm(m.contains(&"hi") as u64)
+                .build()
+        }
         "bar" | "barrier" if m.contains(&"red") => {
             // bar{.cta}.red.popc{.aligned}.u32 d, a{, b}, {!}c;  bar{.cta}.red.op{.aligned}.pred p, a{, b}, {!}c;
             let kind = ["popc", "and", "or"].iter().position(|k| m.contains(k))? as u64;

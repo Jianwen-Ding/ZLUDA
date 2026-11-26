@@ -9,7 +9,14 @@ on the AGX Performance Simulator. Every `.expect` is checked bit for bit
 (floats are parsed at the buffer's type, as the formal model does).
 
   ptxconf.py [--lib target/release/libzluda_metal.so] [--backend agx|metal]
-             [--json out.json] [-j N] [-k SUBSTR] FILE_OR_DIR...
+             [--json out.json] [-j N] [-k SUBSTR] [--fp-mode strict|fast] [--ulp N] FILE_OR_DIR...
+
+--fp-mode (ZLUDA_FP_MODE, zluda_metal/src/compile.rs FpMode) is strict by default: the model's results bit for
+bit. With fast (ZLUDA's default mode: the hardware's floating point, within a few ulp), a differing value of an
+.expect at a float type passes as APPROX when it is within --ulp units in the last place (default 4) or both
+values are at most the smallest normal (flushed denormals) or both are NaN; APPROX? is the same for the words
+of an integer typed .expect that hold floats (the harness programs often write float bits as .u32), which
+cannot be told from an integer error of a few units.
 
 Each program runs in its own process (a crash or a hang is one result).
 Results: PASS, FAIL (an .expect differs), COMPILE (the module did not load),
@@ -311,7 +318,52 @@ def pack_vals(vals, ty):
     return b"".join(v.to_bytes(size, "little") for v in vals)
 
 
+FAST = os.environ.get("ZLUDA_FP_MODE", "strict") == "fast"
+ULP = int(os.environ.get("ZLUDA_PTXCONF_ULP", "4"))
+FLOAT_TYPES = ("f16", "bf16", "f32", "f64")
+# (exponent bits, mantissa bits) by width; 16-bit words in an integer buffer read as half
+FMT = {"f16": (5, 10), "bf16": (8, 7), "f32": (8, 23), "f64": (11, 52), 2: (5, 10), 4: (8, 23), 8: (11, 52)}
+
+
+def close(g, w, ty):
+    """fast mode: g within ULP of w, both flushed-denormal sized, or both NaN (bits at type ty)"""
+    eb, mb = FMT.get(ty) or FMT.get(SIZES.get(ty, 0)) or (None, None)
+    if eb is None:
+        return False
+    width = 1 + eb + mb
+    sign, emask = 1 << (width - 1), ((1 << eb) - 1) << mb
+    nan = lambda x: (x & emask) == emask and (x & ((1 << mb) - 1))
+    if nan(g) or nan(w):
+        return nan(g) and nan(w)
+    return ulps(g, w, ty) <= ULP or abs(fval(g, ty) - fval(w, ty)) <= 2.0 ** (2 - (1 << (eb - 1)))
+
+
+def fval(x, ty):
+    """the value of bits x at float type ty (or of a 2/4/8-byte word)"""
+    eb, mb = FMT.get(ty) or FMT[SIZES[ty]]
+    e, m, s = (x >> mb) & ((1 << eb) - 1), x & ((1 << mb) - 1), -1.0 if x >> (eb + mb) & 1 else 1.0
+    bias = (1 << (eb - 1)) - 1
+    if e == 0:
+        return s * m * 2.0 ** (1 - bias - mb)
+    if e == (1 << eb) - 1:
+        return s * float("inf")
+    return s * (m + (1 << mb)) * 2.0 ** (e - bias - mb)
+
+
+def ulps(g, w, ty):
+    """units in the last place between finite bits g and w (huge for NaN)"""
+    eb, mb = FMT.get(ty) or FMT.get(SIZES.get(ty, 0)) or (None, None)
+    if eb is None:
+        return 1 << 62
+    sign, emask = 1 << (eb + mb), ((1 << eb) - 1) << mb
+    if (g & emask) == emask and g & ((1 << mb) - 1) or (w & emask) == emask and w & ((1 << mb) - 1):
+        return 1 << 62
+    ordered = lambda x: -(x & ~sign) if x & sign else x
+    return abs(ordered(g) - ordered(w))
+
+
 def run_program(path, lib):
+    approx, approx_int = [], False
     text = open(path, errors="replace").read()
     module, dirs = split_program(text)
     for d, _ in dirs:
@@ -471,13 +523,26 @@ def run_program(path, lib):
                 nexp += 1
                 if gv != want:
                     bad = [(i, hex(g), hex(w)) for i, (g, w) in enumerate(zip(gv, want)) if g != w]
-                    checks.append("%s: %d/%d differ, first %s" % (name, len(bad), len(want), bad[:4]))
+                    if FAST and all(close(g, w, ty) for g, w in zip(gv, want) if g != w):
+                        approx.append("%s: %d/%d within %d ulp, first %s" % (name, len(bad), len(want), ULP, bad[:2]))
+                        if ty not in FLOAT_TYPES:
+                            approx_int = True
+                        continue
+                    worst = ""
+                    if FAST:
+                        far = [(i, hex(g), hex(w)) for i, (g, w) in enumerate(zip(gv, want)) if g != w and not close(g, w, ty)]
+                        mu = max(ulps(g, w, ty) for g, w in zip(gv, want) if g != w and not close(g, w, ty))
+                        worst = " (%d beyond tolerance, max %s ulp, first %s)" % (
+                            len(far), mu if mu < 1 << 62 else "NaN", far[:3])
+                    checks.append("%s: %d/%d differ, first %s%s" % (name, len(bad), len(want), bad[:4], worst))
     except Unsupported as e:
         return {"status": "UNSUPPORTED", "detail": str(e)}
     except (KeyError, AttributeError, ValueError, RuntimeError) as e:
         return {"status": "HARNESS" if not isinstance(e, RuntimeError) else "LAUNCH", "detail": repr(e)[-800:]}
     if checks:
         return {"status": "FAIL", "detail": "; ".join(checks)[-1500:]}
+    if approx:
+        return {"status": "APPROX?" if approx_int else "APPROX", "detail": "; ".join(approx)[-1500:]}
     return {"status": "PASS", "detail": "%d expects" % nexp}
 
 
@@ -517,6 +582,8 @@ def main():
     ap.add_argument("-k", action="append")
     ap.add_argument("--timeout", type=int, default=300)
     ap.add_argument("-v", action="store_true")
+    ap.add_argument("--fp-mode", choices=["strict", "fast"], default="strict")
+    ap.add_argument("--ulp", type=int, default=4)
     a = ap.parse_args()
     if a.one:
         # the translator recurses deeply: run on a thread with a large stack
@@ -537,7 +604,7 @@ def main():
         print(json.dumps(out.get("r", {"status": "CRASH", "detail": "no result"})))
         sys.stdout.flush()
         os._exit(0)
-    env = dict(os.environ, ZLUDA_METAL_BACKEND=a.backend)
+    env = dict(os.environ, ZLUDA_METAL_BACKEND=a.backend, ZLUDA_FP_MODE=a.fp_mode, ZLUDA_PTXCONF_ULP=str(a.ulp))
     # a sibling llvm-project checkout's build (the AGX backend's fork)
     sibling = os.path.normpath(os.path.join(HERE, "..", "..", "..", "..", "llvm-project", "build", "bin",
                                             "llvm-air2agx"))

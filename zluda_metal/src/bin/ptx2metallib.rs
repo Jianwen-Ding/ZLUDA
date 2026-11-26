@@ -35,10 +35,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let opts = zluda_metal::compile::Options {
+    let opts = zluda_metal::compile::FpMode::from_env().apply(zluda_metal::compile::Options {
         keep_text: ll_dir.is_some(),
         portable_air: std::env::var_os("ZLUDA_PORTABLE_AIR").is_some(),
-    };
+        ..Default::default()
+    });
     let module = match zluda_metal::compile::compile_ptx(&ptx, opts) {
         Ok(m) => m,
         Err(e) => {

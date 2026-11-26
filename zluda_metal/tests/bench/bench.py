@@ -23,13 +23,14 @@ BENCH = ["corpus-dot", "corpus-gcd", "corpus-histogram", "corpus-matmul", "corpu
          "video-0", "lop3-shf", "bulk", "tma"]
 
 
-def run(path, lib):
+def run(path, lib, fp_mode):
     with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as t:
         stats = t.name
     env = dict(os.environ, ZLUDA_AGX_STATS=stats)
     r = subprocess.run([sys.executable, os.path.join(HERE, "..", "ptxconf", "ptxconf.py"), "--backend", "agx",
-                        "-j", "1", "--lib", lib, path], capture_output=True, text=True, env=env)
-    status = "PASS" if "PASS 1 of 1" in r.stdout else r.stdout.strip().splitlines()[0][:100]
+                        "-j", "1", "--lib", lib, "--fp-mode", fp_mode, path], capture_output=True, text=True, env=env)
+    last = r.stdout.strip().splitlines()[-1].split() if r.stdout.strip() else ["", "CRASH"]
+    status = last[1]  # "---- PASS 1 of 1", APPROX, FAIL, ...
     launches = [json.loads(l) for l in open(stats) if l.strip()]
     os.unlink(stats)
     return {"status": status, "launches": len(launches),
@@ -46,6 +47,7 @@ def main():
     ap.add_argument("--lib", default=os.path.join(HERE, "..", "..", "target", "release", "libzluda_metal.so"))
     ap.add_argument("--json")
     ap.add_argument("--compare")
+    ap.add_argument("--fp-mode", dest="fp_mode", choices=["strict", "fast", "fast-ftz"], default="strict")
     a = ap.parse_args()
     files = a.files or [os.path.join(PF, b + ".ptx") for b in BENCH]
     old = json.load(open(a.compare)) if a.compare else {}
@@ -54,7 +56,7 @@ def main():
                                                 "change"))
     for f in files:
         name = os.path.basename(f)[:-4]
-        r = res[name] = run(f, a.lib)
+        r = res[name] = run(f, a.lib, a.fp_mode)
         ch = ""
         if name in old and old[name]["time_us"]:
             ch = "%+.1f%% time, %+.1f%% instr" % (100 * (r["time_us"] / old[name]["time_us"] - 1),

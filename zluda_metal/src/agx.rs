@@ -321,7 +321,11 @@ pub fn compile_metallib(metallib: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         .arg("--output-dir")
         .arg(&out_dir);
     // PTX's NaN results are the canonical 0x7fffffff (AGXUsage.rst, canonical-nan)
-    let flags = std::env::var("ZLUDA_AGX_FLAGS").unwrap_or_else(|_| "-mattr=+canonical-nan".into());
+    // (strict floating point mode only; fast keeps the hardware's NaN bits)
+    let flags = std::env::var("ZLUDA_AGX_FLAGS").unwrap_or_else(|_| match crate::compile::FpMode::from_env() {
+        crate::compile::FpMode::Strict => "-mattr=+canonical-nan".into(),
+        _ => String::new(),
+    });
     cmd.args(flags.split_whitespace());
     let out = cmd
         .output()

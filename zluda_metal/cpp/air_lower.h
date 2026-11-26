@@ -17,6 +17,8 @@ typedef struct ZludaAirInput
     size_t impl_len;
     int want_text; // also return the whole AIR module as text
     int portable_air; // keep doubles and directed roundings (for llvm-air2agx's air-emulate-f64)
+    int fp_fast;      // floating point within a few ulp (ZLUDA_FP_MODE, compile.rs): hardware operations
+    int fp_ftz;       // and binary32 denormals flushed (ZLUDA_FP_MODE=fast-ftz)
 } ZludaAirInput;
 
 typedef struct ZludaAirKernel

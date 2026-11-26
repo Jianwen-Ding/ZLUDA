@@ -12,6 +12,8 @@ pub struct ZludaAirInput {
     pub impl_len: usize,
     pub want_text: c_int,
     pub portable_air: c_int,
+    pub fp_fast: c_int,
+    pub fp_ftz: c_int,
 }
 
 #[repr(C)]

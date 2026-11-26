@@ -673,10 +673,10 @@ unsafe fn load_module_from_ptx(module: *mut *mut Module, ptx: &str) -> CUresult 
     dump(&format!("module{id}.ptx"), ptx.as_bytes());
     let compiled = match compile::compile_ptx(
         ptx,
-        compile::Options {
+        compile::FpMode::from_env().apply(compile::Options {
             portable_air: backend::use_agx(),
             ..Default::default()
-        },
+        }),
     ) {
         Ok(c) => c,
         Err(e) => {

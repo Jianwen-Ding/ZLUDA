@@ -124,7 +124,7 @@ PTX ──ZLUDA──▶ portable AIR (.metallib) ──llvm-air2agx──▶ AG
 ```
 
 * `src/agx.rs` compiles each module's `.metallib` with the LLVM fork's `llvm-air2agx`
-  (`ZLUDA_AGX_AIR2AGX`, `-mcpu=agx-g14c`, `ZLUDA_AGX_FLAGS`, default `-mattr=+canonical-nan`), fills
+  (`ZLUDA_AGX_AIR2AGX`, `-mcpu=agx-g14c`, `ZLUDA_AGX_FLAGS`, default `-mattr=+canonical-nan` in the strict floating point mode), fills
   the launch's uniforms from the `.agx.kernels` record (buffer table, threadgroups per grid, global
   data buffer, extensions 4 / 6 / 7 / 8 / 9, clusters) and runs it on the AGX Performance
   Simulator's functional model (`agx_sim`, linked in). Device memory is below 4 GiB, so
@@ -139,6 +139,22 @@ PTX ──ZLUDA──▶ portable AIR (.metallib) ──llvm-air2agx──▶ AG
   helpers in `ptx/lib/metal_impl/*.inc`, written from PTX-formalization's Sail model.
 * `ZLUDA_AGX_STATS=FILE` appends each launch's dynamic instructions and the simulator's predicted time
   (dispatch model, M2 Max, CUDA-runtime launch profile) as JSON lines.
+
+### Floating point modes (`ZLUDA_FP_MODE`)
+
+| Mode | Behavior |
+| --- | --- |
+| `fast` (default) | Results within a few ulp of PTX's. The `.approx` transcendentals (`sin`, `cos`, `ex2`, `rsqrt` and the half forms of `ex2` / `tanh`) are the hardware's approximations, `tanh.approx` a short float evaluation (about 2 ulp of the true tanh), NaN results keep the hardware's bit patterns. Denormals are IEEE (as CUDA's default `-ftz=false`); `div`, `sqrt` (correctly rounded), directed roundings and double precision (software) are exact. |
+| `fast-ftz` | `fast` with binary32 denormal operands and results flushed to zero, as `-ftz=true` / `--use_fast_math`: the hardware's own arithmetic. |
+| `strict` | Bit for bit the formal model: IEEE binary32 with denormals (`!agx.keep-denormals`), the model's transcendentals, canonical NaN (`-mattr=+canonical-nan`). |
+
+Division and square root are not relaxed in any mode: a reciprocal-based division is wrong by far more
+than a few ulp for divisors beyond 2^126 (as CUDA's `__fdividef`). Note that the model's own `.approx`
+definitions are not the exact functions (its `tanh.approx` is 13 ulp from tanh near 0.013), so `fast`
+results can be closer to the true function than `strict` ones. `ptxconf.py --fp-mode fast` checks with
+a ulp tolerance (`--ulp`, flushed denormals and NaN bit patterns accepted): `APPROX` for float typed
+expects, `APPROX?` for float bits in integer typed ones; differences of the `.approx` instructions
+beyond the tolerance are expected there (PTX only bounds their error, e.g. 2^-11 relative for tanh).
 
 Tests and tools (no NVIDIA or Apple tool anywhere: PTX is hand written or from clang's NVPTX target):
 

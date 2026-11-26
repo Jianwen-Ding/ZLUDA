@@ -73,6 +73,42 @@ pub struct Options {
     pub keep_text: bool,
     /// keep doubles and directed roundings in the AIR (for llvm-air2agx, which emulates them)
     pub portable_air: bool,
+    /// floating point mode fast or fast-ftz (see [`FpMode`]): results within a few ulp of PTX's
+    pub fp_fast: bool,
+    /// floating point mode fast-ftz: binary32 denormals flushed
+    pub fp_ftz: bool,
+}
+
+/// Floating point accuracy, ZLUDA_FP_MODE:
+///
+/// * `fast` (the default): within a few ulp of PTX's results. Division and square root are the hardware's
+///   (1-2 ulp), the `.approx` transcendentals (sin, cos, ex2, lg2, tanh, rsqrt, and their half precision forms)
+///   short single precision evaluations instead of the formal model's correctly rounded ones, NaN results keep
+///   the hardware's bit patterns. Denormals are IEEE (as CUDA's default `-ftz=false`), operations with directed
+///   rounding exact, double precision exact (software).
+/// * `fast-ftz`: `fast`, and single precision denormal operands and results flushed to zero, as CUDA's
+///   `-ftz=true` (`--use_fast_math`): the hardware's own arithmetic, cheapest.
+/// * `strict`: bit for bit PTX as PTX-formalization's model defines it: IEEE single precision with
+///   denormals, correctly rounded division and square root, the model's transcendentals, canonical NaN.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FpMode {
+    Fast,
+    FastFtz,
+    Strict,
+}
+
+impl FpMode {
+    pub fn from_env() -> FpMode {
+        match std::env::var("ZLUDA_FP_MODE").as_deref() {
+            Ok("strict") | Ok("exact") => FpMode::Strict,
+            Ok("fast-ftz") | Ok("ftz") => FpMode::FastFtz,
+            _ => FpMode::Fast,
+        }
+    }
+    /// the compile options of the mode
+    pub fn apply(self, o: Options) -> Options {
+        Options { fp_fast: self != FpMode::Strict, fp_ftz: self == FpMode::FastFtz, ..o }
+    }
 }
 
 pub fn compile_ptx(ptx: &str, opts: Options) -> Result<CompiledModule, String> {
@@ -96,7 +132,7 @@ pub fn compile_ptx(ptx: &str, opts: Options) -> Result<CompiledModule, String> {
         .then(|| module.llvm_ir.print_module_to_string().to_str().to_string());
     let main_bc = module.llvm_ir.write_bitcode_to_memory();
     let attributes_bc = module.attributes_ir.write_bitcode_to_memory();
-    let lowered = lower_to_air(&main_bc, &attributes_bc, opts.keep_text, opts.portable_air)?;
+    let lowered = lower_to_air(&main_bc, &attributes_bc, opts.keep_text, opts.portable_air, opts.fp_fast, opts.fp_ftz)?;
     let metallib = write_metallib(&lowered.kernels)?;
     let module32 = module.metadata32.as_ref().map(|m| Module32 {
         explicit_params: m
@@ -128,7 +164,14 @@ struct Lowered {
     text: Option<String>,
 }
 
-fn lower_to_air(main_bc: &[u8], attributes_bc: &[u8], want_text: bool, portable_air: bool) -> Result<Lowered, String> {
+fn lower_to_air(
+    main_bc: &[u8],
+    attributes_bc: &[u8],
+    want_text: bool,
+    portable_air: bool,
+    fp_fast: bool,
+    fp_ftz: bool,
+) -> Result<Lowered, String> {
     let input = ffi::ZludaAirInput {
         main_bc: main_bc.as_ptr(),
         main_len: main_bc.len(),
@@ -138,6 +181,8 @@ fn lower_to_air(main_bc: &[u8], attributes_bc: &[u8], want_text: bool, portable_
         impl_len: ZLUDA_PTX_METAL_IMPL.len(),
         want_text: want_text as i32,
         portable_air: portable_air as i32,
+        fp_fast: fp_fast as i32,
+        fp_ftz: fp_ftz as i32,
     };
     let mut output = ffi::ZludaAirOutput {
         kernels: ptr::null_mut(),

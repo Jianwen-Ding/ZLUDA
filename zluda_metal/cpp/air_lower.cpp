@@ -1541,6 +1541,10 @@ void lowerAtomicLoadStore(Instruction *i)
 // Portable AIR for llvm-air2agx: doubles and directed-rounding constrained intrinsics are
 // kept (the AIR target's air-emulate-f64 lowers them), instead of rejected / rounded to nearest.
 static bool g_portable_air = false;
+// floating point mode fast (ZLUDA_FP_MODE, compile.rs FpMode): the hardware's operations, within a few ulp
+static bool g_fp_fast = false;
+// and binary32 denormals flushed (ZLUDA_FP_MODE=fast-ftz)
+static bool g_fp_ftz = false;
 
 // Maps an LLVM / AMDGPU intrinsic call onto AIR. Returns true when handled.
 bool lowerIntrinsic(CallInst *ci)
@@ -2645,7 +2649,8 @@ static bool resolveFPModes(Function &f)
                 }
             }
             // (ZLUDA_AGX_FTZ_ALL: a measurement aid, not PTX: every float operation flushes)
-            if (m.ieee32 && isF32Op(i) && !getenv("ZLUDA_AGX_FTZ_ALL"))
+            // (floating point mode fast-ftz: the hardware's flushing operations)
+            if (m.ieee32 && isF32Op(i) && !g_fp_ftz && !getenv("ZLUDA_AGX_FTZ_ALL"))
                 i.setMetadata("agx.keep-denormals", keep);
             // plain operations in a directed-rounding region (the helper library's) round in it too
             if (auto *bo = dyn_cast<BinaryOperator>(&i))
@@ -2689,14 +2694,124 @@ static bool resolveFPModes(Function &f)
     return entry.ieee32;
 }
 
+// Fast floating point mode: the .approx transcendentals of the library (the formal model's definitions, in
+// software) become short float evaluations: the hardware's approximations (air.fast_<fn>, agx-lower-air: the
+// LLVM intrinsic with afn), tanh by tanhF. Half precision forms are computed in float and rounded to nearest.
+// Division and square root stay correctly rounded (a reciprocal-based division is wrong by far more than a few
+// ulp for divisors beyond 2^126), as does div.approx (whose range behavior PTX defines). Control words as in
+// ptx_parser/src/helper_table/float.rs: bits 4-7 type (1 f32, 2 f16, 3 bf16), 8 packed, 12 .ftz; fsincos_f32
+// bit 0 cos.
+static void fastFPHelpers(Module &m)
+{
+    LLVMContext &c = m.getContext();
+    Type *f32 = Type::getFloatTy(c), *i32 = Type::getInt32Ty(c), *i16 = Type::getInt16Ty(c);
+    auto fast = [&](IRBuilder<> &b, StringRef fn, Value *x) -> Value * {
+        FunctionCallee callee = m.getOrInsertFunction(("air.fast_" + fn + ".f32").str(), FunctionType::get(f32, {f32}, false));
+        if (auto *d = dyn_cast<Function>(callee.getCallee()))
+        {
+            d->setDoesNotAccessMemory();
+            d->setDoesNotThrow();
+            d->addFnAttr(Attribute::WillReturn);
+        }
+        return b.CreateCall(callee, {x});
+    };
+    // tanh x within ~2 ulp: |x| < 0.6 x + x^3 q(x^2) (degree-4 least-squares fit, 0.9 ulp in float), else
+    // 1 - 2 / (2^(2x log2 e) + 1) (1.5 ulp, and the hardware's exp2 and reciprocal), +-1 from |x| >= 9; sign
+    // restored (tanh is odd), NaN propagated
+    auto tanhF = [&](IRBuilder<> &b, Value *x) -> Value * {
+        auto k = [&](double v) { return ConstantFP::get(f32, v); };
+        Value *ax = b.CreateUnaryIntrinsic(Intrinsic::fabs, x);
+        Value *z = b.CreateFMul(x, x);
+        Value *p = k(-0.006339305080473423);
+        for (double cf : {0.02116510644555092, -0.05388752743601799, 0.1333303451538086, -0.3333333134651184})
+            p = b.CreateIntrinsic(Intrinsic::fma, {f32}, {p, z, k(cf)});
+        Value *small = b.CreateIntrinsic(Intrinsic::fma, {f32}, {b.CreateFMul(x, z), p, x});
+        Value *e = fast(b, "exp2", b.CreateFMul(ax, k(2.0 * 1.4426950408889634)));
+        Value *q = b.CreateFDiv(k(2.0), b.CreateFAdd(e, k(1.0)));
+        FastMathFlags fmf;
+        fmf.setApproxFunc();
+        fmf.setAllowReciprocal();
+        cast<Instruction>(q)->setFastMathFlags(fmf);
+        Value *big = b.CreateSelect(b.CreateFCmpOGE(ax, k(9.0)), k(1.0), b.CreateFSub(k(1.0), q));
+        big = b.CreateIntrinsic(Intrinsic::copysign, {f32}, {big, x});
+        Value *r = b.CreateSelect(b.CreateFCmpOLT(ax, k(0.6)), small, big);
+        return b.CreateSelect(b.CreateFCmpUNO(x, x), x, r);
+    };
+    auto fn1 = [&](IRBuilder<> &b, StringRef fn, Value *x) -> Value * {
+        return fn == "tanh" ? tanhF(b, x) : fast(b, fn, x);
+    };
+    // a 16-bit lane (bits in the low half of an i32) as float, and back (nearest even; NaN canonical)
+    auto toF = [&](IRBuilder<> &b, Value *lane, unsigned t) -> Value * {
+        Value *h = b.CreateTrunc(lane, i16);
+        if (t == 2)
+            return b.CreateFPExt(b.CreateBitCast(h, Type::getHalfTy(c)), f32);
+        return b.CreateBitCast(b.CreateShl(b.CreateZExt(h, i32), 16), f32);
+    };
+    auto fromF = [&](IRBuilder<> &b, Value *v, unsigned t) -> Value * {
+        if (t == 2)
+            return b.CreateZExt(b.CreateBitCast(b.CreateFPTrunc(v, Type::getHalfTy(c)), i16), i32);
+        Value *u = b.CreateBitCast(v, i32);
+        Value *odd = b.CreateAnd(b.CreateLShr(u, 16), 1);
+        Value *r = b.CreateLShr(b.CreateAdd(u, b.CreateAdd(b.getInt32(0x7FFF), odd)), 16);
+        return b.CreateSelect(b.CreateFCmpUNO(v, v), b.getInt32(0x7FFF), r);
+    };
+    std::vector<CallInst *> calls;
+    for (Function &f : m)
+        for (Instruction &i : instructions(f))
+            if (auto *ci = dyn_cast<CallInst>(&i))
+                if (auto *callee = dyn_cast<Function>(ci->getCalledOperand()->stripPointerCasts()))
+                    if (callee->getName().starts_with("__zluda_ptx_impl_"))
+                        calls.push_back(ci);
+    for (CallInst *ci : calls)
+    {
+        StringRef n = cast<Function>(ci->getCalledOperand()->stripPointerCasts())->getName().drop_front(strlen("__zluda_ptx_impl_"));
+        auto ctrlAt = [&](unsigned k) -> int64_t {
+            auto *k_ = k < ci->arg_size() ? dyn_cast<ConstantInt>(ci->getArgOperand(k)) : nullptr;
+            return k_ ? (int64_t)k_->getZExtValue() : -1;
+        };
+        IRBuilder<> b(ci);
+        Value *r = nullptr;
+        Type *rt = ci->getType();
+        if (!rt->isIntegerTy())
+            continue;
+        if (n == "fsincos_f32" && ctrlAt(1) >= 0)
+            r = b.CreateBitCast(fast(b, ctrlAt(1) & 1 ? "cos" : "sin", b.CreateBitCast(ci->getArgOperand(0), f32)), i32);
+        else if (n == "frsqrt_f32" && ctrlAt(1) >= 0)
+            r = b.CreateBitCast(fast(b, "rsqrt", b.CreateBitCast(ci->getArgOperand(0), f32)), i32);
+        else if ((n == "ftanh_32" || n == "ftanh_16" || n == "fex2h_32" || n == "fex2h_16") && ctrlAt(1) >= 0)
+        {
+            int64_t ctrl = ctrlAt(1);
+            unsigned t = (ctrl >> 4) & 15;
+            bool pk = ctrl & 256;
+            StringRef fn = n.starts_with("ftanh") ? "tanh" : "exp2";
+            Value *a = b.CreateZExtOrTrunc(ci->getArgOperand(0), i32);
+            if (t == 1 && !pk)
+                r = b.CreateBitCast(fn1(b, fn, b.CreateBitCast(a, f32)), i32);
+            else if (t == 2 || t == 3)
+            {
+                r = fromF(b, fn1(b, fn, toF(b, a, t)), t);
+                if (pk)
+                    r = b.CreateOr(r, b.CreateShl(fromF(b, fn1(b, fn, toF(b, b.CreateLShr(a, 16), t)), t), 16));
+            }
+            if (r)
+                r = b.CreateZExtOrTrunc(r, rt);
+        }
+        if (!r)
+            continue;
+        ci->replaceAllUsesWith(r);
+        ci->eraseFromParent();
+    }
+}
+
 static void portableFPModes(Module &m)
 {
     for (Function &f : m)
     {
         // the function's entry mode (LLVM folds constants by it; IEEE operations are tagged, and
         // the untagged ones of .ftz regions are the hardware's flushing ones)
-        bool ieee = resolveFPModes(f);
+        bool ieee = resolveFPModes(f) && !g_fp_ftz;
         f.addFnAttr("denormal-fp-math-f32", ieee ? "ieee,ieee" : "preserve-sign,preserve-sign");
+
         f.removeFnAttr(Attribute::StrictFP);
         for (Instruction &i : instructions(f))
             if (auto *cb = dyn_cast<CallBase>(&i))
@@ -2785,7 +2900,7 @@ static void lowerIEEEHelperCalls(Module &m)
             r = b.CreateIntrinsic(Intrinsic::fma, {a0->getType()}, {a0, ci->getArgOperand(1), ci->getArgOperand(2)});
         else
             fail("unknown IEEE helper operation " + n.str());
-        if (g_portable_air)
+        if (g_portable_air && !g_fp_ftz)
             if (auto *ri = dyn_cast<Instruction>(r))
                 ri->setMetadata("agx.keep-denormals", keep);
         ci->replaceAllUsesWith(r);
@@ -3057,6 +3172,8 @@ extern "C" int zluda_air_lower(const ZludaAirInput *input, ZludaAirOutput *outpu
     {
         LLVMContext ctx;
         g_portable_air = input->portable_air != 0;
+        g_fp_fast = input->fp_fast != 0;
+        g_fp_ftz = input->fp_ftz != 0;
         std::unique_ptr<Module> main = parse(ctx, input->main_bc, input->main_len, "main");
         if (getenv("ZLUDA_AIR_DEBUG_INPUT"))
             main->print(errs(), nullptr);
@@ -3083,6 +3200,8 @@ extern "C" int zluda_air_lower(const ZludaAirInput *input, ZludaAirOutput *outpu
         if (Linker::linkModules(*main, std::move(impl), Linker::LinkOnlyNeeded))
             fail("failed to link Metal implementation library");
         adaptHelperCalls(*main);
+        if (g_fp_fast)
+            fastFPHelpers(*main);
         if (getenv("ZLUDA_AIR_DEBUG"))
             main->print(errs(), nullptr);
         std::vector<KernelInfo> kernels;

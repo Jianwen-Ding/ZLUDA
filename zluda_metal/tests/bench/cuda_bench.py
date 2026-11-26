@@ -16,7 +16,11 @@ ZLUDA_AGX_STATS gives each launch's predicted time. Output buffers are hashed: -
 reference (bench_ref.json next to this script by default), later runs report OUTPUT-CHANGED when an optimization
 changes a result.
 
-  cuda_bench.py [--clang clang] [--lib LIB] [--json OUT] [--compare OLD.json] [--update] [NAME ...]
+  cuda_bench.py [--clang clang] [--lib LIB] [--json OUT] [--compare OLD.json] [--update] [--fp-mode strict|fast|fast-ftz]
+                [NAME ...]
+
+--fp-mode is ZLUDA_FP_MODE (zluda_metal/src/compile.rs FpMode; default strict here, the mode whose outputs
+bench_ref.json holds; the other modes have their own reference, bench_ref_<mode>.json).
 """
 import argparse
 import ctypes
@@ -150,7 +154,8 @@ def main():
     ap.add_argument("--lib", default=os.path.join(HERE, "..", "..", "target", "release", "libzluda_metal.so"))
     ap.add_argument("--json")
     ap.add_argument("--compare")
-    ap.add_argument("--ref", default=os.path.join(HERE, "bench_ref.json"))
+    ap.add_argument("--ref")
+    ap.add_argument("--fp-mode", dest="fp_mode", choices=["strict", "fast", "fast-ftz"], default="strict")
     ap.add_argument("--update", action="store_true")
     ap.add_argument("--one")
     a = ap.parse_args()
@@ -162,10 +167,12 @@ def main():
             print(json.dumps({"error": str(e)[-500:]}))
         sys.stdout.flush()
         os._exit(0)
+    if not a.ref:
+        a.ref = os.path.join(HERE, "bench_ref.json" if a.fp_mode == "strict" else "bench_ref_%s.json" % a.fp_mode)
     names = a.names or sorted(f[:-3] for f in os.listdir(SRC) if f.endswith(".cu"))
     ref = json.load(open(a.ref)) if os.path.exists(a.ref) else {}
     old = json.load(open(a.compare)) if a.compare else {}
-    env = dict(os.environ)
+    env = dict(os.environ, ZLUDA_FP_MODE=a.fp_mode)
     sib = os.path.join(ROOT, "llvm-project", "build", "bin", "llvm-air2agx")
     if "ZLUDA_AGX_AIR2AGX" not in env and os.path.exists(sib):
         env["ZLUDA_AGX_AIR2AGX"] = sib

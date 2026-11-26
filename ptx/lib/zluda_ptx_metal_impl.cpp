@@ -359,4 +359,5 @@ extern "C"
 #include "metal_impl/float.inc"
 #include "metal_impl/matrix.inc"
 #include "metal_impl/memory.inc"
+#include "metal_impl/tensor.inc"
 }

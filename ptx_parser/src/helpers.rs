@@ -130,8 +130,30 @@ fn parse_hop<'a, 'input>(
             return Some(h);
         }
     }
-    h.op = sub_operand(text, toks)?;
+    h.op = sub_operand(text, toks).or_else(|| long_vector(text, toks))?;
     Some(h)
+}
+
+/// `{a, b, ..}` with more elements than the grammar's vector operands (wgmma / tcgen05 fragments
+/// of up to 128 registers); `_` is a sink
+fn long_vector<'a, 'input>(
+    text: &'input str,
+    toks: &'a [(Token<'input>, logos::Span)],
+) -> Option<ast::ParsedOperand<&'input str>> {
+    let [(Token::LBrace, _), inner @ .., (Token::RBrace, _)] = toks else { return None };
+    let mut out = Vec::new();
+    for part in inner.split(|(t, _)| matches!(t, Token::Comma)) {
+        if let [(Token::Sink, _)] = part {
+            out.push(None);
+            continue;
+        }
+        match sub_operand(text, part)? {
+            ast::ParsedOperand::Reg(r) => out.push(Some(ast::RegOrImmediate::Reg(r))),
+            ast::ParsedOperand::Imm(i) => out.push(Some(ast::RegOrImmediate::Imm(i))),
+            _ => return None,
+        }
+    }
+    Some(ast::ParsedOperand::VecPack(out))
 }
 
 /// Parses one fallback instruction (without its `;`) and lowers it.

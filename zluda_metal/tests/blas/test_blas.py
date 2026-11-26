@@ -185,8 +185,10 @@ for dt in (np.float32, np.float64):
             want[iy] = 1.5 * op @ x.astype(np.float64)[ix] - 0.5 * want[iy]
             return rel(b.get(py, y0), want), tol(dt, max(m, n))
 
+    # (the shapes with m, n multiples of 16 and k of 8 take the SIMD-group matrix kernel for f32)
     for ta, tb, m, n, k, beta in ((N, N, 64, 64, 64, 0.0), (T, N, 100, 37, 81, 1.0), (N, T, 129, 130, 3, -0.5),
-                                  (T, T, 7, 200, 65, 0.25)):
+                                  (T, T, 7, 200, 65, 0.25), (N, N, 48, 32, 40, 1.0), (T, N, 32, 64, 16, -1.0),
+                                  (N, T, 16, 16, 8, 0.5), (T, T, 80, 48, 24, 2.0)):
         @case
         def gemm(b, dt=dt, ta=ta, tb=tb, m=m, n=n, k=k, beta=beta):
             lda = (m if ta == N else k) + 3
@@ -213,6 +215,13 @@ for dt in (np.float32, np.float64):
     @case
     def gemm_strided_batched_device_scalars(b, dt=dt):
         m, n, k, batch = 33, 17, 40, 3
+        return batched(b, dt, m, n, k, batch)
+
+    @case
+    def gemm_strided_batched_mma(b, dt=dt):
+        return batched(b, dt, 32, 48, 24, 4)
+
+    def batched(b, dt, m, n, k, batch):
         A = rng.standard_normal((batch, k, m)).astype(dt)
         B = rng.standard_normal((batch, n, k)).astype(dt)
         C = rng.standard_normal((batch, n, m)).astype(dt)
@@ -244,10 +253,10 @@ def bf16_val(bits):
     return (bits.astype(np.uint32) << 16).view(np.float32).astype(np.float64)
 
 
-for at, ct in (("f16", "f16"), ("f16", "f32"), ("bf16", "bf16"), ("bf16", "f32")):
+for at, ct, m, n, k in (("f16", "f16", 72, 40, 96), ("f16", "f32", 72, 40, 96), ("bf16", "bf16", 72, 40, 96),
+                        ("bf16", "f32", 72, 40, 96), ("f16", "f32", 64, 48, 32), ("bf16", "f32", 32, 16, 64)):
     @case
-    def gemm_ex(b, at=at, ct=ct):
-        m, n, k = 72, 40, 96
+    def gemm_ex(b, at=at, ct=ct, m=m, n=n, k=k):
         codes = {"f16": 2, "bf16": 14, "f32": 0}
         Af = rng.standard_normal((k, m)).astype(np.float32)
         Bf = rng.standard_normal((n, k)).astype(np.float32)

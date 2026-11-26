@@ -358,6 +358,29 @@ unsafe fn gemm_launch(name: &str, ta: c_int, tb: c_int, m: c_int, n: c_int, k: c
     }
     let (ars, acs) = strides(ta, lda);
     let (brs, bcs) = strides(tb, ldb);
+    // the SIMD-group matrix kernel (float C, m and n multiples of 16, k of 8): alpha I and beta I in a buffer
+    let mma = match name {
+        "sgemm" => Some("gemm_mma_f32"),
+        "gemm_f16_f32" => Some("gemm_mma_f16"),
+        "gemm_bf16_f32" => Some("gemm_mma_bf16"),
+        _ => None,
+    };
+    if let Some(mk) = mma.filter(|_| m % 16 == 0 && n % 16 == 0 && k % 8 == 0 && std::env::var_os("ZLUDA_BLAS_NO_MMA").is_none()) {
+        let (al, be) = (f32::from_le_bytes(alpha[..4].try_into().unwrap()), f32::from_le_bytes(beta[..4].try_into().unwrap()));
+        let mut diag = [0f32; 128];
+        for i in 0..8 {
+            diag[i * 9] = al;
+            diag[64 + i * 9] = be;
+        }
+        let d = Tmp::new(512)?;
+        let (p, _) = agx::host_pointer(d.0).ok_or(CUBLAS_STATUS_INTERNAL_ERROR)?;
+        std::ptr::copy_nonoverlapping(diag.as_ptr() as *const u8, p, 512);
+        return launch(mk, [m as u32 / 16, n as u32 / 16, batch as u32], [32, 1, 1], &[
+            i32v(m), i32v(n), i32v(k), Arg::Addr(d.0), Arg::Addr(a), i32v(0), i32v(ars), i32v(acs), i32v(sa as i32),
+            Arg::Addr(b), i32v(0), i32v(brs), i32v(bcs), i32v(sb as i32), i32v((be != 0.0) as i32), Arg::Addr(c),
+            i32v(0), i32v(ldc), i32v(sc as i32),
+        ]);
+    }
     let grid = [(m as u32).div_ceil(64), (n as u32).div_ceil(64), batch as u32];
     launch(name, grid, [16, 16, 1], &[
         i32v(m), i32v(n), i32v(k), Arg::Value(alpha), Arg::Addr(a), i32v(0), i32v(ars), i32v(acs), i32v(sa as i32),

@@ -156,7 +156,11 @@ runs it when `mlir-opt` exists (`ZLUDA_MLIR_OPT`, or `../../llvm-project/build/b
 * not implemented: complex types, the other level 2 / 3 routines (`CUBLAS_STATUS_NOT_SUPPORTED` is not
   returned for them: they are not exported), matrices beyond 2^31 elements
 
-Double precision is emulated (AIR's portable passes). `tests/blas/test_blas.py` checks every routine against
+GEMMs with a float C (`Sgemm`, f16 / bf16 `GemmEx` to f32) whose m and n are multiples of 16 and k of 8 run
+on AGX's SIMD-group matrix multiply (`air.simdgroup_matrix_*`, one SIMD group per 16 x 16 tile; alpha and beta
+as products with alpha I / beta I): a 256^3 Sgemm is predicted at 17.3 us against 120.8 us for the
+register-tiled kernel the other shapes use (`ZLUDA_BLAS_NO_MMA=1` forces it). Double precision is emulated
+(AIR's portable passes). `tests/blas/test_blas.py` checks every routine against
 numpy (transposes, leading dimensions, negative increments, batches, both pointer modes).
 
 ### Floating point modes (`ZLUDA_FP_MODE`)

@@ -31,7 +31,10 @@ pub(crate) unsafe fn check_cooperative(l: &KernelLaunch) -> Result<(), CUresult>
         None => blocks_per_sm(f, threads, l.shared),
     };
     let blocks = l.grid.iter().map(|&g| g as u64).product::<u64>();
-    if blocks > per_sm as u64 * device::multiprocessors() as u64 {
+    // a grid-wide barrier needs every block resident; the functional model runs the blocks one after another, so
+    // only a one-block grid can synchronize (src/device_rt.rs MAX_COOPERATIVE_BLOCKS)
+    let limit = (per_sm as u64 * device::multiprocessors() as u64).min(crate::device_rt::MAX_COOPERATIVE_BLOCKS);
+    if blocks > limit {
         return Err(CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE);
     }
     Ok(())

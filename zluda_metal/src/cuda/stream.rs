@@ -302,7 +302,10 @@ unsafe fn exec(s: &Arc<Stream>, op: &Op) -> CUresult {
     match op {
         Op::Kernel(l) => run_kernel(l),
         Op::Copy(c) => match host_access() {
-            Ok(()) => c.run(),
+            Ok(()) => {
+                crate::device_rt::flush();
+                c.run()
+            }
             Err(e) => e,
         },
         Op::Set(m) => match host_access() {
@@ -330,6 +333,7 @@ pub(crate) fn synchronize_context(c: &Context) -> CUresult {
     for s in context_streams(c) {
         s.wait(s.submitted());
     }
+    crate::device_rt::flush();
     if let Err(e) = host_access() {
         return e;
     }
@@ -470,6 +474,7 @@ pub unsafe extern "system" fn cuStreamSynchronize(stream: *mut Stream) -> CUresu
             }
         }
     }
+    crate::device_rt::flush();
     if let Err(e) = host_access() {
         return e;
     }
@@ -703,8 +708,10 @@ pub unsafe extern "system" fn cuEventSynchronize(event: *mut Event) -> CUresult 
     };
     if let Some((s, seq)) = rec {
         s.wait(seq);
+        crate::device_rt::flush();
         return s.context().sticky.load(Ordering::Acquire);
     }
+    crate::device_rt::flush();
     CUDA_SUCCESS
 }
 

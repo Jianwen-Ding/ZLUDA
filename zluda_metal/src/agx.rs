@@ -399,8 +399,9 @@ pub enum Arg<'a> {
 }
 
 pub struct Library {
-    /// kernel -> (record, code, global data buffer of its object)
-    records: HashMap<String, (Record, Vec<u8>, Option<u64>)>,
+    /// kernel -> (record, its object's code, the kernel's offset in it, global data buffer of its object); a
+    /// kernel's code is copied out when it is first asked for (a library of many kernels loads in one pass)
+    records: HashMap<String, (Record, Arc<Vec<u8>>, usize, Option<u64>)>,
     /// global data buffers (one per object), freed with the library
     globals: Vec<u64>,
 }
@@ -528,28 +529,28 @@ impl Library {
             globals = Some((va, data.len()));
         }
         let mut records = HashMap::new();
+        let text = Arc::new(text.to_vec());
         for r in recs {
             let start = syms
                 .iter()
                 .find(|s| s.0 == r.name && s.3 == text_idx)
                 .ok_or_else(|| format!("kernel {} has no symbol", r.name))?;
-            let code = text
-                .get(start.1 as usize..)
-                .ok_or("kernel outside .text")?
-                .to_vec();
-            records.insert(r.name.clone(), (r, code, globals.map(|g: (u64, usize)| g.0)));
+            if start.1 as usize > text.len() {
+                return Err("kernel outside .text".into());
+            }
+            records.insert(r.name.clone(), (r, text.clone(), start.1 as usize, globals.map(|g: (u64, usize)| g.0)));
         }
         Ok(Library { records, globals: globals.map(|g| vec![g.0]).unwrap_or_default() })
     }
 
     pub fn kernel(&self, name: &str) -> Result<Kernel, String> {
-        let (r, code, g) = self
+        let (r, text, start, g) = self
             .records
             .get(name)
             .ok_or_else(|| format!("kernel {name} not found in the AGX object"))?;
         Ok(Kernel {
             record: r.clone(),
-            code: Arc::new(code.clone()),
+            code: Arc::new(text[*start..].to_vec()),
             globals: *g,
         })
     }

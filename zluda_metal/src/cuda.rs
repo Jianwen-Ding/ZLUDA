@@ -30,8 +30,6 @@ mod proc_address;
 mod stream;
 
 pub use context::Context;
-#[allow(unused_imports)]
-pub(crate) use context::current_limit;
 pub use stream::{Event, Stream};
 
 pub type CUresult = c_uint;
@@ -108,6 +106,8 @@ pub struct Function {
     /// the library it came from (CUkernel), 0 for a module's function
     library: AtomicU64,
     attrs: Mutex<FuncAttrs>,
+    /// the module's device-runtime variables (printf, heap, clocks: src/device_rt.rs)
+    devrt: crate::device_rt::Bindings,
 }
 unsafe impl Send for Function {}
 unsafe impl Sync for Function {}
@@ -174,6 +174,19 @@ macro_rules! tri {
     };
 }
 pub(crate) use tri;
+
+/// The current context (src/device_rt.rs keys its state by it), the primary one if none is current
+pub(crate) fn current_context_key() -> usize {
+    match context::top() {
+        Some(c) => c.key(),
+        None => global().map(|g| g.primary.key()).unwrap_or(0),
+    }
+}
+
+/// [`ensure_current`] for src/device_rt.rs's entry points
+pub(crate) fn check_current() -> Result<(), CUresult> {
+    ensure_current().map(|_| ())
+}
 
 /// The current context must exist and be usable (no sticky fault): CUDA_ERROR_INVALID_CONTEXT without one
 fn ensure_current() -> Result<&'static Global, CUresult> {
@@ -465,6 +478,7 @@ pub unsafe extern "system" fn cuModuleLoadData(
         return CUDA_ERROR_INVALID_VALUE;
     }
     let ptx = tri!(image_to_ptx(image));
+    crate::device_rt::flush();
     load_module_from_ptx(module, ptx)
 }
 
@@ -514,6 +528,8 @@ pub(crate) unsafe fn unload_module(module: *mut Module) -> bool {
         return false;
     }
     stream::wait_all_idle();
+    // the output of its kernels (their formats are in its memory)
+    crate::device_rt::flush();
     let m = Box::from_raw(module);
     if let Some(fs) = FUNCTIONS.lock().unwrap().as_mut() {
         for f in m.functions.lock().unwrap().values() {
@@ -580,6 +596,9 @@ pub(crate) unsafe fn module_function(m: *mut Module, name: &str) -> Result<*mut 
         kernel,
         globals: m.globals,
         fault: m.compiled.globals.iter().find(|g| g.name == "__zluda_fault").map(|g| m.globals + g.offset),
+        devrt: crate::device_rt::Bindings::new(|n| {
+            m.compiled.globals.iter().find(|g| g.name == n).map(|g| m.globals + g.offset)
+        }),
         module: mp,
         name: CString::new(name).unwrap_or_default(),
         library: AtomicU64::new(0),
@@ -1026,7 +1045,12 @@ pub(crate) unsafe fn run_kernel(l: &KernelLaunch) -> CUresult {
     } else {
         0
     };
+    let token = match crate::device_rt::before_launch(&f.devrt) {
+        Ok(t) => t,
+        Err(e) => return report(e, CUDA_ERROR_OUT_OF_MEMORY),
+    };
     let r = launch_result(f.kernel.launch(l.grid, l.block, &l.params, dynamic_shared));
+    crate::device_rt::after_launch(&f.devrt, token);
     check_fault_record(f.fault, &f.info.name);
     r
 }

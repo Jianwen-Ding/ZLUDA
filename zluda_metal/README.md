@@ -42,12 +42,12 @@ asserts next to each check.
 | --- | --- |
 | Initialization (`cuda.rs`, `errors.rs`) | `cuInit` (flags must be 0), `CUDA_ERROR_NOT_INITIALIZED` before it from every call but `cuDriverGetVersion` / `cuGetErrorName` / `cuGetErrorString` / `cuGetProcAddress`, `CUDA_ERROR_DEINITIALIZED` from calls made after the driver's exit handler; every `CUresult` has its name and a description |
 | Devices (`device.rs`) | one device; `cuDeviceGetAttribute` answers every `CUdevice_attribute` (limits of the simulated M2 Max: 38 multiprocessors, 3072 threads / 64 KiB shared memory / 53248 registers each, 48 KiB shared per block, 64 KiB opt-in; `CUDA_ERROR_INVALID_VALUE` for values outside the enumeration), name, UUID, PCI bus id (and back), properties, peer queries (no peer) |
-| Contexts (`context.rs`) | a real per-thread context stack (`cuCtxCreate` v2 / v3 / v4, `Push` / `Pop` / `SetCurrent` / `GetCurrent`, `cuCtxDestroy` pops it if current, other threads then get `CUDA_ERROR_CONTEXT_IS_DESTROYED`); no implicit context (`CUDA_ERROR_INVALID_CONTEXT`); flags, id, API version, limits (`cuCtxSetLimit` / `GetLimit` for every `CUlimit`, `current_limit()` for the device runtime), cache and shared memory configuration, stream priority range (0 .. -5); the primary context is reference counted (`Retain` / `Release` / `GetState` / `SetFlags`; released to 0 or `cuDevicePrimaryCtxReset` it frees its resources, a reset one stays retained); peer access returns the documented errors for a single device |
+| Contexts (`context.rs`) | a real per-thread context stack (`cuCtxCreate` v2 / v3 / v4, `Push` / `Pop` / `SetCurrent` / `GetCurrent`, `cuCtxDestroy` pops it if current, other threads then get `CUDA_ERROR_CONTEXT_IS_DESTROYED`); no implicit context (`CUDA_ERROR_INVALID_CONTEXT`); flags, id, API version, limits (`cuCtxSetLimit` / `GetLimit` for every `CUlimit`: the device runtime's, `src/device_rt.rs`), cache and shared memory configuration, stream priority range (0 .. -5); the primary context is reference counted (`Retain` / `Release` / `GetState` / `SetFlags`; released to 0 or `cuDevicePrimaryCtxReset` it frees its resources, a reset one stays retained); peer access returns the documented errors for a single device |
 | Resources | allocations, modules, streams and events belong to their context: destroying it (or releasing / resetting the primary context) frees them; handles are validated (`CUDA_ERROR_INVALID_HANDLE` for stale or bogus ones) |
 | Memory (`memory.rs`) | `cuMemAlloc` (0 bytes: `CUDA_ERROR_INVALID_VALUE`), `cuMemGetInfo` tracks what is allocated, `cuMemAllocPitch` (512-byte pitch), 1D / 2D / 3D copies and their async forms (`cuMemcpy2D`, `cuMemcpy3D`, unified `cuMemcpy`, peer copies), `cuMemsetD8/16/32`, `cuMemsetD2D8/16/32` and async forms, bounds checked; pinned (`cuMemAllocHost`, `cuMemHostAlloc`), registered (`cuMemHostRegister`, with the documented overlap errors) and managed (`cuMemAllocManaged`, `cuMemPrefetchAsync`, `cuMemAdvise`) memory is mapped for the device at its host address (zero copy: a kernel writes the host's buffer); `cuMemHostGetDevicePointer`, `cuMemHostGetFlags`; `cuPointerGetAttribute(s)` (every attribute; unknown pointers per the documented `cuPointerGetAttributes` defaults), `cuPointerSetAttribute` (SYNC_MEMOPS); the stream ordered allocator (`cuMemAllocAsync`, `cuMemFreeAsync` in stream order, the default memory pool and its attributes) |
 | Streams and events (`stream.rs`) | streams run their work in order: in the calling thread when idle, otherwise on the stream's worker thread, so `cuLaunchHostFunc` / `cuStreamAddCallback` run asynchronously and `cuStreamQuery` / `cuEventQuery` return `CUDA_ERROR_NOT_READY` while work waits behind them; the legacy default stream synchronizes with blocking streams, non-blocking ones are independent; `cuStreamWaitEvent` orders streams; priorities (clamped), flags, ids, context; `cuEventElapsedTime` measures the simulated GPU time (the AGX Performance Simulator's prediction of each kernel; kernels are timed once a timing event exists; `ZLUDA_EVENT_TIMING=wall` for host time) and returns the documented `INVALID_HANDLE` / `NOT_READY` errors |
 | Modules and functions (`cuda.rs`) | `cuModuleLoad(Data(Ex))`, `cuModuleGetFunctionCount`, `cuModuleEnumerateFunctions`, `cuModuleGetLoadingMode`; `cuFuncGetAttribute` for every attribute (registers and stack from the AGX code, PTX target version), `cuFuncSetAttribute` (dynamic shared memory opt-in, carveout, cluster hints; read-only ones rejected), `cuFuncGetName` / `GetModule` / `GetParamInfo` / `IsLoaded` |
-| Launches | grid, block and shared memory limits checked as CUDA does (the dynamic shared memory against the function's `MAX_DYNAMIC_SHARED_SIZE_BYTES`, registers against the core); `cuLaunchCooperativeKernel` (the grid must be co-resident: `CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE`), `cuLaunchKernelEx` with launch attributes |
+| Launches | grid, block and shared memory limits checked as CUDA does (the dynamic shared memory against the function's `MAX_DYNAMIC_SHARED_SIZE_BYTES`, registers against the core); `cuLaunchCooperativeKernel` and `cuLaunchKernelEx`'s cooperative attribute (the grid must be co-resident by the occupancy model, and one block while the functional model runs blocks one after another, see the device runtime below: `CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE`), `cuLaunchKernelEx` with launch attributes |
 | Occupancy (`occupancy.rs`) | `cuOccupancyMaxActiveBlocksPerMultiprocessor(WithFlags)`, `cuOccupancyMaxPotentialBlockSize(WithFlags)` (with the block-size-to-shared-memory callback), `cuOccupancyAvailableDynamicSMemPerBlock`, from the simulator's occupancy model (registers, threads, shared memory) |
 | Library API (`library.rs`) | CUDA 12's context-independent `cuLibraryLoadData` / `LoadFromFile` / `Unload` / `GetKernel` / `GetModule` / `GetGlobal` / `GetKernelCount` / `EnumerateKernels`, `cuKernelGetFunction` / `GetAttribute` / `SetAttribute` / `GetName` / `GetLibrary` / `GetParamInfo`; a `CUkernel` launches directly; `cuLink*` with one PTX input |
 | Graphs (`graph.rs`) | explicit graphs (kernel, memcpy, memset, host, empty, event record / wait nodes, dependencies, node and edge queries, clone), stream capture (`cuStreamBeginCapture` in the three modes, fork / join through events, `cuStreamIsCapturing`, `cuStreamGetCaptureInfo` v1-v3, the documented invalidation errors: synchronizing a capturing stream, unsafe calls in global mode, implicit legacy-stream dependencies, unjoined forks, isolation), `cuGraphInstantiate*`, `cuGraphLaunch` (nodes in a topological order on the stream) |
@@ -179,19 +179,110 @@ dialect (`blas/gen_kernels.py`) and compiled by the LLVM fork's MLIR, GPU -> AIR
 runs it when `mlir-opt` exists (`ZLUDA_MLIR_OPT`, or `../../llvm-project/build/bin/mlir-opt`, a build with
 `-DLLVM_ENABLE_PROJECTS=mlir`) and otherwise uses the checked-in `blas/zluda_blas.agx.o`.
 
-* handle, stream, pointer mode (host and device scalars), math mode, workspace; `Set/GetVector`, `Set/GetMatrix`
-* S / D `axpy scal copy swap dot nrm2 asum amax amin gemv gemm gemmStridedBatched gemmBatched`
-* `Hgemm`, `HgemmStridedBatched`, `GemmEx`, `GemmStridedBatchedEx`, `GemmBatchedEx` for f16 / bf16 data
-  (float accumulation, output in the data type or f32), f32 and f64
-* not implemented: complex types, the other level 2 / 3 routines (`CUBLAS_STATUS_NOT_SUPPORTED` is not
-  returned for them: they are not exported), matrices beyond 2^31 elements
+* handle, stream, pointer mode (host and device scalars), math mode, atomics mode, SM count target, workspace,
+  `GetProperty`, `GetCudartVersion`; `Set/GetVector`, `Set/GetMatrix` and their `Async` forms (synchronous)
+* level 1: S / D `axpy scal copy swap dot nrm2 asum amax amin rot rotg rotm rotmg`; C / Z `axpy scal
+  (Cs/Zd)scal copy swap dotu dotc (Sc/Dz)nrm2 (Sc/Dz)asum (Cs/Zd)rot`
+* level 2: S / D `gemv gemvStridedBatched gemvBatched gbmv symv sbmv spmv ger syr syr2 trmv tbmv tpmv trsv tbsv
+  tpsv`; C / Z `gemv`
+* level 3: S / D `gemm gemmStridedBatched gemmBatched symm syrk syr2k syrkx trmm trsm trsmBatched geam dgmm`; C / Z
+  `gemm gemm3m gemmStridedBatched gemmBatched`; `Hgemm`, `HgemmStridedBatched`, `GemmEx`, `GemmStridedBatchedEx`,
+  `GemmBatchedEx` for f16 / bf16 data (float accumulation, output in the data type or f32), f32 and f64
+* the `_64` entry points of all of these (dimensions beyond int32: `CUBLAS_STATUS_NOT_SUPPORTED`)
+* not implemented (not exported): the complex level 2 / 3 routines other than gemv / gemm (hemv, herk, ...), `Icamax`,
+  `Crot` with a complex sine, packed rank updates (`spr`, `spr2`), the batched LU / QR / least-squares routines,
+  cublasLt; matrices beyond 2^31 elements
 
-GEMMs with a float C (`Sgemm`, f16 / bf16 `GemmEx` to f32) whose m and n are multiples of 16 and k of 8 run
-on AGX's SIMD-group matrix multiply (`air.simdgroup_matrix_*`, one SIMD group per 16 x 16 or, for large C, 32 x 32 tile; alpha and beta
-as products with alpha I / beta I): a 256^3 Sgemm is predicted at 17.3 us against 120.8 us for the
-register-tiled kernel the other shapes use (`ZLUDA_BLAS_NO_MMA=1` forces it). Double precision is emulated
-(AIR's portable passes). `tests/blas/test_blas.py` checks every routine against
-numpy (transposes, leading dimensions, negative increments, batches, both pointer modes).
+Argument checks follow cuBLAS's documented rules (`CUBLAS_STATUS_INVALID_VALUE` for bad enums, negative
+dimensions, short leading dimensions, zero increments, in-place geam other than C = A / B). How the routines map
+onto the kernels:
+
+* GEMMs with a float or half C (`Sgemm`, `Hgemm`, f16 / bf16 `GemmEx`) run on AGX's SIMD-group matrix multiply
+  (`air.simdgroup_matrix_*`: one SIMD group per 16 x 16 or, when that still gives 256 of them, 32 x 32 tile of an
+  f32 C, k in steps of 8; alpha and beta as products with alpha I / beta I). Shapes the tiles do not divide run on
+  zero-padded copies of op(A), op(B) and C (`pad_*` kernels), an f16 / bf16 C on an f32 copy (`cvt_*`), so every
+  shape from 16 x 16 x 8 up (and, for padded copies, 2^17 multiply-adds) uses the matrix hardware; smaller ones and
+  doubles use a register-tiled kernel (4 x 4, f64 2 x 2 per thread). `ZLUDA_BLAS_NO_MMA=1` forces it,
+  `ZLUDA_BLAS_MMA_TILE=16 / 32` the tile.
+* `gemmBatched` / `GemmBatchedEx` read the device arrays of matrix addresses in the kernels (one launch).
+* gemv: 32 rows (a SIMD group's lanes) x 32 (f64: 16) column groups per block with the partial sums added in
+  threadgroup memory, or, for row-contiguous op(A) / few rows, a SIMD group per row; batched over grid y.
+* dot / nrm2 / asum / amax / amin are single launches: blocks of 256 threads write partials and the last block to
+  finish (an atomic count) combines them in block order (deterministic).
+* symmetric / triangular / banded / packed matrices are expanded by one elementwise kernel (`geam`, which also
+  serves geam, dgmm and triangle-masked copies) to dense copies for gemv / gemm: symv, sbmv, spmv, gbmv, trmv,
+  tbmv, tpmv, symm, trmm; syrk / syr2k / syrkx are GEMMs into a copy of C whose triangle is copied back.
+* trsv / tbsv / tpsv / trsm: one SIMD group per right-hand side (trsm: B's columns, or rows on the right); lane l
+  owns the elements i = l mod 32, the solved unknown is broadcast by a shuffle (no shared memory).
+* complex data is the real type's memory interleaved; products are real fmas with per-operand conjugation.
+
+Predicted times (`ZLUDA_AGX_STATS`, `tests/blas/bench_blas.py`, the simulated M2 Max):
+
+| Call | before | now |
+| --- | --- | --- |
+| Sgemm 256^3 / 512^3 / 1024^3 | 17.3 / 46.2 / 238.9 us | 17.3 / 46.1 / 238.3 us |
+| Sgemm 250^3 / 500^3 / 1000^3 | 118.4 / 226.0 / (not simulated) us | 32.5 / 76.1 / 319.9 us |
+| Sgemm 255 x 257 x 129 | 62.6 us | 25.1 us |
+| Hgemm 256^3 / 512^3 | 122.8 / 241.2 us | 21.9 / 53.1 us |
+| Dgemm 128^3 | 2197.9 us | 410.2 us |
+| Sgemv 1000 x 1000 (N / T) | 321.6 / 101.6 us | 16.2 / 13.6 us |
+| Dgemv 1000 x 1000 | 1198.6 us | 75.6 us |
+| Sdot / Snrm2 / Isamax 1e6 | 89.1 / 52.5 / 56.1 us | 27.3 / 15.6 / 16.5 us |
+
+Double precision is emulated (AIR's portable passes). `tests/blas/test_blas.py` checks every routine against
+numpy (transposes, leading dimensions, negative increments, batches, both pointer modes, structured storage,
+argument errors). The kernels' object is 376 KB (49 kernels; the f64 ones are most of it: emulated doubles); it
+loads in 0.3 ms (kernels' code is copied out when first used).
+
+### Device runtime (`src/device_rt.rs`, `ptx/lib/metal_impl/devrt.inc`)
+
+What CUDA's device runtime provides to kernels, with its host-side semantics. The device side keeps its state in
+buffers the host owns, found through module variables (`__zluda_devrt_printf`, `__zluda_devrt_heap`,
+`__zluda_devrt_clock`) that the launch fills; state is per context.
+
+* **printf** (`vprintf`, as clang lowers device `printf`): the device parses the format, copies the arguments (one
+  8-byte slot each; `%s` strings by value, at most 4096 bytes) into a circular FIFO, and the host formats each record
+  with the C library's `snprintf`, spec by spec, so `%d %i %u %x %X %o %c %s %p %f %e %g %a`, flags, width,
+  precision, `*`, `h hh l ll z j t` and `%%` behave as C's (at most 32 arguments, as CUDA). Output goes to the
+  process's C `stdout` at CUDA's flush points: the start of the next launch, `cuCtxSynchronize` /
+  `cuStreamSynchronize` / `cuEventSynchronize`, the blocking `cuMemcpy*`, `cuModuleLoad*` / `cuModuleUnload`,
+  `cuCtxDestroy` / `cuDevicePrimaryCtxReset`. Records print in the order the threads wrote them. The FIFO is
+  `CU_LIMIT_PRINTF_FIFO_SIZE` bytes (1 MiB by default; changing it prints the pending output and replaces the FIFO);
+  a launch that prints more loses its oldest output (16 bytes per record plus 8 per argument). `printf` returns the
+  number of arguments, -1 for a null format, -2 when the record does not fit.
+* **malloc / free** (PTX `call malloc` / `call free`): a lock-free size-class allocator in a heap of
+  `CU_LIMIT_MALLOC_HEAP_SIZE` bytes (8 MiB by default), allocated at the first launch of a kernel that uses it and kept
+  for the context's life, so blocks stay valid across launches until freed. Pointers are 16-byte aligned; freed blocks
+  are reused by allocations of the same class (four classes per power of two, at most 25% padding); blocks are not
+  split or coalesced. An exhausted heap returns NULL. The size cannot change once the heap exists
+  (`CUDA_ERROR_INVALID_VALUE`).
+* **Clocks**: one cycle counter per launch: each SIMD group's read advances it by 25 cycles (the lanes of a group read
+  one value), `nanosleep.u32 t` by `t` ns at the reported 1.398 GHz (capped at 1 ms, PTX's bound), and between
+  launches it moves on by the simulator's instruction count of each launch spread over the 8 reported
+  multiprocessors. So `%clock` / `%clock64` are monotonic within and across launches and `%globaltimer` is
+  nanoseconds since the Unix epoch (the launch's start, then the counter's cycles at the clock rate), monotonic too.
+  Values model time only that coarsely: the functional model has no time of its own.
+* **Special registers**: `%laneid`, `%lanemask_*`, `%warpid` (< `%nwarpid`, the CTA's warps), `%smid` (the CTA's
+  linear index modulo `%nsmid` = 8), `%warpsize` as PTX defines them. Dynamic shared memory is 16-byte aligned.
+* **Limits** (`cuCtxSetLimit` / `cuCtxGetLimit`): the printf FIFO and heap as above; `CU_LIMIT_STACK_SIZE` (1 KiB),
+  the device-runtime sync depth / pending launches and the L2 limits are recorded and reported but change nothing
+  (a kernel whose local memory overflows its stack faults with `CUDA_ERROR_HARDWARE_STACK_ERROR`); other limits are
+  `CUDA_ERROR_UNSUPPORTED_LIMIT`.
+* **Cooperative launches** (`cuLaunchCooperativeKernel`): the AGX functional model runs a dispatch's workgroups one
+  after the other, each to its end, and a threadgroup's SIMD groups each to its next barrier: a grid-wide barrier
+  (every block waiting for every other) can only complete when the grid is one block, so larger cooperative grids
+  fail with `CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE` (720), as CUDA fails a grid that cannot be co-resident.
+  The same scheduling makes cross-block message passing work when the producer block has the lower index (blocks run
+  in order) and hang (`CUDA_ERROR_LAUNCH_TIMEOUT`, sticky) the other way round, and any spin-wait on another SIMD group
+  of the same block that is not separated by a barrier hang too; CUDA (independent thread scheduling) completes both
+  when the blocks are co-resident. Supporting them needs a preemptive scheduler in the functional model (run every
+  workgroup of a cooperative launch, switching groups after a step budget).
+* Memory ordering: `membar` / `fence` / `__threadfence` and atomics are sequentially consistent in the functional
+  model (one SIMD group runs at a time).
+* Not reproduced: out-of-bounds shared memory accesses are dropped (loads read 0) by the functional model, as by the
+  hardware it models, so the kernel completes where CUDA reports `CUDA_ERROR_ILLEGAL_ADDRESS`.
+
+`tests/device/test_device.py` checks all of it (`kernels.cu`, compiled by clang alone to `kernels.ptx`; `--regen`).
 
 ### Floating point modes (`ZLUDA_FP_MODE`)
 
@@ -213,6 +304,7 @@ Tests and tools (no NVIDIA or Apple tool anywhere: PTX is hand written or from c
 
 | Tool | What |
 | --- | --- |
+| `tests/device/test_device.py` | device runtime: printf, malloc / free, clocks, limits, special registers, cooperative launches |
 | `tests/ptxconf/ptxconf.py` | PTX-formalization's harness programs (`.buffer`/`.launch`/`.expect`, `.tensormap`), every `.expect` checked bit for bit; `triage.py` ranks blockers |
 | `tests/stress/gen.sh OUT` | a large generated suite (the formalization's ISA generators with new seeds, 512 cases per launch, ~570 programs); `stress/gen/gen_tanh.py` adds exact `tanh.approx` cases |
 | `tests/alive/opt_check.py` | alive2 (`alive-tv --fp-uf`, the fork in `../../alive2`) proves that each kernel's AGX IR at -O3 refines -O0 |
@@ -234,7 +326,7 @@ ZLUDA_AGX_AIR2AGX=../../llvm-project/build/bin/llvm-air2agx \
   Expect that loading on a real device needs adjustments in `metallib.cpp`
   and possibly a downgrade step after `air_lower.cpp`.
 * No fp64 (Metal has none): such kernels are rejected with a clear error.
-* Textures/surfaces, `printf`, cooperative groups beyond warps, tensor core
+* Textures/surfaces, cooperative groups beyond warps and one-block grids, tensor core
   (`mma`, `ldmatrix`) instructions and cubin/fatbin images are not supported;
   modules must be loaded as PTX text.
 * Kernels of different streams do not run concurrently (the device executes one kernel at a time).

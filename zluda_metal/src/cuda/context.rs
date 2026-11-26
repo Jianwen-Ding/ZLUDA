@@ -8,16 +8,6 @@ use std::cell::RefCell;
 /// cuCtxGetApiVersion of every context
 const API_VERSION: c_uint = 3020;
 
-/// CUlimit: STACK_SIZE, PRINTF_FIFO_SIZE, MALLOC_HEAP_SIZE, DEV_RUNTIME_SYNC_DEPTH,
-/// DEV_RUNTIME_PENDING_LAUNCH_COUNT, MAX_L2_FETCH_GRANULARITY, PERSISTING_L2_CACHE_SIZE
-#[allow(dead_code)]
-pub const CU_LIMIT_STACK_SIZE: usize = 0;
-#[allow(dead_code)]
-pub const CU_LIMIT_PRINTF_FIFO_SIZE: usize = 1;
-#[allow(dead_code)]
-pub const CU_LIMIT_MALLOC_HEAP_SIZE: usize = 2;
-const LIMITS: usize = 7;
-const LIMIT_DEFAULTS: [u64; LIMITS] = [1024, 1 << 20, 8 << 20, 2, 2048, 64, 0];
 
 pub struct Context {
     pub(crate) sticky: AtomicU32,
@@ -36,7 +26,6 @@ pub(crate) struct CtxState {
     /// its last reset)
     pub refs: u32,
     pub active: bool,
-    pub limits: [u64; LIMITS],
     pub cache_config: u32,
     pub shmem_config: u32,
 }
@@ -53,7 +42,6 @@ impl Context {
                 destroyed: false,
                 refs: 0,
                 active: false,
-                limits: LIMIT_DEFAULTS,
                 cache_config: 0,
                 shmem_config: 0,
             }),
@@ -115,16 +103,6 @@ pub(crate) fn current_unchecked() -> Result<&'static Context, CUresult> {
     Ok(c)
 }
 
-/// A context limit of the current context (CUlimit index), its default without one (for the device runtime:
-/// printf FIFO, malloc heap, stack)
-#[allow(dead_code)]
-pub(crate) fn current_limit(limit: usize) -> u64 {
-    match top() {
-        Some(c) => c.state.lock().unwrap().limits.get(limit).copied().unwrap_or(0),
-        None => LIMIT_DEFAULTS.get(limit).copied().unwrap_or(0),
-    }
-}
-
 /// CU_CTX_SCHED_* (one of AUTO 0, SPIN 1, YIELD 2, BLOCKING_SYNC 4), MAP_HOST 8, LMEM_RESIZE_TO_MAX 0x10,
 /// COREDUMP_ENABLE 0x20, USER_COREDUMP_ENABLE 0x40, SYNC_MEMOPS 0x80
 fn valid_flags(flags: c_uint) -> bool {
@@ -134,6 +112,8 @@ fn valid_flags(flags: c_uint) -> bool {
 /// Free everything a context owns: wait for its streams, then its streams, events, modules and allocations
 unsafe fn teardown(c: &Context) {
     stream::destroy_context_streams(c);
+    // printf output, the device heap and FIFO, the limits (src/device_rt.rs)
+    crate::device_rt::context_destroyed(c.key());
     for m in modules_of(c.key()) {
         unload_module(m);
     }
@@ -193,7 +173,6 @@ pub unsafe extern "system" fn cuDevicePrimaryCtxReset_v2(dev: CUdevice) -> CUres
     teardown(&g.primary);
     let mut st = g.primary.state.lock().unwrap();
     st.active = false;
-    st.limits = LIMIT_DEFAULTS;
     st.cache_config = 0;
     st.shmem_config = 0;
     CUDA_SUCCESS
@@ -453,46 +432,7 @@ pub unsafe extern "system" fn cuCtxSynchronize() -> CUresult {
     stream::synchronize_context(c)
 }
 
-/// cuCtxGetLimit / cuCtxSetLimit: every CUlimit; others CUDA_ERROR_UNSUPPORTED_LIMIT.
-/// MAX_L2_FETCH_GRANULARITY takes 0, 32, 64 or 128 (a hint); the persisting L2 size must be 0 (no persisting L2).
-#[no_mangle]
-pub unsafe extern "system" fn cuCtxGetLimit(value: *mut usize, limit: c_int) -> CUresult {
-    let c = tri!(current());
-    if value.is_null() {
-        return CUDA_ERROR_INVALID_VALUE;
-    }
-    if !(0..LIMITS as c_int).contains(&limit) {
-        return CUDA_ERROR_UNSUPPORTED_LIMIT;
-    }
-    *value = c.state.lock().unwrap().limits[limit as usize] as usize;
-    CUDA_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn cuCtxSetLimit(limit: c_int, value: usize) -> CUresult {
-    let c = tri!(current());
-    if !(0..LIMITS as c_int).contains(&limit) {
-        return CUDA_ERROR_UNSUPPORTED_LIMIT;
-    }
-    let mut v = value as u64;
-    match limit {
-        // the stack is rounded up to 16 bytes per thread
-        0 => v = (v + 15) & !15,
-        5 => {
-            if ![0, 32, 64, 128].contains(&v) {
-                return CUDA_ERROR_INVALID_VALUE;
-            }
-        }
-        6 => {
-            if v > device::MAX_PERSISTING_L2 {
-                return CUDA_ERROR_INVALID_VALUE;
-            }
-        }
-        _ => {}
-    }
-    c.state.lock().unwrap().limits[limit as usize] = v;
-    CUDA_SUCCESS
-}
+// cuCtxGetLimit / cuCtxSetLimit: src/device_rt.rs (the limits are the device runtime's)
 
 /// cuCtxGetCacheConfig / cuCtxSetCacheConfig: CU_FUNC_CACHE_PREFER_NONE / SHARED / L1 / EQUAL (a hint)
 #[no_mangle]

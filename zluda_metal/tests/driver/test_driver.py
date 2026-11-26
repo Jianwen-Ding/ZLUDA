@@ -446,7 +446,7 @@ def g_limits(c, t):
     t.eq(c.cuCtxSetLimit(1, 4 << 20), SUCCESS, "cuCtxSetLimit PRINTF_FIFO_SIZE")
     t.eq(c.cuCtxGetLimit(byref(v), 99), UNSUPPORTED_LIMIT, "cuCtxGetLimit of an unknown limit")
     t.eq(c.cuCtxSetLimit(99, 1), UNSUPPORTED_LIMIT, "cuCtxSetLimit of an unknown limit")
-    t.eq(c.cuCtxSetLimit(5, 48), INVALID_VALUE, "MAX_L2_FETCH_GRANULARITY takes 0, 32, 64 or 128")
+    t.eq(c.cuCtxSetLimit(5, 256), INVALID_VALUE, "MAX_L2_FETCH_GRANULARITY is at most 128 bytes")
     cfg = I()
     t.eq(c.cuCtxSetCacheConfig(1), SUCCESS, "cuCtxSetCacheConfig")
     c.cuCtxGetCacheConfig(byref(cfg))
@@ -960,6 +960,9 @@ def g_launch(c, t):
     c.cuDeviceGetAttribute(byref(sms), 16, 0)
     t.eq(c.cuLaunchCooperativeKernel(f, nb.value * sms.value + 1, 1, 1, 1024, 1, 1, 0, None, pa),
          COOPERATIVE_LAUNCH_TOO_LARGE, "a cooperative grid larger than the device holds")
+    # the functional model runs blocks one after another: only a one-block grid can synchronize grid-wide
+    t.eq(c.cuLaunchCooperativeKernel(f, 2, 1, 1, 32, 1, 1, 0, None, pa), COOPERATIVE_LAUNCH_TOO_LARGE,
+         "a cooperative grid the simulator cannot run co-resident")
 
     class LaunchAttr(ctypes.Structure):
         _fields_ = [("id", U), ("pad", U), ("val", U64 * 8)]

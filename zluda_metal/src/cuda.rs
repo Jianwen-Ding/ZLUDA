@@ -483,6 +483,13 @@ pub unsafe extern "system" fn cuModuleLoadDataEx(
     cuModuleLoadData(module, image)
 }
 
+/// cuModuleLoadFatBinary: a fat binary holds machine code for NVIDIA GPUs (CUDA_ERROR_NO_BINARY_FOR_GPU); PTX
+/// text is accepted as by cuModuleLoadData
+#[no_mangle]
+pub unsafe extern "system" fn cuModuleLoadFatBinary(module: *mut *mut Module, image: *const c_void) -> CUresult {
+    cuModuleLoadData(module, image)
+}
+
 #[no_mangle]
 pub unsafe extern "system" fn cuModuleLoad(
     module: *mut *mut Module,

@@ -27,9 +27,38 @@ Everything is built and tested with clang.
 | `cpp/metallib.cpp`, `cpp/sha256.h` | open `.metallib` writer and reader |
 | `../ptx/lib/zluda_ptx_metal_impl.cpp` | Metal versions of the `__zluda_ptx_impl_*` helpers (sregs, shuffles, votes, bit ops, ...) compiled to bitcode by clang at build time |
 | `cpp/metal_backend.cpp` | metal-cpp runtime: buffers, libraries, pipelines, dispatch |
-| `src/cuda.rs` | CUDA driver API exported from `libzluda_metal.so`/`.dylib` (use it as `libcuda.so.1`) |
+| `src/cuda.rs`, `src/cuda/*.rs` | CUDA driver API exported from `libzluda_metal.so`/`.dylib` (use it as `libcuda.so.1`); see [The CUDA driver API](#the-cuda-driver-api) |
 | `linux_shim/` | Linux test harness: an objc-compatible runtime + Foundation subset and a software `MTLDevice` that JIT-executes AIR, so the real metal-cpp code path runs on Linux |
 | `tests/` | cargo tests and the clang-only end-to-end suite |
+
+## The CUDA driver API
+
+`src/cuda.rs` (modules, functions, launches) and `src/cuda/` implement the driver API from the documented
+semantics of the CUDA Driver API reference (every declaration is our own). `tests/driver/test_driver.py` checks
+each behavior below (about 500 checks, each group in its own process, AGX backend), with the documented behavior it
+asserts next to each check.
+
+| Area | Supported |
+| --- | --- |
+| Initialization (`cuda.rs`, `errors.rs`) | `cuInit` (flags must be 0), `CUDA_ERROR_NOT_INITIALIZED` before it from every call but `cuDriverGetVersion` / `cuGetErrorName` / `cuGetErrorString` / `cuGetProcAddress`, `CUDA_ERROR_DEINITIALIZED` from calls made after the driver's exit handler; every `CUresult` has its name and a description |
+| Devices (`device.rs`) | one device; `cuDeviceGetAttribute` answers every `CUdevice_attribute` (limits of the simulated M2 Max: 38 multiprocessors, 3072 threads / 64 KiB shared memory / 53248 registers each, 48 KiB shared per block, 64 KiB opt-in; `CUDA_ERROR_INVALID_VALUE` for values outside the enumeration), name, UUID, PCI bus id (and back), properties, peer queries (no peer) |
+| Contexts (`context.rs`) | a real per-thread context stack (`cuCtxCreate` v2 / v3 / v4, `Push` / `Pop` / `SetCurrent` / `GetCurrent`, `cuCtxDestroy` pops it if current, other threads then get `CUDA_ERROR_CONTEXT_IS_DESTROYED`); no implicit context (`CUDA_ERROR_INVALID_CONTEXT`); flags, id, API version, limits (`cuCtxSetLimit` / `GetLimit` for every `CUlimit`, `current_limit()` for the device runtime), cache and shared memory configuration, stream priority range (0 .. -5); the primary context is reference counted (`Retain` / `Release` / `GetState` / `SetFlags`; released to 0 or `cuDevicePrimaryCtxReset` it frees its resources, a reset one stays retained); peer access returns the documented errors for a single device |
+| Resources | allocations, modules, streams and events belong to their context: destroying it (or releasing / resetting the primary context) frees them; handles are validated (`CUDA_ERROR_INVALID_HANDLE` for stale or bogus ones) |
+| Memory (`memory.rs`) | `cuMemAlloc` (0 bytes: `CUDA_ERROR_INVALID_VALUE`), `cuMemGetInfo` tracks what is allocated, `cuMemAllocPitch` (512-byte pitch), 1D / 2D / 3D copies and their async forms (`cuMemcpy2D`, `cuMemcpy3D`, unified `cuMemcpy`, peer copies), `cuMemsetD8/16/32`, `cuMemsetD2D8/16/32` and async forms, bounds checked; pinned (`cuMemAllocHost`, `cuMemHostAlloc`), registered (`cuMemHostRegister`, with the documented overlap errors) and managed (`cuMemAllocManaged`, `cuMemPrefetchAsync`, `cuMemAdvise`) memory is mapped for the device at its host address (zero copy: a kernel writes the host's buffer); `cuMemHostGetDevicePointer`, `cuMemHostGetFlags`; `cuPointerGetAttribute(s)` (every attribute; unknown pointers per the documented `cuPointerGetAttributes` defaults), `cuPointerSetAttribute` (SYNC_MEMOPS); the stream ordered allocator (`cuMemAllocAsync`, `cuMemFreeAsync` in stream order, the default memory pool and its attributes) |
+| Streams and events (`stream.rs`) | streams run their work in order: in the calling thread when idle, otherwise on the stream's worker thread, so `cuLaunchHostFunc` / `cuStreamAddCallback` run asynchronously and `cuStreamQuery` / `cuEventQuery` return `CUDA_ERROR_NOT_READY` while work waits behind them; the legacy default stream synchronizes with blocking streams, non-blocking ones are independent; `cuStreamWaitEvent` orders streams; priorities (clamped), flags, ids, context; `cuEventElapsedTime` measures the simulated GPU time (the AGX Performance Simulator's prediction of each kernel; kernels are timed once a timing event exists; `ZLUDA_EVENT_TIMING=wall` for host time) and returns the documented `INVALID_HANDLE` / `NOT_READY` errors |
+| Modules and functions (`cuda.rs`) | `cuModuleLoad(Data(Ex))`, `cuModuleGetFunctionCount`, `cuModuleEnumerateFunctions`, `cuModuleGetLoadingMode`; `cuFuncGetAttribute` for every attribute (registers and stack from the AGX code, PTX target version), `cuFuncSetAttribute` (dynamic shared memory opt-in, carveout, cluster hints; read-only ones rejected), `cuFuncGetName` / `GetModule` / `GetParamInfo` / `IsLoaded` |
+| Launches | grid, block and shared memory limits checked as CUDA does (the dynamic shared memory against the function's `MAX_DYNAMIC_SHARED_SIZE_BYTES`, registers against the core); `cuLaunchCooperativeKernel` (the grid must be co-resident: `CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE`), `cuLaunchKernelEx` with launch attributes |
+| Occupancy (`occupancy.rs`) | `cuOccupancyMaxActiveBlocksPerMultiprocessor(WithFlags)`, `cuOccupancyMaxPotentialBlockSize(WithFlags)` (with the block-size-to-shared-memory callback), `cuOccupancyAvailableDynamicSMemPerBlock`, from the simulator's occupancy model (registers, threads, shared memory) |
+| Library API (`library.rs`) | CUDA 12's context-independent `cuLibraryLoadData` / `LoadFromFile` / `Unload` / `GetKernel` / `GetModule` / `GetGlobal` / `GetKernelCount` / `EnumerateKernels`, `cuKernelGetFunction` / `GetAttribute` / `SetAttribute` / `GetName` / `GetLibrary` / `GetParamInfo`; a `CUkernel` launches directly; `cuLink*` with one PTX input |
+| Graphs (`graph.rs`) | explicit graphs (kernel, memcpy, memset, host, empty, event record / wait nodes, dependencies, node and edge queries, clone), stream capture (`cuStreamBeginCapture` in the three modes, fork / join through events, `cuStreamIsCapturing`, `cuStreamGetCaptureInfo` v1-v3, the documented invalidation errors: synchronizing a capturing stream, unsafe calls in global mode, implicit legacy-stream dependencies, unjoined forks, isolation), `cuGraphInstantiate*`, `cuGraphLaunch` (nodes in a topological order on the stream) |
+| Entry points (`proc_address.rs`) | `cuGetProcAddress(_v2)` finds every exported `cu*` function, choosing among `_v2` / `_v3` / ... by the requested CUDA version, with the documented symbol status |
+
+Not implemented: CUDA arrays, textures and surfaces (`CU_MEMORYTYPE_ARRAY` copies return `CUDA_ERROR_NOT_SUPPORTED`),
+the virtual memory management API (`cuMemCreate`, `cuMemMap`, ...), IPC, external memory / semaphores, graphics
+interop, stream memory operations (`cuStreamWaitValue*`), launch-time thread block clusters, grid-wide
+synchronization inside a cooperative kernel (the functional model runs blocks one after another), graph updates
+(`cuGraphExec*SetParams`, `cuGraphExecUpdate`) and child graph nodes, linking several PTX inputs, and the CUDA
+runtime's private export tables (`cuGetExportTable`). Managed and mapped host memory need the AGX backend.
 
 ## The AIR lowering
 
@@ -99,7 +128,8 @@ shared memory with barriers, warp shuffles/ballots, 2D/3D grids and blocks,
 global atomics (including CAS loops and float add), `.func` calls with private
 arrays, by-value struct parameters, integer/float math, pointer loops over
 shared memory, device globals and constant tables, plus driver API basics
-(memset, DtoD, address ranges, streams, events).
+(memset, DtoD, address ranges, streams, events). `tests/driver/test_driver.py` is the driver API conformance
+suite (see [The CUDA driver API](#the-cuda-driver-api)).
 
 Useful tools:
 
@@ -207,6 +237,6 @@ ZLUDA_AGX_AIR2AGX=../../llvm-project/build/bin/llvm-air2agx \
 * Textures/surfaces, `printf`, cooperative groups beyond warps, tensor core
   (`mma`, `ldmatrix`) instructions and cubin/fatbin images are not supported;
   modules must be loaded as PTX text.
-* All CUDA streams share one in-order Metal command queue.
+* Kernels of different streams do not run concurrently (the device executes one kernel at a time).
 * On the software device, warp-level operations inside divergent code where
   only part of a SIMD group participates can deadlock.

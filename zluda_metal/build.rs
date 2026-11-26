@@ -112,6 +112,35 @@ fn main() {
             .file("linux_shim/sw_exec.cpp");
         exec.compile("zluda_metal_swexec");
     }
+
+    // 3. cuBLAS's device code (src/blas.rs): blas/gen_kernels.py's MLIR, compiled by the LLVM fork's MLIR (GPU ->
+    //    AIR -> AGX object). Without mlir-opt (ZLUDA_MLIR_OPT, or a sibling llvm-project build) the checked-in
+    //    object blas/zluda_blas.agx.o (blas/build.sh writes it) is used.
+    build_blas(&out);
+}
+
+fn build_blas(out: &std::path::Path) {
+    println!("cargo:rerun-if-env-changed=ZLUDA_MLIR_OPT");
+    println!("cargo:rerun-if-changed=blas/gen_kernels.py");
+    println!("cargo:rerun-if-changed=blas/build.sh");
+    println!("cargo:rerun-if-changed=blas/zluda_blas.agx.o");
+    let dst = out.join("zluda_blas.agx.o");
+    let mlir_opt = env::var("ZLUDA_MLIR_OPT").ok().map(PathBuf::from).unwrap_or_else(|| {
+        PathBuf::from("../../llvm-project/build/bin/mlir-opt")
+    });
+    if mlir_opt.exists() {
+        let status = Command::new("sh")
+            .arg("blas/build.sh")
+            .arg(&dst)
+            .env("MLIR_OPT", &mlir_opt)
+            .status()
+            .expect("failed to run blas/build.sh");
+        if status.success() {
+            return;
+        }
+        println!("cargo:warning=blas/build.sh failed: using the checked-in blas/zluda_blas.agx.o");
+    }
+    std::fs::copy("blas/zluda_blas.agx.o", &dst).expect("blas/zluda_blas.agx.o");
 }
 
 fn find_metal_cpp() -> PathBuf {

@@ -282,6 +282,14 @@ pub fn launch_value(d: u32, kind: u32) -> u32 {
 // ---------------------------------------------------------------------------
 // Libraries and kernels
 // ---------------------------------------------------------------------------
+/// A kernel argument of [`Kernel::launch_args`]: bytes copied into a temporary buffer (whose address is the
+/// argument), a device address, or a value (the argument's own bytes: a scalar of an MLIR kernel)
+pub enum Arg<'a> {
+    Bytes(&'a [u8]),
+    Addr(u64),
+    Value(Vec<u8>),
+}
+
 pub struct Library {
     /// kernel -> (record, code, global data buffer of its object)
     records: HashMap<String, (Record, Vec<u8>, Option<u64>)>,
@@ -289,6 +297,7 @@ pub struct Library {
     globals: Vec<u64>,
 }
 
+#[derive(Clone)]
 pub struct Kernel {
     record: Record,
     code: Arc<Vec<u8>>,
@@ -489,6 +498,7 @@ impl Kernel {
         &self.record
     }
 
+    /// A launch of a kernel compiled from PTX: buffer 0 is ZLUDA's parameter buffer
     pub fn launch(
         &self,
         grid: [u32; 3],
@@ -496,6 +506,23 @@ impl Kernel {
         params: &[u8],
         dynamic_shared: u32,
     ) -> Result<(), String> {
+        self.launch_args(grid, block, &[Arg::Bytes(params)], dynamic_shared)
+    }
+
+    /// A launch with the kernel's buffer arguments in order (`args[i]` for buffer i; the others get 4 KiB of
+    /// zeros). An AIR kernel from MLIR (src/blas.rs) has its pointers as buffers in order and its scalars packed
+    /// into one last buffer (AIRScalarBufferPacking: in order, naturally aligned).
+    pub fn launch_args(
+        &self,
+        grid: [u32; 3],
+        block: [u32; 3],
+        args: &[Arg],
+        dynamic_shared: u32,
+    ) -> Result<(), String> {
+        let params: &[u8] = match args.first() {
+            Some(Arg::Bytes(b)) => b,
+            _ => &[],
+        };
         let r = &self.record;
         // thread-block clusters (extension 1, agx-cluster-dims): a cluster of C CTAs is one threadgroup, the grid
         // divided by the cluster dims and the threadgroup's z multiplied by C
@@ -519,7 +546,32 @@ impl Kernel {
             if half == u32::MAX {
                 continue;
             }
-            let data: Vec<u8> = if i == 0 { params.to_vec() } else { vec![0u8; 4096] };
+            if let Some(Arg::Value(v)) = args.get(i) {
+                if kind != 0 || v.len() != bytes as usize {
+                    return Err(format!("{}: argument {i} is {bytes} bytes (kind {kind}), given {}", r.name, v.len()));
+                }
+                u.put_bytes(half, v);
+                continue;
+            }
+            if let Some(Arg::Addr(va)) = args.get(i) {
+                if kind == 0 && bytes == 8 {
+                    u.put(half, *va, 2);
+                } else {
+                    let pa = alloc(16)?;
+                    let (pp, _) = host_pointer(pa).unwrap();
+                    unsafe { std::ptr::copy_nonoverlapping(va.to_le_bytes().as_ptr(), pp, 8) };
+                    temps.push(pa);
+                    u.put(half, pa, 2);
+                }
+                continue;
+            }
+            let data: Vec<u8> = match args.get(i) {
+                Some(Arg::Bytes(b)) => b.to_vec(),
+                _ => vec![0u8; 4096],
+            };
+            if args.len() > 1 && i >= args.len() {
+                return Err(format!("{}: {} arguments given, the kernel has {}", r.name, args.len(), r.args.len()));
+            }
             if kind == 0 && bytes != 8 {
                 let mut b = data.clone();
                 b.resize(bytes as usize, 0);

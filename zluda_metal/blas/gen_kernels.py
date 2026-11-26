@@ -2,12 +2,14 @@
 """Generates kernels.mlir: the device code of ZLUDA's cuBLAS for Apple GPUs, in MLIR's GPU dialect.
 
 The kernels are compiled by the LLVM fork's MLIR (GPU -> AIR, convert-gpu-to-air, then gpu-module-to-binary with
-#air.target: a .metallib), see build.rs. One template per BLAS routine, instantiated per element type: s (f32),
+#air.target<chip = "agx-g14c">: AIR's portable passes, which emulate doubles, and the AGX backend, giving an AGX
+object), see build.sh and build.rs. One template per BLAS routine, instantiated per element type: s (f32),
 d (f64: AIR has no double, llvm-air2agx emulates it), and for GEMM the mixed forms of cublasGemmEx (f16 / bf16
 inputs, f32 accumulation).
 
 Conventions (src/blas.rs launches them):
 * every memref is a bare device pointer (use-bare-ptr-memref-call-conv), every scalar an i32 or the element type;
+  each is one kernel argument, in order (the AGX record: a pointer's address or the scalar's bytes in uniforms);
 * vectors are (pointer, offset, increment) in elements: element i is x[off + i * inc] (the host turns BLAS's
   negative increments into an offset);
 * matrices are column-major (pointer, offset, row stride, column stride): A(i, j) = A[off + i * rs + j * cs], so
@@ -15,14 +17,14 @@ Conventions (src/blas.rs launches them):
 * reductions are two launches: blocks of one SIMD group (32 threads) write partial results, then one block reduces
   them (deterministic: the same order for a given n).
 
-  gen_kernels.py > kernels.mlir
+  gen_kernels.py > kernels.mlir   (build.sh runs it)
 """
 
 TYPES = {"s": "f32", "d": "f64"}
 
 
 def hdr():
-    return "module attributes {gpu.container_module} {\n  gpu.module @zluda_blas [#air.target] {\n"
+    return "module attributes {gpu.container_module} {\n  gpu.module @zluda_blas [#air.target<chip = \"agx-g14c\">] {\n"
 
 
 def ftr():

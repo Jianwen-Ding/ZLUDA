@@ -140,6 +140,25 @@ PTX ──ZLUDA──▶ portable AIR (.metallib) ──llvm-air2agx──▶ AG
 * `ZLUDA_AGX_STATS=FILE` appends each launch's dynamic instructions and the simulator's predicted time
   (dispatch model, M2 Max, CUDA-runtime launch profile) as JSON lines.
 
+### cuBLAS (`src/blas.rs`)
+
+The library also exports cuBLAS's entry points (an application linked with cuBLAS uses it through a
+`libcublas.so.12` link to `libzluda_metal.so`), on the AGX backend. Its device code is written in MLIR's GPU
+dialect (`blas/gen_kernels.py`) and compiled by the LLVM fork's MLIR, GPU -> AIR -> AGX object
+(`blas/build.sh`: `convert-gpu-to-air`, `gpu-module-to-binary` with `#air.target<chip = "agx-g14c">`); build.rs
+runs it when `mlir-opt` exists (`ZLUDA_MLIR_OPT`, or `../../llvm-project/build/bin/mlir-opt`, a build with
+`-DLLVM_ENABLE_PROJECTS=mlir`) and otherwise uses the checked-in `blas/zluda_blas.agx.o`.
+
+* handle, stream, pointer mode (host and device scalars), math mode, workspace; `Set/GetVector`, `Set/GetMatrix`
+* S / D `axpy scal copy swap dot nrm2 asum amax amin gemv gemm gemmStridedBatched gemmBatched`
+* `Hgemm`, `HgemmStridedBatched`, `GemmEx`, `GemmStridedBatchedEx`, `GemmBatchedEx` for f16 / bf16 data
+  (float accumulation, output in the data type or f32), f32 and f64
+* not implemented: complex types, the other level 2 / 3 routines (`CUBLAS_STATUS_NOT_SUPPORTED` is not
+  returned for them: they are not exported), matrices beyond 2^31 elements
+
+Double precision is emulated (AIR's portable passes). `tests/blas/test_blas.py` checks every routine against
+numpy (transposes, leading dimensions, negative increments, batches, both pointer modes).
+
 ### Floating point modes (`ZLUDA_FP_MODE`)
 
 | Mode | Behavior |

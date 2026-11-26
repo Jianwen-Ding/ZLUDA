@@ -1853,6 +1853,25 @@ KernelInfo buildKernelWrapper(Module &m, Function *body, const DeviceGlobals &gl
     }
     info.dynamicShared = dynShared != nullptr;
 
+    // Per-CTA global memory (llvm-air2agx's hidden argument "perctamemory", AGXUsage.rst extension 8):
+    // the helpers call __zluda_metal_percta_memory(bytes) for the base of the executing CTA's region
+    // (the tensor family's tensor memory and wgmma scratch); the region is the largest size asked for.
+    SmallVector<CallInst *, 4> perCtaCalls;
+    uint64_t perCtaBytes = 0;
+    for (Instruction &i : instructions(body))
+        if (auto *ci = dyn_cast<CallInst>(&i))
+            if (Function *f = ci->getCalledFunction(); f && f->getName() == "__zluda_metal_percta_memory")
+            {
+                auto *n = dyn_cast<ConstantInt>(ci->getArgOperand(0));
+                if (!n)
+                    fail("__zluda_metal_percta_memory with a non-constant size in " + info.name);
+                perCtaBytes = std::max<uint64_t>(perCtaBytes, n->getZExtValue());
+                perCtaCalls.push_back(ci);
+            }
+    perCtaBytes = alignTo(perCtaBytes, 1024);
+    if (!perCtaCalls.empty() && !g_portable_air)
+        fail("kernel " + info.name + " needs per-CTA global memory, which only the AGX backend provides");
+
     Type *i32 = Type::getInt32Ty(c);
     Type *v3 = FixedVectorType::get(i32, 3);
     PointerType *constPtr = PointerType::get(c, air::Constant);
@@ -1860,6 +1879,9 @@ KernelInfo buildKernelWrapper(Module &m, Function *body, const DeviceGlobals &gl
     std::vector<Type *> wrapperParams = {constPtr, v3, v3, v3, v3, i32};
     if (dynShared)
         wrapperParams.push_back(tgPtr);
+    const unsigned perCtaArg = wrapperParams.size();
+    if (!perCtaCalls.empty())
+        wrapperParams.push_back(PointerType::get(c, air::Device));
     Function *w = Function::Create(FunctionType::get(Type::getVoidTy(c), wrapperParams, false),
                                    GlobalValue::ExternalLinkage, info.name, &m);
     w->addFnAttr(Attribute::NoUnwind);
@@ -1868,8 +1890,13 @@ KernelInfo buildKernelWrapper(Module &m, Function *body, const DeviceGlobals &gl
         w->addFnAttr("agx-cluster-dims", body->getFnAttribute("zluda-cluster-dims-agx").getValueAsString());
     w->addParamAttr(0, Attribute::NoUndef);
     const char *argNames[] = {"zluda_params", "tid", "ctaid", "ntid", "nctaid", "laneid", "zluda_dynamic_shared"};
-    for (unsigned i = 0; i < w->arg_size(); i++)
+    for (unsigned i = 0; i < w->arg_size() && i < 7; i++)
         w->getArg(i)->setName(argNames[i]);
+    if (!perCtaCalls.empty())
+    {
+        w->getArg(perCtaArg)->setName("zluda_percta");
+        w->addParamAttr(perCtaArg, Attribute::get(c, "agx-hidden", "perctamemory:" + std::to_string(perCtaBytes)));
+    }
 
     BasicBlock *entry = BasicBlock::Create(c, "entry", w);
     IRBuilder<> b(entry);
@@ -1936,6 +1963,30 @@ KernelInfo buildKernelWrapper(Module &m, Function *body, const DeviceGlobals &gl
         ci->replaceAllUsesWith(v);
         ci->eraseFromParent();
     }
+    if (!perCtaCalls.empty())
+    {
+        // CTA c = x + nx * (y + ny * z) has the bytes from c * size
+        SmallVector<CallInst *, 4> pc;
+        for (Instruction &i : instructions(w))
+            if (auto *ci = dyn_cast<CallInst>(&i))
+                if (Function *f = ci->getCalledFunction(); f && f->getName() == "__zluda_metal_percta_memory")
+                    pc.push_back(ci);
+        IRBuilder<> pb(&*w->getEntryBlock().getFirstInsertionPt());
+        Value *ct = w->getArg(2), *nct = w->getArg(4);
+        Value *lin = pb.CreateAdd(pb.CreateExtractElement(ct, (uint64_t)0),
+                                  pb.CreateMul(pb.CreateExtractElement(nct, (uint64_t)0),
+                                               pb.CreateAdd(pb.CreateExtractElement(ct, 1),
+                                                            pb.CreateMul(pb.CreateExtractElement(nct, 1),
+                                                                         pb.CreateExtractElement(ct, 2)))));
+        Value *base = pb.CreateAdd(pb.CreatePtrToInt(w->getArg(perCtaArg), pb.getInt64Ty()),
+                                   pb.CreateMul(pb.CreateZExt(lin, pb.getInt64Ty()), pb.getInt64(perCtaBytes)),
+                                   "zluda_percta_base");
+        for (CallInst *ci : pc)
+        {
+            ci->replaceAllUsesWith(base);
+            ci->eraseFromParent();
+        }
+    }
     if (dynShared)
     {
         SmallVector<Use *, 8> uses;
@@ -1970,6 +2021,12 @@ KernelInfo buildKernelWrapper(Module &m, Function *body, const DeviceGlobals &gl
                 mds(c, "air.arg_type_size"), mdi(c, 1), mds(c, "air.arg_type_align_size"), mdi(c, (uint32_t)align),
                 mds(c, "air.arg_type_name"), mds(c, "uchar"), mds(c, "air.arg_name"), mds(c, argNames[6])}));
     }
+    if (!perCtaCalls.empty())
+        argMd.push_back(MDNode::get(
+            c, {mdi(c, perCtaArg), mds(c, "air.buffer"), mds(c, "air.location_index"), mdi(c, 1), mdi(c, 1),
+                mds(c, "air.read_write"), mds(c, "air.address_space"), mdi(c, air::Device), mds(c, "air.arg_type_size"),
+                mdi(c, 4), mds(c, "air.arg_type_align_size"), mdi(c, 4), mds(c, "air.arg_type_name"), mds(c, "uint"),
+                mds(c, "air.arg_name"), mds(c, "zluda_percta")}));
     MDNode *kernelMd =
         MDNode::get(c, {ValueAsMetadata::get(w), MDNode::get(c, {}), MDNode::get(c, argMd)});
     m.getOrInsertNamedMetadata("air.kernel")->addOperand(kernelMd);
@@ -2313,6 +2370,54 @@ static void portableFPModes(Module &m)
     }
 }
 
+static bool usedIn(const Value *v, const Function *f, int depth = 0)
+{
+    for (const User *u : v->users())
+    {
+        if (auto *i = dyn_cast<Instruction>(u))
+        {
+            if (i->getFunction() == f)
+                return true;
+        }
+        else if (isa<Constant>(u) && depth < 8 && usedIn(u, f, depth + 1))
+            return true;
+    }
+    return false;
+}
+
+// A threadgroup address computed from an integer of unknown provenance (the shared memory matrix
+// descriptors of wgmma / tcgen05, a constant address) may point into any threadgroup variable. LLVM
+// only lets such a pointer alias variables whose address is exposed, so the kernel exposes those
+// it uses (a volatile store of the address), or their stores would be dead.
+static void exposeThreadgroupGlobals(Module &m)
+{
+    GlobalVariable *sink = nullptr;
+    for (Function &f : m)
+    {
+        if (f.isDeclaration() || f.getCallingConv() != CallingConv::AMDGPU_KERNEL)
+            continue;
+        bool unknown = false;
+        for (Instruction &i : instructions(f))
+            if (auto *p = dyn_cast<IntToPtrInst>(&i); p && p->getType()->getPointerAddressSpace() == amd::Shared)
+                unknown = true;
+        if (!unknown)
+            continue;
+        IRBuilder<> b(&*f.getEntryBlock().getFirstInsertionPt());
+        for (GlobalVariable &gv : m.globals())
+        {
+            if (gv.getAddressSpace() != amd::Shared || &gv == sink || !usedIn(&gv, &f))
+                continue;
+            if (auto *at = dyn_cast<ArrayType>(gv.getValueType()); at && at->getNumElements() == 0)
+                continue;
+            if (!sink)
+                sink = new GlobalVariable(m, b.getInt32Ty(), false, GlobalValue::InternalLinkage,
+                                          UndefValue::get(b.getInt32Ty()), "zluda_tg_expose", nullptr,
+                                          GlobalValue::NotThreadLocal, amd::Shared);
+            b.CreateStore(b.CreatePtrToInt(&gv, b.getInt32Ty()), sink, true);
+        }
+    }
+}
+
 void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals &globals)
 {
     // a PTX body that falls off its end returns
@@ -2411,6 +2516,7 @@ void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals
                          ": " + toString(asc));
             }
 
+    exposeThreadgroupGlobals(m);
     if (g_portable_air)
         portableFPModes(m);
 

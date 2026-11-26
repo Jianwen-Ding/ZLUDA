@@ -11,6 +11,7 @@ mod float;
 mod matrix;
 mod memory;
 mod misc;
+mod tensor;
 mod video;
 
 pub(crate) use memory::cp_async;
@@ -206,7 +207,7 @@ pub(crate) fn extra<'i>(opcode: &str, ops: &[HOp<'i>]) -> Vec<ast::Instruction<P
 pub(crate) fn lower<'i>(opcode: &str, ops: Vec<HOp<'i>>) -> R<'i> {
     let (base, m) = split(opcode);
     let m = &m[..];
-    for family in [video::lower, misc::lower, cvt::lower, float::lower, matrix::lower, memory::lower] {
+    for family in [video::lower, misc::lower, cvt::lower, float::lower, matrix::lower, memory::lower, tensor::lower] {
         if let Some(r) = family(opcode, base, m, &ops) {
             return Some(r);
         }

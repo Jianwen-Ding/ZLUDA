@@ -114,6 +114,46 @@ target/debug/ptx2metallib kernels.ptx -o kernels.metallib --emit-air air/ --emit
 On macOS, `build.rs` compiles the same `metal_backend.cpp` against Metal.framework
 (no shim) — set `ZLUDA_SYSTEM_LLVM_CONFIG` to an LLVM 18 `llvm-config`.
 
+## The AGX backend (Apple GPU machine code, simulated)
+
+`ZLUDA_METAL_BACKEND=agx` runs every kernel as AGX machine code instead of on the
+software Metal device:
+
+```
+PTX ──ZLUDA──▶ portable AIR (.metallib) ──llvm-air2agx──▶ AGX code + .agx.kernels ──▶ AGX Performance Simulator
+```
+
+* `src/agx.rs` compiles each module's `.metallib` with the LLVM fork's `llvm-air2agx`
+  (`ZLUDA_AGX_AIR2AGX`, `-mcpu=agx-g14c`, `ZLUDA_AGX_FLAGS`, default `-mattr=+canonical-nan`), fills
+  the launch's uniforms from the `.agx.kernels` record (buffer table, threadgroups per grid, global
+  data buffer, extensions 4 / 6 / 7 / 8 / 9, clusters) and runs it on the AGX Performance
+  Simulator's functional model (`agx_sim`, linked in). Device memory is below 4 GiB, so
+  `.address_size 32` modules work too.
+* Portable AIR (`air_lower.cpp`, `portable_air`): doubles and directed-rounding constrained
+  intrinsics are kept for the fork's `air-emulate-f64`; a dataflow over ZLUDA's mode-register writes
+  gives each operation its PTX rounding and denormal mode (`!agx.keep-denormals` for IEEE binary32
+  operations, which the AGX ALU otherwise flushes). Helpers can request IEEE binary32 operations with
+  `__zluda_ieee_*_f32`.
+* Instructions outside ZLUDA's grammar are lowered by `ptx_parser/src/helpers.rs` and
+  `helper_table/` (one module per family: video, misc, cvt, float, matrix, tensor, memory) to calls of
+  helpers in `ptx/lib/metal_impl/*.inc`, written from PTX-formalization's Sail model.
+* `ZLUDA_AGX_STATS=FILE` appends each launch's dynamic instructions and the simulator's predicted time
+  (dispatch model, M2 Max, CUDA-runtime launch profile) as JSON lines.
+
+Tests and tools (no NVIDIA or Apple tool anywhere: PTX is hand written or from clang's NVPTX target):
+
+| Tool | What |
+| --- | --- |
+| `tests/ptxconf/ptxconf.py` | PTX-formalization's harness programs (`.buffer`/`.launch`/`.expect`, `.tensormap`), every `.expect` checked bit for bit; `triage.py` ranks blockers |
+| `tests/stress/gen.sh OUT` | a large generated suite (the formalization's ISA generators with new seeds, 512 cases per launch, ~570 programs); `stress/gen/gen_tanh.py` adds exact `tanh.approx` cases |
+| `tests/alive/opt_check.py` | alive2 (`alive-tv --fp-uf`, the fork in `../../alive2`) proves that each kernel's AGX IR at -O3 refines -O0 |
+| `tests/bench/bench.py`, `cuda_bench.py` | predicted time of the conformance corpus, and of the LLVM fork's agx-bench CUDA kernels at realistic sizes (outputs hashed against `bench_ref.json`) |
+
+```bash
+ZLUDA_AGX_AIR2AGX=../../llvm-project/build/bin/llvm-air2agx \
+    python3 tests/ptxconf/ptxconf.py --backend agx ../../PTX-formalization/tests ../../PTX-formalization/tests/zluda
+```
+
 ## Limitations / status
 
 * **Not yet validated on Apple hardware.** Everything above is tested on Linux

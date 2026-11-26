@@ -261,12 +261,7 @@ extern "C"
     BAR_RED_IMPL(and, 1, if (!p) *(volatile SHARED_SPACE uint32_t *)&bar_red_scratch = 0u)
     BAR_RED_IMPL(or, 0, if (p) *(volatile SHARED_SPACE uint32_t *)&bar_red_scratch = 1u)
 
-    void FUNC(nanosleep_u32)(uint32_t) {}
-
     void FUNC(__assertfail)(uint64_t, uint64_t, uint32_t, uint64_t, uint64_t) {}
-
-    // printf is not supported by the Metal backend; the arguments are dropped
-    int FUNC(vprintf)(const char *, void *) { return 0; }
 
     // ---------------------------------------------------------------------
     // Bit manipulation (portable)
@@ -434,6 +429,7 @@ extern "C"
 #include "metal_impl/tensor.inc"
 #include "metal_impl/warp.inc"
 #include "metal_impl/sreg.inc"
+#include "metal_impl/devrt.inc"
 #include "metal_impl/texture.inc"
 #include "metal_impl/multimem.inc"
 }

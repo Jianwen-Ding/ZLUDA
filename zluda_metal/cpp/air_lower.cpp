@@ -3909,6 +3909,11 @@ extern "C" int zluda_air_lower(const ZludaAirInput *input, ZludaAirOutput *outpu
                 gv.hasName() && !gv.getValueType()->isStructTy()) // not .texref / .surfref
                 g_ptxVars.insert(gv.getName().str());
         }
+        // CUDA's device heap: PTX `call malloc` / `call free` (extern .func declarations) are the helper library's
+        // (ptx/lib/metal_impl/devrt.inc)
+        for (const char *name : {"malloc", "free"})
+            if (Function *f = main->getFunction(name); f && f->isDeclaration())
+                f->setName(std::string("__zluda_ptx_impl_") + name);
         lap("parse-main");
         auto impl = parseLazy(ctx, input->impl_bc, input->impl_len, "zluda_ptx_metal_impl");
         lap("parse-impl");

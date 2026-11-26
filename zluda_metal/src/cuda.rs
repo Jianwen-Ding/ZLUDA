@@ -93,6 +93,8 @@ pub struct Function {
     globals: CUdeviceptr,
     /// the module's trap / assert record (__zluda_fault), if a kernel can trap
     fault: Option<CUdeviceptr>,
+    /// the module's device-runtime variables (printf, heap, clocks: src/device_rt.rs)
+    devrt: crate::device_rt::Bindings,
 }
 
 struct Global {
@@ -148,6 +150,19 @@ fn ensure_current() -> Result<&'static Global, CUresult> {
         0 => Ok(g),
         code => Err(code),
     }
+}
+
+/// The current context (src/device_rt.rs keys its state by it), the primary one if none is current
+pub(crate) fn current_context_key() -> usize {
+    match CURRENT.with(|c| c.get()) {
+        p if p.is_null() => global().map(|g| &*g.primary as *const Context as usize).unwrap_or(0),
+        p => p as usize,
+    }
+}
+
+/// [`ensure_current`] for src/device_rt.rs's entry points
+pub(crate) fn check_current() -> Result<(), CUresult> {
+    ensure_current().map(|_| ())
 }
 
 /// A fault of a kernel: the current context's sticky error (the first fault's code stays), and the message
@@ -456,6 +471,7 @@ pub unsafe extern "system" fn cuCtxDestroy_v2(ctx: *mut Context) -> CUresult {
         return CUDA_ERROR_INVALID_CONTEXT;
     }
     let _ = backend::synchronize();
+    crate::device_rt::context_destroyed(ctx as usize);
     CURRENT.with(|cur| {
         if cur.get() == ctx {
             cur.set(ptr::null_mut());
@@ -478,6 +494,7 @@ pub unsafe extern "system" fn cuDevicePrimaryCtxReset_v2(dev: CUdevice) -> CUres
         return CUDA_ERROR_INVALID_DEVICE;
     }
     let _ = backend::synchronize();
+    crate::device_rt::context_destroyed(&*g.primary as *const Context as usize);
     g.primary.sticky.store(0, std::sync::atomic::Ordering::Release);
     CUDA_SUCCESS
 }
@@ -526,6 +543,7 @@ pub unsafe extern "system" fn cuCtxGetDevice(dev: *mut CUdevice) -> CUresult {
 #[no_mangle]
 pub unsafe extern "system" fn cuCtxSynchronize() -> CUresult {
     tri!(ensure_current());
+    crate::device_rt::flush();
     match backend::synchronize() {
         Ok(()) => CUDA_SUCCESS,
         Err(e) => {
@@ -655,6 +673,7 @@ pub unsafe extern "system" fn cuMemcpyHtoD_v2(
 ) -> CUresult {
     tri!(ensure_current());
     tri!(sync_for_host_access());
+    crate::device_rt::flush();
     let d = tri!(device_slice(dst, n));
     if n > 0 {
         ptr::copy(src as *const u8, d, n);
@@ -670,6 +689,7 @@ pub unsafe extern "system" fn cuMemcpyDtoH_v2(
 ) -> CUresult {
     tri!(ensure_current());
     tri!(sync_for_host_access());
+    crate::device_rt::flush();
     let s = tri!(device_slice(src, n));
     if n > 0 {
         ptr::copy(s, dst as *mut u8, n);
@@ -685,6 +705,7 @@ pub unsafe extern "system" fn cuMemcpyDtoD_v2(
 ) -> CUresult {
     tri!(ensure_current());
     tri!(sync_for_host_access());
+    crate::device_rt::flush();
     let s = tri!(device_slice(src, n));
     let d = tri!(device_slice(dst, n));
     if n > 0 {
@@ -698,6 +719,7 @@ pub unsafe extern "system" fn cuMemcpyDtoD_v2(
 pub unsafe extern "system" fn cuMemcpy(dst: CUdeviceptr, src: CUdeviceptr, n: usize) -> CUresult {
     tri!(ensure_current());
     tri!(sync_for_host_access());
+    crate::device_rt::flush();
     let resolve = |p: CUdeviceptr| match backend::host_pointer(p) {
         Some((h, _)) => h,
         None => p as *mut u8,
@@ -911,6 +933,7 @@ pub unsafe extern "system" fn cuModuleLoadData(
         return CUDA_ERROR_INVALID_VALUE;
     }
     let ptx = tri!(image_to_ptx(image));
+    crate::device_rt::flush();
     load_module_from_ptx(module, ptx)
 }
 
@@ -948,6 +971,8 @@ pub unsafe extern "system" fn cuModuleUnload(module: *mut Module) -> CUresult {
         return CUDA_ERROR_INVALID_HANDLE;
     }
     let _ = backend::synchronize();
+    // the output of its kernels (their formats are in its memory)
+    crate::device_rt::flush();
     let m = Box::from_raw(module);
     if m.globals != 0 {
         backend::free(m.globals);
@@ -1000,6 +1025,9 @@ pub unsafe extern "system" fn cuModuleGetFunction(
         kernel,
         globals: m.globals,
         fault: m.compiled.globals.iter().find(|g| g.name == "__zluda_fault").map(|g| m.globals + g.offset),
+        devrt: crate::device_rt::Bindings::new(|n| {
+            m.compiled.globals.iter().find(|g| g.name == n).map(|g| m.globals + g.offset)
+        }),
     });
     *func = &*f as *const Function as *mut Function;
     functions.insert(name, f);
@@ -1181,12 +1209,17 @@ pub unsafe extern "system" fn cuLaunchKernel(
     } else {
         0
     };
+    let token = match crate::device_rt::before_launch(&f.devrt) {
+        Ok(t) => t,
+        Err(e) => return report(e, CUDA_ERROR_OUT_OF_MEMORY),
+    };
     let r = launch_result(f.kernel.launch(
         [grid_x, grid_y, grid_z],
         [block_x, block_y, block_z],
         &params,
         dynamic_shared,
     ));
+    crate::device_rt::after_launch(&f.devrt, token);
     check_fault_record(f.fault, &f.info.name);
     r
 }
@@ -1270,6 +1303,7 @@ pub unsafe extern "system" fn cuEventSynchronize(event: *mut Event) -> CUresult 
     if event.is_null() {
         return CUDA_ERROR_INVALID_HANDLE;
     }
+    crate::device_rt::flush();
     CUDA_SUCCESS
 }
 

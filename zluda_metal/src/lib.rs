@@ -9,4 +9,5 @@ pub mod blas;
 mod backend;
 pub mod compile;
 pub mod cuda;
+pub mod device_rt;
 mod ffi;

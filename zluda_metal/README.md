@@ -163,6 +163,56 @@ register-tiled kernel the other shapes use (`ZLUDA_BLAS_NO_MMA=1` forces it). Do
 (AIR's portable passes). `tests/blas/test_blas.py` checks every routine against
 numpy (transposes, leading dimensions, negative increments, batches, both pointer modes).
 
+### Device runtime (`src/device_rt.rs`, `ptx/lib/metal_impl/devrt.inc`)
+
+What CUDA's device runtime provides to kernels, with its host-side semantics. The device side keeps its state in
+buffers the host owns, found through module variables (`__zluda_devrt_printf`, `__zluda_devrt_heap`,
+`__zluda_devrt_clock`) that the launch fills; state is per context.
+
+* **printf** (`vprintf`, as clang lowers device `printf`): the device parses the format, copies the arguments (one
+  8-byte slot each; `%s` strings by value, at most 4096 bytes) into a circular FIFO, and the host formats each record
+  with the C library's `snprintf`, spec by spec, so `%d %i %u %x %X %o %c %s %p %f %e %g %a`, flags, width,
+  precision, `*`, `h hh l ll z j t` and `%%` behave as C's (at most 32 arguments, as CUDA). Output goes to the
+  process's C `stdout` at CUDA's flush points: the start of the next launch, `cuCtxSynchronize` /
+  `cuStreamSynchronize` / `cuEventSynchronize`, the blocking `cuMemcpy*`, `cuModuleLoad*` / `cuModuleUnload`,
+  `cuCtxDestroy` / `cuDevicePrimaryCtxReset`. Records print in the order the threads wrote them. The FIFO is
+  `CU_LIMIT_PRINTF_FIFO_SIZE` bytes (1 MiB by default; changing it prints the pending output and replaces the FIFO);
+  a launch that prints more loses its oldest output (16 bytes per record plus 8 per argument). `printf` returns the
+  number of arguments, -1 for a null format, -2 when the record does not fit.
+* **malloc / free** (PTX `call malloc` / `call free`): a lock-free size-class allocator in a heap of
+  `CU_LIMIT_MALLOC_HEAP_SIZE` bytes (8 MiB by default), allocated at the first launch of a kernel that uses it and kept
+  for the context's life, so blocks stay valid across launches until freed. Pointers are 16-byte aligned; freed blocks
+  are reused by allocations of the same class (four classes per power of two, at most 25% padding); blocks are not
+  split or coalesced. An exhausted heap returns NULL. The size cannot change once the heap exists
+  (`CUDA_ERROR_INVALID_VALUE`).
+* **Clocks**: one cycle counter per launch: each SIMD group's read advances it by 25 cycles (the lanes of a group read
+  one value), `nanosleep.u32 t` by `t` ns at the reported 1.398 GHz (capped at 1 ms, PTX's bound), and between
+  launches it moves on by the simulator's instruction count of each launch spread over the 8 reported
+  multiprocessors. So `%clock` / `%clock64` are monotonic within and across launches and `%globaltimer` is
+  nanoseconds since the Unix epoch (the launch's start, then the counter's cycles at the clock rate), monotonic too.
+  Values model time only that coarsely: the functional model has no time of its own.
+* **Special registers**: `%laneid`, `%lanemask_*`, `%warpid` (< `%nwarpid`, the CTA's warps), `%smid` (the CTA's
+  linear index modulo `%nsmid` = 8), `%warpsize` as PTX defines them. Dynamic shared memory is 16-byte aligned.
+* **Limits** (`cuCtxSetLimit` / `cuCtxGetLimit`): the printf FIFO and heap as above; `CU_LIMIT_STACK_SIZE` (1 KiB),
+  the device-runtime sync depth / pending launches and the L2 limits are recorded and reported but change nothing
+  (a kernel whose local memory overflows its stack faults with `CUDA_ERROR_HARDWARE_STACK_ERROR`); other limits are
+  `CUDA_ERROR_UNSUPPORTED_LIMIT`.
+* **Cooperative launches** (`cuLaunchCooperativeKernel`): the AGX functional model runs a dispatch's workgroups one
+  after the other, each to its end, and a threadgroup's SIMD groups each to its next barrier: a grid-wide barrier
+  (every block waiting for every other) can only complete when the grid is one block, so larger cooperative grids
+  fail with `CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE` (720), as CUDA fails a grid that cannot be co-resident.
+  The same scheduling makes cross-block message passing work when the producer block has the lower index (blocks run
+  in order) and hang (`CUDA_ERROR_LAUNCH_TIMEOUT`, sticky) the other way round, and any spin-wait on another SIMD group
+  of the same block that is not separated by a barrier hang too; CUDA (independent thread scheduling) completes both
+  when the blocks are co-resident. Supporting them needs a preemptive scheduler in the functional model (run every
+  workgroup of a cooperative launch, switching groups after a step budget).
+* Memory ordering: `membar` / `fence` / `__threadfence` and atomics are sequentially consistent in the functional
+  model (one SIMD group runs at a time).
+* Not reproduced: out-of-bounds shared memory accesses are dropped (loads read 0) by the functional model, as by the
+  hardware it models, so the kernel completes where CUDA reports `CUDA_ERROR_ILLEGAL_ADDRESS`.
+
+`tests/device/test_device.py` checks all of it (`kernels.cu`, compiled by clang alone to `kernels.ptx`; `--regen`).
+
 ### Floating point modes (`ZLUDA_FP_MODE`)
 
 | Mode | Behavior |
@@ -183,6 +233,7 @@ Tests and tools (no NVIDIA or Apple tool anywhere: PTX is hand written or from c
 
 | Tool | What |
 | --- | --- |
+| `tests/device/test_device.py` | device runtime: printf, malloc / free, clocks, limits, special registers, cooperative launches |
 | `tests/ptxconf/ptxconf.py` | PTX-formalization's harness programs (`.buffer`/`.launch`/`.expect`, `.tensormap`), every `.expect` checked bit for bit; `triage.py` ranks blockers |
 | `tests/stress/gen.sh OUT` | a large generated suite (the formalization's ISA generators with new seeds, 512 cases per launch, ~570 programs); `stress/gen/gen_tanh.py` adds exact `tanh.approx` cases |
 | `tests/alive/opt_check.py` | alive2 (`alive-tv --fp-uf`, the fork in `../../alive2`) proves that each kernel's AGX IR at -O3 refines -O0 |
@@ -204,7 +255,7 @@ ZLUDA_AGX_AIR2AGX=../../llvm-project/build/bin/llvm-air2agx \
   Expect that loading on a real device needs adjustments in `metallib.cpp`
   and possibly a downgrade step after `air_lower.cpp`.
 * No fp64 (Metal has none): such kernels are rejected with a clear error.
-* Textures/surfaces, `printf`, cooperative groups beyond warps, tensor core
+* Textures/surfaces, cooperative groups beyond warps and one-block grids, tensor core
   (`mma`, `ldmatrix`) instructions and cubin/fatbin images are not supported;
   modules must be loaded as PTX text.
 * All CUDA streams share one in-order Metal command queue.

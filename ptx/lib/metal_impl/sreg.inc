@@ -3,14 +3,7 @@
     uint32_t FUNC(sreg_lanemask_eq)() { return 1u << __zluda_ptx_impl_sreg_laneid(); }
     uint32_t FUNC(sreg_lanemask_gt)() { return ~((2u << __zluda_ptx_impl_sreg_laneid()) - 1u); }
 
-    // %clock / %clock64 / %globaltimer: monotonic counters ("tick" of the model, advancing by 25 per read), one counter
-    // per threadgroup
-    static SHARED_SPACE uint32_t __zluda_cluster_clock;
-    static inline uint32_t clock_tick() { return __atomic_fetch_add(&__zluda_cluster_clock, 25u, __ATOMIC_RELAXED) + 25u; }
-    uint64_t FUNC(sreg_clock64)() { return clock_tick(); }
-    uint64_t FUNC(sreg_globaltimer)() { return clock_tick(); }
-    uint32_t FUNC(sreg_globaltimer_lo)() { return clock_tick(); }
-    uint32_t FUNC(sreg_globaltimer_hi)() { return 0; }
+    // %clock / %clock64 / %globaltimer: devrt.inc
 
     static inline uint32_t tg_volume()
     {
@@ -24,8 +17,15 @@
     uint32_t FUNC(sreg_warpid)() { return tg_linear_tid() / 32u; }
     uint32_t FUNC(sreg_nwarpid)() { return (tg_volume() + 31u) / 32u; }
     uint32_t FUNC(sreg_warpsize)() { return 32; }
-    uint32_t FUNC(sreg_smid)() { return 0; }
-    uint32_t FUNC(sreg_nsmid)() { return 1; }
+    // %smid in [0, %nsmid): the CTAs spread round-robin over the multiprocessors the driver reports
+    // (cuDeviceGetAttribute MULTIPROCESSOR_COUNT, 8); %nsmid may exceed the count in PTX, never be below it
+    uint32_t FUNC(sreg_nsmid)() { return 8; }
+    uint32_t FUNC(sreg_smid)()
+    {
+        uint32_t linear = __zluda_ptx_impl_sreg_ctaid(0) +
+                          __zluda_ptx_impl_sreg_nctaid(0) * (__zluda_ptx_impl_sreg_ctaid(1) + __zluda_ptx_impl_sreg_nctaid(1) * __zluda_ptx_impl_sreg_ctaid(2));
+        return linear % 8u;
+    }
     uint64_t FUNC(sreg_gridid)() { return 0; }
     uint64_t FUNC(sreg_current_graph_exec)() { return 0; }
 
@@ -57,4 +57,3 @@
 #define SREG_PM(N) uint32_t FUNC(sreg_pm##N)() { return 0; } uint64_t FUNC(sreg_pm##N##_64)() { return 0; }
     SREG_PM(0) SREG_PM(1) SREG_PM(2) SREG_PM(3) SREG_PM(4) SREG_PM(5) SREG_PM(6) SREG_PM(7)
 #undef SREG_PM
-    uint32_t FUNC(sreg_clock)() { return clock_tick(); }

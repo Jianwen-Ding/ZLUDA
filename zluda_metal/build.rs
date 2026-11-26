@@ -24,6 +24,8 @@ fn main() {
             "-ffreestanding",
             "-fno-exceptions",
             "-fno-rtti",
+            // PTX memory is untyped: no type-based alias metadata from the helpers' C++ types
+            "-fno-strict-aliasing",
             "-emit-llvm",
             "-c",
             impl_src,

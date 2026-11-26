@@ -6,12 +6,12 @@
 //
 // A CTA is one AGX threadgroup and a warpgroup four consecutive SIMD-groups. The CTA's per-CTA
 // global memory (the hidden kernel argument "perctamemory" of llvm-air2agx, see air_lower.cpp)
-// holds a scratch area of 128 words per thread (wgmma accumulators) and the emulated tensor
+// holds a scratch area of up to 128 words per thread (wgmma accumulators) and the emulated tensor
 // memory. No private array is indexed dynamically (see matrix.inc).
 
     uint64_t __zluda_metal_percta_memory(uint32_t bytes);
 
-#define TN_SCRATCH_BYTES (1024u * 512u)
+#define TN_SCRATCH_BYTES (1024u * 4u * 128u)
 #define TN_GLOBAL MX_GLOBAL
 
     void FUNC(tensor_nop)() {}
@@ -23,11 +23,12 @@
                    (__zluda_metal_thread_position_in_threadgroup(1) +
                     __zluda_metal_threads_per_threadgroup(1) * __zluda_metal_thread_position_in_threadgroup(2));
     }
-    // this thread's 128 scratch words
-    MX_INL uint32_t TN_GLOBAL *tn_scratch()
+    // this thread's nw scratch words (nw <= 128: the region of a kernel with wgmma of up to nw accumulator registers is
+    // 1024 * nw words; the tcgen05 regions follow the largest)
+    MX_INL uint32_t TN_GLOBAL *tn_scratch(uint32_t nw)
     {
-        uint64_t b = __zluda_metal_percta_memory(TN_SCRATCH_BYTES);
-        return (uint32_t TN_GLOBAL *)(uintptr_t)(b + (uint64_t)(tn_tid() & 1023u) * 512u);
+        uint64_t b = __zluda_metal_percta_memory(1024u * 4u * nw);
+        return (uint32_t TN_GLOBAL *)(uintptr_t)(b + (uint64_t)(tn_tid() & 1023u) * 4u * nw);
     }
 
     // ---------------------------------------------------------------- shared memory matrix descriptors
@@ -224,7 +225,7 @@ extern "C++"
     template <typename V, int NV>
     MX_INL V tn_wgmma(V c, mx_u32x8 x, uint64_t da, uint64_t db, bool sd, uint64_t ctl)
     {
-        uint32_t TN_GLOBAL *s = tn_scratch();
+        uint32_t TN_GLOBAL *s = tn_scratch(NV);
         const int N = (uint32_t)ctl & 511;
         const int nregs = (((uint32_t)ctl >> 26) & 3) == 0 ? N / 4 : N / 2;
         MX_UNROLL for (int j = 0; j < NV; j++)

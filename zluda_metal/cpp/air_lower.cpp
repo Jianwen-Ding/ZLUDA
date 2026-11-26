@@ -30,6 +30,8 @@
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Metadata.h>
+#include <llvm/Analysis/ValueTracking.h>
+#include <llvm/Support/KnownBits.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/IR/ReplaceConstant.h>
@@ -699,6 +701,8 @@ private:
             return stripCasts(pti->getPointerOperand())->getType()->getPointerAddressSpace();
         if (!visiting.insert(v).second)
             return ~1u; // cycle: neutral element
+        if (Value *x = identityAnd(v))
+            return baseAddressSpace(x, visiting);
         if (auto *bo = dyn_cast<BinaryOperator>(v))
         {
             if (bo->getOpcode() == Instruction::Add || bo->getOpcode() == Instruction::Sub ||
@@ -751,6 +755,26 @@ private:
         return ~0u;
     }
 
+    // `x & C` that keeps every bit x can have (a 32-bit pointer zero-extended, known alignment): x
+    Value *identityAnd(Value *v)
+    {
+        auto *bo = dyn_cast<BinaryOperator>(v);
+        if (!bo || bo->getOpcode() != Instruction::And)
+            return nullptr;
+        auto *c = dyn_cast<ConstantInt>(bo->getOperand(1));
+        if (!c)
+            return nullptr;
+        KnownBits kb = computeKnownBits(bo->getOperand(0), dl);
+        // threadgroup and thread addresses are 32-bit
+        SmallPtrSet<Value *, 16> visiting;
+        unsigned as = baseAddressSpace(bo->getOperand(0), visiting);
+        if ((as == amd::Shared || as == amd::Private) && kb.getBitWidth() > 32)
+            kb.Zero.setBitsFrom(32);
+        if ((~c->getValue() & ~kb.Zero).isZero())
+            return bo->getOperand(0);
+        return nullptr;
+    }
+
     bool recoverable(Value *v)
     {
         SmallPtrSet<Value *, 16> visiting;
@@ -780,6 +804,10 @@ private:
                         result = ConstantExpr::getGetElementPtr(Type::getInt8Ty(f.getContext()), base,
                                                                 ce->getOperand(1 - side));
             }
+        }
+        else if (Value *x = identityAnd(v))
+        {
+            result = recover(x);
         }
         else if (auto *bo = dyn_cast<BinaryOperator>(v))
         {
@@ -2514,6 +2542,8 @@ void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals
     hideSourceNaNs(m);
     runCleanup(m, true, true);
     resolveCluster(m);
+    // the per-thread stack before PointerRecovery: alloca's integer results keep their local provenance (isspacep)
+    resolveLocalStack(m);
     runCleanup(m, false, true);
     for (int iter = 0; iter < 4; iter++)
     {
@@ -2535,7 +2565,8 @@ void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals
         runCleanup(m, false, true);
     }
     canonicalizeFoldedNaNs(m);
-    resolveLocalStack(m);
+    if (getenv("ZLUDA_AIR_DEBUG_RECOVERED"))
+        m.print(errs(), nullptr);
     resolveIsSpacep(m);
     for (Function &f : m)
         if (!f.isDeclaration() && f.getCallingConv() != CallingConv::AMDGPU_KERNEL && !f.use_empty())

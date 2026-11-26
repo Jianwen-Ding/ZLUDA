@@ -1,8 +1,60 @@
 //! lop3, testp, slct and other single instructions.
 use super::*;
 
+/// tried before the grammar: `mov` of special registers the grammar's types reject
+pub(super) fn preempts(_opcode: &str, base: &str, m: &[&str]) -> bool {
+    base == "mov" && (m.contains(&"v4") || m.contains(&"v2") || m == ["u32"] || m == ["b32"] || m == ["s32"])
+}
+
+const VEC_SREGS: [&str; 8] =
+    ["%tid", "%ntid", "%ctaid", "%nctaid", "%clusterid", "%nclusterid", "%cluster_ctaid", "%cluster_nctaid"];
+const PRED_SREGS: [&str; 1] = ["%is_explicit_cluster"];
+
+/// mov.v4.u32 {a, b, c, d}, %tid;  (the members .x .y .z, then 0);  mov.u32 d, %is_explicit_cluster;  (0 / 1)
+fn mov_sreg<'i>(m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
+    let [d, a] = ops else { return None };
+    let ast::ParsedOperand::Reg(src) = a.op else { return None };
+    if PRED_SREGS.contains(&src) && !d.addr && matches!(d.op, ast::ParsedOperand::Reg(_)) && m.len() == 1 {
+        return Some(Ok(ast::Instruction::Selp {
+            data: scalar(m[0])?,
+            arguments: ast::SelpArgs { dst: d.op.clone(), src1: imm(1), src2: imm(0), src3: a.op.clone() },
+        }));
+    }
+    None
+}
+
+/// the movs of a vector special register read (mov_sreg): the first member is the instruction itself
+pub(super) fn mov_sreg_members<'i>(m: &[&str], ops: &[HOp<'i>]) -> Option<Vec<ast::Instruction<ParsedOperandStr<'i>>>> {
+    let [d, a] = ops else { return None };
+    let ast::ParsedOperand::Reg(src) = a.op else { return None };
+    if !VEC_SREGS.contains(&src) || !(m.contains(&"v4") || m.contains(&"v2")) {
+        return None;
+    }
+    let t = scalar(m.last()?)?;
+    let ast::ParsedOperand::VecPack(ds) = &d.op else { return None };
+    let mut out = Vec::new();
+    for (i, x) in ds.iter().enumerate() {
+        let Some(ast::RegOrImmediate::Reg(r)) = x else { continue };
+        let src = if i < 3 { ast::ParsedOperand::VecMember(src, i as u8) } else { imm(0) };
+        out.push(ast::Instruction::Mov {
+            data: ast::MovDetails { typ: ast::Type::Scalar(t) },
+            arguments: ast::MovArgs { dst: ast::ParsedOperand::Reg(*r), src },
+        });
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
 pub(super) fn lower<'i>(_opcode: &str, base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
     match base {
+        "mov" => {
+            if let Some(mut v) = mov_sreg_members(m, ops) {
+                return Some(Ok(v.remove(0)));
+            }
+            mov_sreg(m, ops)
+        }
         "lop3" => {
             // lop3.b32 d, a, b, c, immLut;  lop3.BoolOp.b32 d|p, a, b, c, immLut, q;
             if ops.len() == 5 && m == ["b32"] {

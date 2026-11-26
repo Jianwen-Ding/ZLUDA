@@ -199,6 +199,12 @@ pub(crate) fn lane_mask(s: Option<&str>, n: usize) -> u64 {
 /// Instructions that follow a fallback instruction (under its predicate): a third destination, ...
 pub(crate) fn extra<'i>(opcode: &str, ops: &[HOp<'i>]) -> Vec<ast::Instruction<ParsedOperandStr<'i>>> {
     let (base, m) = split(opcode);
+    if base == "mov" {
+        if let Some(mut v) = misc::mov_sreg_members(&m, ops) {
+            v.remove(0);
+            return v;
+        }
+    }
     memory::extra(base, &m, ops)
 }
 
@@ -219,5 +225,5 @@ pub(crate) fn lower<'i>(opcode: &str, ops: Vec<HOp<'i>>) -> R<'i> {
 /// does not match the ISA there): tried before the grammar (helpers::preempt_instruction).
 pub(crate) fn preempts(opcode: &str) -> bool {
     let (base, m) = split(opcode);
-    float::preempts(opcode, base, &m)
+    float::preempts(opcode, base, &m) || misc::preempts(opcode, base, &m)
 }

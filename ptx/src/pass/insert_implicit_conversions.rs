@@ -83,7 +83,11 @@ fn insert_implicit_conversions_impl<'input>(
     }
     // helper operands (the fallback instructions) follow PTX's relaxed operand rules where the
     // exact ones reject them: a helper's slot types do not know the register's width
-    let is_helper = matches!(stmt, ExpandedStatement::Instruction(ast::Instruction::Helper { .. }));
+    // mov too (PTX ISA 9.7.10.3 / the Sail model: `mov.u16 %r32, ..` writes the value zero-extended to the register)
+    let is_helper = matches!(
+        stmt,
+        ExpandedStatement::Instruction(ast::Instruction::Helper { .. } | ast::Instruction::Mov { .. })
+    );
     let statement = stmt.visit_map::<SpirvWord, TranslateError>(
         &mut |operand,
               type_state: Option<(&ast::Type, ast::StateSpace)>,

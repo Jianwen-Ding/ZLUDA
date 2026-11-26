@@ -3,7 +3,8 @@ use super::*;
 
 /// tried before the grammar: `mov` of special registers the grammar's types reject
 pub(super) fn preempts(_opcode: &str, base: &str, m: &[&str]) -> bool {
-    base == "mov" && (m.contains(&"v4") || m.contains(&"v2") || m == ["u32"] || m == ["b32"] || m == ["s32"])
+    (base == "bar" || base == "barrier") && m.contains(&"red")
+        || base == "mov" && (m.contains(&"v4") || m.contains(&"v2") || m == ["u32"] || m == ["b32"] || m == ["s32"])
 }
 
 const VEC_SREGS: [&str; 8] =
@@ -49,6 +50,25 @@ pub(super) fn mov_sreg_members<'i>(m: &[&str], ops: &[HOp<'i>]) -> Option<Vec<as
 
 pub(super) fn lower<'i>(_opcode: &str, base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
     match base {
+        "bar" | "barrier" if m.contains(&"red") => {
+            // bar{.cta}.red.popc{.aligned}.u32 d, a{, b}, {!}c;  bar{.cta}.red.op{.aligned}.pred p, a{, b}, {!}c;
+            let kind = ["popc", "and", "or"].iter().position(|k| m.contains(k))? as u64;
+            let (d, a, b, c) = match ops {
+                [d, a, c] => (d, a, None, c),
+                [d, a, b, c] => (d, a, Some(b), c),
+                _ => return err("bar.red operands"),
+            };
+            let call = if kind == 0 {
+                Call::new("nbar_red_popc").dst(d.op.clone(), ScalarType::U32)
+            } else {
+                Call::new("nbar_red_pred").dst(d.op.clone(), ScalarType::Pred)
+            };
+            call.src(a.op.clone(), ScalarType::U32)
+                .src(b.map_or(imm(0), |b| b.op.clone()), ScalarType::U32)
+                .src(c.op.clone(), ScalarType::Pred)
+                .imm(kind | ((c.neg as u64) << 4))
+                .build()
+        }
         "mov" => {
             if let Some(mut v) = mov_sreg_members(m, ops) {
                 return Some(Ok(v.remove(0)));

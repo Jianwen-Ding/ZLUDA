@@ -113,8 +113,6 @@ extern "C"
     // Synchronization
     // ---------------------------------------------------------------------
     void FUNC(bar_sync)(uint32_t) { air_wg_barrier(3, 1); }
-    // a thread count: the AGX barrier waits for the whole threadgroup (the non-exited threads)
-    void FUNC(bar_sync_count)(uint32_t, uint32_t) { air_wg_barrier(3, 1); }
 
     static uint32_t ballot32(bool value) { return (uint32_t)air_simd_ballot(value); }
 

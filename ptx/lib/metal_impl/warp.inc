@@ -2,6 +2,10 @@
 // ptx_parser/src/helper_table/warp.rs.  Sail: ptx_coll.sail (collCompute).  The lanes taking part in an
 // instance are the non-exited lanes of the membermask; on AGX a SIMD-group runs its 32 lanes in lockstep
 // and exited (or diverged) lanes are inactive, so they are the active lanes of the mask.
+    static inline uint32_t tg_volume_core()
+    {
+        return __zluda_ptx_impl_sreg_ntid(0) * __zluda_ptx_impl_sreg_ntid(1) * __zluda_ptx_impl_sreg_ntid(2);
+    }
     static inline uint32_t coll_lanes(uint32_t mask) { return ballot32(true) & mask; }
 
     // kind: 0 all, 1 any, 2 uni, 3 ballot; bit 4: the source predicate is negated
@@ -113,4 +117,80 @@
                 s += o;
         }
         return s;
+    }
+
+    // ---- named CTA barriers with thread counts and reductions (bar.red, bar.sync a, b) ----
+    // Sail: ptx_sched.sail (barriers count whole warps: a warp arrives for its 32 threads once its non-exited threads
+    // have arrived).  A barrier of the whole CTA uses the AGX threadgroup barrier; one of fewer threads a software barrier in threadgroup memory: per barrier id, the arrived thread count, a generation
+    // and the reduction of the current and the next generation.  A warp's lowest active lane arrives for it; the warp
+    // then waits (spins) until the generation changes.  Threadgroup memory starts zeroed in the AGX model.
+    static SHARED_SPACE uint32_t nbar_state[16 * 4];
+    static SHARED_SPACE uint32_t nbar_full;
+    static inline uint32_t nbar_need(uint32_t count)
+    {
+        uint32_t all = (tg_volume_core() + 31u) & ~31u;
+        uint32_t n = count ? ((count + 31u) & ~31u) : all;
+        return n > all ? all : n;
+    }
+    // kind 0: popc of the predicates; 1 and; 2 or (the reduction counts the true predicates)
+    static inline uint32_t nbar(uint32_t id, uint32_t count, bool p)
+    {
+        volatile SHARED_SPACE uint32_t *s = &nbar_state[(id & 15) * 4];
+        uint32_t act = ballot32(true);
+        uint32_t mine = __builtin_popcount(ballot32(p) & act);
+        bool leader = __builtin_ctz(act) == __zluda_ptx_impl_sreg_laneid();
+        uint32_t need = nbar_need(count);
+        if (need >= ((tg_volume_core() + 31u) & ~31u))
+        {
+            // the whole CTA: the AGX threadgroup barrier
+            if (tg_volume_core() && __zluda_metal_thread_position_in_threadgroup(0) == 0 &&
+                __zluda_metal_thread_position_in_threadgroup(1) == 0 && __zluda_metal_thread_position_in_threadgroup(2) == 0)
+                nbar_full = 0;
+            air_wg_barrier(3, 1);
+            if (leader)
+                __atomic_fetch_add(&nbar_full, mine, __ATOMIC_SEQ_CST);
+            air_wg_barrier(3, 1);
+            uint32_t r = *(volatile SHARED_SPACE uint32_t *)&nbar_full;
+            air_wg_barrier(3, 1);
+            return r;
+        }
+        air_simdgroup_barrier(2, 1);
+        uint32_t g = s[1];
+        if (leader)
+        {
+            __atomic_fetch_add((SHARED_SPACE uint32_t *)&s[2 + (g & 1)], mine, __ATOMIC_SEQ_CST);
+            uint32_t old = __atomic_fetch_add((SHARED_SPACE uint32_t *)&s[0], 32u, __ATOMIC_SEQ_CST);
+            if (old + 32u >= need)
+            {
+                s[0] = 0;
+                s[2 + ((g + 1) & 1)] = 0;
+                __atomic_store_n((SHARED_SPACE uint32_t *)&s[1], g + 1, __ATOMIC_SEQ_CST);
+            }
+        }
+        while (__atomic_load_n((SHARED_SPACE uint32_t *)&s[1], __ATOMIC_SEQ_CST) == g)
+        {
+        }
+        return s[2 + (g & 1)];
+    }
+    uint32_t FUNC(nbar_red_popc)(uint32_t id, uint32_t count, bool p, uint32_t kind)
+    {
+        bool v = (kind >> 4) & 1 ? !p : p;
+        return nbar(id, count, v);
+    }
+    bool FUNC(nbar_red_pred)(uint32_t id, uint32_t count, bool p, uint32_t kind)
+    {
+        bool v = (kind >> 4) & 1 ? !p : p;
+        uint32_t n = nbar(id, count, (kind & 15) == 1 ? !v : v);
+        return (kind & 15) == 1 ? n == 0 : n != 0;
+    }
+    // bar.sync a, b (a thread count): the threadgroup barrier when b covers the CTA, else the software barrier
+    void FUNC(bar_sync_count)(uint32_t id, uint32_t count)
+    {
+        if (nbar_need(count) >= ((tg_volume_core() + 31u) & ~31u))
+            air_wg_barrier(3, 1);
+        else
+        {
+            nbar(id, count, false);
+            __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        }
     }

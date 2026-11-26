@@ -613,6 +613,103 @@
         return d_from_bits(xenc_ieee(xround_t(v, T_F64, RM_RN, 0, 0, false), 53, 11, 64));
     }
 
+    // ---------------------------------------------------------------- correctly rounded binary32 exponentials
+    // A fast path for the model's correctly rounded e^a and e^-a (tanh.approx.f32), in binary32 arithmetic on
+    // values that are never subnormal (the __zluda_nd_* operations: any denormal mode gives the IEEE result):
+    // k = rint(32 a / ln2), r = a - k ln2/32 as rh + rl (ln2/32 = L1 + L2 + L3, k L1 and k L2 exact, TwoSum),
+    // e^(+-r) = 1 +- r + r^2/2 +- r^3/6 + r^4/24 +- r^5/120 as a float-float hi + lo, times 2^(+-k/32) from
+    // F_EXP2_32 (hi, lo pairs). The float-float value is within about 2^-44 of e^(+-a) (relative); its rounding
+    // to binary32 is returned only when both ends of the interval v + d +- 2^-40 v round to the same v, i.e.
+    // the exact value cannot lie on the other side of a rounding boundary, and false otherwise (the caller
+    // then takes the double precision path). Equality with that path for every binary32 operand is checked
+    // exhaustively (zluda_metal/tests/stress/exhaustive/tanh_fast.cpp, IEEE and flushing operations).
+    static const __attribute__((address_space(4))) float F_EXP2_32[64] = {
+        0x1p+0f, 0x0p+0f, 0x1.059b0ep+0f, -0x1.9d4f52p-25f, 0x1.0b5586p+0f, 0x1.9f3122p-25f,
+        0x1.11301ep+0f, -0x1.fdb496p-25f, 0x1.172b84p+0f, -0x1.c15742p-27f, 0x1.1d4874p+0f, -0x1.d2e8cap-25f,
+        0x1.2387a6p+0f, 0x1.ceac48p-25f, 0x1.29e9ep+0f, -0x1.5c0424p-25f, 0x1.306fep+0f, 0x1.4636e2p-25f,
+        0x1.371a74p+0f, -0x1.18aac6p-25f, 0x1.3dea64p+0f, 0x1.824684p-25f, 0x1.44e086p+0f, 0x1.8624b4p-30f,
+        0x1.4bfdaep+0f, -0x1.593abcp-25f, 0x1.5342b6p+0f, -0x1.2c561p-25f, 0x1.5ab07ep+0f, -0x1.5bd5ecp-27f,
+        0x1.6247ecp+0f, -0x1.f8b55p-25f, 0x1.6a09e6p+0f, 0x1.9fcef4p-26f, 0x1.71f75ep+0f, 0x1.1d8beep-25f,
+        0x1.7a1148p+0f, -0x1.829fdp-25f, 0x1.82589ap+0f, -0x1.accc7cp-26f, 0x1.8ace54p+0f, 0x1.15506ep-27f,
+        0x1.93737cp+0f, -0x1.e64744p-25f, 0x1.9c4918p+0f, 0x1.51f848p-27f, 0x1.a5503cp+0f, -0x1.b83b54p-25f,
+        0x1.ae89fap+0f, -0x1.a94b14p-26f, 0x1.b7f77p+0f, -0x1.a09438p-25f, 0x1.c199bep+0f, -0x1.3d56b2p-27f,
+        0x1.cb720ep+0f, -0x1.8837ccp-27f, 0x1.d5818ep+0f, -0x1.822dbcp-27f, 0x1.dfc974p+0f, -0x1.908c94p-25f,
+        0x1.ea4afap+0f, 0x1.52486cp-27f, 0x1.f50766p+0f, -0x1.246ebp-26f};
+#define ND_ADD __zluda_nd_fadd_f32
+#define ND_SUB __zluda_nd_fsub_f32
+#define ND_MUL __zluda_nd_fmul_f32
+#define ND_FMA __zluda_nd_fma_f32
+    // RN(T 2^m (h + l)) with T = F_EXP2_32[j], if certain
+    static inline bool f_exp_round(int j, int m, float h, float l, float *out)
+    {
+        float th = F_EXP2_32[2 * j], tl = F_EXP2_32[2 * j + 1];
+        float ph = ND_MUL(th, h);
+        float pl = ND_ADD(ND_FMA(th, h, -ph), ND_FMA(th, l, ND_MUL(tl, h)));
+        float v = ND_ADD(ph, pl);
+        float d = ND_ADD(ND_SUB(ph, v), pl);
+        float dl = ND_MUL(v, 0x1p-40f);
+        if (ND_ADD(v, ND_ADD(d, dl)) != v || ND_ADD(v, ND_SUB(d, dl)) != v)
+            return false;
+        *out = ND_MUL(v, __builtin_bit_cast(float, (uint32_t)(m + 127) << 23));
+        return true;
+    }
+    // e^a and e^-a correctly rounded for 2^-12 <= a < 20
+    static inline bool f_exp_pm(float a, float *ep, float *em)
+    {
+        const float shift = 0x1.8p23f;
+        float kf = ND_SUB(ND_FMA(a, 0x1.715476p+5f, shift), shift);
+        int k = (int)kf;
+        float r1 = ND_FMA(-kf, 0x1.62ep-6f, a);
+        float p = ND_MUL(kf, 0x1.0bf8p-20f);
+        // TwoSum(r1, -p)
+        float s = ND_SUB(r1, p);
+        float bb = ND_SUB(s, r1);
+        float e = ND_ADD(ND_SUB(r1, ND_SUB(s, bb)), ND_SUB(-p, bb));
+        float rl = ND_FMA(-kf, 0x1.f473dep-35f, e);
+        float z = ND_MUL(s, s);
+        float ze = ND_FMA(s, s, -z);
+        float codd = ND_MUL(ND_MUL(s, z), ND_FMA(z, 0x1.111112p-7f, 0x1.555556p-3f));
+        float ceven = ND_FMA(ND_MUL(z, z), 0x1.555556p-5f, ND_FMA(ze, 0.5f, ND_MUL(s, rl)));
+        float hz = ND_MUL(z, 0.5f);
+        float odd = ND_ADD(rl, codd);
+        // e^r
+        float h1 = ND_ADD(1.0f, s), t1 = ND_ADD(ND_SUB(1.0f, h1), s);
+        float h2 = ND_ADD(h1, hz), t2 = ND_ADD(ND_SUB(h1, h2), hz);
+        float lp = ND_ADD(ND_ADD(t1, t2), ND_ADD(odd, ceven));
+        // e^-r
+        float g1 = ND_SUB(1.0f, s), u1 = ND_SUB(ND_SUB(1.0f, g1), s);
+        float g2 = ND_ADD(g1, hz), u2 = ND_ADD(ND_SUB(g1, g2), hz);
+        float lm = ND_ADD(ND_ADD(u1, u2), ND_SUB(ceven, odd));
+        int j = k & 31, m = k >> 5;
+        int jm = (32 - j) & 31, mm = -m - (j != 0);
+        return f_exp_round(j, m, h2, lp, ep) && f_exp_round(jm, mm, g2, lm, em);
+    }
+    // 2^x correctly rounded for -125 <= x < 127.5 (normal results): k = rint(32 x), f = x - k/32 (exact, |f| <=
+    // 1/64), 2^x = 2^(k >> 5) 2^((k & 31)/32) e^(f ln2), r = f ln2 as rh + rl and e^r as in f_exp_pm
+    static inline bool f_exp2_fast(float x, float *out)
+    {
+        const float shift = 0x1.8p23f;
+        float kf = ND_SUB(ND_FMA(x, 32.0f, shift), shift);
+        int k = (int)kf;
+        float f = ND_FMA(-kf, 0.03125f, x);
+        float s = ND_MUL(f, 0x1.62e430p-1f);
+        float rl = ND_FMA(f, -0x1.05c610p-29f, ND_FMA(f, 0x1.62e430p-1f, -s));
+        float z = ND_MUL(s, s);
+        float ze = ND_FMA(s, s, -z);
+        float codd = ND_MUL(ND_MUL(s, z), ND_FMA(z, 0x1.111112p-7f, 0x1.555556p-3f));
+        float ceven = ND_FMA(ND_MUL(z, z), 0x1.555556p-5f, ND_FMA(ze, 0.5f, ND_MUL(s, rl)));
+        float hz = ND_MUL(z, 0.5f);
+        float odd = ND_ADD(rl, codd);
+        float h1 = ND_ADD(1.0f, s), t1 = ND_ADD(ND_SUB(1.0f, h1), s);
+        float h2 = ND_ADD(h1, hz), t2 = ND_ADD(ND_SUB(h1, h2), hz);
+        float lp = ND_ADD(ND_ADD(t1, t2), ND_ADD(odd, ceven));
+        return f_exp_round(k & 31, k >> 5, h2, lp, out);
+    }
+#undef ND_ADD
+#undef ND_SUB
+#undef ND_MUL
+#undef ND_FMA
+
     // tanh.approx: halves correctly rounded; f32 as (e^x - e^-x) / (e^x + e^-x) of correctly rounded
     // exponentials, each operation rounded (ptx_math.sail)
     static inline uint64_t f_tanh(uint64_t a, uint32_t t, bool ftz)
@@ -634,6 +731,18 @@
             return xpost(xround_t(xf_fin(x.s, 1, 0), T_F32, RM_RN, 0, 0, false), T_F32, pf);
         if (x.m == 0 || xf_cmp_p2(x, -12) < 0)
             return xpost(x, T_F32, pf);
+#ifndef ZLUDA_NO_FAST_PATHS
+        {
+            // 2^-12 <= |x| < 20: the binary32 fast path for e^|x|, e^-|x| (tanh is odd: the exponentials swap)
+            float ep, em;
+            if (f_exp_pm(__builtin_bit_cast(float, (uint32_t)a & 0x7FFFFFFFu), &ep, &em))
+            {
+                float num = __zluda_nd_fsub_f32(ep, em), den = __zluda_nd_fadd_f32(ep, em);
+                uint32_t r = __builtin_bit_cast(uint32_t, __zluda_nd_fdiv_f32(num, den));
+                return r | ((uint32_t)a & 0x80000000u);
+            }
+        }
+#endif
         double xd = xf_to_d(x);
         double ex = d_exp(xd);
         XF e1 = xdec_t(d_round_to(ex, T_F32, 0), T_F32, false);
@@ -697,7 +806,13 @@
             // .ftz flushes the operand and the result), canonical NaN
             auto fl = [&](uint32_t u) { return (ftz && (u & 0x7F800000u) == 0) ? (u & 0x80000000u) : u; };
             float s = __zluda_ieee_sqrt_f32(__builtin_bit_cast(float, fl(a)));
+#ifndef ZLUDA_NO_FAST_PATHS
+            // the root of a binary32 value is never subnormal (2^-74.5 <= s < 2^64, or 0, inf, NaN), nor is 1 / s:
+            // the division needs no subnormal handling
+            uint32_t r = __builtin_bit_cast(uint32_t, __zluda_nd_fdiv_f32(1.0f, s));
+#else
             uint32_t r = __builtin_bit_cast(uint32_t, __zluda_ieee_fdiv_f32(1.0f, s));
+#endif
             if ((r & 0x7FFFFFFFu) > 0x7F800000u)
                 return 0x7FFFFFFFu;
             return fl(r);
@@ -738,6 +853,221 @@
     {
         uint32_t t = (ctrl >> 4) & 15;
         return (uint32_t)f_ex2h(a & 0xFFFF, t, ctrl & F_FTZ) | ((uint32_t)f_ex2h(a >> 16, t, ctrl & F_FTZ) << 16);
+    }
+    // ex2.approx{.ftz}.f32: 2^x correctly rounded (exp2_r; subnormal results, .ftz flushes the operand and the
+    // result). ctrl: 12 .ftz
+    uint32_t FUNC(fex2_f32)(uint32_t a, uint32_t ctrl)
+    {
+        bool ftz = ctrl & F_FTZ;
+#ifndef ZLUDA_NO_FAST_PATHS
+        if ((a & 0x7FFFFFFFu) < 0x22800000u) // |x| < 2^-58 (zeros, subnormals): 2^x rounds to 1
+            return 0x3F800000u;
+        float x = __builtin_bit_cast(float, a), v;
+        if (x >= -125.0f && x < 127.5f && f_exp2_fast(x, &v))
+            return __builtin_bit_cast(uint32_t, v);
+#endif
+        return (uint32_t)f_ex2h(a, T_F32, ftz);
+    }
+
+    // ---------------------------------------------------------------- lg2.approx{.ftz}.f32: log2 x correctly rounded
+    // (log2_r). x = 2^E m with m in [0.75, 1.5) (subnormals normalized), m = (1 + t) / inv for the slot i of m (32
+    // slots of 1/128 below 1, 32 of 1/64 above; inv = 1 / the slot's center, 1 next to 1 so that t = m - 1 there),
+    // log2 x = E + L_i + log1p(t) / ln2 with L_i = -log2 inv. t = m inv - 1 exactly as th + tl (fma), log1p(t) in
+    // float-float (the t^2 / 2 and t^3 / 3 terms with their errors), within about 2^-44 of the result: taken when
+    // both ends of v + d +- 2^-40 v round to v; otherwise the same evaluation in double with double-double sums
+    // (L_i to 106 bits). Checked exhaustively against binary128 references
+    // (zluda_metal/tests/stress/exhaustive/fastpath.cpp).
+    static const __attribute__((address_space(4))) float F_LG2_INV[64] = {
+        0x1.539094p+0f, 0x1.501502p+0f, 0x1.4cab88p+0f, 0x1.49539ep+0f, 0x1.460cbcp+0f, 0x1.42d662p+0f,
+        0x1.3fb014p+0f, 0x1.3c995ap+0f, 0x1.3991c2p+0f, 0x1.3698ep+0f, 0x1.33ae46p+0f, 0x1.30d19p+0f,
+        0x1.2e025cp+0f, 0x1.2b404ap+0f, 0x1.288b02p+0f, 0x1.25e228p+0f, 0x1.234568p+0f, 0x1.20b47p+0f,
+        0x1.1e2ef4p+0f, 0x1.1bb4a4p+0f, 0x1.194538p+0f, 0x1.16e068p+0f, 0x1.1485fp+0f, 0x1.12358ep+0f,
+        0x1.0fef02p+0f, 0x1.0db20ap+0f, 0x1.0b7e6ep+0f, 0x1.0953f4p+0f, 0x1.07326p+0f, 0x1.05198p+0f,
+        0x1.03091cp+0f, 0x1p+0f, 0x1p+0f, 0x1.f4465ap-1f, 0x1.ecc07cp-1f, 0x1.e573acp-1f,
+        0x1.de5d6ep-1f, 0x1.d77b66p-1f, 0x1.d0cb58p-1f, 0x1.ca4b3p-1f, 0x1.c3f8fp-1f, 0x1.bdd2b8p-1f,
+        0x1.b7d6c4p-1f, 0x1.b20364p-1f, 0x1.ac5702p-1f, 0x1.a6d01ap-1f, 0x1.a16d4p-1f, 0x1.9c2d14p-1f,
+        0x1.970e5p-1f, 0x1.920fb4p-1f, 0x1.8d3018p-1f, 0x1.886e6p-1f, 0x1.83c978p-1f, 0x1.7f406p-1f,
+        0x1.7ad22p-1f, 0x1.767dcep-1f, 0x1.724288p-1f, 0x1.6e1f76p-1f, 0x1.6a13cep-1f, 0x1.661ec6p-1f,
+        0x1.623fa8p-1f, 0x1.5e75bcp-1f, 0x1.5ac056p-1f, 0x1.571ed4p-1f};
+    static const __attribute__((address_space(4))) float F_LG2_L[128] = {
+        -0x1.a152eep-2f, -0x1.a6b326p-27f, -0x1.921804p-2f, 0x1.a1a556p-28f, -0x1.8304d8p-2f, 0x1.df844cp-27f,
+        -0x1.7418acp-2f, 0x1.db59c4p-30f, -0x1.6552b2p-2f, -0x1.61c8b8p-28f, -0x1.56b22cp-2f, -0x1.809bcap-27f,
+        -0x1.48365ep-2f, -0x1.00e582p-27f, -0x1.39de8cp-2f, -0x1.8d4ad8p-27f, -0x1.2baa08p-2f, -0x1.49eb34p-27f,
+        -0x1.1d983p-2f, -0x1.c52cbap-29f, -0x1.0fa84ap-2f, 0x1.2bd5fp-27f, -0x1.01d9bcp-2f, 0x1.195ep-27f,
+        -0x1.e857d4p-3f, 0x1.6b2562p-29f, -0x1.cd3c6ap-3f, 0x1.b26988p-28f, -0x1.b2602cp-3f, -0x1.f52042p-28f,
+        -0x1.97c1d4p-3f, -0x1.a1840ep-28f, -0x1.7d604ep-3f, -0x1.d4e346p-31f, -0x1.633a84p-3f, -0x1.39d024p-33f,
+        -0x1.494f8ap-3f, 0x1.673d24p-28f, -0x1.2f9e32p-3f, -0x1.4f2a9cp-28f, -0x1.162592p-3f, -0x1.783112p-28f,
+        -0x1.f9c952p-4f, 0x1.02f9b6p-29f, -0x1.c7b516p-4f, 0x1.475dbp-33f, -0x1.960ca6p-4f, 0x1.41a4ccp-30f,
+        -0x1.64ce3cp-4f, 0x1.bd9fd8p-29f, -0x1.33f7c2p-4f, -0x1.43f58ap-31f, -0x1.0387dep-4f, -0x1.ee6508p-29f,
+        -0x1.a6f9d6p-5f, -0x1.e3a2d6p-30f, -0x1.47a9eap-5f, -0x1.6b76f6p-31f, -0x1.d23b2ap-6f, -0x1.ce897ap-32f,
+        -0x1.16a25cp-6f, -0x1.4e837ap-33f, 0.0f, 0.0f, 0.0f, 0.0f,
+        0x1.11cd1ap-5f, 0x1.95bee4p-30f, 0x1.c4df98p-5f, 0x1.6b67cap-33f, 0x1.3aa304p-4f, 0x1.59a09ep-29f,
+        0x1.918a1ap-4f, -0x1.5929d6p-33f, 0x1.e72eb8p-4f, 0x1.07542p-30f, 0x1.1dcd2p-3f, -0x1.a4194p-29f,
+        0x1.476aa2p-3f, -0x1.ee0eccp-30f, 0x1.70742ep-3f, 0x1.e698c8p-33f, 0x1.98edd4p-3f, 0x1.be3d5p-29f,
+        0x1.c0db6cp-3f, -0x1.27fd6p-32f, 0x1.e840bep-3f, 0x1.462268p-28f, 0x1.0790acp-2f, 0x1.34f208p-27f,
+        0x1.1ac05cp-2f, 0x1.4bfc42p-27f, 0x1.2db10ep-2f, 0x1.4e14d4p-28f, 0x1.406468p-2f, -0x1.f078d2p-27f,
+        0x1.52dbdep-2f, -0x1.1c050cp-31f, 0x1.6519p-2f, 0x1.0f1768p-27f, 0x1.771d2ep-2f, 0x1.71866p-27f,
+        0x1.88e9c4p-2f, -0x1.b52012p-28f, 0x1.9a8022p-2f, 0x1.3ae12ep-28f, 0x1.abe186p-2f, 0x1.be8f72p-27f,
+        0x1.bd0f3p-2f, 0x1.90ef6ap-27f, 0x1.ce0a4ap-2f, 0x1.68d1e8p-29f, 0x1.ded3fep-2f, -0x1.d40e54p-27f,
+        0x1.ef6d6ap-2f, 0x1.358d76p-31f, 0x1.ffd796p-2f, -0x1.5b318p-30f, 0x1.0809dp-1f, 0x1.f1c384p-27f,
+        0x1.10113ap-1f, -0x1.6d8114p-29f, 0x1.18028cp-1f, 0x1.32824ap-31f, 0x1.1fde3ep-1f, 0x1.5003b6p-26f,
+        0x1.27a4cp-1f, -0x1.34c24ap-28f};
+    static const __attribute__((address_space(4))) uint64_t D_LG2_L[128] = {
+        0xbfda152eed359931ull, 0x3c592f329d22b308ull, 0xbfd9218039796aabull, 0x3c74e5690ff1f06eull,
+        0xbfd8304d7103dda3ull, 0x3c798833591862b5ull, 0xbfd7418abe24a63dull, 0x3c7fa37ab3d61feeull,
+        0xbfd6552b258722e2ull, 0xbc72f241dca6fc3full, 0xbfd56b22cc04de54ull, 0x3c6c9bb0d879afd7ull,
+        0xbfd48365e8072c0dull, 0x3c3803dc35aa1904ull, 0xbfd39de8cc6a56b9ull, 0xbc7c4556357fb55cull,
+        0xbfd2baa08a4f5999ull, 0x3c7a5b286ddf549full, 0xbfd1d983038a5973ull, 0xbc59fabc38b4f1d7ull,
+        0xbfd0fa8496a15078ull, 0xbc7557b896ea3a78ull, 0xbfd01d9bb7350ffbull, 0x3c5b68e9421e42b1ull,
+        0xbfce857d3a536a7bull, 0xbc42ae5ac22439c5ull, 0xbfccd3c6926cb3baull, 0x3c59a0a2a08ad164ull,
+        0xbfcb2602cfa90211ull, 0x3c520b55ede26811ull, 0xbfc97c1d4d0c206aull, 0x3c640e710afb9b3bull,
+        0xbfc7d604e1d4e346ull, 0x3c30ce3d95e5651eull, 0xbfc633a8404e7409ull, 0x3c31c75b8f53b60full,
+        0xbfc494f894c616e5ull, 0xbc59ae20a276fef6ull, 0xbfc2f9e32a7954e4ull, 0x3c411897da40f648ull,
+        0xbfc162592bc18896ull, 0xbc6889ff670a2c9aull, 0xbfbf9c9517e83255ull, 0x3c435900e9f53f2eull,
+        0xbfbc7b515f5c5128ull, 0x3c41f68825e6d096ull, 0xbfb960ca5af96cd0ull, 0xbc529c6aa0b462f4ull,
+        0xbfb64ce3b213013cull, 0x3c485973ab0e8989ull, 0xbfb33f7c2287eb14ull, 0xbc50645f9c69c3e0ull,
+        0xbfb0387def732844ull, 0xbc25eb43e530f38eull, 0xbfaa6f9d6f1d16afull, 0x3c44703c3ec0059cull,
+        0xbfa47a9ea5addbd8ull, 0x3c4ffc052d725bd3ull, 0xbf9d23b2a73a25e5ull, 0xbc387ca1673278c9ull,
+        0xbf916a25c29d06f6ull, 0x3c1696dc0f131e69ull, 0x0000000000000000ull, 0x0000000000000000ull,
+        0x0000000000000000ull, 0x0000000000000000ull, 0x3fa11cd1acadf723ull, 0xbbfefa68b88a0ae7ull,
+        0x3fac4df9816b67cbull, 0xbc2ad73136c614cbull, 0x3fb3aa304acd04f4ull, 0xbc54b3077c27b8b4ull,
+        0x3fb918a19f536b15ull, 0xbc3336be543a9993ull, 0x3fbe72eb841d5082ull, 0xbc5f7c9478921bd7ull,
+        0x3fc1dcd1f96f9b03ull, 0x3c69a5aba13ee9c5ull, 0x3fc476aa1c23e268ull, 0x3c58bdb8834b12ffull,
+        0x3fc70742e079a632ull, 0x3c4bd6b99f1a542full, 0x3fc98edd46f8f540ull, 0x3c51d8e54f6b70ddull,
+        0x3fcc0db6bf6c0150ull, 0xbc6a829cc1512df9ull, 0x3fce840bea311339ull, 0x3c6cbfe95c59cb8aull,
+        0x3fd0790ac9a79044ull, 0x3c63ee2f0e46be64ull, 0x3fd1ac05ca5fe214ull, 0xbc71c2140fbe02dbull,
+        0x3fd2db10e538534dull, 0x3c631cb428346b53ull, 0x3fd40646707c3973ull, 0xbc63ca60d9385e27ull,
+        0x3fd52dbddf71fd7aull, 0xbc7d9b1af94a58afull, 0x3fd651900878bb3cull, 0x3c31f6461fef16c6ull,
+        0x3fd771d2eb8c3300ull, 0xbc5796e600ac247eull, 0x3fd88e9c392b7fbbull, 0xbc6fb8ab87be1f10ull,
+        0x3fd9a80224eb84b9ull, 0xbc5bcddc6a14952cull, 0x3fdabe186df47b97ull, 0x3c3234b98e55c106ull,
+        0x3fdbd0f30c877b4full, 0xbc557b3fe5f0580cull, 0x3fdce0a4a2d1a3cfull, 0xbc1c50ac20cc5c35ull,
+        0x3fdded3fd15f8d60ull, 0xbc72caa8abe0356cull, 0x3fdef6d6a09ac6bbull, 0xbc63186b98f3f398ull,
+        0x3fdffd795ea4ce80ull, 0xbc716c968c39b3b9ull, 0x3fe0809d07c70e13ull, 0x3c8f7e57c5ce4173ull,
+        0x3fe101139e927eecull, 0x3c670576a5aa8a36ull, 0x3fe18028c04ca092ull, 0x3c89995c81c00c2dull,
+        0x3fe1fde3ea801dafull, 0xbc5369b2e485c22cull, 0x3fe27a4bfd967b6eull, 0xbc62ebcc9e150d9dull};
+#define ND_ADD __zluda_nd_fadd_f32
+#define ND_SUB __zluda_nd_fsub_f32
+#define ND_MUL __zluda_nd_fmul_f32
+#define ND_FMA __zluda_nd_fma_f32
+    // TwoSum: a + b = s + e exactly
+    static inline float f_two_sum(float a, float b, float *e)
+    {
+        float s = ND_ADD(a, b), bb = ND_SUB(s, a);
+        *e = ND_ADD(ND_SUB(a, ND_SUB(s, bb)), ND_SUB(b, bb));
+        return s;
+    }
+    static inline bool f_lg2_fast(int E, int i, float m, float *out)
+    {
+        float inv = F_LG2_INV[i];
+        float p = ND_MUL(m, inv);
+        float tl = ND_FMA(m, inv, -p);
+        float th = ND_SUB(p, 1.0f); // exact (Sterbenz)
+        float z = ND_MUL(th, th);
+        float ze = ND_FMA(ND_ADD(th, th), tl, ND_FMA(th, th, -z));
+        float c = ND_MUL(z, th);
+        float ce = ND_FMA(ze, th, ND_FMA(z, tl, ND_FMA(z, th, -c)));
+        float c3 = ND_MUL(c, 0x1.555556p-2f);
+        float c3e = ND_FMA(ce, 0x1.555556p-2f, ND_FMA(c, -0x1.555556p-27f, ND_FMA(c, 0x1.555556p-2f, -c3)));
+        // t^4 (-1/4 + t/5 - t^2/6 + t^3/7 - t^4/8)
+        float q = ND_FMA(th, -0x1p-3f, 0x1.24924ap-3f);
+        q = ND_FMA(th, q, -0x1.555556p-3f);
+        q = ND_FMA(th, q, 0x1.99999ap-3f);
+        q = ND_FMA(th, q, -0.25f);
+        float t4q = ND_MUL(ND_MUL(z, z), q);
+        float hz = ND_MUL(z, -0.5f);
+        // th - z/2 + c3 (Fast2Sum twice: |th| > |z/2| > |c3|)
+        float a = ND_ADD(th, hz), ae = ND_SUB(hz, ND_SUB(a, th));
+        float b = ND_ADD(a, c3), be = ND_SUB(c3, ND_SUB(b, a));
+        float lo = ND_ADD(ND_ADD(ND_ADD(ae, be), ND_ADD(tl, ND_MUL(ze, -0.5f))), ND_ADD(c3e, t4q));
+        // times 1 / ln2
+        float y = ND_MUL(b, 0x1.715476p+0f);
+        float ye = ND_FMA(lo, 0x1.715476p+0f, ND_FMA(b, 0x1.4ae0cp-26f, ND_FMA(b, 0x1.715476p+0f, -y)));
+        // E + L + y
+        float e1, e2;
+        float s1 = f_two_sum((float)E, F_LG2_L[2 * i], &e1);
+        float s2 = f_two_sum(s1, y, &e2);
+        float low = ND_ADD(ND_ADD(e1, e2), ND_ADD(F_LG2_L[2 * i + 1], ye));
+        float v = ND_ADD(s2, low);
+        float d = ND_ADD(ND_SUB(s2, v), low);
+        float dl = ND_MUL(__builtin_fabsf(v), 0x1p-40f);
+        if (ND_ADD(v, ND_ADD(d, dl)) != v || ND_ADD(v, ND_SUB(d, dl)) != v)
+            return false;
+        *out = v;
+        return true;
+    }
+#undef ND_ADD
+#undef ND_SUB
+#undef ND_MUL
+#undef ND_FMA
+    static inline double d_two_sum(double a, double b, double *e)
+    {
+        double s = a + b, bb = s - a;
+        *e = (a - (s - bb)) + (b - bb);
+        return s;
+    }
+    // the same in double (double-double sums), correctly rounded to binary32
+    static inline uint32_t f_lg2_exact(int E, int i, float m)
+    {
+        double inv = F_LG2_INV[i];
+        double t = (double)m * inv - 1.0; // exact: 48-bit product, Sterbenz
+        // log1p(t) = t + t^2 R(t), R = -1/2 + t/3 - ... - t^11/12 (|t| < 2^-6: the rest below 2^-80 t)
+        double r = -1.0 / 12;
+        for (int k = 11; k >= 2; k--)
+            r = __builtin_fma(t, r, ((k & 1) ? 1.0 : -1.0) / k);
+        double u = t * t * r;
+        double ph = t + u, pl = u - (ph - t); // Fast2Sum (|t| > |u|)
+        const double ih = 0x1.71547652b82fep+0, il = 0x1.777d0ffda0d24p-56;
+        double yh = ph * ih;
+        double yl = __builtin_fma(ph, ih, -yh) + (ph * il + pl * ih);
+        double e1, e2;
+        double s1 = d_two_sum((double)E, d_from_bits(D_LG2_L[2 * i]), &e1);
+        double s2 = d_two_sum(s1, yh, &e2);
+        double low = (e1 + e2) + (d_from_bits(D_LG2_L[2 * i + 1]) + yl);
+        double sh = s2 + low, sl = low - (sh - s2);
+        // round sh + sl once: sh rounded to binary32 unless it is a midpoint, which sl then decides
+        uint64_t hb = d_bits(sh);
+        XF v = xdec_t(hb, T_F64, false);
+        if (sl != 0 && (hb & 0x1FFFFFFFull) == 0x10000000ull) // sh on a binary32 midpoint
+            v = xdec_t(d_bits(sl > 0 ? sh + __builtin_fabs(sh) * 0x1p-40 : sh - __builtin_fabs(sh) * 0x1p-40), T_F64, false);
+        return (uint32_t)xfin(v, T_F32, RM_RN, 0, 0, 0, false);
+    }
+    // ctrl: 12 .ftz
+    uint32_t FUNC(flg2_f32)(uint32_t a, uint32_t ctrl)
+    {
+        bool ftz = ctrl & F_FTZ;
+        uint32_t ex = (a >> 23) & 0xFF, mt = a & 0x7FFFFF;
+        if (ftz && ex == 0)
+            mt = 0;
+        if (ex == 0xFF)
+            return mt ? 0x7FFFFFFFu : (a >> 31) ? 0x7FFFFFFFu : 0x7F800000u;
+        if (ex == 0 && mt == 0)
+            return 0xFF800000u; // -inf
+        if (a >> 31)
+            return 0x7FFFFFFFu;
+        int E;
+        if (ex == 0)
+        {
+            int sh = __builtin_clz(mt) - 8; // leading bit to bit 23
+            mt = (mt << sh) & 0x7FFFFF;
+            E = -126 - sh;
+        }
+        else
+            E = (int)ex - 127;
+        if (mt == 0)
+            return __builtin_bit_cast(uint32_t, (float)E); // powers of two: exact
+        uint32_t mb = mt | 0x3F800000u;
+        if (mb >= 0x3FC00000u) // m in [0.75, 1.5)
+        {
+            mb -= 1u << 23;
+            E++;
+        }
+        int i = (int)((mb - 0x3F400000u) >> 17);
+        float m = __builtin_bit_cast(float, mb), v;
+#ifndef ZLUDA_NO_FAST_PATHS
+        if (f_lg2_fast(E, i, m, &v))
+            return __builtin_bit_cast(uint32_t, v);
+#endif
+        return f_lg2_exact(E, i, m);
     }
 
     // sin / cos .approx{.ftz}.f32: correctly rounded (sincos_r), via a Payne-Hanek reduction
@@ -784,6 +1114,96 @@
         double r2 = r * r;
         return 1.0 + r2 * (-0.5 + r2 * (0.041666666666666664 + r2 * (-0.001388888888888889 + r2 * (2.48015873015873e-05 + r2 * (-2.755731922398589e-07 + r2 * (2.08767569878681e-09 + r2 * (-1.1470745597729725e-11 + r2 * (4.779477332387385e-14 + r2 * (-1.5619206968586225e-16)))))))));
     }
+    // A fast path for the model's correctly rounded sin / cos .approx.f32, for 2^-12 <= |x| < 200, in binary32
+    // arithmetic on values that are never subnormal (__zluda_nd_*): k = rint(32 |x| / pi) < 2^11, r = |x| - k pi/32
+    // as rh + rl (pi/32 = P1 + ... + P6, P1..P5 with 13 bits: k Pi exact, |x| - k P1 exact, TwoSums), then
+    // sin(|x|) (cos: k + 16) = S + S (cos r - 1) + C sin r with S, C = sin, cos(k pi/32) from F_SIN_64 (hi, lo pairs),
+    // sin r = r - r^3/6 + r^5/120 - r^7/5040 and cos r - 1 = -r^2/2 + r^4/24 - r^6/720 (|r| <= pi/64) in float-float.
+    // The result is within about 2^-42 (relative); it is returned only when both ends of v + d +- 2^-40 v round to
+    // the same v, and when the result is not close to 0 (S = 0 with |r| < 2^-14, k > 0), otherwise false (the double
+    // path). Checked exhaustively against it (zluda_metal/tests/stress/exhaustive/fastpath.cpp).
+    static const __attribute__((address_space(4))) float F_SIN_64[128] = {
+        0.0f, 0.0f, 0x1.917a6cp-4f, -0x1.eb25eap-31f, 0x1.8f8b84p-3f, -0x1.cb2cfap-30f,
+        0x1.294062p-2f, 0x1.dab3ep-27f, 0x1.87de2ap-2f, 0x1.abaa58p-28f, 0x1.e2b5d4p-2f, -0x1.fe4272p-28f,
+        0x1.1c73b4p-1f, -0x1.9465cep-27f, 0x1.44cf32p-1f, 0x1.424776p-27f, 0x1.6a09e6p-1f, 0x1.9fcef4p-27f,
+        0x1.8bc806p-1f, 0x1.62a2e8p-26f, 0x1.a9b662p-1f, 0x1.21d434p-26f, 0x1.c38b3p-1f, -0x1.cfe84ap-26f,
+        0x1.d906bcp-1f, 0x1.e651a8p-26f, 0x1.e9f416p-1f, -0x1.273a44p-26f, 0x1.f6297cp-1f, 0x1.feeb96p-26f,
+        0x1.fd88dap-1f, 0x1.e89292p-28f, 0x1p+0f, 0.0f, 0x1.fd88dap-1f, 0x1.e89292p-28f,
+        0x1.f6297cp-1f, 0x1.feeb96p-26f, 0x1.e9f416p-1f, -0x1.273a44p-26f, 0x1.d906bcp-1f, 0x1.e651a8p-26f,
+        0x1.c38b3p-1f, -0x1.cfe84ap-26f, 0x1.a9b662p-1f, 0x1.21d434p-26f, 0x1.8bc806p-1f, 0x1.62a2e8p-26f,
+        0x1.6a09e6p-1f, 0x1.9fcef4p-27f, 0x1.44cf32p-1f, 0x1.424776p-27f, 0x1.1c73b4p-1f, -0x1.9465cep-27f,
+        0x1.e2b5d4p-2f, -0x1.fe4272p-28f, 0x1.87de2ap-2f, 0x1.abaa58p-28f, 0x1.294062p-2f, 0x1.dab3ep-27f,
+        0x1.8f8b84p-3f, -0x1.cb2cfap-30f, 0x1.917a6cp-4f, -0x1.eb25eap-31f, 0.0f, 0.0f,
+        -0x1.917a6cp-4f, 0x1.eb25eap-31f, -0x1.8f8b84p-3f, 0x1.cb2cfap-30f, -0x1.294062p-2f, -0x1.dab3ep-27f,
+        -0x1.87de2ap-2f, -0x1.abaa58p-28f, -0x1.e2b5d4p-2f, 0x1.fe4272p-28f, -0x1.1c73b4p-1f, 0x1.9465cep-27f,
+        -0x1.44cf32p-1f, -0x1.424776p-27f, -0x1.6a09e6p-1f, -0x1.9fcef4p-27f, -0x1.8bc806p-1f, -0x1.62a2e8p-26f,
+        -0x1.a9b662p-1f, -0x1.21d434p-26f, -0x1.c38b3p-1f, 0x1.cfe84ap-26f, -0x1.d906bcp-1f, -0x1.e651a8p-26f,
+        -0x1.e9f416p-1f, 0x1.273a44p-26f, -0x1.f6297cp-1f, -0x1.feeb96p-26f, -0x1.fd88dap-1f, -0x1.e89292p-28f,
+        -0x1p+0f, 0.0f, -0x1.fd88dap-1f, -0x1.e89292p-28f, -0x1.f6297cp-1f, -0x1.feeb96p-26f,
+        -0x1.e9f416p-1f, 0x1.273a44p-26f, -0x1.d906bcp-1f, -0x1.e651a8p-26f, -0x1.c38b3p-1f, 0x1.cfe84ap-26f,
+        -0x1.a9b662p-1f, -0x1.21d434p-26f, -0x1.8bc806p-1f, -0x1.62a2e8p-26f, -0x1.6a09e6p-1f, -0x1.9fcef4p-27f,
+        -0x1.44cf32p-1f, -0x1.424776p-27f, -0x1.1c73b4p-1f, 0x1.9465cep-27f, -0x1.e2b5d4p-2f, 0x1.fe4272p-28f,
+        -0x1.87de2ap-2f, -0x1.abaa58p-28f, -0x1.294062p-2f, -0x1.dab3ep-27f, -0x1.8f8b84p-3f, 0x1.cb2cfap-30f,
+        -0x1.917a6cp-4f, 0x1.eb25eap-31f};
+#define ND_ADD __zluda_nd_fadd_f32
+#define ND_SUB __zluda_nd_fsub_f32
+#define ND_MUL __zluda_nd_fmul_f32
+#define ND_FMA __zluda_nd_fma_f32
+    static inline bool f_sincos_fast(float ax, bool iscos, float *out)
+    {
+        const float shift = 0x1.8p23f;
+        float kf = ND_SUB(ND_FMA(ax, 0x1.45f306p+3f, shift), shift);
+        int k = (int)kf;
+        float r1 = ND_FMA(-kf, 0x1.921p-4f, ax);
+        float p2 = ND_MUL(kf, 0x1.f6ap-17f), p3 = ND_MUL(kf, 0x1.11p-30f), p4 = ND_MUL(kf, 0x1.68cp-43f);
+        float p5 = ND_MUL(kf, 0x1.1a6p-58f), p6 = ND_MUL(kf, 0x1.3198a2p-73f);
+        // TwoSum(r1, -p2), TwoSum(s, -p3), TwoSum(s, -p4)
+        float s = ND_SUB(r1, p2), bb = ND_SUB(s, r1);
+        float e1 = ND_SUB(ND_SUB(r1, ND_SUB(s, bb)), ND_ADD(p2, bb));
+        float s2 = ND_SUB(s, p3), b2 = ND_SUB(s2, s);
+        float e2 = ND_SUB(ND_SUB(s, ND_SUB(s2, b2)), ND_ADD(p3, b2));
+        float s3 = ND_SUB(s2, p4), b3 = ND_SUB(s3, s2);
+        float e3 = ND_SUB(ND_SUB(s2, ND_SUB(s3, b3)), ND_ADD(p4, b3));
+        float low = ND_SUB(ND_SUB(ND_ADD(ND_ADD(e1, e2), e3), p5), p6);
+        float sh = ND_ADD(s3, low), sl = ND_SUB(low, ND_SUB(sh, s3));
+        int js = (k + (iscos ? 16 : 0)) & 63, jc = (js + 16) & 63;
+        if ((js & 31) == 0 && k != 0 && __builtin_fabsf(sh) < 0x1p-14f)
+            return false;
+        // z = r^2
+        float zh = ND_MUL(sh, sh);
+        float zl = ND_ADD(ND_FMA(sh, sh, -zh), ND_MUL(ND_ADD(sh, sh), sl));
+        // sin r = r - r z / 6 + r z^2 (1/120 - z/5040)
+        float p = ND_MUL(sh, zh);
+        float plo = ND_ADD(ND_FMA(sh, zh, -p), ND_ADD(ND_MUL(sh, zl), ND_MUL(sl, zh)));
+        float th = ND_MUL(p, 0x1.555556p-3f);
+        float tl = ND_ADD(ND_FMA(p, 0x1.555556p-3f, -th), ND_ADD(ND_MUL(p, -0x1.555556p-28f), ND_MUL(plo, 0x1.555556p-3f)));
+        float u = ND_MUL(ND_MUL(p, zh), ND_FMA(zh, -0x1.a01a02p-13f, 0x1.111112p-7f));
+        float srh = ND_SUB(sh, th);
+        float srl = ND_ADD(ND_SUB(ND_SUB(sh, srh), th), ND_ADD(ND_SUB(sl, tl), u));
+        // cos r - 1 = -z/2 + z^2 (1/24 - z/720)
+        float cmh = ND_MUL(zh, -0.5f);
+        float cml = ND_FMA(zl, -0.5f, ND_MUL(ND_MUL(zh, zh), ND_FMA(zh, -0x1.6c16c2p-10f, 0x1.555556p-5f)));
+        float Sh = F_SIN_64[2 * js], Sl = F_SIN_64[2 * js + 1], Ch = F_SIN_64[2 * jc], Cl = F_SIN_64[2 * jc + 1];
+        float a1 = ND_MUL(Sh, cmh);
+        float a1l = ND_ADD(ND_FMA(Sh, cmh, -a1), ND_ADD(ND_MUL(Sh, cml), ND_MUL(Sl, cmh)));
+        float a2 = ND_MUL(Ch, srh);
+        float a2l = ND_ADD(ND_FMA(Ch, srh, -a2), ND_ADD(ND_MUL(Ch, srl), ND_MUL(Cl, srh)));
+        // Fast2Sum(Sh, a2), Fast2Sum(b1, a1): |Sh| >= sin(pi/32) > |a2| or Sh = 0, |b1| > |a1| or a1 = 0
+        float b1 = ND_ADD(Sh, a2), b1e = ND_SUB(a2, ND_SUB(b1, Sh));
+        float bb2 = ND_ADD(b1, a1), b2e = ND_SUB(a1, ND_SUB(bb2, b1));
+        float lo = ND_ADD(ND_ADD(ND_ADD(b1e, b2e), Sl), ND_ADD(a1l, a2l));
+        float v = ND_ADD(bb2, lo);
+        float d = ND_ADD(ND_SUB(bb2, v), lo);
+        float dl = ND_MUL(__builtin_fabsf(v), 0x1p-40f);
+        if (ND_ADD(v, ND_ADD(d, dl)) != v || ND_ADD(v, ND_SUB(d, dl)) != v)
+            return false;
+        *out = v;
+        return true;
+    }
+#undef ND_ADD
+#undef ND_SUB
+#undef ND_MUL
+#undef ND_FMA
     uint32_t FUNC(fsincos_f32)(uint32_t a, uint32_t ctrl)
     {
         bool issin = !(ctrl & 1), ftz = ctrl & F_FTZ;
@@ -793,6 +1213,16 @@
             return 0x7FFFFFFF;
         if (x.m == 0)
             return issin ? (uint32_t)xpost(x, T_F32, pf) : 0x3F800000u;
+#ifndef ZLUDA_NO_FAST_PATHS
+        {
+            uint32_t ua = (uint32_t)a & 0x7FFFFFFFu;
+            if (ua < 0x39800000u) // |x| < 2^-12: sin x rounds to x, cos x to 1
+                return issin ? (uint32_t)xpost(x, T_F32, pf) : 0x3F800000u;
+            float v;
+            if (ua < 0x43480000u && f_sincos_fast(__builtin_bit_cast(float, ua), !issin, &v)) // |x| < 200
+                return __builtin_bit_cast(uint32_t, v) ^ (issin ? (uint32_t)a & 0x80000000u : 0);
+        }
+#endif
         double ax = xf_to_d(xf_abs(x));
         int q = 0;
         double r = ax;

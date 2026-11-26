@@ -11,10 +11,15 @@ set -e
 OUT=${1:?usage: gen.sh OUT [N] [SEEDS...]}; shift
 N=${1:-512}; [ $# -gt 0 ] && shift
 SEEDS=${*:-1001 1002 1003 1004 1005 1006 1007 1008 1009 1010}
+HERE=$(cd "$(dirname "$0")" && pwd)
 PF=${PTX_FORMALIZATION:-$(cd "$(dirname "$0")/../../../.." && pwd)/PTX-formalization}
 S=$PF/scripts
 mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd)
+l() { # name, generator of gen/, args...
+    name=$1; shift
+    python3 "$HERE/gen/$@" > "$OUT/$name.ptx" 2>/dev/null || { echo "generator failed: $*" >&2; rm -f "$OUT/$name.ptx"; }
+}
 g() { # name, generator, args...
     name=$1; shift
     python3 "$S/$@" > "$OUT/$name.ptx" 2>/dev/null || { echo "generator failed: $*" >&2; rm -f "$OUT/$name.ptx"; }
@@ -33,6 +38,10 @@ for s in $SEEDS; do
     for p in 0 1 2 3 4 5; do g pred-$p-s$s gen_pred.py "$N" "$s" "$p" 6; done
     for p in 0 1 2 3; do g mini-$p-s$s gen_mini.py "$N" "$s" "$p" 4; done
     for p in 0 1 2 3; do g warp-$p-s$s gen_warp.py "$s" "$p" 4; done
+    # this directory's generators: sin / cos .approx.f32 near the limits of the helpers' binary32 fast path
+    for fn in sin cos; do l sincos-$fn-s$s gen_sincos.py "$N" "$s" "$fn"; done
+    # ex2 / lg2 / rsqrt / sqrt / rcp .approx.f32 against the model's correctly rounded definitions (.ftz on odd seeds)
+    for op in ex2 lg2 rsqrt sqrt rcp; do l transc-$op-s$s gen_transc.py "$N" "$s" "$op" $([ $((s % 2)) = 1 ] && echo ftz); done
 done
 # matrix generators: they write tests/<name>.ptx in their working directory
 set -- $SEEDS

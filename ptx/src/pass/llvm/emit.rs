@@ -522,7 +522,11 @@ fn get_input_argument_type(
     state_space: ast::StateSpace,
 ) -> Result<LLVMTypeRef, TranslateError> {
     match state_space {
-        ast::StateSpace::ParamEntry | ast::StateSpace::Shared => {
+        // pointers; helper functions (ast::Instruction::Helper) also take .global / generic ones
+        ast::StateSpace::ParamEntry
+        | ast::StateSpace::Shared
+        | ast::StateSpace::Global
+        | ast::StateSpace::Generic => {
             Ok(unsafe { LLVMPointerTypeInContext(context, get_state_space(state_space)?) })
         }
         ast::StateSpace::Reg => get_type(context, v_type),

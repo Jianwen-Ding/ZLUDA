@@ -174,6 +174,7 @@ fn compare<'i>(base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
     let tys: Vec<&str> = m.iter().copied().filter(|x| cvt::cvt_ty(x).is_some()).collect();
     let st = *tys.last()?;
     let (code, pk) = match st {
+        "f32" => (1u64, false),
         "f16" => (2u64, false),
         "bf16" => (3, false),
         "f16x2" => (2, true),
@@ -198,8 +199,12 @@ fn compare<'i>(base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
     if bop != 0 && ops.len() != 4 {
         return err("compare needs c");
     }
+    if !pk && ops[0].pair.is_some() {
+        return err("scalar compare with two destinations");
+    }
     let mut ctrl = cmpc | code << 4 | (pk as u64) << 8 | bop << 9 | ftz << 11 | negc << 12;
-    let w = if pk { ScalarType::B32 } else { ScalarType::B16 };
+    let w = if pk || st == "f32" { ScalarType::B32 } else { ScalarType::B16 };
+    let sw = if st == "f32" { 32 } else { 16 };
     let call = |name: String| {
         Call::new(name)
     };
@@ -208,7 +213,7 @@ fn compare<'i>(base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
             return err("setp types");
         }
         if !pk {
-            return call("fsetp_16".into())
+            return call(format!("fsetp_{sw}"))
                 .dst(ops[0].op.clone(), ScalarType::Pred)
                 .src(ops[1].op.clone(), w)
                 .src(ops[2].op.clone(), w)
@@ -246,7 +251,7 @@ fn compare<'i>(base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
         "f16" | "bf16" | "u16" | "s16" | "b16" => (16, ScalarType::B16),
         _ => (32, ScalarType::B32),
     };
-    call(format!("fset_{dn}_16"))
+    call(format!("fset_{dn}_{sw}"))
         .dst(ops[0].op.clone(), dty)
         .src(ops[1].op.clone(), w)
         .src(ops[2].op.clone(), w)
@@ -279,6 +284,46 @@ fn divsqrt<'i>(base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
         .build()
 }
 
+/// tanh.approx.{f32,f16,bf16,f16x2,bf16x2}; rcp / rsqrt.approx{.ftz}.f64 (on the upper 32 bits);
+/// div.approx{.ftz}.f32
+fn approx<'i>(base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
+    if !m.contains(&"approx") {
+        return None;
+    }
+    let t = *m.last()?;
+    let ftz = (m.contains(&"ftz") as u64) << 12;
+    match (base, t) {
+        ("tanh", _) => {
+            let (code, pk, w) = ftype(t)?;
+            if code == 0 || t == "f32x2" {
+                return err("tanh type");
+            }
+            Call::new(format!("ftanh_{w}"))
+                .dst(ops[0].op.clone(), bits(w))
+                .src(cvt::fimm(ops[1].op.clone(), if pk { 0 } else { w }), bits(w))
+                .imm(code << 4 | (pk as u64) << 8 | ftz)
+                .build()
+        }
+        ("rcp" | "rsqrt", "f64") => Call::new("fapx64")
+            .dst(ops[0].op.clone(), ScalarType::B64)
+            .src(cvt::fimm(ops[1].op.clone(), 64), ScalarType::B64)
+            .imm((base == "rsqrt") as u64)
+            .build(),
+        ("rsqrt", "f32") => Call::new("frsqrt_f32")
+            .dst(ops[0].op.clone(), ScalarType::B32)
+            .src(cvt::fimm(ops[1].op.clone(), 32), ScalarType::B32)
+            .imm(ftz)
+            .build(),
+        ("div", "f32") => Call::new("fdiv_approx_f32")
+            .dst(ops[0].op.clone(), ScalarType::B32)
+            .src(cvt::fimm(ops[1].op.clone(), 32), ScalarType::B32)
+            .src(cvt::fimm(ops.get(2)?.op.clone(), 32), ScalarType::B32)
+            .imm(ftz)
+            .build(),
+        _ => None,
+    }
+}
+
 /// neg / abs{.ftz}.{f32,f16,bf16,f16x2,bf16x2}: flush, then the sign bit
 fn negabs<'i>(base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
     let (code, pk, w) = ftype(m.last()?)?;
@@ -297,8 +342,10 @@ pub(super) fn lower<'i>(_opcode: &str, base: &str, m: &[&str], ops: &[HOp<'i>]) 
     match base {
         "add" | "sub" | "mul" | "fma" | "min" | "max" => arith(base, m, ops),
         "set" | "setp" => compare(base, m, ops),
-        "div" | "sqrt" | "rcp" => divsqrt(base, m, ops),
+        "div" if m.contains(&"approx") => approx(base, m, ops),
+        "div" | "sqrt" | "rcp" if !m.contains(&"approx") => divsqrt(base, m, ops),
         "neg" | "abs" => negabs(base, m, ops),
+        "tanh" | "rcp" | "rsqrt" => approx(base, m, ops),
         _ => None,
     }
 }
@@ -310,11 +357,18 @@ pub(super) fn preempts(_opcode: &str, base: &str, m: &[&str]) -> bool {
     let any = |l: &[&str]| l.iter().any(|x| m.contains(x));
     match base {
         // half comparisons (.ftz, NaN, the pair destinations)
-        "set" | "setp" => m.last().map_or(false, |t| half(t)),
-        // half arithmetic: NaN results, subnormals, directed roundings, .relu / .sat / .oob
-        "add" | "sub" | "mul" | "fma" => m.iter().any(half),
+        "set" | "setp" => m.last().map_or(false, |t| half(t) || (*t == "f32" && m.contains(&"ftz"))),
+        // half arithmetic: NaN results, subnormals, directed roundings, .relu / .sat / .oob;
+        // f32 with a directed rounding or .sat (exact, with subnormals)
+        "add" | "sub" | "mul" | "fma" => {
+            m.iter().any(half) || (m.contains(&"f32") && any(&["rz", "rm", "rp", "sat"]))
+        }
         // min / max: .ftz .NaN .xorsign .abs (llvm.canonicalize is not available), halves, f64 NaN payloads
         "min" | "max" => m.iter().any(half) || m.contains(&"f64") || any(&["ftz", "NaN", "xorsign", "abs"]),
+        // the approximate forms the model defines exactly (see `approx`)
+        "tanh" => true,
+        "rcp" | "rsqrt" if m == ["approx", "f64"] || m == ["approx", "ftz", "f64"] => true,
+        "div" if m == ["approx", "f32"] || m == ["approx", "ftz", "f32"] => true,
         // neg / abs .ftz (llvm.canonicalize is not available)
         "neg" | "abs" => m.contains(&"ftz"),
         // f32 division and square root with a directed rounding or .ftz (exact, with subnormals)

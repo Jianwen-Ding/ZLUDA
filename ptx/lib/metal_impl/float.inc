@@ -441,6 +441,13 @@
     }
     bool FUNC(fsetp_pair_lo)(uint32_t a, uint32_t b, bool c, uint32_t ctrl) { return __zluda_ptx_impl_fsetp_pair(a, b, c, ctrl).x; }
     bool FUNC(fsetp_pair_hi)(uint32_t a, uint32_t b, bool c, uint32_t ctrl) { return __zluda_ptx_impl_fsetp_pair(a, b, c, ctrl).y; }
+    bool FUNC(fsetp_16)(uint16_t a, uint16_t b, bool c, uint32_t ctrl);
+    bool FUNC(fsetp_32)(uint32_t a, uint32_t b, bool c, uint32_t ctrl)
+    {
+        uint32_t t = (ctrl >> 4) & 15, bop = (ctrl >> 9) & 3;
+        bool cc = (ctrl & (1u << 12)) ? !c : c;
+        return bool_op(bop, f_cmp(ctrl & 15, t, a, b, ctrl & (1u << 11)), cc);
+    }
     bool FUNC(fsetp_16)(uint16_t a, uint16_t b, bool c, uint32_t ctrl)
     {
         uint32_t t = (ctrl >> 4) & 15, bop = (ctrl >> 9) & 3;
@@ -466,10 +473,12 @@
         uint32_t tv = dt == T_F16 ? 0x3C00 : dt == T_BF16 ? 0x3F80 : 0xFFFF;
         return (p.x ? tv : 0) | ((p.y ? tv : 0) << 16);
     }
-#define FSET_16(DN, DT) \
-    DT FUNC(fset_##DN##_16)(uint16_t a, uint16_t b, bool c, uint32_t ctrl) { return __zluda_ptx_impl_fsetp_16(a, b, c, ctrl) ? (DT)set_true((ctrl >> 16) & 31) : 0; }
-    FSET_16(16, uint16_t)
-    FSET_16(32, uint32_t)
+#define FSET(DN, DT, SN, ST) \
+    DT FUNC(fset_##DN##_##SN)(ST a, ST b, bool c, uint32_t ctrl) { return __zluda_ptx_impl_fsetp_##SN(a, b, c, ctrl) ? (DT)set_true((ctrl >> 16) & 31) : 0; }
+    FSET(16, uint16_t, 16, uint16_t)
+    FSET(32, uint32_t, 16, uint16_t)
+    FSET(16, uint16_t, 32, uint32_t)
+    FSET(32, uint32_t, 32, uint32_t)
 
     // ---------------------------------------------------------------- f32 div / sqrt / rcp, exact
     // ctrl: 0-1 op (0 div 1 sqrt 2 rcp), 9-11 rounding, 12 .ftz, 13 .sat
@@ -499,3 +508,141 @@
     }
     uint16_t FUNC(fnegabs_16)(uint16_t a, uint32_t ctrl) { return (uint16_t)f_negabs_v(a, ctrl); }
     uint32_t FUNC(fnegabs_32)(uint32_t a, uint32_t ctrl) { return (uint32_t)f_negabs_v(a, ctrl); }
+
+    // ---------------------------------------------------------------- transcendental helpers in double
+    // (soft-f64 on AGX: correctly rounded IEEE operations)
+    static inline double d_from_bits(uint64_t b) { return __builtin_bit_cast(double, b); }
+    static inline uint64_t d_bits(double d) { return __builtin_bit_cast(uint64_t, d); }
+    // 2^k for -1022 <= k <= 1023
+    static inline double d_pow2(int k) { return d_from_bits((uint64_t)(k + 1023) << 52); }
+    // e^y for |y| <= 60 (relative error a few units of 2^-53)
+    static inline double d_exp(double y)
+    {
+        const double inv_ln2 = 1.4426950408889634074, ln2_hi = 6.93147180369123816490e-01, ln2_lo = 1.90821492927058770002e-10;
+        double kf = y * inv_ln2;
+        int k = (int)(kf >= 0 ? kf + 0.5 : kf - 0.5);
+        double r = (y - k * ln2_hi) - k * ln2_lo;
+        double t = 1.0, s = 1.0;
+        for (int i = 1; i <= 16; i++)
+        {
+            t = t * r / i;
+            s += t;
+        }
+        return s * d_pow2(k);
+    }
+    // e^y - 1 for |y| <= 0.5
+    static inline double d_expm1_small(double y)
+    {
+        double t = y, s = y;
+        for (int i = 2; i <= 22; i++)
+        {
+            t = t * y / i;
+            s += t;
+        }
+        return s;
+    }
+    // tanh(x) for x >= 0
+    static inline double d_tanh_pos(double x)
+    {
+        if (x >= 20.0)
+            return 1.0;
+        if (x < 0.25)
+        {
+            double e = d_expm1_small(2.0 * x);
+            return e / (e + 2.0);
+        }
+        double E = d_exp(2.0 * x);
+        return 1.0 - 2.0 / (E + 1.0);
+    }
+    // round a double to format t (nearest even)
+    static inline uint64_t d_round_to(double d, uint32_t t, uint32_t pf)
+    {
+        return xfin(xdec_t(d_bits(d), T_F64, false), t, RM_RN, pf, 0, 0, false);
+    }
+    static inline double xf_to_d(XF v)
+    {
+        return d_from_bits(xenc_ieee(xround_t(v, T_F64, RM_RN, 0, 0, false), 53, 11, 64));
+    }
+
+    // tanh.approx: halves correctly rounded; f32 as (e^x - e^-x) / (e^x + e^-x) of correctly rounded
+    // exponentials, each operation rounded (ptx_math.sail)
+    static inline uint64_t f_tanh(uint64_t a, uint32_t t, bool ftz)
+    {
+        XF x = xdec_t(a, t, ftz && t == T_F32);
+        uint32_t pf = (ftz && t == T_F32) ? PF_FTZ : 0;
+        if (x.c == XF_NAN)
+            return canon_nan(t);
+        if (t != T_F32)
+        {
+            if (x.c == XF_INF)
+                return xenc_t(xround_t(xf_fin(x.s, 1, 0), t, RM_RN, 0, 0, false), t);
+            if (x.m == 0)
+                return a;
+            double r = d_tanh_pos(xf_to_d(xf_abs(x)));
+            return d_round_to(x.s ? -r : r, t, 0);
+        }
+        if (x.c == XF_INF || (x.m != 0 && xf_cmp_p2(x, 4) >= 0 && xf_cmp(xf_abs(x), xf_fin(false, 20, 0)) >= 0))
+            return xpost(xround_t(xf_fin(x.s, 1, 0), T_F32, RM_RN, 0, 0, false), T_F32, pf);
+        if (x.m == 0 || xf_cmp_p2(x, -12) < 0)
+            return xpost(x, T_F32, pf);
+        double xd = xf_to_d(x);
+        XF e1 = xdec_t(d_round_to(d_exp(xd), T_F32, 0), T_F32, false);
+        XF e2 = xdec_t(d_round_to(d_exp(-xd), T_F32, 0), T_F32, false);
+        XF num = xround_t(xf_add(e1, xf_neg(e2), RM_RN), T_F32, RM_RN, 0, 0, false);
+        XF den = xround_t(xf_add(e1, e2, RM_RN), T_F32, RM_RN, 0, 0, false);
+        return xfin(xf_div(num, den, 24), T_F32, RM_RN, pf, 0, 0, false);
+    }
+    // ctrl: 4-7 type, 8 packed, 12 .ftz
+    uint16_t FUNC(ftanh_16)(uint16_t a, uint32_t ctrl) { return (uint16_t)f_tanh(a, (ctrl >> 4) & 15, false); }
+    uint32_t FUNC(ftanh_32)(uint32_t a, uint32_t ctrl)
+    {
+        uint32_t t = (ctrl >> 4) & 15;
+        if (ctrl & F_PK)
+            return (uint32_t)f_tanh(a & 0xFFFF, t, false) | ((uint32_t)f_tanh(a >> 16, t, false) << 16);
+        return (uint32_t)f_tanh(a, t, ctrl & F_FTZ);
+    }
+
+    // rcp / rsqrt .approx{.ftz}.f64 (apx64): on a[63:32], result rounded to 1.11.20
+    uint64_t FUNC(fapx64)(uint64_t a, uint32_t isr)
+    {
+        uint64_t hi = 0xFFFFFFFF00000000ull;
+        uint64_t b = flush_bits(a & hi, T_F64);
+        XF x = xdec_t(b, T_F64, false);
+        uint64_t nan = 0x7FFFFFFF00000000ull;
+        if (x.c == XF_NAN)
+            return nan;
+        if (x.c == XF_INF)
+            return (isr && x.s) ? nan : (x.s ? 1ull << 63 : 0);
+        if (x.m == 0)
+            return (x.s ? 1ull << 63 : 0) | 0x7FF0000000000000ull;
+        if (isr && x.s)
+            return nan;
+        double d = d_from_bits(b);
+        double r = isr ? 1.0 / __builtin_sqrt(d) : 1.0 / d;
+        XF v = xdec_t(d_bits(r), T_F64, false);
+        XF q = xround_v(v, 21, -1022, 1023, RM_RN, 0, 0, false);
+        uint64_t e = xenc_ieee(xround_t(q, T_F64, RM_RN, 0, 0, false), 53, 11, 64);
+        return flush_bits(e, T_F64) & hi;
+    }
+
+    // div.approx{.ftz}.f32 (divApprox): the quotient correctly rounded, except for 2^126 < |b|
+    uint32_t FUNC(fdiv_approx_f32)(uint32_t a, uint32_t b, uint32_t ctrl)
+    {
+        bool ftz = ctrl & F_FTZ;
+        XF x = xdec_t(a, T_F32, ftz), y = xdec_t(b, T_F32, false);
+        if (y.c == XF_FIN && y.m != 0 && xf_cmp_p2(y, 126) > 0)
+        {
+            if (x.c != XF_FIN)
+                return 0x7FFFFFFF;
+            return (a ^ b) & 0x80000000u;
+        }
+        return __zluda_ptx_impl_fdivsqrt_f32(a, b, ctrl & ~3u);
+    }
+    // rsqrt.approx{.ftz}.f32: 1 / sqrt(x), two roundings
+    uint32_t FUNC(frsqrt_f32)(uint32_t a, uint32_t ctrl)
+    {
+        bool ftz = ctrl & F_FTZ;
+        XF x = xdec_t(a, T_F32, ftz);
+        XF r = xround_t(xf_sqrt(x, 24), T_F32, RM_RN, 0, 0, false);
+        return (uint32_t)xfin(xf_div(xf_fin(false, 1, 0), r, 24), T_F32, RM_RN, ftz ? PF_FTZ : 0, 0, 0, false);
+    }

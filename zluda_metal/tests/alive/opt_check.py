@@ -53,13 +53,16 @@ def kernels_of(ll):
 PASSES = []  # per-pass results (--per-pass)
 
 
-def alive(a, k, src, tgt):
-    """alive-tv on kernel k: (status, detail, output)"""
+def alive(a, k, src, tgt, unroll=None):
+    """alive-tv on kernel k: (status, detail, output). A source whose every path goes around a loop ("doesn't
+    reach a return instruction" without unrolling) is retried with the loops unrolled 2, then 8 times: a proof
+    then covers the executions within that many iterations (status correct-bounded)."""
+    u = a.unroll if unroll is None else unroll
     cmd = [a.alive_tv, "--smt-to=%d" % (a.timeout * 1000), "--src-fn=" + k, "--tgt-fn=" + k, src, tgt]
     if not a.exact:
         cmd.insert(1, "--fp-uf")
-    if a.unroll:
-        cmd[1:1] = ["--src-unroll=%d" % a.unroll, "--tgt-unroll=%d" % a.unroll]
+    if u:
+        cmd[1:1] = ["--src-unroll=%d" % u, "--tgt-unroll=%d" % u]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=a.timeout * 4 + 60)
         txt = r.stdout + r.stderr
@@ -77,6 +80,15 @@ def alive(a, k, src, tgt):
     if st != "correct":
         m = re.search(r"(ERROR:[^\n]*|Transformation doesn't verify![^\n]*\n[^\n]*)", txt)
         detail = m.group(1) if m else txt[-300:]
+    if st == "unknown" and "doesn't reach a return" in detail and unroll is None and not a.unroll:
+        for n in (2, 8):
+            st2, d2, t2 = alive(a, k, src, tgt, unroll=n)
+            if st2 == "correct":
+                return "correct-bounded", "loops unrolled %d times" % n, t2
+            if st2 == "INCORRECT":
+                return st2, d2, t2
+            if "doesn't reach a return" not in d2:
+                return st2, d2, t2
     return st, detail.strip(), txt
 
 
@@ -121,7 +133,7 @@ def check_per_pass(path, a, lib, t):
                 PASSES.append({"program": path, "kernel": k, "pass": pname, "status": st, "detail": detail[:200]})
                 if a.v:
                     print("  %-9s %s %s %s  %s" % (st, os.path.basename(path), k, pname, detail[:120]), flush=True)
-                rank = {"correct": 0, "error": 1, "unknown": 2, "INCORRECT": 3}
+                rank = {"correct": 0, "correct-bounded": 1, "error": 2, "unknown": 3, "INCORRECT": 4}
                 if rank[st] > rank[worst[k][0]]:
                     worst[k] = (st, pname + ": " + detail)
                 if st == "INCORRECT" and a.keep:
@@ -217,7 +229,7 @@ def main():
         for rs in ex.map(lambda f: check_program(f, a), files):
             for r in rs:
                 res.append(r)
-                if r["status"] != "correct":
+                if r["status"] not in ("correct", "correct-bounded"):
                     print("%-9s %s %s  %s" % (r["status"], os.path.relpath(r["program"]), r["kernel"],
                                              r["detail"].replace("\n", " ")[:200]), flush=True)
     counts = {}

@@ -493,6 +493,18 @@ impl Kernel {
         dynamic_shared: u32,
     ) -> Result<(), String> {
         let r = &self.record;
+        // thread-block clusters (extension 1, agx-cluster-dims): a cluster of C CTAs is one threadgroup, the grid
+        // divided by the cluster dims and the threadgroup's z multiplied by C
+        let (grid, block, dynamic_shared) = match r.cluster {
+            Some(cd) if cd.iter().product::<u32>() > 1 => {
+                if (0..3).any(|d| cd[d] == 0 || grid[d] % cd[d] != 0) {
+                    return Err(format!("grid {:?} is not a multiple of the cluster dims {:?}", grid, cd));
+                }
+                let n: u32 = cd.iter().product();
+                ([0, 1, 2].map(|d| grid[d] / cd[d]), [block[0], block[1], block[2] * n], dynamic_shared * n)
+            }
+            _ => (grid, block, dynamic_shared),
+        };
         let mut u = Uniforms(BTreeMap::new());
         let mut temps = vec![];
         // Metal buffer table: location 0 is ZLUDA's parameter buffer (`[[buffer(0)]]`), the

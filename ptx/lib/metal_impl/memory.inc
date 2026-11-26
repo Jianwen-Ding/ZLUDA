@@ -44,18 +44,18 @@
         uint32_t cphase; // the conditional phase
         uint32_t report; // bit 0: report of the current primary phase, bit 1: of the last completed one
     };
-    static SHARED_SPACE uint32_t mb_words[MB_SLOTS * 8];
-    static SHARED_SPACE uint32_t mb_epoch; // counts mbarrier state changes (progress, for try_wait's time limit)
+    static SHARED_SPACE uint32_t __zluda_cluster_mb_words[MB_SLOTS * 8];
+    static SHARED_SPACE uint32_t __zluda_cluster_mb_epoch; // counts mbarrier state changes (progress, for try_wait's time limit)
 
     static inline uint32_t mb_key(SHARED_SPACE uint64_t *a) { return (uint32_t)(uintptr_t)a + 1u; }
     static inline volatile SHARED_SPACE MbSlot *mb_find(uint32_t key)
     {
         for (int i = 0; i < MB_SLOTS; i++)
-            if (((volatile SHARED_SPACE MbSlot *)&mb_words[8 * i])->key == key)
-                return (volatile SHARED_SPACE MbSlot *)&mb_words[8 * i];
+            if (((volatile SHARED_SPACE MbSlot *)&__zluda_cluster_mb_words[8 * i])->key == key)
+                return (volatile SHARED_SPACE MbSlot *)&__zluda_cluster_mb_words[8 * i];
         return nullptr;
     }
-    static inline void mb_bump() { *(volatile SHARED_SPACE uint32_t *)&mb_epoch = *(volatile SHARED_SPACE uint32_t *)&mb_epoch + 1u; }
+    static inline void mb_bump() { *(volatile SHARED_SPACE uint32_t *)&__zluda_cluster_mb_epoch = *(volatile SHARED_SPACE uint32_t *)&__zluda_cluster_mb_epoch + 1u; }
     // mbCheck: the phase completes when the pending count and the tx-count are both zero
     static inline void mb_check(volatile SHARED_SPACE MbSlot *s)
     {
@@ -173,7 +173,7 @@
         uint32_t rp = 0;
         bool done = mb_done(a, v, ctrl, &rp);
         uint32_t rounds = 0;
-        uint32_t epoch = *(volatile SHARED_SPACE uint32_t *)&mb_epoch;
+        uint32_t epoch = *(volatile SHARED_SPACE uint32_t *)&__zluda_cluster_mb_epoch;
         // test_wait yields once (a later observation is a legal schedule); try_wait until the time limit
         uint32_t limit = (ctrl & 2) ? MB_TIMEOUT_ROUNDS : 1;
         while ((uint32_t)air_simd_ballot(!done) != 0 && rounds < limit)
@@ -181,7 +181,7 @@
             air_wg_barrier(3, 1);
             if (!done)
                 done = mb_done(a, v, ctrl, &rp);
-            uint32_t e = *(volatile SHARED_SPACE uint32_t *)&mb_epoch;
+            uint32_t e = *(volatile SHARED_SPACE uint32_t *)&__zluda_cluster_mb_epoch;
             if (e != epoch && (ctrl & 2))
                 rounds = 0, epoch = e;
             else
@@ -1076,3 +1076,152 @@
     {
         *__zluda_metal_local_sp() = (uint32_t)(a - (uint64_t)(uintptr_t)__zluda_metal_local_stack());
     }
+
+    // ---------------------------------------------------------------- thread-block clusters
+    // the per-CTA copies of the .shared variables (air_lower.cpp resolveCluster): rank r's copy at base + r * stride;
+    // stride 0 without clusters. A .shared::cluster address is the threadgroup address of the target CTA's copy.
+    uint32_t __zluda_metal_cluster_stride();
+    SHARED_SPACE uint8_t *__zluda_metal_cluster_base();
+    uint32_t __zluda_ptx_impl_sreg_cluster_ctarank();
+    uint32_t __zluda_ptx_impl_sreg_cluster_nctarank();
+    static inline uint32_t cl_rank_of(uint32_t a)
+    {
+        uint32_t st = __zluda_metal_cluster_stride();
+        if (!st)
+            return 0;
+        return (a - (uint32_t)(uintptr_t)__zluda_metal_cluster_base()) / st;
+    }
+    // the same offset in CTA r's copy
+    static inline int32_t cl_delta(uint32_t a, uint32_t r)
+    {
+        uint32_t st = __zluda_metal_cluster_stride();
+        if (!st)
+            return 0;
+        return ((int32_t)r - (int32_t)cl_rank_of(a)) * (int32_t)st;
+    }
+    static inline SHARED_SPACE uint8_t *cl_map(SHARED_SPACE uint8_t *p, uint32_t r)
+    {
+        return p + cl_delta((uint32_t)(uintptr_t)p, r);
+    }
+    // mapa: .shared::cluster addresses (32 / 64-bit integers) and generic ones
+    uint32_t FUNC(mapa_c32)(uint32_t a, uint32_t r) { return a + (uint32_t)cl_delta(a, r); }
+    uint64_t FUNC(mapa_c64)(uint64_t a, uint32_t r) { return a + (uint64_t)(int64_t)cl_delta((uint32_t)a, r); }
+    uint64_t FUNC(mapa_g64)(uint64_t a, uint32_t r)
+    {
+        SHARED_SPACE uint8_t *p = (SHARED_SPACE uint8_t *)(uint8_t *)a;
+        return (uint64_t)(uintptr_t)(uint8_t *)cl_map(p, r);
+    }
+    uint32_t FUNC(getctarank_c32)(uint32_t a) { return cl_rank_of(a); }
+    uint32_t FUNC(getctarank_c64)(uint64_t a) { return cl_rank_of((uint32_t)a); }
+    uint32_t FUNC(getctarank_g64)(uint64_t a)
+    {
+        SHARED_SPACE uint8_t *p = (SHARED_SPACE uint8_t *)(uint8_t *)a;
+        return cl_rank_of((uint32_t)(uintptr_t)p);
+    }
+    // barrier.cluster: the cluster is one threadgroup; arrive is part of wait
+    void FUNC(barrier_cluster_wait)() { air_wg_barrier(3, 1); }
+
+    // the ranks of a ctaMask
+    static inline uint32_t cl_mask(uint32_t mk)
+    {
+        uint32_t n = __zluda_ptx_impl_sreg_cluster_nctarank();
+        return n >= 32 ? mk : mk & ((1u << n) - 1);
+    }
+    // mbarrier .multicast::cluster: the operation on the object at the same offset in each CTA of the mask
+    void FUNC(mbar_arrive_mc)(SHARED_SPACE uint64_t *a, uint32_t count, uint32_t tx, uint32_t mask, uint32_t drop)
+    {
+        for (uint32_t m = cl_mask(mask); m; m &= m - 1)
+            __zluda_ptx_impl_mbar_arrive_nd((SHARED_SPACE uint64_t *)cl_map((SHARED_SPACE uint8_t *)a, __builtin_ctz(m)), count, tx, drop);
+    }
+    void FUNC(mbar_tx_mc)(SHARED_SPACE uint64_t *a, uint32_t n, uint32_t mask, uint32_t complete)
+    {
+        for (uint32_t m = cl_mask(mask); m; m &= m - 1)
+            __zluda_ptx_impl_mbar_tx((SHARED_SPACE uint64_t *)cl_map((SHARED_SPACE uint8_t *)a, __builtin_ctz(m)), n, complete);
+    }
+    // cp.async.bulk.shared::cluster.global.multicast::cluster: the copy and the complete-tx in each CTA of the mask
+    void FUNC(bulk_g2s_mc)(SHARED_SPACE uint8_t *d, GLOBAL_SPACE uint8_t *s, uint32_t n, SHARED_SPACE uint64_t *mb, uint32_t mask,
+                           uint32_t ctrl)
+    {
+        for (uint32_t m = cl_mask(mask); m; m &= m - 1)
+        {
+            uint32_t r = __builtin_ctz(m);
+            __zluda_ptx_impl_bulk_g2s(cl_map(d, r), s, n, (SHARED_SPACE uint64_t *)cl_map((SHARED_SPACE uint8_t *)mb, r), ctrl);
+        }
+    }
+    // TMA multicast: ctrl bit 8 .cta_group::2 (the complete-tx goes to the mbarrier of the CTA pair's member of the
+    // mbarrier operand's parity, tmBarLocs of ptx_tma.sail)
+    void FUNC(tma_load_mc)(SHARED_SPACE uint8_t *dst, uint64_t tmap, I32x8 cs, SHARED_SPACE uint64_t *mb, uint32_t mask, uint32_t ctrl)
+    {
+        MEM_SERIAL({
+            Tm t;
+            tm_read(tmap, &t);
+            I32x8 inf = {0, 0, 0, 0, 0, 0, 0, 0};
+            uint32_t par = cl_rank_of((uint32_t)(uintptr_t)mb) % 2;
+            for (uint32_t m = cl_mask(mask); m; m &= m - 1)
+            {
+                uint32_t r = __builtin_ctz(m);
+                uint32_t rb = (ctrl >> 8) & 1 ? r - r % 2 + par : r;
+                tma_load_impl(cl_map(dst, r), &t, cs, (SHARED_SPACE uint64_t *)cl_map((SHARED_SPACE uint8_t *)mb, rb), inf, ctrl & 255);
+            }
+        })
+    }
+    // st.async / red.async: the store (or reduction) into the shared memory of a CTA of the cluster, then a
+    // complete-tx of its bytes on the mbarrier object
+    void FUNC(st_async32)(SHARED_SPACE uint32_t *a, uint32_t v, SHARED_SPACE uint64_t *mb)
+    {
+        MEM_SERIAL({ *(volatile SHARED_SPACE uint32_t *)a = v; })
+        __zluda_ptx_impl_mbar_tx(mb, 4, 1);
+    }
+    void FUNC(st_async64)(SHARED_SPACE uint64_t *a, uint64_t v, SHARED_SPACE uint64_t *mb)
+    {
+        MEM_SERIAL({ *(volatile SHARED_SPACE uint64_t *)a = v; })
+        __zluda_ptx_impl_mbar_tx(mb, 8, 1);
+    }
+    void FUNC(st_async32_g)(uint32_t *a, uint32_t v, uint64_t *mb) { __zluda_ptx_impl_st_async32((SHARED_SPACE uint32_t *)a, v, (SHARED_SPACE uint64_t *)mb); }
+    void FUNC(st_async64_g)(uint64_t *a, uint64_t v, uint64_t *mb) { __zluda_ptx_impl_st_async64((SHARED_SPACE uint64_t *)a, v, (SHARED_SPACE uint64_t *)mb); }
+    void FUNC(red_async32)(SHARED_SPACE uint32_t *a, uint32_t v, SHARED_SPACE uint64_t *mb, uint32_t ctrl)
+    {
+        MEM_SERIAL({
+            volatile SHARED_SPACE uint32_t *p = (volatile SHARED_SPACE uint32_t *)a;
+            *p = (uint32_t)rmw_elem(ctrl, *p, v, 0, 4);
+        })
+        __zluda_ptx_impl_mbar_tx(mb, 4, 1);
+    }
+    void FUNC(red_async64)(SHARED_SPACE uint64_t *a, uint64_t v, SHARED_SPACE uint64_t *mb, uint32_t ctrl)
+    {
+        MEM_SERIAL({
+            volatile SHARED_SPACE uint64_t *p = (volatile SHARED_SPACE uint64_t *)a;
+            *p = rmw_elem(ctrl, *p, v, 0, 8);
+        })
+        __zluda_ptx_impl_mbar_tx(mb, 8, 1);
+    }
+    void FUNC(red_async32_g)(uint32_t *a, uint32_t v, uint64_t *mb, uint32_t c) { __zluda_ptx_impl_red_async32((SHARED_SPACE uint32_t *)a, v, (SHARED_SPACE uint64_t *)mb, c); }
+    void FUNC(red_async64_g)(uint64_t *a, uint64_t v, uint64_t *mb, uint32_t c) { __zluda_ptx_impl_red_async64((SHARED_SPACE uint64_t *)a, v, (SHARED_SPACE uint64_t *)mb, c); }
+    // st.bulk [a], size, 0: zeros
+    void FUNC(st_bulk)(SHARED_SPACE uint8_t *a, uint64_t n)
+    {
+        MEM_SERIAL({
+            for (uint64_t i = 0; i < n; i++)
+                ((volatile SHARED_SPACE uint8_t *)a)[i] = 0;
+        })
+    }
+    void FUNC(st_bulk_g)(uint8_t *a, uint64_t n) { __zluda_ptx_impl_st_bulk((SHARED_SPACE uint8_t *)a, n); }
+    // clusterlaunchcontrol.try_cancel: the failure response (16 zero bytes) and a complete-tx of 16 bytes, in each CTA
+    // with .multicast::cluster::all
+    void FUNC(clc_try_cancel)(SHARED_SPACE uint8_t *a, SHARED_SPACE uint64_t *mb, uint32_t all)
+    {
+        uint32_t mask = all ? 0xFFFFFFFFu : (1u << __zluda_ptx_impl_sreg_cluster_ctarank());
+        for (uint32_t m = cl_mask(mask); m; m &= m - 1)
+        {
+            uint32_t r = __builtin_ctz(m);
+            SHARED_SPACE uint8_t *p = cl_map(a, r);
+            MEM_SERIAL({
+                for (int i = 0; i < 16; i++)
+                    ((volatile SHARED_SPACE uint8_t *)p)[i] = 0;
+            })
+            __zluda_ptx_impl_mbar_tx((SHARED_SPACE uint64_t *)cl_map((SHARED_SPACE uint8_t *)mb, r), 16, 1);
+        }
+    }
+    void FUNC(clc_try_cancel_g)(uint8_t *a, uint64_t *mb, uint32_t all) { __zluda_ptx_impl_clc_try_cancel((SHARED_SPACE uint8_t *)a, (SHARED_SPACE uint64_t *)mb, all); }
+    bool FUNC(mem_false)() { return false; }
+    uint32_t FUNC(mem_zero32)() { return 0; }

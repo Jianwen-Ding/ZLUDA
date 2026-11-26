@@ -786,6 +786,9 @@ fn tuning_directive<'a, 'input>(
         (Token::DotMaxntid, _) => tuple1to3_u32.map(|(nx, ny, nz)| ast::TuningDirective::MaxNtid(nx, ny, nz)),
         (Token::DotReqntid, _) => tuple1to3_u32.map(|(nx, ny, nz)| ast::TuningDirective::ReqNtid(nx, ny, nz)),
         (Token::DotMinnctapersm, _) => u32.map(ast::TuningDirective::MinNCtaPerSm),
+        (Token::DotReqnctapercluster, _) => tuple1to3_u32.map(|(nx, ny, nz)| ast::TuningDirective::ReqNCtaPerCluster(nx, ny, nz)),
+        (Token::DotExplicitcluster, _) => empty.map(|_| ast::TuningDirective::ExplicitCluster),
+        (Token::DotMaxclusterrank, _) => u32.map(ast::TuningDirective::MaxClusterRank),
         (Token::DotNoreturn, _) => empty.map(|_| ast::TuningDirective::NoReturn),
         _ => fail
     }
@@ -2207,6 +2210,12 @@ derive_parser!(
         DotReqntid,
         #[token(".minnctapersm")]
         DotMinnctapersm,
+        #[token(".reqnctapercluster")]
+        DotReqnctapercluster,
+        #[token(".explicitcluster")]
+        DotExplicitcluster,
+        #[token(".maxclusterrank")]
+        DotMaxclusterrank,
         #[token(".entry")]
         DotEntry,
         #[token(".func")]

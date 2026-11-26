@@ -36,7 +36,41 @@ fn mbarrier<'i>(m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
     let sp = shared_or_generic(m);
     let sfx = suffix(sp);
     if m.iter().any(|x| x.starts_with("multicast")) {
-        return err("mbarrier .multicast::cluster needs thread-block clusters");
+        // the operation on the object at the same offset in each CTA of ctaMask (the last operand)
+        let w32 = has(m, "multicast::cluster::32b");
+        let mask_of = |o: &HOp<'i>| o.op.clone();
+        let _ = w32;
+        if has(m, "arrive") || has(m, "arrive_drop") {
+            if ops.len() < 3 {
+                return err("mbarrier multicast operands");
+            }
+            let Some(a) = addr(&ops[1]) else { return err("mbarrier multicast address") };
+            let mask = mask_of(ops.last().unwrap());
+            let args = &ops[2..ops.len() - 1];
+            let (count, tx) = if has(m, "expect_tx") {
+                (imm(1), args.first().map(|x| x.op.clone()).unwrap_or(imm(0)))
+            } else {
+                (args.first().map(|x| x.op.clone()).unwrap_or(imm(1)), imm(0))
+            };
+            return Call::new("mbar_arrive_mc")
+                .src_space(a, ScalarType::B64, StateSpace::Shared)
+                .src(count, ScalarType::U32)
+                .src(tx, ScalarType::U32)
+                .src(mask, ScalarType::B32)
+                .imm(has(m, "arrive_drop") as u64)
+                .build();
+        }
+        if has(m, "expect_tx") || has(m, "complete_tx") {
+            let [a, n, mk] = ops else { return err("mbarrier multicast tx operands") };
+            let Some(a) = addr(a) else { return err("mbarrier multicast address") };
+            return Call::new("mbar_tx_mc")
+                .src_space(a, ScalarType::B64, StateSpace::Shared)
+                .src(n.op.clone(), ScalarType::U32)
+                .src(mk.op.clone(), ScalarType::B32)
+                .imm(has(m, "complete_tx") as u64)
+                .build();
+        }
+        return err("mbarrier multicast form");
     }
     if has(m, "init") {
         let [a, n] = ops else { return err("mbarrier.init operands") };
@@ -249,8 +283,24 @@ fn tensor<'i>(m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
     if has(m, "prefetch") {
         return Call::new("mem_nop").build();
     }
-    if m.iter().any(|x| x.starts_with("multicast") || x.starts_with("cta_group")) {
-        return err("cp.async.bulk.tensor .multicast::cluster / .cta_group need thread-block clusters");
+    if m.iter().any(|x| x.starts_with("multicast")) {
+        // [dst], [tmap, {coords}], [mbar], ctaMask{, cache-policy}: tile mode
+        if ops.len() < 4 || !ops[0].addr || !ops[1].addr || !ops[2].addr {
+            return err("cp.async.bulk.tensor multicast operands");
+        }
+        if m.iter().any(|x| x.starts_with("im2col") || x.starts_with("tile::gather4")) {
+            return err("cp.async.bulk.tensor multicast im2col / gather4");
+        }
+        let [cs] = &ops[1].items[..] else { return err("cp.async.bulk.tensor coordinates") };
+        let mask = if has(m, "multicast::cluster::32b") { ops[3].op.clone() } else { ops[3].op.clone() };
+        return Call::new("tma_load_mc")
+            .src_space(ops[0].op.clone(), ScalarType::B8, StateSpace::Shared)
+            .src(ops[1].op.clone(), ScalarType::U64)
+            .src_vec(cs.clone(), 8, ScalarType::S32)
+            .src_space(ops[2].op.clone(), ScalarType::B64, StateSpace::Shared)
+            .src(mask, if has(m, "multicast::cluster::32b") { ScalarType::B32 } else { ScalarType::B16 })
+            .imm((report_code(m) << 4) | ((has(m, "cta_group::2") as u64) << 8))
+            .build();
     }
     if has(m, "override::global_dim") || has(m, "override::global_dim_stride") {
         // [dst], [tmap, gaddr, {dims}, {lower strides}, upper, {coords}], [mbar]: coordinates, dims and strides go in
@@ -375,7 +425,18 @@ fn bulk<'i>(m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
         return Call::new("mem_nop").build();
     }
     if m.iter().any(|x| x.starts_with("multicast")) {
-        return err("cp.async.bulk .multicast::cluster needs thread-block clusters");
+        // [dst], [src], size, [mbar], ctaMask
+        if ops.len() < 5 || !ops[0].addr || !ops[1].addr || !ops[3].addr {
+            return err("cp.async.bulk multicast operands");
+        }
+        return Call::new("bulk_g2s_mc")
+            .src_space(ops[0].op.clone(), ScalarType::B8, StateSpace::Shared)
+            .src_space(ops[1].op.clone(), ScalarType::B8, StateSpace::Global)
+            .src(ops[2].op.clone(), ScalarType::U32)
+            .src_space(ops[3].op.clone(), ScalarType::B64, StateSpace::Shared)
+            .src(ops[4].op.clone(), if has(m, "multicast::cluster::32b") { ScalarType::B32 } else { ScalarType::B16 })
+            .imm(report_code(m) << 12)
+            .build();
     }
     if ops.len() < 3 || !ops[0].addr || !ops[1].addr {
         return err("cp.async.bulk operands");
@@ -506,7 +567,20 @@ fn atom_type(t: &str) -> Option<(u64, u64)> {
 fn atom_red<'i>(base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
     let red = base == "red";
     if red && has(m, "async") {
-        return err("red.async needs thread-block clusters");
+        // red.async{.sem}{.scope}{.ss}.completion.op.type [a], b, [mbar]
+        let ops_ = ["add", "min", "max", "inc", "dec", "and", "or", "xor"];
+        let op = ops_.iter().position(|o| m.contains(o))? as u64 + 1;
+        let (code, size) = m.iter().rev().find_map(|x| atom_type(x))?;
+        let [a, b, mb] = ops else { return err("red.async operands") };
+        let (Some(a), Some(mb)) = (addr(a), addr(mb)) else { return err("red.async address") };
+        let sp = shared_or_generic(m);
+        let bits = if size == 8 { ScalarType::B64 } else { ScalarType::B32 };
+        return Call::new(format!("red_async{}{}", size * 8, suffix(sp)))
+            .src_space(a, bits, sp)
+            .src(b.op.clone(), bits)
+            .src_space(mb, ScalarType::B64, sp)
+            .imm(op | (code << 4))
+            .build();
     }
     let ops_ = ["add", "min", "max", "inc", "dec", "and", "or", "xor", "exch", "cas"];
     let op = ops_.iter().position(|o| m.contains(o))? as u64 + 1;
@@ -629,6 +703,78 @@ pub(super) fn lower<'i>(opcode: &str, base: &str, m: &[&str], ops: &[HOp<'i>]) -
             let [a] = ops else { return err("stackrestore operands") };
             Call::new("stackrestore_u64").src(a.op.clone(), ScalarType::U64).build()
         }
+        // mapa{.shared::cluster}.type d, a, rank;  getctarank{.shared::cluster}.type d, a
+        "mapa" => {
+            let [d, a, r] = ops else { return err("mapa operands") };
+            let (name, t) = match (has(m, "shared::cluster"), has(m, "u64")) {
+                (true, false) => ("mapa_c32", ScalarType::U32),
+                (true, true) => ("mapa_c64", ScalarType::U64),
+                (false, true) => ("mapa_g64", ScalarType::U64),
+                (false, false) => return err("mapa.u32 generic"),
+            };
+            Call::new(name).dst(d.op.clone(), t).src(a.op.clone(), t).src(r.op.clone(), ScalarType::U32).build()
+        }
+        "getctarank" => {
+            let [d, a] = ops else { return err("getctarank operands") };
+            let (name, t) = match (has(m, "shared::cluster"), has(m, "u64")) {
+                (true, false) => ("getctarank_c32", ScalarType::U32),
+                (true, true) => ("getctarank_c64", ScalarType::U64),
+                (false, true) => ("getctarank_g64", ScalarType::U64),
+                (false, false) => return err("getctarank.u32 generic"),
+            };
+            Call::new(name).dst(d.op.clone(), ScalarType::U32).src(a.op.clone(), t).build()
+        }
+        // barrier.cluster.arrive / .wait{.acquire}{.aligned}
+        "barrier" if m.first() == Some(&"cluster") && ops.is_empty() => {
+            if has(m, "wait") {
+                Call::new("barrier_cluster_wait").build()
+            } else {
+                Call::new("mem_nop").build()
+            }
+        }
+        // st.async{.sem}{.scope}{.ss}.completion{.vec}.type [a], b, [mbar]
+        "st" if has(m, "async") => {
+            let [a, b, mb] = ops else { return err("st.async operands") };
+            let (Some(a), Some(mb)) = (addr(a), addr(mb)) else { return err("st.async address") };
+            if m.iter().any(|x| x.starts_with('v') && x[1..].parse::<u32>().is_ok()) {
+                return err("st.async vector");
+            }
+            let size = m.iter().rev().find_map(|x| atom_type(x)).map(|x| x.1).unwrap_or(4);
+            let sp = shared_or_generic(m);
+            let bits = if size == 8 { ScalarType::B64 } else { ScalarType::B32 };
+            Call::new(format!("st_async{}{}", size * 8, suffix(sp)))
+                .src_space(a, bits, sp)
+                .src(b.op.clone(), bits)
+                .src_space(mb, ScalarType::B64, sp)
+                .build()
+        }
+        // st.bulk{.weak}{.shared::cta} [a], size, initval
+        "st" if has(m, "bulk") => {
+            let [a, n, ..] = ops else { return err("st.bulk operands") };
+            let Some(a) = addr(a) else { return err("st.bulk address") };
+            let sp = shared_or_generic(m);
+            Call::new(format!("st_bulk{}", suffix(sp))).src_space(a, ScalarType::B8, sp).src(n.op.clone(), ScalarType::U64).build()
+        }
+        "clusterlaunchcontrol" => {
+            if has(m, "try_cancel") {
+                let [a, mb] = ops else { return err("clusterlaunchcontrol.try_cancel operands") };
+                let (Some(a), Some(mb)) = (addr(a), addr(mb)) else { return err("clusterlaunchcontrol address") };
+                let sp = shared_or_generic(m);
+                return Call::new(format!("clc_try_cancel{}", suffix(sp)))
+                    .src_space(a, ScalarType::B8, sp)
+                    .src_space(mb, ScalarType::B64, sp)
+                    .imm(has(m, "multicast::cluster::all") as u64)
+                    .build();
+            }
+            // query_cancel: the response is always the failure response (0)
+            let Some(d) = ops.first() else { return err("clusterlaunchcontrol.query_cancel operands") };
+            let t = if has(m, "pred") { ScalarType::Pred } else { ScalarType::B32 };
+            if let ast::ParsedOperand::VecPack(_) = d.op {
+                return err("clusterlaunchcontrol.query_cancel vector");
+            }
+            Call::new(if t == ScalarType::Pred { "mem_false" } else { "mem_zero32" }).dst(d.op.clone(), t).build()
+        }
+        "griddepcontrol" | "setmaxnreg" => Call::new("mem_nop").build(),
         "ldu" => {
             let [d, a] = ops else { return err("ldu operands") };
             let Some(a) = addr(a) else { return err("ldu address") };

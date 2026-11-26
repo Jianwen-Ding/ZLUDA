@@ -394,6 +394,14 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                     let value = format!("{ctas},1024");
                     self.emit_fn_attribute_string(fn_, "amdgpu-waves-per-eu", &value);
                 }
+                ptx_parser::TuningDirective::ReqNCtaPerCluster(x, y, z) => {
+                    let value = format!("{x},{y},{z}");
+                    self.emit_fn_attribute_string(fn_, "zluda-cluster-dims", &value);
+                }
+                ptx_parser::TuningDirective::ExplicitCluster => {
+                    self.emit_fn_attribute_string(fn_, "zluda-explicit-cluster", "1");
+                }
+                ptx_parser::TuningDirective::MaxClusterRank(_) => {}
             }
         }
     }

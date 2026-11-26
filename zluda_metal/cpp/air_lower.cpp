@@ -201,6 +201,166 @@ void runCleanup(Module &m, bool inlineAll, bool inferAddressSpaces)
 // integer that is (ptrtoint P) + offsets, possibly through phi/select, is
 // rewritten as a GEP chain on P.
 // ---------------------------------------------------------------------------
+// Thread-block clusters (.reqnctapercluster, function attribute "zluda-cluster-dims" of the translator): a cluster of
+// C CTAs runs as one AGX threadgroup ("agx-cluster-dims", llvm/docs/AGXUsage.rst: the launch divides the grid by the
+// cluster dims and multiplies the threadgroup's z by C). The special registers of the helper library derive from
+// the placeholders __zluda_metal_cluster_dim(d) / __zluda_metal_explicit_cluster(), resolved here per kernel; each CTA
+// gets its own copy of the kernel's .shared variables: they are laid out in one block of `stride` bytes, repeated C
+// times (__zluda_cta_shared), and CTA `rank` uses the copy at rank * stride (rank = tid.z / (ntid.z / C), the
+// threadgroup's z). mapa / getctarank use __zluda_metal_cluster_base() / __zluda_metal_cluster_stride(). Variables of
+// the helper library named __zluda_cluster_* stay shared by the cluster.
+static void clusterDimsOf(Function &f, unsigned d[3], bool *expl)
+{
+    d[0] = d[1] = d[2] = 1;
+    *expl = f.hasFnAttribute("zluda-explicit-cluster");
+    Attribute a = f.getFnAttribute("zluda-cluster-dims");
+    if (!a.isValid())
+        return;
+    SmallVector<StringRef, 3> parts;
+    a.getValueAsString().split(parts, ',');
+    for (unsigned i = 0; i < 3 && i < parts.size(); i++)
+        parts[i].trim().getAsInteger(10, d[i]);
+    *expl = true;
+}
+
+static void resolveCluster(Module &m)
+{
+    LLVMContext &c = m.getContext();
+    Type *i32 = Type::getInt32Ty(c);
+    // the cluster of each function (after inlining, the kernels)
+    auto dimsOf = [&](Function *f, unsigned d[3], bool *e) { clusterDimsOf(*f, d, e); };
+    // per-CTA .shared variables of the kernels with clusters of more than one CTA
+    std::vector<GlobalVariable *> vars;
+    unsigned cd[3] = {1, 1, 1};
+    bool expl = false;
+    Function *kernel = nullptr;
+    for (Function &f : m)
+        if (!f.isDeclaration() && f.hasFnAttribute("zluda-cluster-dims"))
+        {
+            unsigned d[3];
+            bool e;
+            dimsOf(&f, d, &e);
+            if (d[0] * d[1] * d[2] > 1 && !kernel)
+            {
+                kernel = &f;
+                cd[0] = d[0], cd[1] = d[1], cd[2] = d[2];
+                expl = e;
+            }
+        }
+    unsigned C = cd[0] * cd[1] * cd[2];
+    GlobalVariable *block = nullptr;
+    uint64_t stride = 0;
+    if (kernel)
+    {
+        const DataLayout &dl = m.getDataLayout();
+        for (GlobalVariable &gv : m.globals())
+        {
+            if (gv.getAddressSpace() != amd::Shared || gv.getName().contains("__zluda_cluster_") || gv.use_empty())
+                continue;
+            if (auto *at = dyn_cast<ArrayType>(gv.getValueType()); at && at->getNumElements() == 0)
+                continue; // dynamic shared memory: not per CTA (not supported with clusters)
+            vars.push_back(&gv);
+        }
+        uint64_t off = 0, maxAlign = 16;
+        std::vector<uint64_t> offs;
+        for (GlobalVariable *gv : vars)
+        {
+            uint64_t al = std::max<uint64_t>(gv->getAlign() ? gv->getAlign()->value() : 1,
+                                             dl.getABITypeAlign(gv->getValueType()).value());
+            maxAlign = std::max(maxAlign, al);
+            off = alignTo(off, al);
+            offs.push_back(off);
+            off += dl.getTypeAllocSize(gv->getValueType());
+        }
+        stride = alignTo(std::max<uint64_t>(off, 1), maxAlign);
+        ArrayType *bt = ArrayType::get(Type::getInt8Ty(c), stride * C);
+        block = new GlobalVariable(m, bt, false, GlobalValue::InternalLinkage, UndefValue::get(bt), "__zluda_cta_shared",
+                                   nullptr, GlobalValue::NotThreadLocal, amd::Shared);
+        block->setAlignment(Align(maxAlign));
+        FunctionCallee tpos = m.getOrInsertFunction("__zluda_metal_thread_position_in_threadgroup", i32, i32);
+        FunctionCallee tptg = m.getOrInsertFunction("__zluda_metal_threads_per_threadgroup", i32, i32);
+        std::map<Function *, Value *> rankOf;
+        auto rank = [&](Function *f) -> Value * {
+            auto it = rankOf.find(f);
+            if (it != rankOf.end())
+                return it->second;
+            IRBuilder<> b(&*f->getEntryBlock().getFirstInsertionPt());
+            Value *tz = b.CreateCall(tpos, {b.getInt32(2)});
+            Value *nz = b.CreateUDiv(b.CreateCall(tptg, {b.getInt32(2)}), b.getInt32(C));
+            Value *r = b.CreateUDiv(tz, nz, "cta.rank");
+            rankOf[f] = r;
+            return r;
+        };
+        for (size_t k = 0; k < vars.size(); k++)
+        {
+            GlobalVariable *gv = vars[k];
+            convertUsersOfConstantsToInstructions({gv});
+            std::vector<Use *> uses;
+            for (Use &u : gv->uses())
+                uses.push_back(&u);
+            for (Use *u : uses)
+            {
+                auto *i = dyn_cast<Instruction>(u->getUser());
+                if (!i)
+                    continue;
+                Function *f = i->getFunction();
+                Value *r = rank(f);
+                IRBuilder<> b(cast<Instruction>(r)->getNextNode());
+                Value *o = b.CreateAdd(b.CreateMul(b.CreateZExt(r, b.getInt64Ty()), b.getInt64(stride)), b.getInt64(offs[k]));
+                Value *p = b.CreateGEP(b.getInt8Ty(), block, o);
+                if (p->getType() != gv->getType())
+                    p = b.CreateAddrSpaceCast(p, gv->getType());
+                u->set(p);
+            }
+        }
+        for (GlobalVariable *gv : vars)
+            if (gv->use_empty())
+                gv->eraseFromParent();
+    }
+    // placeholders
+    for (const char *name : {"__zluda_metal_cluster_dim", "__zluda_metal_explicit_cluster", "__zluda_metal_cluster_stride",
+                             "__zluda_metal_cluster_base"})
+    {
+        Function *ph = m.getFunction(name);
+        if (!ph)
+            continue;
+        std::vector<CallInst *> calls;
+        for (User *u : ph->users())
+            if (auto *ci = dyn_cast<CallInst>(u))
+                calls.push_back(ci);
+        for (CallInst *ci : calls)
+        {
+            unsigned d[3];
+            bool e;
+            dimsOf(ci->getFunction(), d, &e);
+            bool mine = ci->getFunction() == kernel;
+            Value *v;
+            std::string n = name;
+            if (n == "__zluda_metal_cluster_dim")
+            {
+                auto *k = dyn_cast<ConstantInt>(ci->getArgOperand(0));
+                unsigned dim = k ? (unsigned)k->getZExtValue() : 0;
+                v = ConstantInt::get(ci->getType(), dim < 3 ? d[dim] : 1);
+            }
+            else if (n == "__zluda_metal_explicit_cluster")
+                v = ConstantInt::get(ci->getType(), e ? 1 : 0);
+            else if (n == "__zluda_metal_cluster_stride")
+                v = ConstantInt::get(ci->getType(), mine ? stride : 0);
+            else
+                v = mine && block ? (Value *)ConstantExpr::getPointerCast(block, ci->getType())
+                                  : (Value *)Constant::getNullValue(ci->getType());
+            ci->replaceAllUsesWith(v);
+            ci->eraseFromParent();
+        }
+    }
+    if (kernel)
+    {
+        std::string v = std::to_string(cd[0]) + "," + std::to_string(cd[1]) + "," + std::to_string(cd[2]);
+        kernel->addFnAttr("zluda-cluster-dims-agx", v);
+    }
+    (void)expl;
+}
+
 // alloca / stacksave / stackrestore (ptx/lib/metal_impl/memory.inc): a per-thread stack, an entry-block alloca of
 // each kernel, and its stack offset (the stack grows down from its end)
 static void resolveLocalStack(Module &m)
@@ -1659,6 +1819,8 @@ KernelInfo buildKernelWrapper(Module &m, Function *body, const DeviceGlobals &gl
                                    GlobalValue::ExternalLinkage, info.name, &m);
     w->addFnAttr(Attribute::NoUnwind);
     w->addFnAttr("frame-pointer", "none");
+    if (body->hasFnAttribute("zluda-cluster-dims-agx"))
+        w->addFnAttr("agx-cluster-dims", body->getFnAttribute("zluda-cluster-dims-agx").getValueAsString());
     w->addParamAttr(0, Attribute::NoUndef);
     const char *argNames[] = {"zluda_params", "tid", "ctaid", "ntid", "nctaid", "laneid", "zluda_dynamic_shared"};
     for (unsigned i = 0; i < w->arg_size(); i++)
@@ -1800,7 +1962,8 @@ void stripTargetAttributes(Module &m)
         AttributeList al = f.getAttributes();
         AttrBuilder ab(m.getContext(), al.getFnAttrs());
         for (const Attribute &a : al.getFnAttrs())
-            if (a.isStringAttribute() && !(g_portable_air && a.getKindAsString().starts_with("denormal-fp-math")))
+            if (a.isStringAttribute() && !(g_portable_air && a.getKindAsString().starts_with("denormal-fp-math")) &&
+                a.getKindAsString() != "agx-cluster-dims")
                 ab.removeAttribute(a.getKindAsString());
         ab.removeAttribute(Attribute::StrictFP);
         f.setAttributes(al.removeFnAttributes(m.getContext()).addFnAttributes(m.getContext(), ab));
@@ -2165,6 +2328,8 @@ void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals
         gv.setVisibility(GlobalValue::DefaultVisibility);
     }
     runCleanup(m, true, true);
+    resolveCluster(m);
+    runCleanup(m, false, true);
     for (int iter = 0; iter < 4; iter++)
     {
         // address arithmetic folded into constant expressions (ptrtoint (addrspacecast @shared)

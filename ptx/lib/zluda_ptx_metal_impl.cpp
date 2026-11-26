@@ -59,10 +59,51 @@ extern "C"
     // ---------------------------------------------------------------------
     // Special registers
     // ---------------------------------------------------------------------
-    uint32_t FUNC(sreg_tid)(uint8_t member) { return __zluda_metal_thread_position_in_threadgroup(member); }
-    uint32_t FUNC(sreg_ntid)(uint8_t member) { return __zluda_metal_threads_per_threadgroup(member); }
-    uint32_t FUNC(sreg_ctaid)(uint8_t member) { return __zluda_metal_threadgroup_position_in_grid(member); }
-    uint32_t FUNC(sreg_nctaid)(uint8_t member) { return __zluda_metal_threadgroups_per_grid(member); }
+    // Thread-block clusters: a cluster of C CTAs is one threadgroup whose z is C times the CTA's (the AIR lowering's
+    // resolveCluster resolves __zluda_metal_cluster_dim to the kernel's .reqnctapercluster, 1 without)
+    uint32_t __zluda_metal_cluster_dim(uint32_t dim);
+    uint32_t __zluda_metal_explicit_cluster();
+    static inline uint32_t cluster_size()
+    {
+        return __zluda_metal_cluster_dim(0) * __zluda_metal_cluster_dim(1) * __zluda_metal_cluster_dim(2);
+    }
+    static inline uint32_t cta_ntid_z() { return __zluda_metal_threads_per_threadgroup(2) / cluster_size(); }
+    static inline uint32_t cluster_rank() { return __zluda_metal_thread_position_in_threadgroup(2) / cta_ntid_z(); }
+    // the CTA's position in its cluster along dim
+    static inline uint32_t cluster_cta(uint32_t dim)
+    {
+        uint32_t r = cluster_rank();
+        uint32_t x = __zluda_metal_cluster_dim(0), y = __zluda_metal_cluster_dim(1);
+        return dim == 0 ? r % x : dim == 1 ? (r / x) % y : dim == 2 ? r / (x * y) : 0;
+    }
+    uint32_t FUNC(sreg_tid)(uint8_t member)
+    {
+        uint32_t t = __zluda_metal_thread_position_in_threadgroup(member);
+        return member == 2 ? t % cta_ntid_z() : t;
+    }
+    uint32_t FUNC(sreg_ntid)(uint8_t member)
+    {
+        return member == 2 ? cta_ntid_z() : __zluda_metal_threads_per_threadgroup(member);
+    }
+    uint32_t FUNC(sreg_ctaid)(uint8_t member)
+    {
+        if (member > 2)
+            return __zluda_metal_threadgroup_position_in_grid(member);
+        return __zluda_metal_threadgroup_position_in_grid(member) * __zluda_metal_cluster_dim(member) + cluster_cta(member);
+    }
+    uint32_t FUNC(sreg_nctaid)(uint8_t member)
+    {
+        if (member > 2)
+            return __zluda_metal_threadgroups_per_grid(member);
+        return __zluda_metal_threadgroups_per_grid(member) * __zluda_metal_cluster_dim(member);
+    }
+    uint32_t FUNC(sreg_cluster_ctarank)() { return cluster_rank(); }
+    uint32_t FUNC(sreg_cluster_nctarank)() { return cluster_size(); }
+    uint32_t FUNC(sreg_clusterid)(uint8_t member) { return member > 2 ? 0 : __zluda_metal_threadgroup_position_in_grid(member); }
+    uint32_t FUNC(sreg_nclusterid)(uint8_t member) { return member > 2 ? 1 : __zluda_metal_threadgroups_per_grid(member); }
+    uint32_t FUNC(sreg_cluster_ctaid)(uint8_t member) { return cluster_cta(member); }
+    uint32_t FUNC(sreg_cluster_nctaid)(uint8_t member) { return member > 2 ? 1 : __zluda_metal_cluster_dim(member); }
+    bool FUNC(sreg_is_explicit_cluster)() { return __zluda_metal_explicit_cluster() != 0; }
     uint32_t FUNC(sreg_laneid)() { return __zluda_metal_thread_index_in_simdgroup(); }
     uint32_t FUNC(sreg_lanemask_le)() { return (2U << __zluda_ptx_impl_sreg_laneid()) - 1U; }
     uint32_t FUNC(sreg_lanemask_lt)() { return (1U << __zluda_ptx_impl_sreg_laneid()) - 1U; }

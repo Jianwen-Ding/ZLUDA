@@ -2320,6 +2320,13 @@ extern "C" int zluda_air_lower(const ZludaAirInput *input, ZludaAirOutput *outpu
         std::unique_ptr<Module> main = parse(ctx, input->main_bc, input->main_len, "main");
         if (getenv("ZLUDA_AIR_DEBUG_INPUT"))
             main->print(errs(), nullptr);
+        // PTX registers are allocas of the translator; the formal model reads an unwritten register as 0
+        for (Function &f : *main)
+            if (!f.isDeclaration())
+                for (Instruction &i : f.getEntryBlock())
+                    if (auto *ai = dyn_cast<AllocaInst>(&i))
+                        if (ai->isStaticAlloca() && ai->getAllocatedType()->isSingleValueType() && ai->getNextNode())
+                            new StoreInst(Constant::getNullValue(ai->getAllocatedType()), ai, ai->getNextNode());
         if (input->attributes_bc)
         {
             auto attrs = parse(ctx, input->attributes_bc, input->attributes_len, "attributes");

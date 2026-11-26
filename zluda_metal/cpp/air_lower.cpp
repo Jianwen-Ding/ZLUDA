@@ -277,6 +277,8 @@ static void resolveCluster(Module &m)
         block = new GlobalVariable(m, bt, false, GlobalValue::InternalLinkage, UndefValue::get(bt), "__zluda_cta_shared",
                                    nullptr, GlobalValue::NotThreadLocal, amd::Shared);
         block->setAlignment(Align(maxAlign));
+        block->setMetadata("zluda.cluster", MDNode::get(c, {ConstantAsMetadata::get(ConstantInt::get(i32, stride)),
+                                                           ConstantAsMetadata::get(ConstantInt::get(i32, C))}));
         FunctionCallee tpos = m.getOrInsertFunction("__zluda_metal_thread_position_in_threadgroup", i32, i32);
         FunctionCallee tptg = m.getOrInsertFunction("__zluda_metal_threads_per_threadgroup", i32, i32);
         std::map<Function *, Value *> rankOf;
@@ -434,7 +436,50 @@ static void resolveIsSpacep(Module &m)
         uint64_t kind = cast<ConstantInt>(ci->getArgOperand(1))->getZExtValue();
         bool r = kind == 5 ? space == 1 : (uint64_t)space == kind;
         Value *arg = ci->getArgOperand(0);
-        ci->replaceAllUsesWith(ConstantInt::get(ci->getType(), r));
+        GlobalVariable *block = m.getGlobalVariable("__zluda_cta_shared", true);
+        MDNode *md = block ? block->getMetadata("zluda.cluster") : nullptr;
+        Value *repl = ConstantInt::get(ci->getType(), r);
+        if (md && space == 1 && (kind == 1 || kind == 5))
+        {
+            // with clusters, the CTA of a shared address is decided at run time: rebuild the address as a
+            // threadgroup pointer (the GEPs above the object) and compare its offset in the cluster's copies
+            uint64_t stride = mdconst::extract<ConstantInt>(md->getOperand(0))->getZExtValue();
+            uint64_t n = mdconst::extract<ConstantInt>(md->getOperand(1))->getZExtValue();
+            SmallVector<GEPOperator *, 4> geps;
+            Value *q = arg;
+            for (int guard = 0; guard < 64; guard++)
+            {
+                if (auto *o = dyn_cast<Operator>(q); o && (o->getOpcode() == Instruction::AddrSpaceCast || o->getOpcode() == Instruction::BitCast))
+                    q = o->getOperand(0);
+                else if (auto *g = dyn_cast<GEPOperator>(q))
+                {
+                    geps.push_back(g);
+                    q = g->getPointerOperand();
+                }
+                else
+                    break;
+            }
+            IRBuilder<> b(ci);
+            Value *sp = q;
+            for (auto it = geps.rbegin(); it != geps.rend(); ++it)
+            {
+                SmallVector<Value *, 4> idx((*it)->idx_begin(), (*it)->idx_end());
+                sp = b.CreateGEP((*it)->getSourceElementType(), sp, idx);
+            }
+            Value *off = b.CreateSub(b.CreatePtrToInt(sp, b.getInt32Ty()), b.CreatePtrToInt(block, b.getInt32Ty()));
+            Value *in = b.CreateICmpULT(off, b.getInt32(stride * n));
+            if (kind == 1)
+            {
+                Type *i32 = b.getInt32Ty();
+                FunctionCallee tpos = m.getOrInsertFunction("__zluda_metal_thread_position_in_threadgroup", i32, i32);
+                FunctionCallee tptg = m.getOrInsertFunction("__zluda_metal_threads_per_threadgroup", i32, i32);
+                Value *self = b.CreateUDiv(b.CreateCall(tpos, {b.getInt32(2)}),
+                                           b.CreateUDiv(b.CreateCall(tptg, {b.getInt32(2)}), b.getInt32(n)));
+                in = b.CreateAnd(in, b.CreateICmpEQ(b.CreateUDiv(off, b.getInt32(stride)), self));
+            }
+            repl = b.CreateZExt(in, ci->getType());
+        }
+        ci->replaceAllUsesWith(repl);
         ci->eraseFromParent();
         if (auto *i = dyn_cast<Instruction>(arg))
             RecursivelyDeleteTriviallyDeadInstructions(i);

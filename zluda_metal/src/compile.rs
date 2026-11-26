@@ -41,8 +41,20 @@ pub struct DeviceGlobal {
     pub size: u64,
 }
 
+/// `.address_size 32` modules (ptx's convert_32bit_to_64bit pass): every kernel takes, after
+/// its own parameters, a 64-bit base and a 32-bit pseudo-pointer per module variable; 32-bit
+/// addresses are offsets from the base.
+#[derive(Clone, Debug, Default)]
+pub struct Module32 {
+    /// kernel name -> number of its source (explicit) parameters
+    pub explicit_params: std::collections::HashMap<String, usize>,
+    /// module variables: (name, initial bytes, alignment), in hidden-argument order
+    pub globals: Vec<(String, Vec<u8>, u32)>,
+}
+
 #[derive(Clone, Debug)]
 pub struct CompiledModule {
+    pub module32: Option<Module32>,
     pub kernels: Vec<Kernel>,
     pub globals: Vec<DeviceGlobal>,
     /// Initial contents of the device-globals buffer
@@ -83,7 +95,20 @@ pub fn compile_ptx(ptx: &str, opts: Options) -> Result<CompiledModule, String> {
     let attributes_bc = module.attributes_ir.write_bitcode_to_memory();
     let lowered = lower_to_air(&main_bc, &attributes_bc, opts.keep_text, opts.portable_air)?;
     let metallib = write_metallib(&lowered.kernels)?;
+    let module32 = module.metadata32.as_ref().map(|m| Module32 {
+        explicit_params: m
+            .explicit_args_size_align
+            .iter()
+            .map(|(k, a)| (k.clone(), a.len()))
+            .collect(),
+        globals: m
+            .globals
+            .iter()
+            .map(|g| (g.name.clone(), g.initializer.clone(), g.align))
+            .collect(),
+    });
     Ok(CompiledModule {
+        module32,
         kernels: lowered.kernels,
         globals: lowered.globals,
         globals_init: lowered.globals_init,

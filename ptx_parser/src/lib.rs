@@ -1153,8 +1153,18 @@ fn multi_variable<'a, 'input: 'a>(
                         count,
                     });
                 } else {
-                    let array_dimensions = opt(array_dimensions).parse_next(stream)?;
+                    let mut array_dimensions = opt(array_dimensions).parse_next(stream)?;
                     let initializer = match state_space {
+                        StateSpace::Global | StateSpace::Const
+                            if matches!(stream.input.first(), Some((Token::Eq, _))) =>
+                        {
+                            let mut dims = array_dimensions.clone().unwrap_or_default();
+                            let init = shaped_initializer(stream, type_, vector, &mut dims)?;
+                            if array_dimensions.is_some() {
+                                array_dimensions = Some(dims);
+                            }
+                            init
+                        }
                         StateSpace::Global | StateSpace::Const => match array_dimensions {
                             Some(ref dimensions) => {
                                 array_initializer(type_, vector, dimensions).parse_next(stream)?
@@ -1239,6 +1249,108 @@ fn array_initializer<'b, 'a: 'b, 'input: 'a>(
         })
         .map(pad_with_zeros),
     )
+}
+
+/// An initializer `= { ... }` shaped by the array dimensions (and the vector width, as the
+/// innermost dimension): nested braces each fill one sub-array, padded with zeros, values
+/// without braces fill the elements in order (C's brace elision), and an unsized first
+/// dimension (`a[] = {..}`) takes the initializer's length, which is written back to `dims`.
+fn shaped_initializer<'a, 'input>(
+    stream: &mut PtxParser<'a, 'input>,
+    type_: ScalarType,
+    vector: Option<NonZeroU8>,
+    dims: &mut Vec<u32>,
+) -> PResult<Vec<RegOrImmediate<&'input str>>> {
+    enum Init<'i> {
+        Leaf(RegOrImmediate<&'i str>),
+        List(Vec<Init<'i>>),
+    }
+    fn tree<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<Init<'input>> {
+        if opt(Token::LBrace).parse_next(stream)?.is_some() {
+            let items: Vec<Init<'input>> = separated(0.., tree, Token::Comma).parse_next(stream)?;
+            Token::RBrace.parse_next(stream)?;
+            Ok(Init::List(items))
+        } else {
+            Ok(Init::Leaf(reg_or_immediate.parse_next(stream)?))
+        }
+    }
+    fn leaves<'i>(t: Init<'i>, out: &mut Vec<RegOrImmediate<&'i str>>) {
+        match t {
+            Init::Leaf(l) => out.push(l),
+            Init::List(v) => v.into_iter().for_each(|x| leaves(x, out)),
+        }
+    }
+    // shape[level..] elements of one sub-array at `level`
+    fn fill<'i>(
+        t: Init<'i>,
+        shape: &[u32],
+        zero: &ast::ImmediateValue,
+        out: &mut Vec<RegOrImmediate<&'i str>>,
+    ) {
+        let total: usize = shape.iter().map(|&d| d as usize).product();
+        let start = out.len();
+        match t {
+            Init::Leaf(l) => out.push(l),
+            Init::List(items) if shape.len() > 1 && items.iter().all(|i| matches!(i, Init::List(_))) => {
+                for item in items.into_iter().take(shape[0] as usize) {
+                    fill(item, &shape[1..], zero, out);
+                }
+            }
+            Init::List(items) => {
+                let mut flat = Vec::new();
+                items.into_iter().for_each(|x| leaves(x, &mut flat));
+                out.extend(flat.into_iter().take(total));
+            }
+        }
+        while out.len() < start + total {
+            out.push(RegOrImmediate::Imm(*zero));
+        }
+    }
+    Token::Eq.parse_next(stream)?;
+    let t = tree(stream)?;
+    let mut shape = dims.clone();
+    if let Some(v) = vector {
+        shape.push(v.get() as u32);
+    }
+    if shape.first() == Some(&0) {
+        let inner: u32 = shape[1..].iter().product::<u32>().max(1);
+        shape[0] = match &t {
+            Init::List(items) if shape.len() > 1 && items.iter().all(|i| matches!(i, Init::List(_))) => {
+                items.len() as u32
+            }
+            Init::List(items) => {
+                let mut n = Vec::new();
+                for i in items {
+                    if let Init::Leaf(_) = i {
+                        n.push(());
+                    } else {
+                        n.push(());
+                    }
+                }
+                let mut flat = Vec::new();
+                if let Init::List(items) = t {
+                    items.into_iter().for_each(|x| leaves(x, &mut flat));
+                    let count = (flat.len() as u32 + inner - 1) / inner;
+                    shape[0] = count.max(1);
+                    dims[0] = shape[0];
+                    let zero = default_immediate_from_type(type_);
+                    let total: usize = shape.iter().map(|&d| d as usize).product();
+                    let mut out = flat;
+                    while out.len() < total {
+                        out.push(RegOrImmediate::Imm(zero));
+                    }
+                    return Ok(out);
+                }
+                unreachable!()
+            }
+            Init::Leaf(_) => 1,
+        };
+        dims[0] = shape[0];
+    }
+    let zero = default_immediate_from_type(type_);
+    let mut out = Vec::new();
+    fill(t, &shape, &zero, &mut out);
+    Ok(out)
 }
 
 fn default_immediate_from_type(type_: ScalarType) -> ast::ImmediateValue {

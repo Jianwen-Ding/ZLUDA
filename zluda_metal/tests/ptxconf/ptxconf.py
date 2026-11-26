@@ -298,7 +298,7 @@ def run_program(path, lib):
                 r = cuda.cuLaunchKernel(fn, grid[0], grid[1], grid[2], block[0], block[1], block[2], shared, None,
                                         arr, None)
                 if r != 0 or cuda.cuCtxSynchronize() != 0:
-                    return {"status": "LAUNCH", "detail": "%s: %s" % (name, cuda.last_error()[-1500:])}
+                    return {"status": "LAUNCH", "detail": "%s (CUresult %d): %s" % (name, r, cuda.last_error()[-1500:])}
             elif d == "expect":
                 m = re.match(r"(\w+)\s+\.(\w+)\s*(?:@\s*(\w+))?\s*=\s*(\{.*\})\s*$", body, re.S)
                 if not m:

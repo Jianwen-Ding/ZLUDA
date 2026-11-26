@@ -260,7 +260,7 @@ pub(super) fn lower<'i>(_opcode: &str, base: &str, m: &[&str], ops: &[HOp<'i>]) 
 }
 
 fn hop<'i>(op: Op<'i>) -> HOp<'i> {
-    HOp { op, addr: false, neg: false, sel: None, pair: None, sink: false, minus: false }
+    HOp { op, addr: false, neg: false, sel: None, pair: None, sink: false, minus: false, items: Default::default() }
 }
 
 /// Should a grammar-parsed `cvt` go through the soft-float helper?  ZLUDA's own lowering is

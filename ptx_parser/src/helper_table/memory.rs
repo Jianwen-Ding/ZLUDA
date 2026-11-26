@@ -196,7 +196,249 @@ fn cp<'i>(m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
             .imm(0)
             .build();
     }
+    if has(m, "tensor") {
+        return tensor(m, ops);
+    }
+    if has(m, "bulk") {
+        return bulk(m, ops);
+    }
     None
+}
+
+/// 0 or the report pattern code of .mbarrier::report::validity::* (memory.inc rep_chunk)
+fn report_code(m: &[&str]) -> u64 {
+    for x in m {
+        if let Some(p) = x.strip_prefix("mbarrier::report::validity::") {
+            return match p {
+                "per_element::ff" => 1,
+                "per_16bytes::80000000" => 2,
+                "per_16bytes::8000" => 3,
+                "per_16bytes::80" => 4,
+                "per_16bytes::8" => 5,
+                _ => 0,
+            };
+        }
+    }
+    0
+}
+
+fn red_op(m: &[&str]) -> Option<u64> {
+    ["add", "min", "max", "inc", "dec", "and", "or", "xor"]
+        .iter()
+        .position(|o| m.contains(o))
+        .map(|i| i as u64 + 1)
+}
+
+/// the destination comes first: `.shared::cluster.global` is a load, `.global.shared::cta` a store
+fn to_shared(m: &[&str]) -> bool {
+    let g = m.iter().position(|x| *x == "global");
+    let s = m.iter().position(|x| x.starts_with("shared"));
+    match (g, s) {
+        (Some(g), Some(s)) => s < g,
+        (None, Some(_)) => true,
+        _ => false,
+    }
+}
+
+fn vec_or_none<'i>(op: Option<&Op<'i>>) -> Op<'i> {
+    op.cloned().unwrap_or(ast::ParsedOperand::VecPack(Vec::new()))
+}
+
+/// cp.async.bulk.tensor / cp.reduce.async.bulk.tensor / cp.async.bulk.prefetch.tensor
+fn tensor<'i>(m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
+    if has(m, "prefetch") {
+        return Call::new("mem_nop").build();
+    }
+    if m.iter().any(|x| x.starts_with("multicast") || x.starts_with("cta_group")) {
+        return err("cp.async.bulk.tensor .multicast::cluster / .cta_group need thread-block clusters");
+    }
+    if has(m, "override::global_dim") || has(m, "override::global_dim_stride") {
+        return err("cp.async.bulk.tensor .override::global_dim(_stride)");
+    }
+    if to_shared(m) {
+        // [dst], [tmap, {coords}], [mbar]{, im2colInfo}{, cache-policy}
+        if ops.len() < 3 || !ops[0].addr || !ops[1].addr || !ops[2].addr {
+            return err("cp.async.bulk.tensor operands");
+        }
+        let (mode, imd) = if has(m, "tile::gather4") {
+            (1, 0)
+        } else if has(m, "im2col::w") {
+            (2, 1)
+        } else if has(m, "im2col::w::128") {
+            (2, 2)
+        } else if has(m, "im2col_no_offs::w") {
+            (2, 3)
+        } else if has(m, "im2col") {
+            (2, 0)
+        } else {
+            (0, 0)
+        };
+        let ctrl = mode | (imd << 2) | (report_code(m) << 4);
+        if has(m, "override::global_address") {
+            let [g, cs] = &ops[1].items[..] else { return err("override::global_address operands") };
+            return Call::new("tma_load_ga")
+                .src_space(ops[0].op.clone(), ScalarType::B8, StateSpace::Shared)
+                .src(ops[1].op.clone(), ScalarType::U64)
+                .src(g.clone(), ScalarType::U64)
+                .src_vec(cs.clone(), 8, ScalarType::S32)
+                .src_space(ops[2].op.clone(), ScalarType::B64, StateSpace::Shared)
+                .imm(ctrl)
+                .build();
+        }
+        let [cs] = &ops[1].items[..] else { return err("cp.async.bulk.tensor coordinates") };
+        let inf = if mode == 2 { ops.get(3).filter(|o| matches!(o.op, ast::ParsedOperand::VecPack(_))).map(|o| &o.op) } else { None };
+        return Call::new("tma_load")
+            .src_space(ops[0].op.clone(), ScalarType::B8, StateSpace::Shared)
+            .src(ops[1].op.clone(), ScalarType::U64)
+            .src_vec(cs.clone(), 8, ScalarType::S32)
+            .src_space(ops[2].op.clone(), ScalarType::B64, StateSpace::Shared)
+            .src_vec(vec_or_none(inf), 8, ScalarType::S32)
+            .imm(ctrl)
+            .build();
+    }
+    // [tmap, {coords}], [src]{, cache-policy}
+    if ops.len() < 2 || !ops[0].addr || !ops[1].addr {
+        return err("cp.async.bulk.tensor store operands");
+    }
+    let [cs] = &ops[0].items[..] else { return err("cp.async.bulk.tensor coordinates") };
+    let op = if has(m, "reduce") {
+        let Some(o) = red_op(m) else { return err("cp.reduce.async.bulk.tensor operation") };
+        o
+    } else {
+        0
+    };
+    let mode = if has(m, "tile::scatter4") {
+        1
+    } else if has(m, "im2col_no_offs::w") {
+        3
+    } else if has(m, "im2col_no_offs") {
+        2
+    } else {
+        0
+    };
+    Call::new("tma_store")
+        .src(ops[0].op.clone(), ScalarType::U64)
+        .src_vec(cs.clone(), 8, ScalarType::S32)
+        .src_space(ops[1].op.clone(), ScalarType::B8, StateSpace::Shared)
+        .imm(op | (mode << 4))
+        .build()
+}
+
+/// element type code of a bulk reduction (memory.inc red_elem) and its size
+fn red_type(t: &str) -> Option<(u64, u64)> {
+    Some(match t {
+        "u32" | "b32" => (2, 4),
+        "s32" => (3, 4),
+        "u64" | "b64" => (4, 8),
+        "s64" => (5, 8),
+        "f16" => (6, 2),
+        "f32" => (7, 4),
+        "f64" => (9, 8),
+        "bf16" => (10, 2),
+        _ => return None,
+    })
+}
+
+/// cp.async.bulk / cp.reduce.async.bulk (non-tensor), prefetch, commit_group / wait_group
+fn bulk<'i>(m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
+    if has(m, "prefetch") || has(m, "commit_group") || has(m, "wait_group") || has(m, "wait_group.read") {
+        return Call::new("mem_nop").build();
+    }
+    if m.iter().any(|x| x.starts_with("multicast")) {
+        return err("cp.async.bulk .multicast::cluster needs thread-block clusters");
+    }
+    if ops.len() < 3 || !ops[0].addr || !ops[1].addr {
+        return err("cp.async.bulk operands");
+    }
+    let src_global = has(m, "global") && to_shared(m);
+    let (rop, rty) = if has(m, "reduce") {
+        let Some(o) = red_op(m) else { return err("cp.reduce.async.bulk operation") };
+        let Some(t) = m.iter().rev().find_map(|x| red_type(x)) else { return err("cp.reduce.async.bulk type") };
+        (o, t)
+    } else {
+        (0, (0, 1))
+    };
+    let ctrl = rop | (rty.0 << 4) | (rty.1 << 8) | (report_code(m) << 12) | ((has(m, "cp_mask") as u64) << 16);
+    if to_shared(m) {
+        // [dst], [src], size, [mbar]: from global (or from the CTA's own shared memory)
+        let Some(mb) = ops.get(3).filter(|o| o.addr) else { return err("cp.async.bulk mbarrier operand") };
+        let c = Call::new(if src_global { "bulk_g2s" } else { "bulk_s2s" })
+            .src_space(ops[0].op.clone(), ScalarType::B8, StateSpace::Shared);
+        let c = if src_global {
+            c.src_space(ops[1].op.clone(), ScalarType::B8, StateSpace::Global)
+        } else {
+            c.src_space(ops[1].op.clone(), ScalarType::B8, StateSpace::Shared)
+        };
+        return c
+            .src(ops[2].op.clone(), ScalarType::U32)
+            .src_space(mb.op.clone(), ScalarType::B64, StateSpace::Shared)
+            .imm(ctrl)
+            .build();
+    }
+    // global <- shared::cta: [dst], [src], size{, byteMask}{, cache-policy}
+    let mask = if has(m, "cp_mask") { ops.get(3).map(|o| o.op.clone()).unwrap_or(imm(0xFFFF)) } else { imm(0xFFFF) };
+    Call::new("bulk_s2g")
+        .src_space(ops[0].op.clone(), ScalarType::B8, StateSpace::Global)
+        .src_space(ops[1].op.clone(), ScalarType::B8, StateSpace::Shared)
+        .src(ops[2].op.clone(), ScalarType::U32)
+        .src(mask, ScalarType::U32)
+        .imm(ctrl)
+        .build()
+}
+
+fn tensormap<'i>(m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
+    if has(m, "cp_fenceproxy") {
+        // tensormap.cp_fenceproxy.global.shared::cta.tensormap::generic.release.scope.sync.aligned [dst], [src], 128
+        let [d, s, _] = ops else { return err("tensormap.cp_fenceproxy operands") };
+        return Call::new("tensormap_cp")
+            .src(d.op.clone(), ScalarType::U64)
+            .src_space(s.op.clone(), ScalarType::B8, StateSpace::Shared)
+            .build();
+    }
+    if !has(m, "replace") {
+        return None;
+    }
+    let fields = [
+        "global_address", "rank", "box_dim", "global_dim", "global_stride", "element_stride", "elemtype",
+        "interleave_layout", "swizzle_mode", "swizzle_atomicity", "fill_mode",
+    ];
+    let Some(f) = fields.iter().position(|x| m.contains(x)) else { return err("tensormap.replace field") };
+    let vt = if has(m, "b64") { ScalarType::B64 } else { ScalarType::B32 };
+    let (a, ord, v) = match ops {
+        [a, o, v] => (a, o.op.clone(), v),
+        [a, v] => (a, imm(0), v),
+        _ => return err("tensormap.replace operands"),
+    };
+    let v = if vt == ScalarType::B32 {
+        // the helper takes the new value as 64 bits; a 32-bit register goes through a b32 slot
+        return Call::new(if has(m, "shared::cta") { "tensormap_replace32_s" } else { "tensormap_replace32" })
+            .src_space_or_int(a, has(m, "shared::cta"))
+            .imm(f as u64)
+            .src(ord, ScalarType::U32)
+            .src(v.op.clone(), ScalarType::B32)
+            .build();
+    } else {
+        v
+    };
+    Call::new(if has(m, "shared::cta") { "tensormap_replace_s" } else { "tensormap_replace" })
+        .src_space_or_int(a, has(m, "shared::cta"))
+        .imm(f as u64)
+        .src(ord, ScalarType::U32)
+        .src(v.op.clone(), ScalarType::B64)
+        .build()
+}
+
+trait AddrSrc<'i> {
+    fn src_space_or_int(self, a: &HOp<'i>, shared: bool) -> Self;
+}
+impl<'i> AddrSrc<'i> for Call<'i> {
+    fn src_space_or_int(self, a: &HOp<'i>, shared: bool) -> Self {
+        if shared {
+            self.src_space(a.op.clone(), ScalarType::B8, StateSpace::Shared)
+        } else {
+            self.src(a.op.clone(), ScalarType::U64)
+        }
+    }
 }
 
 #[allow(unused_variables)]
@@ -204,6 +446,28 @@ pub(super) fn lower<'i>(opcode: &str, base: &str, m: &[&str], ops: &[HOp<'i>]) -
     match base {
         "mbarrier" => mbarrier(m, ops),
         "cp" => cp(m, ops),
+        "tensormap" => tensormap(m, ops),
+        // fence.proxy.* (asynchronous operations complete at issue), and the fence forms the grammar lacks: a
+        // SIMD group runs until a barrier, so no reordering is observable
+        "fence" if ops.len() <= 2 => Call::new("mem_fence").build(),
+        "isspacep" => {
+            // isspacep.space p, a;  a is a generic address (decided statically, air_lower.cpp resolveIsSpacep)
+            let [p, a] = ops else { return err("isspacep operands") };
+            let kind = match m {
+                ["global"] => 0,
+                ["shared"] | ["shared::cta"] => 1,
+                ["local"] => 2,
+                ["const"] => 3,
+                ["param"] | ["param::entry"] => 4,
+                ["shared::cluster"] => 5,
+                _ => return err("isspacep space"),
+            };
+            Call::new("isspacep")
+                .dst(p.op.clone(), ScalarType::Pred)
+                .src(a.op.clone(), ScalarType::B64)
+                .imm(kind)
+                .build()
+        }
         _ => None,
     }
 }

@@ -47,6 +47,7 @@
 #include <llvm/Transforms/Scalar/SROA.h>
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
 #include <llvm/Transforms/Utils/Cloning.h>
+#include <llvm/Transforms/Utils/Local.h>
 #include <llvm/Transforms/Utils/ValueMapper.h>
 
 #include <cstring>
@@ -200,6 +201,48 @@ void runCleanup(Module &m, bool inlineAll, bool inferAddressSpaces)
 // integer that is (ptrtoint P) + offsets, possibly through phi/select, is
 // rewritten as a GEP chain on P.
 // ---------------------------------------------------------------------------
+// isspacep (ptx/lib/metal_impl/memory.inc): `__zluda_metal_isspacep(generic pointer, kind)` is decided from the
+// pointer's provenance after PointerRecovery (AGX has no generic addressing: every generic access must resolve
+// statically anyway). kind: 0 global, 1 shared::cta, 2 local, 3 const, 4 param, 5 shared::cluster. A pointer
+// without a known object (an integer from memory or a parameter) is a global address.
+static void resolveIsSpacep(Module &m)
+{
+    Function *f = m.getFunction("__zluda_metal_isspacep");
+    if (!f)
+        return;
+    std::vector<CallInst *> calls;
+    for (User *u : f->users())
+        if (auto *ci = dyn_cast<CallInst>(u))
+            calls.push_back(ci);
+    for (CallInst *ci : calls)
+    {
+        Value *p = ci->getArgOperand(0);
+        for (int guard = 0; guard < 64; guard++)
+        {
+            p = p->stripPointerCasts();
+            if (auto *g = dyn_cast<GEPOperator>(p))
+                p = g->getPointerOperand();
+            else
+                break;
+        }
+        unsigned as = p->getType()->getPointerAddressSpace();
+        int space = 0;
+        if (as == amd::Shared)
+            space = 1;
+        else if (as == amd::Private)
+            space = 2;
+        else if (as == amd::Constant || as == amd::Constant32)
+            space = isa<Argument>(p) ? 4 : 3;
+        uint64_t kind = cast<ConstantInt>(ci->getArgOperand(1))->getZExtValue();
+        bool r = kind == 5 ? space == 1 : (uint64_t)space == kind;
+        Value *arg = ci->getArgOperand(0);
+        ci->replaceAllUsesWith(ConstantInt::get(ci->getType(), r));
+        ci->eraseFromParent();
+        if (auto *i = dyn_cast<Instruction>(arg))
+            RecursivelyDeleteTriviallyDeadInstructions(i);
+    }
+}
+
 class PointerRecovery
 {
 public:
@@ -2054,6 +2097,7 @@ void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals
             break;
         runCleanup(m, false, true);
     }
+    resolveIsSpacep(m);
     for (Function &f : m)
         if (!f.isDeclaration() && f.getCallingConv() != CallingConv::AMDGPU_KERNEL && !f.use_empty())
             fail("function could not be inlined into its kernel (recursion is not supported): " + f.getName());

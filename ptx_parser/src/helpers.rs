@@ -23,6 +23,8 @@ pub(crate) struct HOp<'i> {
     pub sink: bool,
     /// `-x` on a register
     pub minus: bool,
+    /// the operands after the first of an address list `[a, b, {c, d}]` (tensor maps: `[tmap, {coords}]`)
+    pub items: Vec<ast::ParsedOperand<&'i str>>,
 }
 
 fn statement_end(toks: &[(Token, logos::Span)]) -> Option<usize> {
@@ -82,6 +84,23 @@ fn sub_operand<'a, 'input>(
     Some(r)
 }
 
+/// `{1, -2, %r}`: a vector of registers and (possibly negative) integer immediates
+fn imm_vector<'a, 'input>(
+    text: &'input str,
+    toks: &'a [(Token<'input>, logos::Span)],
+) -> Option<ast::ParsedOperand<&'input str>> {
+    let [(Token::LBrace, _), inner @ .., (Token::RBrace, _)] = toks else { return None };
+    let mut out = Vec::new();
+    for part in inner.split(|(t, _)| matches!(t, Token::Comma)) {
+        match sub_operand(text, part)? {
+            ast::ParsedOperand::Reg(r) => out.push(Some(ast::RegOrImmediate::Reg(r))),
+            ast::ParsedOperand::Imm(i) => out.push(Some(ast::RegOrImmediate::Imm(i))),
+            _ => return None,
+        }
+    }
+    Some(ast::ParsedOperand::VecPack(out))
+}
+
 fn parse_hop<'a, 'input>(
     text: &'input str,
     mut toks: &'a [(Token<'input>, logos::Span)],
@@ -94,6 +113,7 @@ fn parse_hop<'a, 'input>(
         pair: None,
         sink: false,
         minus: false,
+        items: Vec::new(),
     };
     if let [(Token::Sink, _)] = toks {
         h.sink = true;
@@ -111,7 +131,25 @@ fn parse_hop<'a, 'input>(
     }
     if let [(Token::LBracket, _), inner @ .., (Token::RBracket, _)] = toks {
         h.addr = true;
-        h.op = sub_operand(text, inner)?;
+        // `[a, b, {c, d}]`: split at the top-level commas
+        let mut parts = Vec::new();
+        let (mut depth, mut start) = (0i32, 0usize);
+        for (i, (t, _)) in inner.iter().enumerate() {
+            match t {
+                Token::LBrace | Token::LBracket => depth += 1,
+                Token::RBrace | Token::RBracket => depth -= 1,
+                Token::Comma if depth == 0 => {
+                    parts.push(&inner[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        parts.push(&inner[start..]);
+        h.op = sub_operand(text, parts[0])?;
+        for p in &parts[1..] {
+            h.items.push(sub_operand(text, p).or_else(|| imm_vector(text, p))?);
+        }
         return Some(h);
     }
     if let Some(p) = toks.iter().position(|(t, _)| matches!(t, Token::Pipe)) {

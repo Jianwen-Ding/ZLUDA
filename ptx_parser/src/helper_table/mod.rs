@@ -61,6 +61,23 @@ impl<'i> Call<'i> {
         self.next_src += 1;
         self
     }
+    /// a vector source (`{a, b}`), padded with zeros to `n` elements
+    pub fn src_vec(mut self, op: Op<'i>, n: u8, t: ScalarType) -> Self {
+        let i = self.next_src;
+        let op = match op {
+            ast::ParsedOperand::VecPack(mut v) => {
+                while v.len() < n as usize {
+                    v.push(Some(ast::RegOrImmediate::Imm(ast::ImmediateValue::U64(0))));
+                }
+                ast::ParsedOperand::VecPack(v)
+            }
+            other => other,
+        };
+        self.data = self.data.with_type(i, ast::Type::Vector(n, t), StateSpace::Reg);
+        self.slots[i] = Some(op);
+        self.next_src += 1;
+        self
+    }
     pub fn imm(self, v: u64) -> Self {
         self.src(imm(v), ScalarType::U32)
     }

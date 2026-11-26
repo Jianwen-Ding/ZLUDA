@@ -38,7 +38,7 @@ HARNESS = ("buffer", "launch", "print", "expect", "patch", "append", "tensormap"
 # .ub strict: the model's undefined-behaviour checking; the programs that enable it expect their normal results (an
 # undefined behaviour the model would report is not detected here)
 IGNORED = ("print", "memmodel", "isacheck", "convergence", "occupancy", "ub")
-UNSUPPORTED = ("fabric",)
+UNSUPPORTED = ()
 
 SIZES = {"u8": 1, "s8": 1, "b8": 1, "u16": 2, "s16": 2, "b16": 2, "f16": 2, "bf16": 2, "u32": 4, "s32": 4,
          "b32": 4, "f32": 4, "u64": 8, "s64": 8, "b64": 8, "f64": 8, "pred": 1, "b128": 16}
@@ -386,6 +386,32 @@ def run_program(path, lib):
                     img[pg:pg + 8 * (4 + len(addrs))] = pack_vals(multimem_words(w.ptr, pg, size, addrs), "u64")
                 cuda.check(cuda.cuMemcpyHtoD_v2(w.ptr, bytes(img), total), "multimem")
                 bufs[name] = last = w
+            elif d == "fabric":
+                # .fabric ID .size N { B0, B1, ... };  the endpoint table of the helper library (multimem.inc):
+                # 16 entries of 8 u64 words: id + 1, size, buffer count, buffer addresses
+                m = re.match(r"(\w+)\s+\.size\s+(\w+)\s*\{([^}]*)\}\s*$", body, re.S)
+                if not m:
+                    raise Unsupported("fabric syntax")
+                eid, size, members = int(m.group(1), 0), int(m.group(2), 0), split_list(m.group(3))
+                addrs = []
+                for bn in members:
+                    b = bufs[bn]
+                    if b.ptr is None:
+                        b.ptr = cuda.alloc(bytes(b.data))
+                    addrs.append(b.ptr)
+                gp, gs = ctypes.c_uint64(), ctypes.c_size_t()
+                if cuda.cuModuleGetGlobal_v2(ctypes.byref(gp), ctypes.byref(gs), mod, b"__zluda_fabric_tab") == 0:
+                    tab = bytearray(cuda.read(gp.value, 8 * 128))
+                    slot = None
+                    for i in range(16):
+                        w = int.from_bytes(tab[64 * i:64 * i + 8], "little")
+                        if w == eid + 1 or (w == 0 and slot is None):
+                            slot = i
+                            if w == eid + 1:
+                                break
+                    words = ([eid + 1, size, len(addrs)] + addrs[:5] + [0] * 5)[:8]
+                    tab[64 * slot:64 * slot + 64] = pack_vals(words, "u64")
+                    cuda.check(cuda.cuMemcpyHtoD_v2(gp.value, bytes(tab), len(tab)), "fabric")
             elif d == "append":
                 m = re.match(r"(\w+)\s+\.(\w+)\s*=\s*(\{.*\})\s*$", body, re.S)
                 b = bufs[m.group(1)]

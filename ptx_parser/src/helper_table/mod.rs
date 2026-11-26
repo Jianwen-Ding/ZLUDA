@@ -207,6 +207,10 @@ pub(crate) fn extra<'i>(opcode: &str, ops: &[HOp<'i>]) -> Vec<ast::Instruction<P
             return v;
         }
     }
+    let t = multimem::extra(base, &m, ops);
+    if !t.is_empty() {
+        return t;
+    }
     let t = texture::extra(base, ops);
     if !t.is_empty() {
         return t;

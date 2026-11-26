@@ -4,6 +4,8 @@ use super::*;
 /// tried before the grammar: `mov` of special registers the grammar's types reject
 pub(super) fn preempts(_opcode: &str, base: &str, m: &[&str]) -> bool {
     base == "bmsk"
+        // textures and surfaces in software (texture.rs): the grammar's forms need the descriptor objects too
+        || matches!(base, "tex" | "tld4" | "txq" | "suld" | "sust" | "sured" | "suq" | "istypep")
         // packed integer lanes (float.rs ipack): the grammar's lowering is a 32-bit operation
         || matches!(base, "add" | "sub" | "min" | "max" | "neg" | "abs")
             && m.iter().any(|x| matches!(*x, "u8x4" | "s8x4" | "u16x2" | "s16x2"))

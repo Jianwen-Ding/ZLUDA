@@ -172,7 +172,7 @@ fn parse_hop<'a, 'input>(
             return Some(h);
         }
     }
-    h.op = sub_operand(text, toks)?;
+    h.op = sub_operand(text, toks).or_else(|| imm_vector(text, toks))?;
     Some(h)
 }
 

@@ -22,6 +22,8 @@ use winnow::{prelude::*, Stateful};
 mod ast;
 mod helper_table;
 mod helpers;
+mod preprocess;
+pub use preprocess::preprocess;
 pub use ast::*;
 
 impl From<RawMulIntControl> for ast::MulIntControl {

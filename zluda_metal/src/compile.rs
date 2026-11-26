@@ -76,7 +76,8 @@ pub struct Options {
 }
 
 pub fn compile_ptx(ptx: &str, opts: Options) -> Result<CompiledModule, String> {
-    let ast = ptx_parser::parse_module_checked(ptx).map_err(|errs| {
+    let ptx = ptx_parser::preprocess(ptx);
+    let ast = ptx_parser::parse_module_checked(&ptx).map_err(|errs| {
         errs.iter()
             .map(|e| format!("{e:?}"))
             .collect::<Vec<_>>()

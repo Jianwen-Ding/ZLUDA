@@ -672,6 +672,16 @@
     uint32_t FUNC(frsqrt_f32)(uint32_t a, uint32_t ctrl)
     {
         bool ftz = ctrl & F_FTZ;
+        {
+            // RN(1 / RN(sqrt x)): two correctly rounded IEEE operations of the backend (subnormals kept;
+            // .ftz flushes the operand and the result), canonical NaN
+            auto fl = [&](uint32_t u) { return (ftz && (u & 0x7F800000u) == 0) ? (u & 0x80000000u) : u; };
+            float s = __zluda_ieee_sqrt_f32(__builtin_bit_cast(float, fl(a)));
+            uint32_t r = __builtin_bit_cast(uint32_t, __zluda_ieee_fdiv_f32(1.0f, s));
+            if ((r & 0x7FFFFFFFu) > 0x7F800000u)
+                return 0x7FFFFFFFu;
+            return fl(r);
+        }
         XF x = xdec_t(a, T_F32, ftz);
         XF r = xround_t(xf_sqrt(x, 24), T_F32, RM_RN, 0, 0, false);
         return (uint32_t)xfin(xf_div(xf_fin(false, 1, 0), r, 24), T_F32, RM_RN, ftz ? PF_FTZ : 0, 0, 0, false);

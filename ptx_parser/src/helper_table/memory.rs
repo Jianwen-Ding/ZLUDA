@@ -483,12 +483,94 @@ pub(super) fn extra<'i>(base: &str, m: &[&str], ops: &[HOp<'i>]) -> Vec<ast::Ins
     Vec::new()
 }
 
+/// element type code (memory.inc rmw_elem) and size of an atom / red type
+fn atom_type(t: &str) -> Option<(u64, u64)> {
+    Some(match t {
+        "u16" | "b16" => (1, 2),
+        "u32" | "b32" => (2, 4),
+        "s32" => (3, 4),
+        "u64" | "b64" => (4, 8),
+        "s64" => (5, 8),
+        "f16" => (6, 2),
+        "f32" => (7, 4),
+        "f64" => (9, 8),
+        "bf16" => (10, 2),
+        "f16x2" => (13, 4),
+        "bf16x2" => (14, 4),
+        _ => return None,
+    })
+}
+
+/// atom / red forms outside the grammar: atom{.sem}{.scope}{.space}{.vec}.op{.noftz}{.hint}.type d, [a], b{, c}{, pol};
+/// red ... [a], b{, pol}. Lane-serialised read-modify-write (memory.inc atom_*): a SIMD group runs until a barrier.
+fn atom_red<'i>(base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
+    let red = base == "red";
+    if red && has(m, "async") {
+        return err("red.async needs thread-block clusters");
+    }
+    let ops_ = ["add", "min", "max", "inc", "dec", "and", "or", "xor", "exch", "cas"];
+    let op = ops_.iter().position(|o| m.contains(o))? as u64 + 1;
+    let (code, size) = m.iter().rev().find_map(|x| atom_type(x))?;
+    let vec = m.iter().find_map(|x| match *x {
+        "v2" => Some(2u8),
+        "v4" => Some(4),
+        "v8" => Some(8),
+        _ => None,
+    });
+    let space = if m.iter().any(|x| x.starts_with("shared")) {
+        StateSpace::Shared
+    } else if has(m, "global") {
+        StateSpace::Global
+    } else {
+        StateSpace::Generic
+    };
+    let ftz = op == 1 && code == 7 && !has(m, "noftz") && space != StateSpace::Shared;
+    let ctrl = op | (code << 4) | ((ftz as u64) << 8);
+    let sfx = match space {
+        StateSpace::Shared => "s",
+        StateSpace::Global => "g",
+        _ => "f",
+    };
+    let (d, rest) = if red { (None, ops) } else { (Some(&ops[0]), &ops[1..]) };
+    let [a, b, more @ ..] = rest else { return err("atom operands") };
+    let Some(a) = addr(a) else { return err("atom address") };
+    let bits = match size {
+        2 => ScalarType::B16,
+        8 => ScalarType::B64,
+        _ => ScalarType::B32,
+    };
+    if let Some(n) = vec {
+        let c = Call::new(format!("atom_v{n}_{sfx}"));
+        let c = match d {
+            Some(d) if !d.sink => c.dst_vec(d.op.clone(), n, ScalarType::B32),
+            _ => c,
+        };
+        return c
+            .src_space(a, ScalarType::B32, space)
+            .src_vec(b.op.clone(), n, ScalarType::B32)
+            .imm(ctrl)
+            .build();
+    }
+    let cv = if op == 10 { more.first().map(|x| x.op.clone()) } else { None };
+    let c = Call::new(format!("atom{}_{sfx}", size * 8));
+    let c = match d {
+        Some(d) if !d.sink => c.dst(d.op.clone(), bits),
+        _ => c,
+    };
+    c.src_space(a, bits, space)
+        .src(b.op.clone(), bits)
+        .src(cv.unwrap_or(imm(0)), bits)
+        .imm(ctrl)
+        .build()
+}
+
 #[allow(unused_variables)]
 pub(super) fn lower<'i>(opcode: &str, base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
     match base {
         "mbarrier" => mbarrier(m, ops),
         "cp" => cp(m, ops),
         "tensormap" => tensormap(m, ops),
+        "atom" | "red" => atom_red(base, m, ops),
         // fence.proxy.* (asynchronous operations complete at issue), and the fence forms the grammar lacks: a
         // SIMD group runs until a barrier, so no reordering is observable
         "fence" if ops.len() <= 2 => Call::new("mem_fence").build(),

@@ -42,6 +42,12 @@ impl<'i> Call<'i> {
         self.slots[0] = Some(op);
         self
     }
+    /// a vector destination (`{a, b}`) of n elements
+    pub fn dst_vec(mut self, op: Op<'i>, n: u8, t: ScalarType) -> Self {
+        self.data = self.data.with_type(0, ast::Type::Vector(n, t), StateSpace::Reg);
+        self.slots[0] = Some(op);
+        self
+    }
     pub fn dst2(mut self, op: Op<'i>, t: ScalarType) -> Self {
         self.data = self.data.with(1, t);
         self.slots[1] = Some(op);

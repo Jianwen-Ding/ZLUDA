@@ -730,8 +730,29 @@ unsigned atomicScope(unsigned as) { return as == air::Threadgroup ? SCOPE_THREAD
 // CAS-based emulation of an atomic read-modify-write that AIR has no intrinsic for
 Value *emitCasLoop(IRBuilder<> &b, Value *ptr, Type *valTy, function_ref<Value *(IRBuilder<> &, Value *)> op);
 
+Value *emitCasLoop(IRBuilder<> &b, Value *ptr, Type *valTy, function_ref<Value *(IRBuilder<> &, Value *)> op);
+
 Value *emitCmpXchgStrong(IRBuilder<> &b, Value *ptr, Value *cmp, Value *desired, Value **successOut)
 {
+    if (cmp->getType()->isIntegerTy(8) || cmp->getType()->isIntegerTy(16))
+    {
+        // no 8 / 16-bit compare-exchange: a 32-bit one on the containing word
+        Type *t = cmp->getType();
+        Value *off = b.CreateAnd(b.CreatePtrToInt(ptr, b.getInt64Ty()), 3);
+        Value *base = b.CreateGEP(b.getInt8Ty(), ptr, b.CreateNeg(off));
+        Value *shift = b.CreateTrunc(b.CreateShl(off, 3), b.getInt32Ty());
+        Value *mask = b.CreateShl(b.getInt32((1u << t->getIntegerBitWidth()) - 1), shift);
+        Value *old32 = emitCasLoop(b, base, b.getInt32Ty(), [&](IRBuilder<> &lb, Value *old) -> Value * {
+            Value *cur = lb.CreateTrunc(lb.CreateLShr(old, shift), t);
+            Value *upd = lb.CreateOr(lb.CreateAnd(old, lb.CreateNot(mask)),
+                                     lb.CreateShl(lb.CreateZExt(desired, lb.getInt32Ty()), shift));
+            return lb.CreateSelect(lb.CreateICmpEQ(cur, cmp), upd, old);
+        });
+        Value *observed = b.CreateTrunc(b.CreateLShr(old32, shift), t);
+        if (successOut)
+            *successOut = b.CreateICmpEQ(observed, cmp);
+        return observed;
+    }
     // air.atomic.*.cmpxchg.weak.iN(ptr object, ptr(thread) expected, iN desired,
     //                               i32 order_success, i32 order_failure, i32 scope, i1 volatile)
     // returns i1 and writes the observed value to *expected. Wrap it into a
@@ -778,6 +799,20 @@ Value *emitCasLoop(IRBuilder<> &b, Value *ptr, Type *valTy, function_ref<Value *
     Function *f = b.GetInsertBlock()->getParent();
     LLVMContext &ctx = f->getContext();
     Type *intTy = IntegerType::get(ctx, valTy->getPrimitiveSizeInBits());
+    if (intTy->getIntegerBitWidth() < 32)
+    {
+        // 8 / 16-bit read-modify-write: on the containing 32-bit word
+        Value *off = b.CreateAnd(b.CreatePtrToInt(ptr, b.getInt64Ty()), 3);
+        Value *base = b.CreateGEP(b.getInt8Ty(), ptr, b.CreateNeg(off));
+        Value *shift = b.CreateTrunc(b.CreateShl(off, 3), b.getInt32Ty());
+        Value *mask = b.CreateShl(b.getInt32((1u << intTy->getIntegerBitWidth()) - 1), shift);
+        Value *old32 = emitCasLoop(b, base, b.getInt32Ty(), [&](IRBuilder<> &lb, Value *old) -> Value * {
+            Value *cur = lb.CreateBitCast(lb.CreateTrunc(lb.CreateLShr(old, shift), intTy), valTy);
+            Value *nv = lb.CreateBitCast(op(lb, cur), intTy);
+            return lb.CreateOr(lb.CreateAnd(old, lb.CreateNot(mask)), lb.CreateShl(lb.CreateZExt(nv, lb.getInt32Ty()), shift));
+        });
+        return b.CreateBitCast(b.CreateTrunc(b.CreateLShr(old32, shift), intTy), valTy);
+    }
     unsigned as = ptr->getType()->getPointerAddressSpace();
     Value *initial = callAir(b, std::string("air.atomic.") + atomicSpace(as) + ".load." + airTypeSuffix(intTy), intTy,
                              {ptr, b.getInt32(MEMORY_ORDER_RELAXED), b.getInt32(atomicScope(as)), b.getTrue()});
@@ -793,6 +828,9 @@ Value *emitCasLoop(IRBuilder<> &b, Value *ptr, Type *valTy, function_ref<Value *
     Value *oldVal = b.CreateBitCast(old, valTy);
     Value *newVal = b.CreateBitCast(op(b, oldVal), intTy);
     Value *success = nullptr;
+    // emitCmpXchgStrong splits the current block, which needs a terminator: a branch to the rest, which ends
+    // in the "done" block below
+    b.SetInsertPoint(b.CreateBr(rest));
     Value *observed = emitCmpXchgStrong(b, ptr, old, newVal, &success);
     BasicBlock *loopEnd = b.GetInsertBlock();
     BasicBlock *done;
@@ -873,6 +911,12 @@ void lowerAtomicRMW(AtomicRMWInst *rmw)
     }
     Value *result = nullptr;
     bool native = !op.empty() && (t->isIntegerTy(32) || t->isIntegerTy(64) || t->isFloatTy());
+    // the hardware's float atomic add flushes subnormals; PTX's atom / red .shared.add.f32 keeps them (only the
+    // .global form without .noftz flushes): a compare-exchange loop with an IEEE add
+    bool keepDenormals = t->isFloatTy() && as == air::Threadgroup &&
+                         (rmw->getOperation() == AtomicRMWInst::FAdd || rmw->getOperation() == AtomicRMWInst::FSub);
+    if (keepDenormals)
+        native = false;
     if (native && t->isFloatTy() && rmw->getOperation() == AtomicRMWInst::Xchg)
         native = true;
     if (native)
@@ -900,9 +944,14 @@ void lowerAtomicRMW(AtomicRMWInst *rmw)
             case AtomicRMWInst::FMin:
                 return lb.CreateMinNum(old, val);
             case AtomicRMWInst::FAdd:
-                return lb.CreateFAdd(old, val);
             case AtomicRMWInst::FSub:
-                return lb.CreateFSub(old, val);
+            {
+                Value *r = opcode == AtomicRMWInst::FAdd ? lb.CreateFAdd(old, val) : lb.CreateFSub(old, val);
+                if (keepDenormals)
+                    if (auto *ri = dyn_cast<Instruction>(r))
+                        ri->setMetadata("agx.keep-denormals", MDNode::get(ri->getContext(), {}));
+                return r;
+            }
             case AtomicRMWInst::Add:
                 return lb.CreateAdd(old, val);
             case AtomicRMWInst::Sub:

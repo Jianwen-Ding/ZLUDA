@@ -984,3 +984,71 @@
     void FUNC(tma_load_ov1)(SHARED_SPACE uint8_t *d, uint64_t t, uint64_t g, I32x8 v, SHARED_SPACE uint64_t *mb, uint16_t up) { tma_load_ov(d, t, g, v, mb, up, 1); }
     void FUNC(tma_load_ov2)(SHARED_SPACE uint8_t *d, uint64_t t, uint64_t g, I32x8 v, SHARED_SPACE uint64_t *mb, uint16_t up) { tma_load_ov(d, t, g, v, mb, up, 2); }
     void FUNC(tma_load_ov3)(SHARED_SPACE uint8_t *d, uint64_t t, uint64_t g, I32x8 v, SHARED_SPACE uint64_t *mb, uint16_t up) { tma_load_ov(d, t, g, v, mb, up, 3); }
+
+    // ---------------------------------------------------------------- atom / red outside the grammar
+    // ctrl: bits 0-3 op (1 add, 2 min, 3 max, 4 inc, 5 dec, 6 and, 7 or, 8 xor, 9 exch, 10 cas), 4-7 type code
+    // (red_elem codes, 13 f16x2, 14 bf16x2), 8 add.f32 flushing subnormal inputs and results (atom.global.add.f32)
+    static inline uint64_t f32_ftz(uint64_t b) { return ((b >> 23) & 255) == 0 ? (b & 0x80000000u) : b; }
+    static inline uint64_t rmw_elem(uint32_t ctrl, uint64_t o, uint64_t b, uint64_t c, uint32_t eb)
+    {
+        uint32_t op = ctrl & 15, code = (ctrl >> 4) & 15;
+        if (op == 9)
+            return b;
+        if (op == 10)
+            return o == b ? c : o;
+        if (code == 13 || code == 14)
+        {
+            uint64_t lo = red_elem(op, code == 13 ? 6 : 10, o & 0xFFFF, b & 0xFFFF, 2);
+            uint64_t hi = red_elem(op, code == 13 ? 6 : 10, (o >> 16) & 0xFFFF, (b >> 16) & 0xFFFF, 2);
+            return (lo & 0xFFFF) | ((hi & 0xFFFF) << 16);
+        }
+        if ((ctrl >> 8) & 1)
+            return f32_ftz(red_elem(1, 7, f32_ftz(o), f32_ftz(b), 4));
+        return red_elem(op, code, o, b, eb);
+    }
+#define ATOM_IMPL(BITS, T, SFX, SPACE)                                                                     \
+    T FUNC(atom##BITS##_##SFX)(SPACE T * a, T b, T c, uint32_t ctrl)                                    \
+    {                                                                                                     \
+        T r = 0;                                                                                          \
+        MEM_SERIAL({                                                                                      \
+            volatile SPACE T *p = (volatile SPACE T *)a;                                                  \
+            r = *p;                                                                                       \
+            *p = (T)rmw_elem(ctrl, r, b, c, BITS / 8);                                                    \
+        })                                                                                                \
+        return r;                                                                                         \
+    }
+    ATOM_IMPL(16, uint16_t, g, GLOBAL_SPACE)
+    ATOM_IMPL(32, uint32_t, g, GLOBAL_SPACE)
+    ATOM_IMPL(64, uint64_t, g, GLOBAL_SPACE)
+    ATOM_IMPL(16, uint16_t, s, SHARED_SPACE)
+    ATOM_IMPL(32, uint32_t, s, SHARED_SPACE)
+    ATOM_IMPL(64, uint64_t, s, SHARED_SPACE)
+    ATOM_IMPL(16, uint16_t, f, )
+    ATOM_IMPL(32, uint32_t, f, )
+    ATOM_IMPL(64, uint64_t, f, )
+    // vector forms: element-wise on 32-bit elements
+#define ATOMV_IMPL(N, SFX, SPACE)                                                                           \
+    typedef uint32_t U32x##N##_##SFX __attribute__((ext_vector_type(N)));                                 \
+    U32x##N##_##SFX FUNC(atom_v##N##_##SFX)(SPACE uint32_t * a, U32x##N##_##SFX b, uint32_t ctrl)         \
+    {                                                                                                       \
+        U32x##N##_##SFX r;                                                                                  \
+        MEM_SERIAL({                                                                                        \
+            volatile SPACE uint32_t *p = (volatile SPACE uint32_t *)a;                                      \
+            _Pragma("clang loop unroll(full)") for (int i = 0; i < N; i++)                                  \
+            {                                                                                               \
+                uint32_t o = p[i];                                                                          \
+                r[i] = o;                                                                                   \
+                p[i] = (uint32_t)rmw_elem(ctrl, o, b[i], 0, 4);                                             \
+            }                                                                                               \
+        })                                                                                                  \
+        return r;                                                                                           \
+    }
+    ATOMV_IMPL(2, g, GLOBAL_SPACE)
+    ATOMV_IMPL(4, g, GLOBAL_SPACE)
+    ATOMV_IMPL(8, g, GLOBAL_SPACE)
+    ATOMV_IMPL(2, s, SHARED_SPACE)
+    ATOMV_IMPL(4, s, SHARED_SPACE)
+    ATOMV_IMPL(8, s, SHARED_SPACE)
+    ATOMV_IMPL(2, f, )
+    ATOMV_IMPL(4, f, )
+    ATOMV_IMPL(8, f, )

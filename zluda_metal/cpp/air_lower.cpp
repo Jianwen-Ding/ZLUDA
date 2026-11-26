@@ -2255,10 +2255,10 @@ static bool isF32Op(Instruction &i)
     return false;
 }
 
-static void resolveFPModes(Function &f)
+static bool resolveFPModes(Function &f)
 {
     if (f.isDeclaration())
-        return;
+        return true;
     LLVMContext &c = f.getContext();
     FPMode entry;
     if (Attribute a = f.getFnAttribute("denormal-fp-math-f32"); a.isValid())
@@ -2360,15 +2360,17 @@ static void resolveFPModes(Function &f)
         old->replaceAllUsesWith(nv);
         old->eraseFromParent();
     }
+    return entry.ieee32;
 }
 
 static void portableFPModes(Module &m)
 {
     for (Function &f : m)
     {
-        resolveFPModes(f);
-        // the hardware's float mode; IEEE operations are tagged
-        f.addFnAttr("denormal-fp-math-f32", "preserve-sign,preserve-sign");
+        // the function's entry mode (LLVM folds constants by it; IEEE operations are tagged, and
+        // the untagged ones of .ftz regions are the hardware's flushing ones)
+        bool ieee = resolveFPModes(f);
+        f.addFnAttr("denormal-fp-math-f32", ieee ? "ieee,ieee" : "preserve-sign,preserve-sign");
         f.removeFnAttr(Attribute::StrictFP);
         for (Instruction &i : instructions(f))
             if (auto *cb = dyn_cast<CallBase>(&i))

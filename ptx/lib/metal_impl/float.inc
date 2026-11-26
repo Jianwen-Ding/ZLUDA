@@ -243,11 +243,33 @@
         default: return xf_fma(x, y, z, rm);
         }
     }
+    // add / sub / mul of halves to nearest without .ftz / .sat / .relu: the f32 operation, rounded once
+    // more (innocuous double rounding: 24 >= 2 * 11 + 2 and 2 * 8 + 2). f16 operands, their sums and
+    // products are normal f32 values (multiples of 2^-24, products of 2^-48), so the hardware's
+    // flushing f32 ALU is exact; bf16 shares f32's exponent range and uses the IEEE operations.
+    static inline bool f_half_fast(uint32_t op, uint32_t t, uint64_t a, uint64_t b, uint64_t *r)
+    {
+        if (op > 2 || t != T_F16)
+            return false;
+        {
+            float x = (float)__builtin_bit_cast(_Float16, (uint16_t)a), y = (float)__builtin_bit_cast(_Float16, (uint16_t)b);
+            float v = op == 0 ? x + y : op == 1 ? x - y : x * y;
+            uint16_t h = __builtin_bit_cast(uint16_t, (_Float16)v);
+            *r = ((h & 0x7FFF) > 0x7C00) ? 0x7FFF : h;
+            return true;
+        }
+        // bf16: subnormal bf16 values are subnormal f32 ones; a constant operation of them would be
+        // folded with the kernel's denormal mode before the IEEE tagging applies: the exact path
+        return false;
+    }
     static inline uint64_t f_elem(uint64_t a, uint64_t b, uint64_t c, uint32_t ctrl)
     {
         uint32_t op = ctrl & 15, t = (ctrl >> 4) & 15;
         int rm = (ctrl >> 9) & 7;
         bool ftz = (ctrl & F_FTZ) && t != T_F64;
+        uint64_t fast;
+        if (rm == RM_RN && f_pf(ctrl, t) == 0 && !(ctrl & F_OOB) && f_half_fast(op, t, a, b, &fast))
+            return fast;
         if (op >= 4)
         {
             bool isMin = op == 4 || op == 6;

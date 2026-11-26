@@ -182,3 +182,10 @@ pub(crate) fn lower<'i>(opcode: &str, ops: Vec<HOp<'i>>) -> R<'i> {
     }
     None
 }
+
+/// Opcodes that a family lowers even though the grammar accepts them (the grammar's lowering
+/// does not match the ISA there): tried before the grammar (helpers::preempt_instruction).
+pub(crate) fn preempts(opcode: &str) -> bool {
+    let (base, m) = split(opcode);
+    float::preempts(opcode, base, &m)
+}

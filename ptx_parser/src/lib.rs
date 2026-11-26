@@ -883,6 +883,9 @@ fn statement<'a, 'input>(
                     .map(|var| Some(Statement::Variable(var))),
                 Token::Semicolon,
             ),
+            // instructions the fallback lowers although the grammar accepts them
+            (opt(pred_at), helpers::preempt_instruction, Token::Semicolon)
+                .map(|(p, i, _)| Some(ast::Statement::Instruction(p, i))),
             predicated_instruction.map(Some),
             // instructions outside the grammar: helpers.rs / helper_table.rs
             (opt(pred_at), helpers::helper_instruction, Token::Semicolon)

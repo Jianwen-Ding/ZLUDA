@@ -1983,6 +1983,15 @@ void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals
     runCleanup(m, true, true);
     for (int iter = 0; iter < 4; iter++)
     {
+        // address arithmetic folded into constant expressions (ptrtoint (addrspacecast @shared)
+        // + 4) is invisible to PointerRecovery: make it instructions first
+        {
+            std::vector<Constant *> cs;
+            for (GlobalVariable &gv : m.globals())
+                if (!gv.use_empty())
+                    cs.push_back(&gv);
+            convertUsersOfConstantsToInstructions(cs);
+        }
         bool changed = false;
         for (Function &f : m)
             if (!f.isDeclaration())

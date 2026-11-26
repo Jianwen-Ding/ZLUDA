@@ -209,9 +209,11 @@ pub(crate) fn helper_instruction<'a, 'input>(
             start = i + 1;
         }
     }
+    let extra = crate::helper_table::extra(opcode, &ops);
     match crate::helper_table::lower(opcode, ops) {
         Some(Ok(inst)) => {
             stream.input = &toks[end..];
+            stream.state.helper_extra = extra;
             Ok(inst)
         }
         Some(Err(e)) => {

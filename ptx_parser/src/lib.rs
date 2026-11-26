@@ -116,6 +116,8 @@ struct PtxParserState<'a, 'input> {
     /// names of the `.reg .pred` variables declared so far (instructions whose operand may be a predicate or an
     /// integer, such as cp.async's ignore-src / src-size)
     pred_regs: rustc_hash::FxHashSet<&'input str>,
+    /// instructions that follow the last fallback instruction (helper_table::extra), under its predicate
+    helper_extra: Vec<ast::Instruction<ParsedOperandStr<'input>>>,
 }
 
 impl<'a, 'input> PtxParserState<'a, 'input> {
@@ -125,6 +127,7 @@ impl<'a, 'input> PtxParserState<'a, 'input> {
             errors,
             function_declarations: FxHashMap::default(),
             pred_regs: Default::default(),
+            helper_extra: Vec::new(),
         }
     }
 
@@ -905,8 +908,7 @@ fn statement<'a, 'input>(
             ),
             predicated_instruction.map(Some),
             // instructions outside the grammar: helpers.rs / helper_table.rs
-            (opt(pred_at), helpers::helper_instruction, Token::Semicolon)
-                .map(|(p, i, _)| Some(ast::Statement::Instruction(p, i))),
+            helper_statement,
             pragma.map(|_| None),
             block_statement.map(Some),
         )),
@@ -915,6 +917,20 @@ fn statement<'a, 'input>(
     )
     .map(Option::flatten)
     .parse_next(stream)
+}
+
+fn helper_statement<'a, 'input>(
+    stream: &mut PtxParser<'a, 'input>,
+) -> PResult<Option<Statement<ParsedOperandStr<'input>>>> {
+    let (p, i, _) = (opt(pred_at), helpers::helper_instruction, Token::Semicolon).parse_next(stream)?;
+    let extra = std::mem::take(&mut stream.state.helper_extra);
+    if extra.is_empty() {
+        return Ok(Some(ast::Statement::Instruction(p, i)));
+    }
+    let cp = |p: &Option<ast::PredAt<&'input str>>| p.as_ref().map(|x| ast::PredAt { not: x.not, label: x.label });
+    let mut v = vec![ast::Statement::Instruction(cp(&p), i)];
+    v.extend(extra.into_iter().map(|e| ast::Statement::Instruction(cp(&p), e)));
+    Ok(Some(ast::Statement::Block(v)))
 }
 
 fn variable_statement<'a, 'input>(

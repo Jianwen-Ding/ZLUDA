@@ -189,6 +189,12 @@ pub(crate) fn lane_mask(s: Option<&str>, n: usize) -> u64 {
 }
 
 
+/// Instructions that follow a fallback instruction (under its predicate): a third destination, ...
+pub(crate) fn extra<'i>(opcode: &str, ops: &[HOp<'i>]) -> Vec<ast::Instruction<ParsedOperandStr<'i>>> {
+    let (base, m) = split(opcode);
+    memory::extra(base, &m, ops)
+}
+
 /// Lowers a fallback-parsed instruction: each family module returns None for opcodes it
 /// does not know.
 pub(crate) fn lower<'i>(opcode: &str, ops: Vec<HOp<'i>>) -> R<'i> {

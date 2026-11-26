@@ -441,6 +441,18 @@ impl<'i> AddrSrc<'i> for Call<'i> {
     }
 }
 
+/// mbarrier.{test,try}_wait.phase_type::primary waitComplete|reportPredicate, reportValue, [a], state: the model
+/// writes reportValue 0 ("only ever OR'ed with 0")
+pub(super) fn extra<'i>(base: &str, m: &[&str], ops: &[HOp<'i>]) -> Vec<ast::Instruction<ParsedOperandStr<'i>>> {
+    if base == "mbarrier" && (has(m, "test_wait") || has(m, "try_wait")) && ops.len() >= 3 && ops[2].addr && !ops[1].addr {
+        return vec![ast::Instruction::Mov {
+            data: ast::MovDetails { typ: ast::Type::Scalar(ScalarType::B32) },
+            arguments: ast::MovArgs { dst: ops[1].op.clone(), src: imm(0) },
+        }];
+    }
+    Vec::new()
+}
+
 #[allow(unused_variables)]
 pub(super) fn lower<'i>(opcode: &str, base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
     match base {

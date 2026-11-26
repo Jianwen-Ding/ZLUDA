@@ -525,24 +525,15 @@
         double kf = y * inv_ln2;
         int k = (int)(kf >= 0 ? kf + 0.5 : kf - 0.5);
         double r = (y - k * ln2_hi) - k * ln2_lo;
-        double t = 1.0, s = 1.0;
-        for (int i = 1; i <= 16; i++)
-        {
-            t = t * r / i;
-            s += t;
-        }
+        // e^r for |r| <= ln2 / 2: Taylor to degree 16 in Horner form (no divisions in soft-f64)
+        double s = 1.0 + r * (1.0 + r * (0.5 + r * (0.16666666666666666 + r * (0.041666666666666664 + r * (0.008333333333333333 + r * (0.001388888888888889 + r * (0.0001984126984126984 + r * (2.48015873015873e-05 + r * (2.7557319223985893e-06 + r * (2.755731922398589e-07 + r * (2.505210838544172e-08 + r * (2.08767569878681e-09 + r * (1.6059043836821613e-10 + r * (1.1470745597729725e-11 + r * (7.647163731819816e-13 + r * (4.779477332387385e-14))))))))))))))));
         return s * d_pow2(k);
     }
     // e^y - 1 for |y| <= 0.5
     static inline double d_expm1_small(double y)
     {
-        double t = y, s = y;
-        for (int i = 2; i <= 22; i++)
-        {
-            t = t * y / i;
-            s += t;
-        }
-        return s;
+        // Taylor to degree 22 in Horner form (no divisions in soft-f64)
+        return y * (1.0 + y * (0.5 + y * (0.16666666666666666 + y * (0.041666666666666664 + y * (0.008333333333333333 + y * (0.001388888888888889 + y * (0.0001984126984126984 + y * (2.48015873015873e-05 + y * (2.7557319223985893e-06 + y * (2.755731922398589e-07 + y * (2.505210838544172e-08 + y * (2.08767569878681e-09 + y * (1.6059043836821613e-10 + y * (1.1470745597729725e-11 + y * (7.647163731819816e-13 + y * (4.779477332387385e-14 + y * (2.8114572543455206e-15 + y * (1.5619206968586225e-16 + y * (8.22063524662433e-18 + y * (4.110317623312165e-19 + y * (1.9572941063391263e-20 + y * (8.896791392450574e-22))))))))))))))))))))));
     }
     // tanh(x) for x >= 0
     static inline double d_tanh_pos(double x)
@@ -589,8 +580,9 @@
         if (x.m == 0 || xf_cmp_p2(x, -12) < 0)
             return xpost(x, T_F32, pf);
         double xd = xf_to_d(x);
-        XF e1 = xdec_t(d_round_to(d_exp(xd), T_F32, 0), T_F32, false);
-        XF e2 = xdec_t(d_round_to(d_exp(-xd), T_F32, 0), T_F32, false);
+        double ex = d_exp(xd);
+        XF e1 = xdec_t(d_round_to(ex, T_F32, 0), T_F32, false);
+        XF e2 = xdec_t(d_round_to(1.0 / ex, T_F32, 0), T_F32, false);
         XF num = xround_t(xf_add(e1, xf_neg(e2), RM_RN), T_F32, RM_RN, 0, 0, false);
         XF den = xround_t(xf_add(e1, e2, RM_RN), T_F32, RM_RN, 0, 0, false);
         return xfin(xf_div(num, den, 24), T_F32, RM_RN, pf, 0, 0, false);
@@ -717,23 +709,15 @@
     }
     static inline double d_sin_k(double r)
     {
-        double r2 = r * r, t = r, s = r;
-        for (int i = 2; i <= 26; i += 2)
-        {
-            t = -t * r2 / (double)(i * (i + 1));
-            s += t;
-        }
-        return s;
+        // Taylor to degree 27 in Horner form (no divisions in soft-f64)
+        double r2 = r * r;
+        return r * (1.0 + r2 * (-0.16666666666666666 + r2 * (0.008333333333333333 + r2 * (-0.0001984126984126984 + r2 * (2.7557319223985893e-06 + r2 * (-2.505210838544172e-08 + r2 * (1.6059043836821613e-10 + r2 * (-7.647163731819816e-13 + r2 * (2.8114572543455206e-15 + r2 * (-8.22063524662433e-18 + r2 * (1.9572941063391263e-20 + r2 * (-3.868170170630684e-23 + r2 * (6.446950284384474e-26 + r2 * (-9.183689863795546e-29))))))))))))));
     }
     static inline double d_cos_k(double r)
     {
-        double r2 = r * r, t = 1.0, s = 1.0;
-        for (int i = 1; i <= 26; i += 2)
-        {
-            t = -t * r2 / (double)(i * (i + 1));
-            s += t;
-        }
-        return s;
+        // Taylor to degree 28 in Horner form (no divisions in soft-f64)
+        double r2 = r * r;
+        return 1.0 + r2 * (-0.5 + r2 * (0.041666666666666664 + r2 * (-0.001388888888888889 + r2 * (2.48015873015873e-05 + r2 * (-2.755731922398589e-07 + r2 * (2.08767569878681e-09 + r2 * (-1.1470745597729725e-11 + r2 * (4.779477332387385e-14 + r2 * (-1.5619206968586225e-16 + r2 * (4.110317623312165e-19 + r2 * (-8.896791392450574e-22 + r2 * (1.6117375710961184e-24 + r2 * (-2.4795962632247976e-27 + r2 * (3.279889237069838e-30))))))))))))));
     }
     uint32_t FUNC(fsincos_f32)(uint32_t a, uint32_t ctrl)
     {

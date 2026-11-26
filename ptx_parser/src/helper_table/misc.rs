@@ -4,6 +4,8 @@ use super::*;
 /// tried before the grammar: `mov` of special registers the grammar's types reject
 pub(super) fn preempts(_opcode: &str, base: &str, m: &[&str]) -> bool {
     base == "bmsk"
+        // video shifts: the grammar's lowering lacks the secondary operations (video.rs has them all)
+        || matches!(base, "vshl" | "vshr")
         // textures and surfaces in software (texture.rs): the grammar's forms need the descriptor objects too
         || matches!(base, "tex" | "tld4" | "txq" | "suld" | "sust" | "sured" | "suq" | "istypep")
         // packed integer lanes (float.rs ipack): the grammar's lowering is a 32-bit operation
@@ -169,8 +171,9 @@ pub(super) fn lower<'i>(_opcode: &str, base: &str, m: &[&str], ops: &[HOp<'i>]) 
                 .imm(kind | ((c.neg as u64) << 4))
                 .build()
         }
-        // ld{.ss}.type.proxy::readonly d, [a];  (PTX ISA 9.4: a hint without effect on the result)
-        "ld" if m.contains(&"proxy::readonly") => {
+        // ld{.ss}.type.proxy::readonly d, [a];  (PTX ISA 9.4: a hint without effect on the result); qualifier
+        // combinations the ISA text rules out (ld.volatile.relaxed.scope: a load, the model's evident meaning)
+        "ld" if m.contains(&"proxy::readonly") || (m.contains(&"volatile") && (m.contains(&"relaxed") || m.contains(&"acquire"))) => {
             let [d, a] = ops else { return err("ld operands") };
             if !a.addr {
                 return err("ld address");
@@ -189,7 +192,7 @@ pub(super) fn lower<'i>(_opcode: &str, base: &str, m: &[&str], ops: &[HOp<'i>]) 
             };
             Some(Ok(ast::Instruction::Ld {
                 data: ast::LdDetails {
-                    qualifier: ast::LdStQualifier::Weak,
+                    qualifier: if m.contains(&"volatile") { ast::LdStQualifier::Volatile } else { ast::LdStQualifier::Weak },
                     state_space: ss,
                     caching: ast::LdCacheOperator::Cached,
                     typ: ast::Type::Scalar(t),

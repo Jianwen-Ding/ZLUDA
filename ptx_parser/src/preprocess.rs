@@ -46,6 +46,7 @@ fn needs_work(text: &str) -> bool {
         || text.contains(".alias")
         || text.contains("generic(")
         || text.contains("texmode_")
+        || text.contains("compute_")
         || text.contains("0b")
         || text.contains('[')
         || b.iter().any(|c| matches!(c, b'*' | b'/' | b'%' | b'&' | b'^' | b'~' | b'?' | b'<' | b'>' | b'(' | b'+' | b'-'))
@@ -277,7 +278,11 @@ fn drop_directives(text: &str) -> String {
         for part in line[".target".len()..].split(',') {
             let w = part.trim();
             if !(w.starts_with("texmode_") || w == "map_f64_to_f32" || w == "debug") {
-                keep.push(w.to_string());
+                // compute_NN is a synonym of sm_NN (11.1.2)
+                keep.push(match w.strip_prefix("compute_") {
+                    Some(v) => format!("sm_{v}"),
+                    None => w.to_string(),
+                });
             }
         }
         let repl = format!(".target {}", keep.join(", "));

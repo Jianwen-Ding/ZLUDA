@@ -5,13 +5,16 @@
 //! (convert-gpu-to-air) -> an AGX object (gpu-module-to-binary with `#air.target<chip = "agx-g14c">`), see build.rs.
 //! Its kernels take each pointer and each scalar as one argument, in order ([`agx::Arg`]). Vectors are (pointer,
 //! offset, increment) with BLAS's negative increments as an offset; matrices are column-major with explicit row
-//! and column strides, so transposes are strides. Reductions are two launches (per-block partials, then one
-//! block). Launches are synchronous: the stream of a handle is recorded only.
+//! and column strides, so transposes are strides. Reductions are one launch (the last block combines the
+//! blocks' partials). Launches are synchronous: the stream of a handle is recorded only.
 //!
-//! Implemented: handle and modes, Set/GetVector, Set/GetMatrix; S/D axpy, scal, copy, swap, dot, nrm2, asum,
-//! amax, amin, gemv, gemm (and strided-batched, batched); Hgemm (and strided-batched), GemmEx /
-//! GemmStridedBatchedEx / GemmBatchedEx for f16, bf16, f32 and f64 data with float (double for f64)
-//! accumulation. Complex types are not implemented (CUBLAS_STATUS_NOT_SUPPORTED).
+//! Implemented (README, cuBLAS): handle and modes, Set/GetVector / Matrix (and Async); S/D level 1 (with rot,
+//! rotg, rotm, rotmg), gemv (batched), gbmv, symv, sbmv, spmv, ger, syr, syr2, trmv / trsv in full, band and
+//! packed storage, gemm (strided-batched, batched with device pointer arrays), symm, syrk, syr2k, syrkx, trmm,
+//! trsm, geam, dgmm; C/Z axpy, scal, copy, swap, dotu, dotc, nrm2, asum, rot, gemv, gemm; Hgemm, GemmEx and their
+//! batched forms for f16, bf16, f32 and f64 data; the _64 entry points. Structured matrices are expanded to dense
+//! copies (the geam kernel); float / half GEMMs run on the SIMD-group matrix kernel (zero-padded copies where its
+//! tiles do not divide the shape).
 #![allow(non_snake_case, dead_code, clippy::missing_safety_doc, clippy::too_many_arguments)]
 
 use crate::agx::{self, Arg};

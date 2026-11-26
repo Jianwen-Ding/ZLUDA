@@ -149,19 +149,60 @@ dialect (`blas/gen_kernels.py`) and compiled by the LLVM fork's MLIR, GPU -> AIR
 runs it when `mlir-opt` exists (`ZLUDA_MLIR_OPT`, or `../../llvm-project/build/bin/mlir-opt`, a build with
 `-DLLVM_ENABLE_PROJECTS=mlir`) and otherwise uses the checked-in `blas/zluda_blas.agx.o`.
 
-* handle, stream, pointer mode (host and device scalars), math mode, workspace; `Set/GetVector`, `Set/GetMatrix`
-* S / D `axpy scal copy swap dot nrm2 asum amax amin gemv gemm gemmStridedBatched gemmBatched`
-* `Hgemm`, `HgemmStridedBatched`, `GemmEx`, `GemmStridedBatchedEx`, `GemmBatchedEx` for f16 / bf16 data
-  (float accumulation, output in the data type or f32), f32 and f64
-* not implemented: complex types, the other level 2 / 3 routines (`CUBLAS_STATUS_NOT_SUPPORTED` is not
-  returned for them: they are not exported), matrices beyond 2^31 elements
+* handle, stream, pointer mode (host and device scalars), math mode, atomics mode, SM count target, workspace,
+  `GetProperty`, `GetCudartVersion`; `Set/GetVector`, `Set/GetMatrix` and their `Async` forms (synchronous)
+* level 1: S / D `axpy scal copy swap dot nrm2 asum amax amin rot rotg rotm rotmg`; C / Z `axpy scal
+  (Cs/Zd)scal copy swap dotu dotc (Sc/Dz)nrm2 (Sc/Dz)asum (Cs/Zd)rot`
+* level 2: S / D `gemv gemvStridedBatched gemvBatched gbmv symv sbmv spmv ger syr syr2 trmv tbmv tpmv trsv tbsv
+  tpsv`; C / Z `gemv`
+* level 3: S / D `gemm gemmStridedBatched gemmBatched symm syrk syr2k syrkx trmm trsm trsmBatched geam dgmm`; C / Z
+  `gemm gemm3m gemmStridedBatched gemmBatched`; `Hgemm`, `HgemmStridedBatched`, `GemmEx`, `GemmStridedBatchedEx`,
+  `GemmBatchedEx` for f16 / bf16 data (float accumulation, output in the data type or f32), f32 and f64
+* the `_64` entry points of all of these (dimensions beyond int32: `CUBLAS_STATUS_NOT_SUPPORTED`)
+* not implemented (not exported): the complex level 2 / 3 routines other than gemv / gemm (hemv, herk, ...), `Icamax`,
+  `Crot` with a complex sine, packed rank updates (`spr`, `spr2`), the batched LU / QR / least-squares routines,
+  cublasLt; matrices beyond 2^31 elements
 
-GEMMs with a float C (`Sgemm`, f16 / bf16 `GemmEx` to f32) whose m and n are multiples of 16 and k of 8 run
-on AGX's SIMD-group matrix multiply (`air.simdgroup_matrix_*`, one SIMD group per 16 x 16 or, for large C, 32 x 32 tile; alpha and beta
-as products with alpha I / beta I): a 256^3 Sgemm is predicted at 17.3 us against 120.8 us for the
-register-tiled kernel the other shapes use (`ZLUDA_BLAS_NO_MMA=1` forces it). Double precision is emulated
-(AIR's portable passes). `tests/blas/test_blas.py` checks every routine against
-numpy (transposes, leading dimensions, negative increments, batches, both pointer modes).
+Argument checks follow cuBLAS's documented rules (`CUBLAS_STATUS_INVALID_VALUE` for bad enums, negative
+dimensions, short leading dimensions, zero increments, in-place geam other than C = A / B). How the routines map
+onto the kernels:
+
+* GEMMs with a float or half C (`Sgemm`, `Hgemm`, f16 / bf16 `GemmEx`) run on AGX's SIMD-group matrix multiply
+  (`air.simdgroup_matrix_*`: one SIMD group per 16 x 16 or, when that still gives 256 of them, 32 x 32 tile of an
+  f32 C, k in steps of 8; alpha and beta as products with alpha I / beta I). Shapes the tiles do not divide run on
+  zero-padded copies of op(A), op(B) and C (`pad_*` kernels), an f16 / bf16 C on an f32 copy (`cvt_*`), so every
+  shape from 16 x 16 x 8 up (and, for padded copies, 2^17 multiply-adds) uses the matrix hardware; smaller ones and
+  doubles use a register-tiled kernel (4 x 4, f64 2 x 2 per thread). `ZLUDA_BLAS_NO_MMA=1` forces it,
+  `ZLUDA_BLAS_MMA_TILE=16 / 32` the tile.
+* `gemmBatched` / `GemmBatchedEx` read the device arrays of matrix addresses in the kernels (one launch).
+* gemv: 32 rows (a SIMD group's lanes) x 32 (f64: 16) column groups per block with the partial sums added in
+  threadgroup memory, or, for row-contiguous op(A) / few rows, a SIMD group per row; batched over grid y.
+* dot / nrm2 / asum / amax / amin are single launches: blocks of 256 threads write partials and the last block to
+  finish (an atomic count) combines them in block order (deterministic).
+* symmetric / triangular / banded / packed matrices are expanded by one elementwise kernel (`geam`, which also
+  serves geam, dgmm and triangle-masked copies) to dense copies for gemv / gemm: symv, sbmv, spmv, gbmv, trmv,
+  tbmv, tpmv, symm, trmm; syrk / syr2k / syrkx are GEMMs into a copy of C whose triangle is copied back.
+* trsv / tbsv / tpsv / trsm: one SIMD group per right-hand side (trsm: B's columns, or rows on the right); lane l
+  owns the elements i = l mod 32, the solved unknown is broadcast by a shuffle (no shared memory).
+* complex data is the real type's memory interleaved; products are real fmas with per-operand conjugation.
+
+Predicted times (`ZLUDA_AGX_STATS`, `tests/blas/bench_blas.py`, the simulated M2 Max):
+
+| Call | before | now |
+| --- | --- | --- |
+| Sgemm 256^3 / 512^3 / 1024^3 | 17.3 / 46.2 / 238.9 us | 17.3 / 46.1 / 238.3 us |
+| Sgemm 250^3 / 500^3 / 1000^3 | 118.4 / 226.0 / (not simulated) us | 32.5 / 76.1 / 319.9 us |
+| Sgemm 255 x 257 x 129 | 62.6 us | 25.1 us |
+| Hgemm 256^3 / 512^3 | 122.8 / 241.2 us | 21.9 / 53.1 us |
+| Dgemm 128^3 | 2197.9 us | 410.2 us |
+| Sgemv 1000 x 1000 (N / T) | 321.6 / 101.6 us | 16.2 / 13.6 us |
+| Dgemv 1000 x 1000 | 1198.6 us | 75.6 us |
+| Sdot / Snrm2 / Isamax 1e6 | 89.1 / 52.5 / 56.1 us | 27.3 / 15.6 / 16.5 us |
+
+Double precision is emulated (AIR's portable passes). `tests/blas/test_blas.py` checks every routine against
+numpy (transposes, leading dimensions, negative increments, batches, both pointer modes, structured storage,
+argument errors). The kernels' object is 376 KB (49 kernels; the f64 ones are most of it: emulated doubles); it
+loads in 0.3 ms (kernels' code is copied out when first used).
 
 ### Floating point modes (`ZLUDA_FP_MODE`)
 

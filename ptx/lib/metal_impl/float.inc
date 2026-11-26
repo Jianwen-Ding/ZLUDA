@@ -672,8 +672,10 @@
         float v = ND_ADD(ph, pl);
         float d = ND_ADD(ND_SUB(ph, v), pl);
         float dl = ND_MUL(v, 0x1p-40f);
+#ifndef ZLUDA_FAST_NOCHECK
         if (ND_ADD(v, ND_ADD(d, dl)) != v || ND_ADD(v, ND_SUB(d, dl)) != v)
             return false;
+#endif
         *out = ND_MUL(v, __builtin_bit_cast(float, (uint32_t)(m + 127) << 23));
         return true;
     }

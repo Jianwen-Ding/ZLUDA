@@ -690,7 +690,15 @@ fn run_instruction<'input>(
             to_call(
                 resolver,
                 fn_declarations,
-                format!("ldmatrix_{}_{}{}_{}", shape, number, trans, type_str).into(),
+                format!(
+                    "ldmatrix_{}_{}{}_{}{}",
+                    shape,
+                    number,
+                    trans,
+                    type_str,
+                    if data.state_space == ast::StateSpace::Generic { "_generic" } else { "" }
+                )
+                .into(),
                 i,
             )?
         }

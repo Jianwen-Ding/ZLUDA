@@ -2014,7 +2014,8 @@ impl LdMatrixDetails {
             shape,
             number,
             transpose,
-            state_space: ss.unwrap_or(StateSpace::Shared),
+            // without .shared the address is generic (it must fall in the .shared window)
+            state_space: ss.unwrap_or(StateSpace::Generic),
             type_,
         }
     }

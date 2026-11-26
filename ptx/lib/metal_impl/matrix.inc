@@ -1052,6 +1052,13 @@ extern "C++"
         VT r;                                                                            \
         MX_UNROLL for (int i = 0; i < NOUT; i++) r[i] = d[i];                            \
         return r;                                                                        \
+    }                                                                                    \
+    VT FUNC(NAME##_generic)(void *p)                                                     \
+    {                                                                                    \
+        mx_u32x8 d = mx_ldmatrix_generic((const uint8_t *)p, CTL);                       \
+        VT r;                                                                            \
+        MX_UNROLL for (int i = 0; i < NOUT; i++) r[i] = d[i];                            \
+        return r;                                                                        \
     }
     MX_LDM_NAMED(ldmatrix_m8n8_x1_b16, mx_u32x1, 1, 1)
     MX_LDM_NAMED(ldmatrix_m8n8_x2_b16, mx_u32x2, 2, 2)

@@ -205,9 +205,54 @@ class PointerRecovery
 public:
     explicit PointerRecovery(Function &f) : f(f), dl(f.getParent()->getDataLayout()) {}
 
-    bool run()
+    // integer pointer arithmetic that folded into constant expressions (on module-scope variables) is expanded
+    // into instructions, which the recovery below handles
+    static bool hasIntToPtr(Constant *c)
+    {
+        auto *ce = dyn_cast<ConstantExpr>(c);
+        if (!ce)
+            return false;
+        if (ce->getOpcode() == Instruction::IntToPtr)
+            return true;
+        for (Value *op : ce->operands())
+            if (auto *oc = dyn_cast<Constant>(op))
+                if (hasIntToPtr(oc))
+                    return true;
+        return false;
+    }
+    static Instruction *expandConstant(ConstantExpr *ce, Instruction *before)
+    {
+        Instruction *ni = ce->getAsInstruction();
+        ni->insertBefore(before);
+        for (unsigned i = 0; i < ni->getNumOperands(); i++)
+            if (auto *oc = dyn_cast<ConstantExpr>(ni->getOperand(i)))
+                if (hasIntToPtr(oc))
+                    ni->setOperand(i, expandConstant(oc, ni));
+        return ni;
+    }
+    bool expandConstants()
     {
         bool changed = false;
+        SmallVector<Instruction *, 32> users;
+        for (Instruction &i : instructions(f))
+            users.push_back(&i);
+        for (Instruction *i : users)
+            for (unsigned k = 0; k < i->getNumOperands(); k++)
+                if (auto *ce = dyn_cast<ConstantExpr>(i->getOperand(k)))
+                    if (hasIntToPtr(ce))
+                    {
+                        Instruction *at = i;
+                        if (auto *phi = dyn_cast<PHINode>(i))
+                            at = phi->getIncomingBlock(k)->getTerminator();
+                        i->setOperand(k, expandConstant(ce, at));
+                        changed = true;
+                    }
+        return changed;
+    }
+
+    bool run()
+    {
+        bool changed = expandConstants();
         SmallVector<Instruction *, 32> worklist;
         for (Instruction &i : instructions(f))
             if (isa<IntToPtrInst>(i) || isa<AddrSpaceCastInst>(i) || isa<ICmpInst>(i))
@@ -263,6 +308,15 @@ private:
     const DataLayout &dl;
     std::map<Value *, Value *> memo;
 
+    // the pointer under addrspacecasts (cvta: the generic address of a shared or local object keeps the
+    // provenance of that object)
+    static Value *stripCasts(Value *p)
+    {
+        while (auto *o = dyn_cast<AddrSpaceCastOperator>(p))
+            p = o->getPointerOperand();
+        return p;
+    }
+
     Value *castTo(IRBuilder<> &b, Value *p, PointerType *t)
     {
         if (p->getType() == t)
@@ -286,7 +340,7 @@ private:
     unsigned baseAddressSpace(Value *v, SmallPtrSetImpl<Value *> &visiting)
     {
         if (auto *pti = dyn_cast<PtrToIntOperator>(v))
-            return pti->getPointerAddressSpace();
+            return stripCasts(pti->getPointerOperand())->getType()->getPointerAddressSpace();
         if (!visiting.insert(v).second)
             return ~1u; // cycle: neutral element
         if (auto *bo = dyn_cast<BinaryOperator>(v))
@@ -357,12 +411,12 @@ private:
         Value *result = nullptr;
         if (auto *pti = dyn_cast<PtrToIntInst>(v))
         {
-            result = pti->getOperand(0);
+            result = stripCasts(pti->getOperand(0));
         }
         else if (auto *ce = dyn_cast<ConstantExpr>(v))
         {
             if (ce->getOpcode() == Instruction::PtrToInt)
-                result = ce->getOperand(0);
+                result = stripCasts(ce->getOperand(0));
             else if (ce->getOpcode() == Instruction::Add)
             {
                 for (unsigned side = 0; side < 2 && !result; side++)

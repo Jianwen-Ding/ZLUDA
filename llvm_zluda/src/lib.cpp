@@ -4,8 +4,10 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Type.h>
 #include <llvm/IR/Instructions.h>
+#ifndef ZLUDA_NO_LLD
 #include <lld/Common/Driver.h>
 #include <lld/Common/CommonLinkerContext.h>
+#endif
 #include <llvm/Support/raw_ostream.h>
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
@@ -13,8 +15,10 @@
 
 #include <mutex>
 
+#ifndef ZLUDA_NO_LLD
 // Declare that we want to use the ELF driver
 LLD_HAS_DRIVER(elf)
+#endif
 
 using namespace llvm;
 
@@ -210,6 +214,7 @@ void LLVMZludaSetAtomic(
     }
 }
 
+#ifndef ZLUDA_NO_LLD
 std::mutex lld_mutex;
 
 int LLVMZludaLinkWithLLD(uint32_t inputs, const char **input_paths, const char *output_path, char **ErrorMessage)
@@ -255,6 +260,15 @@ int LLVMZludaLinkWithLLD(uint32_t inputs, const char **input_paths, const char *
     return 0;
 }
 
+#else
+int LLVMZludaLinkWithLLD(uint32_t, const char **, const char *, char **ErrorMessage)
+{
+    if (ErrorMessage)
+        *ErrorMessage = strdup("LLD is not available when building against a system LLVM");
+    return 1;
+}
+#endif
+
 bool LLVMZludaParseCommandLineOptions(int argc, const char *const *argv,
                                       char **ErrorMessage)
 {
@@ -267,5 +281,35 @@ bool LLVMZludaParseCommandLineOptions(int argc, const char *const *argv,
     }
     return result;
 }
+
+#ifdef ZLUDA_NO_LLD
+// Backports of LLVM-C entry points that the emitter uses but which are not
+// present in older (system) LLVM releases. They are approximations that are
+// good enough for targets which do not consume the denormal attributes.
+static const char *zludaDenormalName(unsigned kind)
+{
+    switch (kind)
+    {
+    case 0:
+        return "ieee";
+    case 1:
+        return "preserve-sign";
+    case 2:
+        return "positive-zero";
+    default:
+        return "dynamic";
+    }
+}
+
+LLVMAttributeRef LLVMCreateDenormalFPEnvAttribute(LLVMContextRef C, unsigned DefaultOut, unsigned DefaultIn,
+                                                  unsigned FloatOut, unsigned FloatIn)
+{
+    (void)DefaultOut;
+    (void)DefaultIn;
+    std::string value = std::string(zludaDenormalName(FloatOut)) + "," + zludaDenormalName(FloatIn);
+    const char *key = "denormal-fp-math-f32";
+    return LLVMCreateStringAttribute(C, key, (unsigned)strlen(key), value.c_str(), (unsigned)value.size());
+}
+#endif
 
 LLVM_C_EXTERN_C_END

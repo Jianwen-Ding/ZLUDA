@@ -19,6 +19,13 @@ const COMPONENTS: &[&'static str] = &[
 ];
 
 fn main() {
+    // Opt-in: build against an already-installed LLVM (for example the
+    // distribution's LLVM 18) instead of the ROCm LLVM submodule. This is
+    // what the Metal backend uses: it needs no AMDGPU target and no LLD.
+    println!("cargo:rerun-if-env-changed=ZLUDA_SYSTEM_LLVM_CONFIG");
+    if let Ok(llvm_config_path) = env::var("ZLUDA_SYSTEM_LLVM_CONFIG") {
+        return system_llvm_main(PathBuf::from(llvm_config_path));
+    }
     let bc_path1 = "src/device-libs/ockl.bc";
     println!("cargo:rerun-if-changed={}", bc_path1);
     check_lfs_file(bc_path1);
@@ -234,4 +241,34 @@ fn link_llvm_components(components: String) {
 fn link_lld_components() {
     println!("cargo:rustc-link-lib=lldELF");
     println!("cargo:rustc-link-lib=lldCommon");
+}
+
+fn system_llvm_main(llvm_config_path: PathBuf) {
+    let run = |args: &[&str]| -> String {
+        let out = Command::new(&llvm_config_path)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run {}: {e}", llvm_config_path.display()));
+        assert!(out.status.success(), "llvm-config {:?} failed", args);
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    let libdir = run(&["--libdir"]);
+    let cxxflags = run(&["--cxxflags"]);
+    println!("cargo:rustc-cfg=zluda_system_llvm");
+    println!("cargo:rustc-link-search=native={libdir}");
+    // The distribution ships one shared libLLVM; link to it dynamically.
+    println!("cargo:rustc-link-lib=dylib=LLVM");
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{libdir}");
+    println!("cargo:build-path={}", run(&["--prefix"]));
+    let mut cc = cc::Build::new();
+    for flag in cxxflags.split_whitespace() {
+        // -fno-exceptions etc are fine; drop -std= so we can pick our own
+        if !flag.starts_with("-std=") {
+            cc.flag(flag);
+        }
+    }
+    cc.flag("-std=c++17");
+    cc.define("ZLUDA_NO_LLD", None);
+    cc.cpp(true).file("src/lib.cpp").compile("llvm_zluda_cpp");
+    println!("cargo:rerun-if-changed=src/lib.cpp");
 }

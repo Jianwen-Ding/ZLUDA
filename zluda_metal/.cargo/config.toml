@@ -1,0 +1,4 @@
+# The Metal backend links against an installed LLVM 18 (and its clang).
+# Override with e.g. ZLUDA_SYSTEM_LLVM_CONFIG=/opt/homebrew/opt/llvm@18/bin/llvm-config
+[env]
+ZLUDA_SYSTEM_LLVM_CONFIG = { value = "llvm-config-18", force = false }

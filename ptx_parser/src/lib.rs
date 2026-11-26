@@ -913,8 +913,7 @@ fn statement<'a, 'input>(
                 Token::Semicolon,
             ),
             // instructions the fallback lowers although the grammar accepts them
-            (opt(pred_at), helpers::preempt_instruction, Token::Semicolon)
-                .map(|(p, i, _)| Some(ast::Statement::Instruction(p, i))),
+            preempt_statement,
             predicated_instruction.map(Some),
             // instructions outside the grammar: helpers.rs / helper_table.rs
             helper_statement,
@@ -928,10 +927,26 @@ fn statement<'a, 'input>(
     .parse_next(stream)
 }
 
+fn preempt_statement<'a, 'input>(
+    stream: &mut PtxParser<'a, 'input>,
+) -> PResult<Option<Statement<ParsedOperandStr<'input>>>> {
+    let (p, i, _) = (opt(pred_at), helpers::preempt_instruction, Token::Semicolon).parse_next(stream)?;
+    with_helper_extra(stream, p, i)
+}
+
 fn helper_statement<'a, 'input>(
     stream: &mut PtxParser<'a, 'input>,
 ) -> PResult<Option<Statement<ParsedOperandStr<'input>>>> {
     let (p, i, _) = (opt(pred_at), helpers::helper_instruction, Token::Semicolon).parse_next(stream)?;
+    with_helper_extra(stream, p, i)
+}
+
+/// the fallback instruction and the instructions that follow it (helper_table::extra), under its predicate
+fn with_helper_extra<'a, 'input>(
+    stream: &mut PtxParser<'a, 'input>,
+    p: Option<ast::PredAt<&'input str>>,
+    i: ast::Instruction<ParsedOperandStr<'input>>,
+) -> PResult<Option<Statement<ParsedOperandStr<'input>>>> {
     let extra = std::mem::take(&mut stream.state.helper_extra);
     if extra.is_empty() {
         return Ok(Some(ast::Statement::Instruction(p, i)));

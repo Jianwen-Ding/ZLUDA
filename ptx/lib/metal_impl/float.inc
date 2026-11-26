@@ -646,3 +646,36 @@
         XF r = xround_t(xf_sqrt(x, 24), T_F32, RM_RN, 0, 0, false);
         return (uint32_t)xfin(xf_div(xf_fin(false, 1, 0), r, 24), T_F32, RM_RN, ftz ? PF_FTZ : 0, 0, 0, false);
     }
+
+    // ex2.approx{.ftz}.{f16,bf16,f16x2,bf16x2}: 2^x correctly rounded
+    static inline uint64_t f_ex2h(uint64_t a, uint32_t t, bool ftz)
+    {
+        XF x = xdec_t(a, t, ftz);
+        uint32_t pf = ftz ? PF_FTZ : 0;
+        if (x.c == XF_NAN)
+            return canon_nan(t);
+        if (x.c == XF_INF)
+            return x.s ? 0 : xenc_t(x, t);
+        if (x.m == 0)
+            return xpost(xround_t(xf_fin(false, 1, 0), t, RM_RN, 0, 0, false), t, pf);
+        double xd = xf_to_d(x);
+        if (xd >= 160.0)
+            return xpost(xf_inf(false), t, pf);
+        if (xd <= -160.0)
+            return xpost(xf_fin(false, 0, 0), t, pf);
+        double n = (double)(int)xd;
+        if (n > xd)
+            n -= 1.0;
+        double f = xd - n;
+        double r = f == 0.0 ? 1.0 : d_exp(f * 0.69314718055994530942);
+        int k = (int)n;
+        XF v = xdec_t(d_bits(r), T_F64, false);
+        v.e += k;
+        return xfin(v, t, RM_RN, pf, 0, 0, false);
+    }
+    uint16_t FUNC(fex2h_16)(uint16_t a, uint32_t ctrl) { return (uint16_t)f_ex2h(a, (ctrl >> 4) & 15, ctrl & F_FTZ); }
+    uint32_t FUNC(fex2h_32)(uint32_t a, uint32_t ctrl)
+    {
+        uint32_t t = (ctrl >> 4) & 15;
+        return (uint32_t)f_ex2h(a & 0xFFFF, t, ctrl & F_FTZ) | ((uint32_t)f_ex2h(a >> 16, t, ctrl & F_FTZ) << 16);
+    }

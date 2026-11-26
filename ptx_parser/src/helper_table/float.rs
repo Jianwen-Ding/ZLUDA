@@ -304,6 +304,14 @@ fn approx<'i>(base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
                 .imm(code << 4 | (pk as u64) << 8 | ftz)
                 .build()
         }
+        ("ex2", "f16" | "bf16" | "f16x2" | "bf16x2") => {
+            let (code, pk, w) = ftype(t)?;
+            Call::new(format!("fex2h_{w}"))
+                .dst(ops[0].op.clone(), bits(w))
+                .src(ops[1].op.clone(), bits(w))
+                .imm(code << 4 | (pk as u64) << 8 | ftz)
+                .build()
+        }
         ("rcp" | "rsqrt", "f64") => Call::new("fapx64")
             .dst(ops[0].op.clone(), ScalarType::B64)
             .src(cvt::fimm(ops[1].op.clone(), 64), ScalarType::B64)
@@ -345,7 +353,7 @@ pub(super) fn lower<'i>(_opcode: &str, base: &str, m: &[&str], ops: &[HOp<'i>]) 
         "div" if m.contains(&"approx") => approx(base, m, ops),
         "div" | "sqrt" | "rcp" if !m.contains(&"approx") => divsqrt(base, m, ops),
         "neg" | "abs" => negabs(base, m, ops),
-        "tanh" | "rcp" | "rsqrt" => approx(base, m, ops),
+        "tanh" | "rcp" | "rsqrt" | "ex2" => approx(base, m, ops),
         _ => None,
     }
 }
@@ -367,6 +375,7 @@ pub(super) fn preempts(_opcode: &str, base: &str, m: &[&str]) -> bool {
         "min" | "max" => m.iter().any(half) || m.contains(&"f64") || any(&["ftz", "NaN", "xorsign", "abs"]),
         // the approximate forms the model defines exactly (see `approx`)
         "tanh" => true,
+        "ex2" => m.iter().any(half),
         "rcp" | "rsqrt" if m == ["approx", "f64"] || m == ["approx", "ftz", "f64"] => true,
         "div" if m == ["approx", "f32"] || m == ["approx", "ftz", "f32"] => true,
         // neg / abs .ftz (llvm.canonicalize is not available)

@@ -17,6 +17,7 @@ pub fn preprocess(text: &str) -> Cow<'_, str> {
     let s = drop_directives(text);
     let s = fold_expressions(&s);
     let s = expand_param_names(&s);
+    let s = array_operands(&s);
     Cow::Owned(s)
 }
 
@@ -31,6 +32,7 @@ fn needs_work(text: &str) -> bool {
         || text.contains("generic(")
         || text.contains("texmode_")
         || text.contains("0b")
+        || text.contains('[')
         || b.iter().any(|c| matches!(c, b'*' | b'/' | b'%' | b'&' | b'^' | b'~' | b'?' | b'<' | b'>' | b'(' | b'+' | b'-'))
 }
 
@@ -976,5 +978,164 @@ mod tests {
         assert_eq!(f("call (%r2), f, (1 + 2);"), "call (%r2), f, (3);");
         assert_eq!(f(".global .u32 g[2 * 2] = { 1 + 1, WARP_SZ / 4 };"), ".global .u32 g[4] = { 2, 8 };");
         assert_eq!(f("mov.u32 %r3, 0b1111;"), "mov.u32 %r3, 15;");
+    }
+}
+
+// ------------------------------------------------------------------------------------------------ array operands
+
+/// array elements as operands (6.4.1, 6.4.2): `ld.global.u32 s, a[8];` -> `ld.global.u32 s, [a+8];`,
+/// `mov.u64 p, a[4];` -> `mov.u64 p, a+4;`; a register index `a[r+4]` of a memory operand computes the address in a
+/// scoped register: `{ .reg .u64 %__zluda_ai; mov.u64 %__zluda_ai, a; add.u64 %__zluda_ai, %__zluda_ai, r; ld ... [%__zluda_ai+4]; }`
+fn array_operands(t: &str) -> String {
+    let wide = !t.contains(".address_size 32");
+    let at = if wide { "u64" } else { "u32" };
+    let op = opaque_ranges(t);
+    let b = t.as_bytes();
+    let mut out = String::with_capacity(t.len());
+    let mut last = 0;
+    let mut i = 0;
+    // statement boundaries
+    while i < b.len() {
+        let start = i;
+        while i < b.len() && !matches!(b[i], b';' | b'{' | b'}') {
+            if let Some(&(_, e)) = op.iter().find(|&&(a, _)| a == i) {
+                i = e;
+            } else {
+                i += 1;
+            }
+        }
+        let end = i;
+        if i < b.len() {
+            i += 1;
+        }
+        // the statement starts after the comments that precede it
+        let start = op.iter().filter(|&&(a, e)| a >= start && e <= end).map(|&(_, e)| e).max().unwrap_or(start);
+        let stmt = &t[start..end];
+        if !stmt.contains('[') {
+            continue;
+        }
+        if let Some(repl) = rewrite_array_stmt(stmt, at) {
+            out.push_str(&t[last..start]);
+            out.push_str(&repl);
+            last = end;
+            if repl.ends_with('}') && end < b.len() && b[end] == b';' {
+                last = end + 1;
+            }
+        }
+    }
+    out.push_str(&t[last..]);
+    out
+}
+
+fn rewrite_array_stmt(stmt: &str, at: &str) -> Option<String> {
+    // leading label(s) and predicate
+    let lead_len = stmt.len() - stmt.trim_start().len();
+    let mut body = &stmt[lead_len..];
+    let mut prefix = String::new();
+    loop {
+        let w = body.split_whitespace().next()?;
+        if w.ends_with(':') && !w.contains("::") {
+            let p = body.find(':')? + 1;
+            prefix.push_str(&body[..p]);
+            body = &body[p..];
+            let l = body.len() - body.trim_start().len();
+            prefix.push_str(&body[..l]);
+            body = &body[l..];
+            continue;
+        }
+        break;
+    }
+    let mut pred = "";
+    if body.starts_with('@') {
+        let e = body.find(char::is_whitespace)?;
+        pred = &body[..e];
+        body = body[e..].trim_start();
+    }
+    let opcode = body.split_whitespace().next()?;
+    if opcode.starts_with('.') || !opcode.bytes().next()?.is_ascii_alphabetic() {
+        return None;
+    }
+    let base = opcode.split('.').next()?;
+    let memop = matches!(base, "ld" | "st" | "ldu" | "atom" | "red" | "prefetch" | "prefetchu" | "cp" | "mbarrier");
+    let bb = body.as_bytes();
+    let mut out = String::new();
+    let mut k = 0;
+    let mut pre: Vec<String> = Vec::new();
+    let mut changed = false;
+    let mut idx = 0;
+    let mut post: Option<String> = None;
+    while k < bb.len() {
+        // an identifier directly followed by `[` (after optional spaces), not inside `[...]`
+        if (bb[k].is_ascii_alphabetic() || bb[k] == b'_' || bb[k] == b'$') && (k == 0 || !is_word(bb[k - 1])) && k >= opcode.len() {
+            let s = k;
+            while k < bb.len() && (bb[k].is_ascii_alphanumeric() || bb[k] == b'_' || bb[k] == b'$') {
+                k += 1;
+            }
+            let name = &body[s..k];
+            let mut j = k;
+            while j < bb.len() && bb[j] == b' ' {
+                j += 1;
+            }
+            // not an operand of a bracketed list `[name, ...]` nor a declaration
+            let in_brackets = body[..s].matches('[').count() > body[..s].matches(']').count();
+            if j < bb.len() && bb[j] == b'[' && !in_brackets {
+                let close = body[j..].find(']')? + j;
+                let inner = body[j + 1..close].trim();
+                if inner.starts_with('%') {
+                    // register index (+ / - a constant offset)
+                    let split = inner.find(|c| c == '+' || c == '-');
+                    let (reg, off) = match split {
+                        Some(p) => (inner[..p].trim(), inner[p..].replace(' ', "")),
+                        None => (inner, String::new()),
+                    };
+                    if !memop || !reg[1..].bytes().all(is_word) {
+                        return None;
+                    }
+                    let tmp = format!("%__zluda_ai{idx}");
+                    idx += 1;
+                    pre.push(format!(".reg .{at} {tmp}; mov.{at} {tmp}, {name}; add.{at} {tmp}, {tmp}, {reg};"));
+                    out.push_str(&format!("[{tmp}{}]", if off.is_empty() { String::new() } else { format!("+{}", off.trim_start_matches('+')) }));
+                } else {
+                    let off = if inner.starts_with('-') { inner.to_string() } else { format!("+{inner}") };
+                    if memop {
+                        out.push_str(&format!("[{name}{off}]"));
+                    } else if base == "mov" {
+                        // mov.T d, a[N]: d = a, then d += N
+                        let ty = opcode.rsplit('.').next()?;
+                        let dst = body[opcode.len()..].split(',').next()?.trim();
+                        if !dst.starts_with('%') && !dst.bytes().all(is_word) {
+                            return None;
+                        }
+                        let pfx = if pred.is_empty() { String::new() } else { format!("{pred} ") };
+                        post = Some(format!("; {pfx}add.{ty} {dst}, {dst}, {}", inner));
+                        out.push_str(name);
+                    } else {
+                        return None;
+                    }
+                }
+                k = close + 1;
+                changed = true;
+                continue;
+            }
+            out.push_str(name);
+            continue;
+        }
+        let ch = body[k..].chars().next()?;
+        out.push(ch);
+        k += ch.len_utf8();
+    }
+    if !changed {
+        return None;
+    }
+    let lead = &stmt[..lead_len];
+    if let Some(p) = post {
+        out.push_str(&p);
+    }
+    let inst = if pred.is_empty() { out } else { format!("{pred} {out}") };
+    if pre.is_empty() {
+        Some(format!("{lead}{prefix}{inst}"))
+    } else {
+        // the statement's `;` follows: close the scope after it
+        Some(format!("{lead}{prefix}{{ {} {inst}; }}", pre.join(" ")))
     }
 }

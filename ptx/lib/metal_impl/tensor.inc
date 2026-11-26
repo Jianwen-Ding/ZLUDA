@@ -35,10 +35,12 @@
     struct TnDesc
     {
         int start, lbo, sbo, swz, base;
+        int cta; // >= 0: the addresses are in the shared memory of this CTA of the cluster (tn_smap)
     };
     MX_INL TnDesc tn_desc(uint64_t d)
     {
         TnDesc r;
+        r.cta = -1;
         r.start = (int)((d & 16383u) << 4);
         r.lbo = (int)(((d >> 16) & 16383u) << 4);
         r.sbo = (int)(((d >> 32) & 16383u) << 4);
@@ -69,6 +71,16 @@
         if (z == 0) return (mn % t) + (mn / t) * s + (k % 8) * t + (k / 8) * l;
         return (mn % t) + ((mn / t) % tn_swG(z)) * t + (mn / (t * tn_swG(z))) * l + (k % 8) * tn_swG(z) * t + (k / 8) * s;
     }
+    // a shared memory address of a descriptor in CTA r of the cluster: the descriptor's address taken as an offset
+    // in a CTA's copy of the .shared variables (an address of any CTA's copy, or CTA-relative), in r's copy
+    MX_INL uint32_t tn_smap(uint32_t a, int r)
+    {
+        uint32_t st = __zluda_metal_cluster_stride();
+        if (!st || r < 0) return a;
+        uint32_t b = (uint32_t)(uintptr_t)__zluda_metal_cluster_base();
+        uint32_t off = a >= b ? (a - b) % st : a;
+        return b + (uint32_t)r * st + off;
+    }
     MX_INL uint32_t tn_rdsh(uint32_t a, int nb)
     {
         if (nb == 1) return *(const SHARED_SPACE uint8_t *)(uintptr_t)a;
@@ -80,7 +92,7 @@
     {
         int bo = tn_eo(d.swz, km, 128 / w, mn, k, d.lbo * 8 / w, d.sbo * 8 / w) * w;
         int a = tn_swizzle(d.swz, d.start + (bo >> 3), d.base);
-        return (tn_rdsh((uint32_t)a, w >= 8 ? w / 8 : 1) >> (bo & 7)) & mx_mask(w);
+        return (tn_rdsh(tn_smap((uint32_t)a, d.cta), w >= 8 ? w / 8 : 1) >> (bo & 7)) & mx_mask(w);
     }
     // negation of float elements (imm-scale = -1): the sign bit
     MX_INL uint32_t tn_neg(int t, bool neg, uint32_t v)
@@ -263,14 +275,22 @@ extern "C++"
 #define TN_WB_OFF (TN_WA_OFF + 512u * 256u * 4u)
 #define TN_WS_OFF (TN_WB_OFF + 256u * 512u * 4u)
 #define TN_PERCTA (TN_WS_OFF + 8192u * 4u)
-    MX_INL uint8_t TN_GLOBAL *tn_base() { return (uint8_t TN_GLOBAL *)(uintptr_t)__zluda_metal_percta_memory(TN_PERCTA); }
-    MX_INL volatile uint32_t TN_GLOBAL *tn_state() { return (volatile uint32_t TN_GLOBAL *)(tn_base() + TN_STATE_OFF); }
-    MX_INL uint32_t TN_GLOBAL *tn_cell(uint32_t lane, uint32_t col)
+    // Thread-block clusters run as one threadgroup (air_lower.cpp resolveCluster): the per-threadgroup region holds the
+    // regions of the cluster's CTAs, CTA (cluster rank) r's at r * TN_PERCTA; cta < 0 is the executing thread's CTA
+    MX_INL uint32_t tn_rank() { return cluster_rank(); }
+    MX_INL uint8_t TN_GLOBAL *tn_base(int cta = -1)
     {
-        return (uint32_t TN_GLOBAL *)(tn_base() + TN_TM_OFF) + ((lane & 511u) << 10) + (col & 1023u);
+        uint32_t r = cta < 0 ? tn_rank() : (uint32_t)cta;
+        return (uint8_t TN_GLOBAL *)(uintptr_t)__zluda_metal_percta_memory(TN_PERCTA * cluster_size()) +
+               (uint64_t)r * TN_PERCTA;
     }
-    MX_INL uint32_t tn_word(uint32_t lane, uint32_t col) { return *tn_cell(lane, col); }
-    MX_INL uint32_t TN_GLOBAL *tn_ws(uint32_t off) { return (uint32_t TN_GLOBAL *)(tn_base() + off); }
+    MX_INL volatile uint32_t TN_GLOBAL *tn_state() { return (volatile uint32_t TN_GLOBAL *)(tn_base() + TN_STATE_OFF); }
+    MX_INL uint32_t TN_GLOBAL *tn_cell(uint32_t lane, uint32_t col, int cta = -1)
+    {
+        return (uint32_t TN_GLOBAL *)(tn_base(cta) + TN_TM_OFF) + ((lane & 511u) << 10) + (col & 1023u);
+    }
+    MX_INL uint32_t tn_word(uint32_t lane, uint32_t col, int cta = -1) { return *tn_cell(lane, col, cta); }
+    MX_INL uint32_t TN_GLOBAL *tn_ws(uint32_t off, int cta = -1) { return (uint32_t TN_GLOBAL *)(tn_base(cta) + off); }
     MX_INL uint32_t tn_lead() { return (uint32_t)__builtin_ctz((uint32_t)air_simd_ballot(true)); }
     // the active lanes one after the other (operations issued by single threads)
 #define TN_SERIAL(...)                                       \
@@ -640,6 +660,7 @@ extern "C++"
     MX_INL TnDesc tn_tcdesc(uint64_t d)
     {
         TnDesc r = tn_desc(d);
+        r.cta = (int)tn_rank();
         uint32_t c = (uint32_t)(d >> 61) & 7;
         r.swz = c == 2 ? 1 : c == 4 ? 2 : c == 6 ? 3 : c == 1 ? 4 : 0;
         return r;
@@ -674,12 +695,14 @@ extern "C++"
         return (int)((nib >> (2 * j)) & 3);
     }
     // tcNib
-    MX_INL uint32_t tn_tcnib(int t, int r, uint32_t mc, uint32_t sel, int c, int kp)
+    MX_INL uint32_t tn_tcnib(int t, int r, uint32_t mc, uint32_t sel, int c, int kp, int cta)
     {
         if ((2 * kp) / tn_spCwT(t) <= 8)
-            return (tn_word(16 * (r / 16) + 8 * (c / 4) + r % 8, mc + sel) >> (16 * ((r % 16) / 8) + 4 * (c % 4))) & 15;
-        return (tn_word(r, mc + c / 8) >> (4 * (c % 8))) & 15;
+            return (tn_word(16 * (r / 16) + 8 * (c / 4) + r % 8, mc + sel, cta) >> (16 * ((r % 16) / 8) + 4 * (c % 4))) & 15;
+        return (tn_word(r, mc + c / 8, cta) >> (4 * (c % 8))) & 15;
     }
+    // tcHalfM: the M field halved (each CTA of a cta_group::2 pair computes half the rows)
+    MX_INL uint32_t tn_halfM(uint32_t id) { return (id & ~(31u << 24)) | ((((id >> 24) & 31u) / 2u) << 24); }
     // block scale factor (tcScaleF): st 1 UE8M0, 2 UE5M3, 0 UE4M3
     MX_INL MxF tn_scaleF(int st, uint32_t x)
     {
@@ -718,7 +741,9 @@ extern "C++"
     //    enable-input-d, scale-input-d, 0, disable-output-lane 16..23
     // ctl: kind | sp << 3 | lut << 4 | block_scale << 5 | ws << 6 | A in shared memory << 7 | ashift << 8
     //      | zero-column mask << 9 | disable-output-lane << 10 | enable from a predicate << 11 | scale vector << 12
-    MX_INL void tn_mma(tn_u32x32 xx, uint64_t da, uint64_t db, uint64_t zm, bool en, uint32_t ctl)
+    // cta: the CTA whose tensor memory (D, A) and shared memory (A) the product uses; ev >= 0: one CTA of a
+    // cta_group::2 pair (tc_mma): M halved, B's first N/2 rows from CTA ev's shared memory, the others from CTA od's
+    MX_INL void tn_mma(tn_u32x32 xx, uint64_t da, uint64_t db, uint64_t zm, bool en, uint32_t ctl, int cta, int ev, int od)
     {
         const int kind = ctl & 7;
         const bool sp = (ctl >> 3) & 1, lut = (ctl >> 4) & 1, bs = (ctl >> 5) & 1, ws = (ctl >> 6) & 1;
@@ -726,7 +751,7 @@ extern "C++"
         const int sv = (ctl >> 12) & 3;
         const uint32_t dcol = (xx[0] + xx[1]) & 65535u;
         const uint32_t ta = xx[2] + xx[3];
-        const uint32_t id = xx[4];
+        const uint32_t id = ev >= 0 ? tn_halfM(xx[4]) : xx[4];
         const uint32_t mcol = (xx[5] + xx[6]) & 65535u, lcol = (xx[7] + xx[8]) & 65535u;
         const uint32_t sacol = (xx[9] + xx[10]) & 65535u, sbcol = (xx[11] + xx[12]) & 65535u;
         const uint32_t sc = ws ? 0u : xx[14];
@@ -745,17 +770,26 @@ extern "C++"
         const bool kmA = !((id >> 15) & 1), kmB = !((id >> 16) & 1);
         const uint32_t sel = id & 3;
         if (md > 512 || n > 512 || ks > 256 || md == 0 || n == 0) return;
-        const TnDesc dA = tn_tcdesc(da), dB = tn_tcdesc(db);
+        TnDesc dA = tn_tcdesc(da), dB = tn_tcdesc(db);
+        dA.cta = cta;
+        dB.cta = cta;
         const int sh = hz ? (int)((zm >> 56) & 63) : 0;
-        uint32_t TN_GLOBAL *WA = tn_ws(TN_WA_OFF);
-        uint32_t TN_GLOBAL *WB = tn_ws(TN_WB_OFF);
-        uint32_t TN_GLOBAL *WS = tn_ws(TN_WS_OFF);
+        uint32_t TN_GLOBAL *WA = tn_ws(TN_WA_OFF, cta);
+        uint32_t TN_GLOBAL *WB = tn_ws(TN_WB_OFF, cta);
+        uint32_t TN_GLOBAL *WS = tn_ws(TN_WS_OFF, cta);
+        const int n2 = n / 2;
         // B (ks x n), tcTileB
         for (int nn = 0; nn < n; nn++)
             for (int kk = 0; kk < ks; kk++)
             {
                 uint32_t v = 0;
-                if (!tn_zero(hz, zm, md, n, nn))
+                if (ev >= 0)
+                {
+                    TnDesc dP = dB;
+                    dP.cta = nn < n2 ? ev : od;
+                    v = tn_tcneg(bt, negB, tn_se(dP, kmB, bt, nn % n2, kk, K));
+                }
+                else if (!tn_zero(hz, zm, md, n, nn))
                 {
                     if (lut)
                     {
@@ -763,7 +797,7 @@ extern "C++"
                         uint32_t lo = tn_elem(dB, true, 8, nn + sh, bp >> 3);
                         uint32_t hi = (bp & 7) + 3 > 8 ? tn_elem(dB, true, 8, nn + sh, (bp >> 3) + 1) << 8 : 0u;
                         uint32_t j = ((lo | hi) >> (bp & 7)) & 7;
-                        v = (tn_word((nn + sh) / 8, lcol + j / 4) >> (8 * (j % 4))) & 255;
+                        v = (tn_word((nn + sh) / 8, lcol + j / 4, cta) >> (8 * (j % 4))) & 255;
                     }
                     else
                         v = tn_se(dB, kmB, bt, nn + sh, kk, K);
@@ -785,18 +819,18 @@ extern "C++"
                 else if (tn_sub(at) && at != MX_E2M1 && K == 64)
                 {
                     int bp = 6 * kk;
-                    uint64_t lo = tn_word(r0, (ta & 65535u) + bp / 32);
-                    uint64_t hi = (bp % 32) + 6 > 32 ? (uint64_t)tn_word(r0, (ta & 65535u) + bp / 32 + 1) << 32 : 0;
+                    uint64_t lo = tn_word(r0, (ta & 65535u) + bp / 32, cta);
+                    uint64_t hi = (bp % 32) + 6 > 32 ? (uint64_t)tn_word(r0, (ta & 65535u) + bp / 32 + 1, cta) << 32 : 0;
                     v = (uint32_t)(((lo | hi) >> (bp % 32)) & 63);
                 }
                 else
-                    v = (tn_word(r0, (ta & 65535u) + (kk * ewa) / 32) >> ((kk * ewa) % 32)) & mx_mask(ewa);
+                    v = (tn_word(r0, (ta & 65535u) + (kk * ewa) / 32, cta) >> ((kk * ewa) % 32)) & mx_mask(ewa);
                 v = tn_tcneg(at, negA, v);
                 int pos = kk;
                 if (sp)
                 {
                     const int nz = tn_spNzT(spt), cw = tn_spCwT(spt);
-                    uint32_t nib = tn_tcnib(spt, r0, mcol, sel, kk / nz, K);
+                    uint32_t nib = tn_tcnib(spt, r0, mcol, sel, kk / nz, K, cta);
                     pos = cw * (kk / nz) + tn_spPosT(spt, nib, kk % nz);
                 }
                 if (pos < ks) row[pos] = v;
@@ -815,15 +849,15 @@ extern "C++"
                 for (int j = 0; j < nb && j < 8; j++)
                 {
                     int b = ida + j;
-                    uint32_t w = l128 ? tn_word(r, sacol + b / 4)
-                                      : tn_word(r % 32, sacol + (b / 4) * (md > 128 ? 8 : 4) + r / 32);
+                    uint32_t w = l128 ? tn_word(r, sacol + b / 4, cta)
+                                      : tn_word(r % 32, sacol + (b / 4) * (md > 128 ? 8 : 4) + r / 32, cta);
                     WS[r * 8 + j] = (w >> (8 * (b % 4))) & 255;
                 }
             for (int nn = 0; nn < n; nn++)
                 for (int j = 0; j < nb && j < 8; j++)
                 {
                     int b = idb + j;
-                    uint32_t w = tn_word(nn % 32, sbcol + (b / 4) * (n > 128 ? 8 : 4) + nn / 32);
+                    uint32_t w = tn_word(nn % 32, sbcol + (b / 4) * (n > 128 ? 8 : 4) + nn / 32, cta);
                     WS[4096 + nn * 8 + j] = (w >> (8 * (b % 4))) & 255;
                 }
         }
@@ -834,7 +868,7 @@ extern "C++"
             const uint32_t TN_GLOBAL *row = WA + r * 256;
             for (int c = 0; c < n; c++)
             {
-                uint32_t cv = en ? tn_word(r, dcol + c) & mx_mask(ewd) : 0u;
+                uint32_t cv = en ? tn_word(r, dcol + c, cta) & mx_mask(ewd) : 0u;
                 uint32_t res;
                 if (isint)
                 {
@@ -875,26 +909,43 @@ extern "C++"
                     res = ewd == 16 ? (uint32_t)mxa_round(acc, 11, 5, 16, 0, sat)
                                     : (uint32_t)mxa_round(acc, 24, 8, 32, 0, sat);
                 }
-                if (!off) *tn_cell(r, dcol + c) = res;
+                if (!off) *tn_cell(r, dcol + c, cta) = res;
             }
         }
     }
+    // ctl bit 16: .cta_group::2, the products of both CTAs of the pair (tc_mma; no peer CTA: nothing)
+    MX_INL void tn_mma_cg(tn_u32x32 x, uint64_t da, uint64_t db, uint64_t zm, bool en, uint64_t ctl)
+    {
+        int me = (int)tn_rank();
+        if (!((ctl >> 16) & 1))
+        {
+            tn_mma(x, da, db, zm, en, (uint32_t)ctl, me, -1, -1);
+            return;
+        }
+        int pt = me ^ 1;
+        if ((uint32_t)pt >= cluster_size()) return;
+        int ev = (me & 1) ? pt : me, od = (me & 1) ? me : pt;
+        tn_mma(x, da, db, zm, en, (uint32_t)ctl, me, ev, od);
+        tn_mma(x, da, db, zm, en, (uint32_t)ctl, pt, ev, od);
+    }
     void FUNC(tcgen05_mma)(tn_u32x32 x, uint64_t da, uint64_t db, uint64_t zm, uint64_t ctl)
     {
-        TN_SERIAL(tn_mma(x, da, db, zm, x[13] != 0, (uint32_t)ctl);)
+        TN_SERIAL(tn_mma_cg(x, da, db, zm, x[13] != 0, ctl);)
     }
     void FUNC(tcgen05_mma_p)(tn_u32x32 x, uint64_t da, uint64_t db, uint64_t zm, bool p, uint64_t ctl)
     {
-        TN_SERIAL(tn_mma(x, da, db, zm, p != (bool)((ctl >> 14) & 1), (uint32_t)ctl);)
+        TN_SERIAL(tn_mma_cg(x, da, db, zm, p != (bool)((ctl >> 14) & 1), ctl);)
     }
 
     // ---------------------------------------------------------------- cp / shift
     // ctl: rows | words << 8 | destination pattern << 12 (0 -, 1 warpx4, 2 warpx2::02_13, 3 warpx2::01_23)
     //      | decompression << 16 (6 b6x16_p32, 4 b4x16_p64)
-    MX_INL void tn_cp(uint32_t a, uint64_t sd, uint32_t ctl)
+    //      | cta_group::2 << 20 (the copy into both CTAs of the pair, each from its own shared memory)
+    MX_INL void tn_cp(uint32_t a, uint64_t sd, uint32_t ctl, int cta)
     {
         const int rows = ctl & 255, words = (ctl >> 8) & 15, pat = (ctl >> 12) & 3, dec = (ctl >> 16) & 7;
-        const TnDesc d = tn_tcdesc(sd);
+        TnDesc d = tn_tcdesc(sd);
+        d.cta = cta;
         const uint32_t l = a >> 16, cl = a & 65535u;
         for (int i = 0; i < rows; i++)
         {
@@ -933,16 +984,36 @@ extern "C++"
                 {
                     uint32_t rr = q == 0 ? r0 : q == 1 ? r1 : q == 2 ? r2 : r3;
                     MX_UNROLL for (int j = 0; j < 8; j++)
-                        if (j < words) *tn_cell(l + rr, cl + j) = w[j];
+                        if (j < words) *tn_cell(l + rr, cl + j, cta) = w[j];
                 }
             }
         }
     }
-    void FUNC(tcgen05_cp)(uint32_t ta, uint32_t off, uint64_t sd, uint32_t ctl) { TN_SERIAL(tn_cp(ta + off, sd, ctl);) }
-    MX_INL void tn_shift(uint32_t a)
+    // the CTAs of an operation of .cta_group::2 (pair != 0): this one and its peer, if the cluster has it
+    MX_INL int tn_peer(uint32_t pair)
+    {
+        int pt = (int)tn_rank() ^ 1;
+        return pair && (uint32_t)pt < cluster_size() ? pt : -1;
+    }
+    void FUNC(tcgen05_cp)(uint32_t ta, uint32_t off, uint64_t sd, uint32_t ctl)
+    {
+        TN_SERIAL({
+            tn_cp(ta + off, sd, ctl, (int)tn_rank());
+            int pt = tn_peer((ctl >> 20) & 1);
+            if (pt >= 0) tn_cp(ta + off, sd, ctl, pt);
+        })
+    }
+    MX_INL void tn_shift(uint32_t a, int cta)
     {
         const uint32_t l = a >> 16, cl = a & 65535u;
         for (int r = 30; r >= 0; r--)
-            MX_UNROLL for (int w = 0; w < 8; w++) *tn_cell(l + r + 1, cl + w) = tn_word(l + r, cl + w);
+            MX_UNROLL for (int w = 0; w < 8; w++) *tn_cell(l + r + 1, cl + w, cta) = tn_word(l + r, cl + w, cta);
     }
-    void FUNC(tcgen05_shift)(uint32_t ta, uint32_t off) { TN_SERIAL(tn_shift(ta + off);) }
+    void FUNC(tcgen05_shift)(uint32_t ta, uint32_t off, uint32_t pair)
+    {
+        TN_SERIAL({
+            tn_shift(ta + off, (int)tn_rank());
+            int pt = tn_peer(pair);
+            if (pt >= 0) tn_shift(ta + off, pt);
+        })
+    }

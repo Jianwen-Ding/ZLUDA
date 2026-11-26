@@ -414,13 +414,15 @@ fn mma_kind(m: &[&str]) -> Option<u64> {
 }
 
 fn lower_tc_mma<'i>(m: &[&str], ops: &[HOp<'i>]) -> Result<ast::Instruction<ParsedOperandStr<'i>>, String> {
-    if has(m, "cta_group::2") {
-        return Err("tcgen05.mma.cta_group::2 needs thread-block clusters".into());
-    }
     let kind = mma_kind(m).ok_or("tcgen05.mma kind")?;
     let sp = has(m, "sp");
     let lut = has(m, "decompress::lut::b");
     let bs = has(m, "block_scale");
+    // .cta_group::2: the products of both CTAs of the pair (the model's tc_mma; its block-scaled mma is per CTA)
+    let pair = has(m, "cta_group::2") && !bs;
+    if pair && lut {
+        return Err("tcgen05.mma.cta_group::2 with .decompress::lut::b is not modelled".into());
+    }
     let ws = has(m, "ws");
     // x: d taddr, d off, A taddr, A off, idesc, meta taddr, meta off, lut taddr, lut off, scale-A taddr, off,
     //    scale-B taddr, off, enable-input-d, scale-input-d, 0, disable-output-lane mask 16..23
@@ -523,7 +525,11 @@ fn lower_tc_mma<'i>(m: &[&str], ops: &[HOp<'i>]) -> Result<ast::Instruction<Pars
         | (has_zm as u64) << 9
         | (has_mask as u64) << 10
         | (en_reg.is_some() as u64) << 11
-        | (en_neg as u64) << 14;
+        | (en_neg as u64) << 14
+        | (pair as u64) << 16;
+    if pair && has_mask {
+        return Err("tcgen05.mma.cta_group::2 with disable-output-lane is not modelled".into());
+    }
     // block scale vector size: 0 default, 1 block16, 2 scale_vec::2X, 3 scale_vec::4X
     ctl |= (if has(m, "block16") {
         1
@@ -553,9 +559,7 @@ fn lower_tcgen05<'i>(m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
         }
         if first == "alloc" || first == "dealloc" {
             let ex = has(m, "exclusive");
-            if has(m, "cta_group::2") {
-                return Err("tcgen05.alloc.cta_group::2 needs thread-block clusters".into());
-            }
+            // .cta_group::2: each CTA's warp allocates in its own CTA's tensor memory (the model's P_tcalloc)
             if ops.len() != 2 {
                 return Err("tcgen05.alloc operands".into());
             }
@@ -587,8 +591,9 @@ fn lower_tcgen05<'i>(m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
         }
         if first == "commit" {
             // an arrive-on operation on the mbarrier (the memory family's mbarrier objects)
-            if has(m, "cta_group::2") || m.iter().any(|x| x.starts_with("multicast")) {
-                return Err("tcgen05.commit .multicast / cta_group::2 need thread-block clusters".into());
+            // .cta_group::2 arrives on the given mbarrier as ::1 does (the model)
+            if m.iter().any(|x| x.starts_with("multicast")) {
+                return Err("tcgen05.commit .multicast needs thread-block clusters".into());
             }
             if ops.len() != 1 || !ops[0].addr {
                 return Err("tcgen05.commit operands".into());
@@ -604,9 +609,8 @@ fn lower_tcgen05<'i>(m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
                 .unwrap()?);
         }
         if first == "cp" || first == "shift" || m.contains(&"shift") {
-            if has(m, "cta_group::2") {
-                return Err("tcgen05.cp / shift .cta_group::2 need thread-block clusters".into());
-            }
+            // .cta_group::2: also into the peer CTA's tensor memory, from its own shared memory
+            let pair = has(m, "cta_group::2") as u64;
             if ops.is_empty() || !ops[0].addr {
                 return Err("tcgen05.cp / shift operands".into());
             }
@@ -648,13 +652,14 @@ fn lower_tcgen05<'i>(m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
                     .src(a, ScalarType::B32)
                     .src(imm(aoff), ScalarType::U32)
                     .src(ops[1].op.clone(), ScalarType::B64)
-                    .src(imm(rows | words << 8 | pat << 12 | dec << 16), ScalarType::U32)
+                    .src(imm(rows | words << 8 | pat << 12 | dec << 16 | pair << 20), ScalarType::U32)
                     .build()
                     .unwrap()?);
             }
             return Ok(Call::new("tcgen05_shift")
                 .src(a, ScalarType::B32)
                 .src(imm(aoff), ScalarType::U32)
+                .src(imm(pair), ScalarType::U32)
                 .build()
                 .unwrap()?);
         }

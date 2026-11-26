@@ -8,7 +8,7 @@ clang's NVPTX target: no CUDA toolkit, no nvcc). Each is compiled to PTX, loaded
 * the scalar arguments come from the source's `// agx-cost:` line (`--uniform I=V`: argument words in order, a
   pointer or a 64-bit integer taking two, aligned);
 * the grid is the line's `--grid`, or 64 workgroups of its `--wg` (8 x 8 for 2D workgroups);
-* every pointer argument gets its own 4 MiB buffer: float-like data (`float`, `half`, `f4`, `double`, ...) a
+* every pointer argument gets its own 16 MiB buffer: float-like data (`float`, `half`, `f4`, `double`, ...) a
   deterministic pattern of small values, integer data zeros (index arrays then stay in bounds), CSR row pointers a
   regular pattern.
 
@@ -36,7 +36,7 @@ SRC = os.path.join(ROOT, "llvm-project", "llvm", "utils", "agx-bench", "cuda")
 sys.path.insert(0, os.path.join(HERE, "..", "ptxconf"))
 import ptxconf  # noqa: E402
 
-BUF = 4 << 20
+BUF = 16 << 20
 
 
 def compile_ptx(src, clang):

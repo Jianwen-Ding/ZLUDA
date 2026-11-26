@@ -314,7 +314,30 @@ fn lower_tc_ldst<'i>(ld: bool, m: &[&str], ops: &[HOp<'i>]) -> Result<ast::Instr
         let mut out: VecElems = vec![];
         let mut nv = 0usize;
         if spc {
-            return Err("tcgen05.ld.spcompress is not supported".into());
+            // md, cd (, rv), [a]: the metadata words, the kept values, the reduction
+            if has(m, "b4") || !has(m, "f32") || !has(m, "sp::2:4") {
+                return Err("tcgen05.ld.spcompress form".into());
+            }
+            let md = elems(&ops[0].op).ok_or("tcgen05.ld.spcompress metadata")?;
+            let cd = elems(&ops.get(1).ok_or("tcgen05.ld.spcompress values")?.op).ok_or("tcgen05.ld.spcompress values")?;
+            if ai != if red { 3 } else { 2 } {
+                return Err("tcgen05.ld.spcompress operands".into());
+            }
+            ctl |= (md.len() as u64) << 32 | (cd.len() as u64) << 40;
+            out.extend(md);
+            out.extend(cd);
+            if red {
+                out.extend(elems(&ops[2].op).ok_or("tcgen05.ld.red destination")?);
+            }
+            let n = vec_size(out.len());
+            return Call::new(format!("tcgen05_ldspc_{n}"))
+                .tvdst(pad(out, n, true)?, n as u8, ScalarType::B32)
+                .src(a, ScalarType::B32)
+                .src(h, ScalarType::B32)
+                .src(imm(aoff), ScalarType::U32)
+                .src(imm(ctl), ScalarType::U64)
+                .build()
+                .unwrap();
         }
         let d = elems(&ops[0].op).ok_or("tcgen05.ld destination")?;
         nv = nv.max(d.len());

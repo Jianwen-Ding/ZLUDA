@@ -261,7 +261,7 @@ extern "C++"
 #define TN_WA_OFF (TN_TM_OFF + 512u * 1024u * 4u)
 #define TN_WB_OFF (TN_WA_OFF + 512u * 256u * 4u)
 #define TN_WS_OFF (TN_WB_OFF + 256u * 512u * 4u)
-#define TN_PERCTA (TN_WS_OFF + 4096u * 4u)
+#define TN_PERCTA (TN_WS_OFF + 8192u * 4u)
     MX_INL uint8_t TN_GLOBAL *tn_base() { return (uint8_t TN_GLOBAL *)(uintptr_t)__zluda_metal_percta_memory(TN_PERCTA); }
     MX_INL volatile uint32_t TN_GLOBAL *tn_state() { return (volatile uint32_t TN_GLOBAL *)(tn_base() + TN_STATE_OFF); }
     MX_INL uint32_t TN_GLOBAL *tn_cell(uint32_t lane, uint32_t col)
@@ -464,6 +464,77 @@ extern "C++"
                 if (i == n) d[i] = acc;
         return d;
     }
+    // tcgen05.ld.spcompress (spcKeep / spcFin of ptx_spc.sail with .f32 elements and 2-bit indices): of every group
+    // of four loaded values the two that come first by value (max, or min with ctl bit 13; |x| with bit 14; NaN
+    // first) in index order; the result is the nm metadata words, the nc words of kept values (and the reduction)
+    template <typename V, int NV>
+    MX_INL V tn_ldspc(uint32_t ta, uint32_t h, uint32_t off, uint64_t ctl64)
+    {
+        const uint32_t ctl = (uint32_t)ctl64;
+        const int shape = ctl & 7;
+        const bool red = (ctl >> 12) & 1, mn = (ctl >> 13) & 1, ab = (ctl >> 14) & 1;
+        const int nload = (ctl >> 19) & 1023;
+        const int nm = (int)((ctl64 >> 32) & 255), nc = (int)((ctl64 >> 40) & 255);
+        const uint32_t a = ta + off;
+        const int t = mx_lane();
+        uint32_t mdw[4] = {0, 0, 0, 0};
+        uint32_t cs[64];
+        uint32_t acc = 0;
+        MX_UNROLL for (int g = 0; g < 32; g++)
+        {
+            if (4 * g + 3 < nload)
+            {
+                uint32_t v[4];
+                int32_t key[4];
+                bool nan[4];
+                MX_UNROLL for (int q = 0; q < 4; q++)
+                {
+                    uint32_t ln, cl;
+                    tn_cellpos(shape, a, t, 4 * g + q, h, ln, cl);
+                    v[q] = tn_word(ln, cl);
+                    uint32_t x = ab ? (v[q] & 0x7FFFFFFFu) : v[q];
+                    nan[q] = tn_f32nan(v[q]);
+                    key[q] = tn_f32key(x);
+                    if (red)
+                        acc = (g == 0 && q == 0) ? (ab ? (v[q] & 0x7FFFFFFFu) : v[q]) : tn_red(acc, v[q], ctl);
+                }
+                int k0 = -1, k1 = -1;
+                MX_UNROLL for (int i = 0; i < 4; i++)
+                {
+                    int r = 0;
+                    MX_UNROLL for (int j = 0; j < 4; j++)
+                    {
+                        if (j == i) continue;
+                        bool before;
+                        if (nan[j]) before = !nan[i] || j < i;
+                        else before = !nan[i] && ((mn ? key[j] < key[i] : key[i] < key[j]) || (key[j] == key[i] && j < i));
+                        r += before ? 1 : 0;
+                    }
+                    if (r < 2)
+                    {
+                        if (k0 < 0) k0 = i;
+                        else k1 = i;
+                    }
+                }
+                uint32_t c0 = k0 == 0 ? v[0] : k0 == 1 ? v[1] : k0 == 2 ? v[2] : v[3];
+                uint32_t c1 = k1 == 0 ? v[0] : k1 == 1 ? v[1] : k1 == 2 ? v[2] : v[3];
+                if (2 * g + 1 < 64) { cs[2 * g] = c0; cs[2 * g + 1] = c1; }
+                uint32_t idx = (uint32_t)(k0 & 3) | ((uint32_t)(k1 & 3) << 2);
+                mdw[g / 8] |= idx << (4 * (g % 8));
+            }
+            else if (2 * g + 1 < 64) { cs[2 * g] = 0; cs[2 * g + 1] = 0; }
+        }
+        V d;
+        MX_UNROLL for (int i = 0; i < NV; i++)
+        {
+            uint32_t x = 0;
+            if (i < nm) x = i < 4 ? mdw[i] : 0u;
+            else if (i < nm + nc) x = i - nm < 64 ? cs[i - nm] : 0u;
+            else if (red && i == nm + nc) x = acc;
+            d[i] = x;
+        }
+        return d;
+    }
     template <typename V, int NV>
     MX_INL void tn_st(uint32_t ta, uint32_t h, uint32_t off, V v, uint64_t ctl64)
     {
@@ -497,6 +568,10 @@ extern "C++"
     tn_u32x##NV FUNC(tcgen05_ld_##NV)(uint32_t ta, uint32_t h, uint32_t off, uint64_t ctl)             \
     {                                                                                                   \
         return tn_ld<tn_u32x##NV, NV>(ta, h, off, ctl);                                                \
+    }                                                                                                   \
+    tn_u32x##NV FUNC(tcgen05_ldspc_##NV)(uint32_t ta, uint32_t h, uint32_t off, uint64_t ctl)          \
+    {                                                                                                   \
+        return tn_ldspc<tn_u32x##NV, NV>(ta, h, off, ctl);                                             \
     }                                                                                                   \
     void FUNC(tcgen05_st_##NV)(uint32_t ta, uint32_t h, uint32_t off, tn_u32x##NV v, uint64_t ctl)     \
     {                                                                                                   \
@@ -736,19 +811,19 @@ extern "C++"
             const int ida = (id >> 29) & 3, idb = (id >> 4) & 3;
             const bool l128 = (id >> 26) & 1;
             for (int r = 0; r < md; r++)
-                for (int j = 0; j < nb && j < 4; j++)
+                for (int j = 0; j < nb && j < 8; j++)
                 {
                     int b = ida + j;
                     uint32_t w = l128 ? tn_word(r, sacol + b / 4)
                                       : tn_word(r % 32, sacol + (b / 4) * (md > 128 ? 8 : 4) + r / 32);
-                    WS[r * 4 + j] = (w >> (8 * (b % 4))) & 255;
+                    WS[r * 8 + j] = (w >> (8 * (b % 4))) & 255;
                 }
             for (int nn = 0; nn < n; nn++)
-                for (int j = 0; j < nb && j < 4; j++)
+                for (int j = 0; j < nb && j < 8; j++)
                 {
                     int b = idb + j;
                     uint32_t w = tn_word(nn % 32, sbcol + (b / 4) * (n > 128 ? 8 : 4) + nn / 32);
-                    WS[2048 + nn * 4 + j] = (w >> (8 * (b % 4))) & 255;
+                    WS[4096 + nn * 8 + j] = (w >> (8 * (b % 4))) & 255;
                 }
         }
         // the products, row by row
@@ -791,8 +866,8 @@ extern "C++"
                         if (bs)
                         {
                             int j = kk / blk;
-                            p = mx_mul(p, tn_scaleF(st, WS[r * 4 + j]));
-                            p = mx_mul(p, tn_scaleF(st, WS[2048 + c * 4 + j]));
+                            p = mx_mul(p, tn_scaleF(st, WS[r * 8 + j]));
+                            p = mx_mul(p, tn_scaleF(st, WS[4096 + c * 8 + j]));
                         }
                         mxa_addF(acc, p);
                     }

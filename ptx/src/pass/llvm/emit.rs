@@ -394,6 +394,14 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                     let value = format!("{ctas},1024");
                     self.emit_fn_attribute_string(fn_, "amdgpu-waves-per-eu", &value);
                 }
+                ptx_parser::TuningDirective::ReqNCtaPerCluster(x, y, z) => {
+                    let value = format!("{x},{y},{z}");
+                    self.emit_fn_attribute_string(fn_, "zluda-cluster-dims", &value);
+                }
+                ptx_parser::TuningDirective::ExplicitCluster => {
+                    self.emit_fn_attribute_string(fn_, "zluda-explicit-cluster", "1");
+                }
+                ptx_parser::TuningDirective::MaxClusterRank(_) => {}
             }
         }
     }
@@ -530,6 +538,8 @@ fn get_input_argument_type(
             Ok(unsafe { LLVMPointerTypeInContext(context, get_state_space(state_space)?) })
         }
         ast::StateSpace::Reg => get_type(context, v_type),
+        // .local pointer arguments of helper functions
+        ast::StateSpace::Local => Ok(unsafe { LLVMPointerTypeInContext(context, get_state_space(state_space)?) }),
         ast::StateSpace::Global | ast::StateSpace::Const
             if matches!(v_type, ast::Type::Texref | ast::Type::Surfref) =>
         {

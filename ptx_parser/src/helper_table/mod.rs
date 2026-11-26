@@ -13,6 +13,8 @@ mod memory;
 mod misc;
 mod video;
 
+pub(crate) use memory::cp_async;
+
 pub(crate) type Op<'i> = ast::ParsedOperand<&'i str>;
 pub(crate) type R<'i> = Option<Result<ast::Instruction<ParsedOperandStr<'i>>, String>>;
 
@@ -40,6 +42,12 @@ impl<'i> Call<'i> {
         self.slots[0] = Some(op);
         self
     }
+    /// a vector destination (`{a, b}`) of n elements
+    pub fn dst_vec(mut self, op: Op<'i>, n: u8, t: ScalarType) -> Self {
+        self.data = self.data.with_type(0, ast::Type::Vector(n, t), StateSpace::Reg);
+        self.slots[0] = Some(op);
+        self
+    }
     pub fn dst2(mut self, op: Op<'i>, t: ScalarType) -> Self {
         self.data = self.data.with(1, t);
         self.slots[1] = Some(op);
@@ -55,6 +63,23 @@ impl<'i> Call<'i> {
     pub fn src_space(mut self, op: Op<'i>, t: ScalarType, space: StateSpace) -> Self {
         let i = self.next_src;
         self.data = self.data.with_type(i, ast::Type::Scalar(t), space);
+        self.slots[i] = Some(op);
+        self.next_src += 1;
+        self
+    }
+    /// a vector source (`{a, b}`), padded with zeros to `n` elements
+    pub fn src_vec(mut self, op: Op<'i>, n: u8, t: ScalarType) -> Self {
+        let i = self.next_src;
+        let op = match op {
+            ast::ParsedOperand::VecPack(mut v) => {
+                while v.len() < n as usize {
+                    v.push(Some(ast::RegOrImmediate::Imm(ast::ImmediateValue::U64(0))));
+                }
+                ast::ParsedOperand::VecPack(v)
+            }
+            other => other,
+        };
+        self.data = self.data.with_type(i, ast::Type::Vector(n, t), StateSpace::Reg);
         self.slots[i] = Some(op);
         self.next_src += 1;
         self
@@ -169,6 +194,12 @@ pub(crate) fn lane_mask(s: Option<&str>, n: usize) -> u64 {
     }
 }
 
+
+/// Instructions that follow a fallback instruction (under its predicate): a third destination, ...
+pub(crate) fn extra<'i>(opcode: &str, ops: &[HOp<'i>]) -> Vec<ast::Instruction<ParsedOperandStr<'i>>> {
+    let (base, m) = split(opcode);
+    memory::extra(base, &m, ops)
+}
 
 /// Lowers a fallback-parsed instruction: each family module returns None for opcodes it
 /// does not know.

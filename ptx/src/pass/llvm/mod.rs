@@ -60,7 +60,9 @@ fn get_state_space(space: ast::StateSpace) -> Result<u32, TranslateError> {
         ast::StateSpace::Global => Ok(GLOBAL_ADDRESS_SPACE),
         ast::StateSpace::Const => Ok(CONSTANT_ADDRESS_SPACE),
         ast::StateSpace::Shared => Ok(SHARED_ADDRESS_SPACE),
-        ast::StateSpace::SharedCta => Err(error_todo()),
-        ast::StateSpace::SharedCluster => Err(error_todo()),
+        // a CTA is one threadgroup; a cluster runs as one threadgroup too, the .shared::cluster window being the
+        // threadgroup addresses of the CTAs' copies (zluda_metal/cpp/air_lower.cpp resolveCluster)
+        ast::StateSpace::SharedCta => Ok(SHARED_ADDRESS_SPACE),
+        ast::StateSpace::SharedCluster => Ok(SHARED_ADDRESS_SPACE),
     }
 }

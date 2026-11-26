@@ -14,7 +14,7 @@ on the AGX Performance Simulator. Every `.expect` is checked bit for bit
 Each program runs in its own process (a crash or a hang is one result).
 Results: PASS, FAIL (an .expect differs), COMPILE (the module did not load),
 LAUNCH (a launch failed), UNSUPPORTED (a harness directive this runner does not
-implement: tensor maps, textures, multimem, ...), HARNESS (could not parse),
+implement: textures, multimem, ...), HARNESS (could not parse),
 TIMEOUT, CRASH.
 
 No proprietary tool is involved: no nvcc / ptxas, no Apple Metal compiler.
@@ -36,7 +36,7 @@ DEFAULT_LIB = os.path.join(HERE, "..", "..", "target", "release", "libzluda_meta
 HARNESS = ("buffer", "launch", "print", "expect", "patch", "append", "tensormap", "texture", "sampler", "surface",
            "multimem", "fabric", "memmodel", "ub", "occupancy", "cooplaunch", "convergence", "isacheck")
 IGNORED = ("print", "memmodel", "isacheck", "convergence", "occupancy")
-UNSUPPORTED = ("tensormap", "texture", "sampler", "surface", "multimem", "fabric", "ub")
+UNSUPPORTED = ("texture", "sampler", "surface", "multimem", "fabric", "ub")
 
 SIZES = {"u8": 1, "s8": 1, "b8": 1, "u16": 2, "s16": 2, "b16": 2, "f16": 2, "bf16": 2, "u32": 4, "s32": 4,
          "b32": 4, "f32": 4, "u64": 8, "s64": 8, "b64": 8, "f64": 8, "pred": 1, "b128": 16}
@@ -224,6 +224,51 @@ class Buffer:
         self.ptr = None
 
 
+# .tensormap NAME .type BUFFER .dims {..} .strides {..} .box {..} .swizzle Z [.im2col {lower} {upper} .estrides {..}];
+# builds the 128-byte tensor-map object in PTX-formalization's encoding (sail/ptx/ptx_tma.sail tmBlob / harness_tma):
+# 16 little-endian u64 words: 0 magic, 1 element type (tensormap.replace.elemtype numbering) | im2col lower corners
+# << 8, 2 rank | im2col upper corners << 8, 3 global address, 4-8 dims, 9-12 strides of dims 1-4, 13 box 0-3 (16 bits
+# each), 14 box 4 | swizzle mode << 16 | fill mode << 24 | interleave << 32 | im2col flag << 40 | swizzle atomicity
+# << 48, 15 element strides (8 bits each).
+TM_ETYPE = {"u8": 0, "u16": 1, "u32": 2, "s32": 3, "u64": 4, "s64": 5, "f16": 6, "f32": 7, "f64": 9, "bf16": 10,
+            "tf32": 11}
+
+
+def tensormap_words(ty, addr, ds, ss, bs, z, im2col=None):
+    nth = lambda l, i: l[i] if i < len(l) else 0
+    zm = z & 255
+    mode = 3 if 3 <= zm <= 6 else zm
+    atom = zm - 3 if 4 <= zm <= 6 else 0
+    w = [1414021456, TM_ETYPE.get(ty, 0), len(ds), addr] + [nth(ds, i) for i in range(5)] + \
+        [nth(ss, i) for i in range(4)] + \
+        [nth(bs, 0) | nth(bs, 1) << 16 | nth(bs, 2) << 32 | nth(bs, 3) << 48,
+         nth(bs, 4) | mode << 16 | (z >> 8) << 24 | atom << 48, 0x0101010101010101]
+    if im2col is not None:
+        ls, us, es = im2col
+        pack = lambda l, wd, off: sum((v + off) << (wd * i) for i, v in enumerate(l))
+        w[1] |= pack(ls, 16, 32768) << 8
+        w[2] |= pack(us, 16, 32768) << 8
+        w[14] |= 1 << 40
+        w[15] = pack(es, 8, 0)
+    return [x & (2 ** 64 - 1) for x in w]
+
+
+def parse_tensormap(body):
+    m = re.match(r"(\w+)\s+\.(\w+)\s+(\w+)\s+\.dims\s*\{([^}]*)\}\s*\.strides\s*\{([^}]*)\}\s*\.box\s*\{([^}]*)\}\s*"
+                 r"\.swizzle\s+(\w+)\s*(.*)$", body, re.S)
+    if not m:
+        raise Unsupported("tensormap syntax")
+    ints = lambda t: [int(x, 0) for x in split_list(t)]
+    name, ty, buf, ds, ss, bs, z, rest = m.groups()
+    im2col = None
+    if rest.strip():
+        mi = re.match(r"\.im2col\s*\{([^}]*)\}\s*\{([^}]*)\}\s*\.estrides\s*\{([^}]*)\}\s*$", rest.strip(), re.S)
+        if not mi:
+            raise Unsupported("tensormap syntax")
+        im2col = tuple(ints(x) for x in mi.groups())
+    return name, ty, buf, ints(ds), ints(ss), ints(bs), int(z, 0), im2col
+
+
 def pack_vals(vals, ty):
     size = SIZES[ty]
     return b"".join(v.to_bytes(size, "little") for v in vals)
@@ -260,6 +305,13 @@ def run_program(path, lib):
                 count = int(n, 0) if n else len(vals)
                 data = pack_vals(vals, ty).ljust(count * SIZES[ty], b"\0")
                 bufs[name] = last = Buffer(name, ty, data)
+            elif d == "tensormap":
+                name, ty, buf, ds, ss, bs, z, im2col = parse_tensormap(body)
+                b = bufs[buf]
+                if b.ptr is None:
+                    b.ptr = cuda.alloc(bytes(b.data))
+                words = tensormap_words(ty, b.ptr, ds, ss, bs, z, im2col)
+                bufs[name] = last = Buffer(name, "u64", pack_vals(words, "u64"))
             elif d == "append":
                 m = re.match(r"(\w+)\s+\.(\w+)\s*=\s*(\{.*\})\s*$", body, re.S)
                 b = bufs[m.group(1)]

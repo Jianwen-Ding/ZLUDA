@@ -113,6 +113,11 @@ struct PtxParserState<'a, 'input> {
     errors: &'a mut Vec<PtxError<'input>>,
     function_declarations:
         FxHashMap<&'input str, (Vec<(ast::Type, StateSpace)>, Vec<(ast::Type, StateSpace)>)>,
+    /// names of the `.reg .pred` variables declared so far (instructions whose operand may be a predicate or an
+    /// integer, such as cp.async's ignore-src / src-size)
+    pred_regs: rustc_hash::FxHashSet<&'input str>,
+    /// instructions that follow the last fallback instruction (helper_table::extra), under its predicate
+    helper_extra: Vec<ast::Instruction<ParsedOperandStr<'input>>>,
 }
 
 impl<'a, 'input> PtxParserState<'a, 'input> {
@@ -121,6 +126,26 @@ impl<'a, 'input> PtxParserState<'a, 'input> {
             text,
             errors,
             function_declarations: FxHashMap::default(),
+            pred_regs: Default::default(),
+            helper_extra: Vec::new(),
+        }
+    }
+
+    fn record_preds(&mut self, var: &MultiVariable<&'input str>) {
+        match var {
+            MultiVariable::List(items) => items.iter().for_each(|v| self.record_preds(v)),
+            MultiVariable::Names { info, names } => {
+                if info.v_type == ast::Type::Scalar(ScalarType::Pred) {
+                    self.pred_regs.extend(names.iter().copied());
+                }
+            }
+            MultiVariable::Parameterized { info, name, count } => {
+                if info.v_type == ast::Type::Scalar(ScalarType::Pred) {
+                    for i in 0..*count {
+                        self.pred_regs.insert(&*Box::leak(format!("{name}{i}").into_boxed_str()));
+                    }
+                }
+            }
         }
     }
 
@@ -761,6 +786,9 @@ fn tuning_directive<'a, 'input>(
         (Token::DotMaxntid, _) => tuple1to3_u32.map(|(nx, ny, nz)| ast::TuningDirective::MaxNtid(nx, ny, nz)),
         (Token::DotReqntid, _) => tuple1to3_u32.map(|(nx, ny, nz)| ast::TuningDirective::ReqNtid(nx, ny, nz)),
         (Token::DotMinnctapersm, _) => u32.map(ast::TuningDirective::MinNCtaPerSm),
+        (Token::DotReqnctapercluster, _) => tuple1to3_u32.map(|(nx, ny, nz)| ast::TuningDirective::ReqNCtaPerCluster(nx, ny, nz)),
+        (Token::DotExplicitcluster, _) => empty.map(|_| ast::TuningDirective::ExplicitCluster),
+        (Token::DotMaxclusterrank, _) => u32.map(ast::TuningDirective::MaxClusterRank),
         (Token::DotNoreturn, _) => empty.map(|_| ast::TuningDirective::NoReturn),
         _ => fail
     }
@@ -878,9 +906,7 @@ fn statement<'a, 'input>(
             label.map(Some),
             debug_directive.map(|_| None),
             terminated(
-                method_space
-                    .flat_map(|space| multi_variable(false, space))
-                    .map(|var| Some(Statement::Variable(var))),
+                variable_statement,
                 Token::Semicolon,
             ),
             // instructions the fallback lowers although the grammar accepts them
@@ -888,8 +914,7 @@ fn statement<'a, 'input>(
                 .map(|(p, i, _)| Some(ast::Statement::Instruction(p, i))),
             predicated_instruction.map(Some),
             // instructions outside the grammar: helpers.rs / helper_table.rs
-            (opt(pred_at), helpers::helper_instruction, Token::Semicolon)
-                .map(|(p, i, _)| Some(ast::Statement::Instruction(p, i))),
+            helper_statement,
             pragma.map(|_| None),
             block_statement.map(Some),
         )),
@@ -898,6 +923,30 @@ fn statement<'a, 'input>(
     )
     .map(Option::flatten)
     .parse_next(stream)
+}
+
+fn helper_statement<'a, 'input>(
+    stream: &mut PtxParser<'a, 'input>,
+) -> PResult<Option<Statement<ParsedOperandStr<'input>>>> {
+    let (p, i, _) = (opt(pred_at), helpers::helper_instruction, Token::Semicolon).parse_next(stream)?;
+    let extra = std::mem::take(&mut stream.state.helper_extra);
+    if extra.is_empty() {
+        return Ok(Some(ast::Statement::Instruction(p, i)));
+    }
+    let cp = |p: &Option<ast::PredAt<&'input str>>| p.as_ref().map(|x| ast::PredAt { not: x.not, label: x.label });
+    let mut v = vec![ast::Statement::Instruction(cp(&p), i)];
+    v.extend(extra.into_iter().map(|e| ast::Statement::Instruction(cp(&p), e)));
+    Ok(Some(ast::Statement::Block(v)))
+}
+
+fn variable_statement<'a, 'input>(
+    stream: &mut PtxParser<'a, 'input>,
+) -> PResult<Option<Statement<ParsedOperandStr<'input>>>> {
+    let var = method_space
+        .flat_map(|space| multi_variable(false, space))
+        .parse_next(stream)?;
+    stream.state.record_preds(&var);
+    Ok(Some(Statement::Variable(var)))
 }
 
 fn take_till_end_of_statement<
@@ -2164,6 +2213,12 @@ derive_parser!(
         DotReqntid,
         #[token(".minnctapersm")]
         DotMinnctapersm,
+        #[token(".reqnctapercluster")]
+        DotReqnctapercluster,
+        #[token(".explicitcluster")]
+        DotExplicitcluster,
+        #[token(".maxclusterrank")]
+        DotMaxclusterrank,
         #[token(".entry")]
         DotEntry,
         #[token(".func")]
@@ -2267,7 +2322,7 @@ derive_parser!(
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-st
     st{.weak}{.ss}{.cop}{.level::eviction_priority}{.level::cache_hint}{.vec}.type  [a], b{, cache_policy} => {
         if level_eviction_priority.is_some() || level_cache_hint || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("st instruction with cache policy/eviction priority/cache hints".to_string()));
+            // (st instruction with cache policy/eviction priority/cache hints): cache hints, eviction priorities and MMIO do not change the result; ignored
         }
         Instruction::St {
             data: StData {
@@ -2292,7 +2347,7 @@ derive_parser!(
     }
     st.relaxed.scope{.ss}{.level::eviction_priority}{.level::cache_hint}{.vec}.type [a], b{, cache_policy} => {
         if level_eviction_priority.is_some() || level_cache_hint || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("st.relaxed instruction with cache policy/eviction priority/cache hints".to_string()));
+            // (st.relaxed instruction with cache policy/eviction priority/cache hints): cache hints, eviction priorities and MMIO do not change the result; ignored
         }
         Instruction::St {
             data: StData {
@@ -2306,7 +2361,7 @@ derive_parser!(
     }
     st.release.scope{.ss}{.level::eviction_priority}{.level::cache_hint}{.vec}.type [a], b{, cache_policy} => {
         if level_eviction_priority.is_some() || level_cache_hint || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("st.release instruction with cache policy/eviction priority/cache hints".to_string()));
+            // (st.release instruction with cache policy/eviction priority/cache hints): cache hints, eviction priorities and MMIO do not change the result; ignored
         }
         Instruction::St {
             data: StData {
@@ -2319,7 +2374,7 @@ derive_parser!(
         }
     }
     st.mmio.relaxed.sys{.global}.type                                               [a], b => {
-        state.errors.push(PtxError::Todo("st.mmio.relaxed.sys instruction (MMIO store operations)".to_string()));
+        // (st.mmio.relaxed.sys instruction (MMIO store operations)): cache hints, eviction priorities and MMIO do not change the result; ignored
         Instruction::St {
             data: ast::StData {
                 qualifier: ast::LdStQualifier::Relaxed(MemScope::Sys),
@@ -2348,7 +2403,7 @@ derive_parser!(
     ld{.weak}{.ss}{.cop}{.level::eviction_priority}{.level::cache_hint}{.level::prefetch_size}{.vec}.type   d, [a]{.unified}{, cache_policy} => {
         let (a, unified) = a;
         if level_eviction_priority.is_some() || level_cache_hint || level_prefetch_size.is_some() || unified || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("ld instruction with cache policy/eviction priority/cache hints/prefetch size".to_string()));
+            // (ld instruction with cache policy/eviction priority/cache hints/prefetch size): cache hints, eviction priorities and MMIO do not change the result; ignored
         }
         Instruction::Ld {
             data: LdDetails {
@@ -2363,7 +2418,7 @@ derive_parser!(
     }
     ld.volatile{.ss}{.level::prefetch_size}{.vec}.type                                                      d, [a] => {
         if level_prefetch_size.is_some() {
-            state.errors.push(PtxError::Todo("ld.volatile instruction with prefetch size".to_string()));
+            // (ld.volatile instruction with prefetch size): cache hints, eviction priorities and MMIO do not change the result; ignored
         }
         Instruction::Ld {
             data: LdDetails {
@@ -2378,7 +2433,7 @@ derive_parser!(
     }
     ld.relaxed.scope{.ss}{.level::eviction_priority}{.level::cache_hint}{.level::prefetch_size}{.vec}.type  d, [a]{, cache_policy} => {
         if level_eviction_priority.is_some() || level_cache_hint || level_prefetch_size.is_some() || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("ld.relaxed instruction with cache policy/eviction priority/cache hints/prefetch size".to_string()));
+            // (ld.relaxed instruction with cache policy/eviction priority/cache hints/prefetch size): cache hints, eviction priorities and MMIO do not change the result; ignored
         }
         Instruction::Ld {
             data: LdDetails {
@@ -2393,7 +2448,7 @@ derive_parser!(
     }
     ld.acquire.scope{.ss}{.level::eviction_priority}{.level::cache_hint}{.level::prefetch_size}{.vec}.type  d, [a]{, cache_policy} => {
         if level_eviction_priority.is_some() || level_cache_hint || level_prefetch_size.is_some() || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("ld.acquire instruction with cache policy/eviction priority/cache hints/prefetch size".to_string()));
+            // (ld.acquire instruction with cache policy/eviction priority/cache hints/prefetch size): cache hints, eviction priorities and MMIO do not change the result; ignored
         }
         Instruction::Ld {
             data: LdDetails {
@@ -2407,7 +2462,7 @@ derive_parser!(
         }
     }
     ld.mmio.relaxed.sys{.global}.type                                                                       d, [a] => {
-        state.errors.push(PtxError::Todo("ld.mmio.relaxed.sys instruction (MMIO load operations)".to_string()));
+        // (ld.mmio.relaxed.sys instruction (MMIO load operations)): cache hints, eviction priorities and MMIO do not change the result; ignored
         Instruction::Ld {
             data: LdDetails {
                 qualifier: ast::LdStQualifier::Relaxed(MemScope::Sys),
@@ -2442,7 +2497,7 @@ derive_parser!(
             }
         }
         if level_eviction_priority.is_some() || level_cache_hint || level_prefetch_size.is_some() || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("ld.global.nc instruction with cache policy/eviction priority/cache hints/prefetch size".to_string()));
+            // (ld.global.nc instruction with cache policy/eviction priority/cache hints/prefetch size): cache hints, eviction priorities and MMIO do not change the result; ignored
         }
         Instruction::Ld {
             data: LdDetails {
@@ -2461,7 +2516,7 @@ derive_parser!(
                                               .L1::evict_first, .L1::evict_last, .L1::no_allocate};
     .level::cache_hint =                    { .L2::cache_hint };
     .level::prefetch_size: PrefetchSize =   { .L2::64B, .L2::128B, .L2::256B };
-    .vec: VectorPrefix  =                   { .v2, .v4 };
+    .vec: VectorPrefix  =                   { .v2, .v4, .v8 };
     .type: ScalarType =                     { .b8, .b16, .b32, .b64, .b128,
                                               .u8, .u16, .u32, .u64,
                                               .s8, .s16, .s32, .s64,
@@ -4183,34 +4238,14 @@ derive_parser!(
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async
     cp.async.cop.space.global{.level::cache_hint}{.level::prefetch_size}
                              [dst], [src], cp-size{, src-size}{, cache-policy} => {
-        // TODO: handle cache hints and cache policies
-        let _ = level_cache_hint;
-        let _ = level_prefetch_size;
-        let _ = cache_policy;
-
-        let cp_size = cp_size
-            .as_immediate()
-            .and_then(|imm| imm.as_u64())
-            .and_then(|n| CpAsyncCpSize::from_u64(n))
-            .unwrap_or_else(|| {
-                state.errors.push(PtxError::SyntaxError(format!("invalid cp.async cp-size {} in {:?}", cp_size, state.text)));
-                CpAsyncCpSize::Bytes4
-            });
-
-        let src_size = src_size
-            .and_then(|op| op.as_immediate())
-            .and_then(|imm| imm.as_u64());
-
-        Instruction::CpAsync {
-            data: CpAsyncDetails {
-                caching: cop.into(),
-                space,
-                cp_size,
-                src_size,
-            },
-            arguments: CpAsyncArgs {
-                src_to: dst,
-                src_from: src,
+        // a helper (helper_table/memory.rs): src-size may be a register, or an ignore-src predicate
+        let _ = (level_prefetch_size, cop, space);
+        let pred = matches!(src_size, Some(ast::ParsedOperand::Reg(r)) if state.pred_regs.contains(r));
+        match crate::helper_table::cp_async(dst, src, cp_size, src_size, level_cache_hint, cache_policy, pred) {
+            Ok(i) => i,
+            Err(e) => {
+                state.errors.push(PtxError::Todo(e));
+                Instruction::CpAsyncCommitGroup {}
             }
         }
     }
@@ -4412,10 +4447,11 @@ derive_parser!(
     .type: ScalarType = { .f32, .f64 };
 
     prefetch{.space}.level [a] => {
-        let space = space.unwrap_or(StateSpace::Generic);
-        ast::Instruction::Prefetch {
-            data: PrefetchData { space, level, },
-            arguments: PrefetchArgs { src: a }
+        // a cache hint without effect on the results: a no-op helper (helper_table/memory.rs)
+        let _ = (space, level, a);
+        ast::Instruction::Helper {
+            data: ast::HelperData::new("mem_nop"),
+            arguments: ast::HelperArgs { dst: None, dst2: None, src1: None, src2: None, src3: None, src4: None, src5: None, src6: None },
         }
     }
 

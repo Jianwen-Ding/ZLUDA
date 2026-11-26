@@ -2045,6 +2045,10 @@ pub enum TuningDirective {
     ReqNtid(u32, u32, u32),
     MinNCtaPerSm(u32),
     NoReturn,
+    /// thread-block clusters (a cluster runs as one AGX threadgroup, zluda_metal/cpp/air_lower.cpp)
+    ReqNCtaPerCluster(u32, u32, u32),
+    ExplicitCluster,
+    MaxClusterRank(u32),
 }
 
 pub struct MethodDeclaration<'input, ID> {

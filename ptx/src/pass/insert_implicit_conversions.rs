@@ -223,11 +223,11 @@ fn is_addressable(this: ast::StateSpace) -> bool {
         | ast::StateSpace::Global
         | ast::StateSpace::ParamEntry
         | ast::StateSpace::Local
-        | ast::StateSpace::Shared => true,
+        | ast::StateSpace::Shared
+        | ast::StateSpace::SharedCluster
+        | ast::StateSpace::SharedCta => true,
         ast::StateSpace::Param | ast::StateSpace::Reg => false,
-        ast::StateSpace::SharedCluster
-        | ast::StateSpace::SharedCta
-        | ast::StateSpace::ParamFunc => todo!(),
+        ast::StateSpace::ParamFunc => todo!(),
     }
 }
 
@@ -255,15 +255,18 @@ fn default_implicit_conversion_space(
                 | ast::StateSpace::Const
                 | ast::StateSpace::Local
                 | ast::StateSpace::Shared
+                | ast::StateSpace::SharedCta
+                | ast::StateSpace::SharedCluster
                 | ast::StateSpace::Param => Ok(Some(ConversionKind::BitToPtr)),
                 _ => Err(error_mismatched_type()),
             },
             (ast::Type::Scalar(ast::ScalarType::B32), _)
             | (ast::Type::Scalar(ast::ScalarType::U32), _)
             | (ast::Type::Scalar(ast::ScalarType::S32), _) => match instruction_space {
-                ast::StateSpace::Local | ast::StateSpace::Shared => {
-                    Ok(Some(ConversionKind::BitToPtr))
-                }
+                ast::StateSpace::Local
+                | ast::StateSpace::Shared
+                | ast::StateSpace::SharedCta
+                | ast::StateSpace::SharedCluster => Ok(Some(ConversionKind::BitToPtr)),
                 _ => Err(error_mismatched_type()),
             },
             _ => Err(error_mismatched_type()),

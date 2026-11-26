@@ -177,6 +177,13 @@ enum PtxSpecialRegister {
     LanemaskLt,
     LanemaskGe,
     Laneid,
+    ClusterCtarank,
+    ClusterNctarank,
+    Clusterid,
+    Nclusterid,
+    ClusterCtaid,
+    ClusterNctaid,
+    IsExplicitCluster,
 }
 
 impl PtxSpecialRegister {
@@ -191,6 +198,13 @@ impl PtxSpecialRegister {
             Self::LanemaskLt => "%lanemask_lt",
             Self::LanemaskGe => "%lanemask_ge",
             Self::Laneid => "%laneid",
+            Self::ClusterCtarank => "%cluster_ctarank",
+            Self::ClusterNctarank => "%cluster_nctarank",
+            Self::Clusterid => "%clusterid",
+            Self::Nclusterid => "%nclusterid",
+            Self::ClusterCtaid => "%cluster_ctaid",
+            Self::ClusterNctaid => "%cluster_nctaid",
+            Self::IsExplicitCluster => "%is_explicit_cluster",
         }
     }
 
@@ -199,7 +213,11 @@ impl PtxSpecialRegister {
             PtxSpecialRegister::Tid
             | PtxSpecialRegister::Ntid
             | PtxSpecialRegister::Ctaid
-            | PtxSpecialRegister::Nctaid => ast::Type::Vector(4, self.get_function_return_type()),
+            | PtxSpecialRegister::Nctaid
+            | PtxSpecialRegister::Clusterid
+            | PtxSpecialRegister::Nclusterid
+            | PtxSpecialRegister::ClusterCtaid
+            | PtxSpecialRegister::ClusterNctaid => ast::Type::Vector(4, self.get_function_return_type()),
             _ => ast::Type::Scalar(self.get_function_return_type()),
         }
     }
@@ -215,6 +233,13 @@ impl PtxSpecialRegister {
             PtxSpecialRegister::LanemaskLt => ast::ScalarType::U32,
             PtxSpecialRegister::LanemaskGe => ast::ScalarType::U32,
             PtxSpecialRegister::Laneid => ast::ScalarType::U32,
+            PtxSpecialRegister::IsExplicitCluster => ast::ScalarType::Pred,
+            PtxSpecialRegister::ClusterCtarank
+            | PtxSpecialRegister::ClusterNctarank
+            | PtxSpecialRegister::Clusterid
+            | PtxSpecialRegister::Nclusterid
+            | PtxSpecialRegister::ClusterCtaid
+            | PtxSpecialRegister::ClusterNctaid => ast::ScalarType::U32,
         }
     }
 
@@ -223,8 +248,15 @@ impl PtxSpecialRegister {
             PtxSpecialRegister::Tid
             | PtxSpecialRegister::Ntid
             | PtxSpecialRegister::Ctaid
-            | PtxSpecialRegister::Nctaid => Some(ast::ScalarType::U8),
-            PtxSpecialRegister::Clock
+            | PtxSpecialRegister::Nctaid
+            | PtxSpecialRegister::Clusterid
+            | PtxSpecialRegister::Nclusterid
+            | PtxSpecialRegister::ClusterCtaid
+            | PtxSpecialRegister::ClusterNctaid => Some(ast::ScalarType::U8),
+            PtxSpecialRegister::ClusterCtarank
+            | PtxSpecialRegister::ClusterNctarank
+            | PtxSpecialRegister::IsExplicitCluster
+            | PtxSpecialRegister::Clock
             | PtxSpecialRegister::LanemaskLe
             | PtxSpecialRegister::LanemaskLt
             | PtxSpecialRegister::LanemaskGe
@@ -243,6 +275,13 @@ impl PtxSpecialRegister {
             PtxSpecialRegister::LanemaskLe => "sreg_lanemask_le",
             PtxSpecialRegister::LanemaskGe => "sreg_lanemask_ge",
             PtxSpecialRegister::Laneid => "sreg_laneid",
+            PtxSpecialRegister::ClusterCtarank => "sreg_cluster_ctarank",
+            PtxSpecialRegister::ClusterNctarank => "sreg_cluster_nctarank",
+            PtxSpecialRegister::Clusterid => "sreg_clusterid",
+            PtxSpecialRegister::Nclusterid => "sreg_nclusterid",
+            PtxSpecialRegister::ClusterCtaid => "sreg_cluster_ctaid",
+            PtxSpecialRegister::ClusterNctaid => "sreg_cluster_nctaid",
+            PtxSpecialRegister::IsExplicitCluster => "sreg_is_explicit_cluster",
         }
     }
 }

@@ -444,8 +444,15 @@
             t->w[i] = g_rd(a + 8 * i, 8);
     }
     static inline uint32_t tm_rank(const Tm *t) { return (uint32_t)(t->w[2] & 255); }
-    static inline int64_t tm_dim(const Tm *t, int i) { return (int64_t)t->w[4 + i]; }
-    static inline int64_t tm_stride(const Tm *t, int i) { return (int64_t)t->w[8 + i]; }
+    // (selects rather than dynamically indexed stack accesses)
+    static inline int64_t tm_dim(const Tm *t, int i)
+    {
+        return (int64_t)(i == 0 ? t->w[4] : i == 1 ? t->w[5] : i == 2 ? t->w[6] : i == 3 ? t->w[7] : t->w[8]);
+    }
+    static inline int64_t tm_stride(const Tm *t, int i)
+    {
+        return (int64_t)(i <= 1 ? t->w[9] : i == 2 ? t->w[10] : i == 3 ? t->w[11] : t->w[12]);
+    }
     static inline int64_t tm_box(const Tm *t, int i) { return i < 4 ? (int64_t)((t->w[13] >> (16 * i)) & 65535) : (int64_t)(t->w[14] & 65535); }
     static inline int64_t tm_est(const Tm *t, int i) { return (int64_t)((t->w[15] >> (8 * i)) & 255); }
     static inline uint32_t tm_swz(const Tm *t) { return (uint32_t)((t->w[14] >> 16) & 255); }
@@ -534,16 +541,19 @@
         if (g)
             return 4 * tm_box(t, 0);
         int64_t a = 1;
-        for (uint32_t i = 0; i < tm_rank(t) && i < 5; i++)
-            a *= tm_n(t, i);
+        _Pragma("clang loop unroll(full)") for (uint32_t i = 0; i < 5; i++)
+            if (i < tm_rank(t))
+                a *= tm_n(t, i);
         return a;
     }
     // the global address of element e of the box at coordinates cs, -1 when out of bounds
     static inline int64_t tm_addr_t(const Tm *t, I32x8 cs, int64_t e)
     {
         int64_t dv = 1, acc = 0;
-        for (uint32_t i = 0; i < tm_rank(t) && i < 5; i++)
+        _Pragma("clang loop unroll(full)") for (uint32_t i = 0; i < 5; i++)
         {
+            if (i >= tm_rank(t))
+                break;
             int64_t g = (int64_t)cs[i] + tmod(tdiv(e, dv), tm_n(t, i)) * tm_est(t, i);
             if (g < 0 || g >= tm_dim(t, i))
                 return -1;
@@ -574,8 +584,10 @@
     {
         int64_t mu = 1, acc = 0;
         int r = (int)tm_rank(t);
-        for (int k = 1; k <= r - 2; k++)
+        _Pragma("clang loop unroll(full)") for (int k = 1; k <= 3; k++)
         {
+            if (k > r - 2)
+                break;
             acc += fdiv((int64_t)cs[k] - tm_lo(t, k - 1), tm_est(t, k)) * mu;
             mu *= tm_nk(t, k);
         }
@@ -592,8 +604,10 @@
     static inline int64_t tm_addr_w(const Tm *t, I32x8 cs, int64_t sh, int64_t acc)
     {
         int r = (int)tm_rank(t);
-        for (int k = 1; k <= r - 2; k++)
+        _Pragma("clang loop unroll(full)") for (int k = 1; k <= 3; k++)
         {
+            if (k > r - 2)
+                break;
             int64_t v = (int64_t)cs[k] + (k == 1 ? sh : 0);
             if (v < 0 || v >= tm_dim(t, k))
                 return -1;
@@ -621,8 +635,10 @@
         int64_t idx = tm_start(t, cs) + p;
         int64_t acc = acc0;
         int r = (int)tm_rank(t);
-        for (int k = 1; k <= r - 2; k++)
+        _Pragma("clang loop unroll(full)") for (int k = 1; k <= 3; k++)
         {
+            if (k > r - 2)
+                break;
             int64_t pos = tm_lo(t, k - 1) + tmod(idx, tm_nk(t, k)) * tm_est(t, k) + inf[k - 1];
             if (pos < 0 || pos >= tm_dim(t, k))
                 return -1;

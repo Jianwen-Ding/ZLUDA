@@ -69,7 +69,8 @@ fn arith<'i>(base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
         return None;
     }
     let mods: Vec<&str> = m.iter().copied().filter(|x| !tys.contains(x)).collect();
-    let op = |i: usize| ops[i].op.clone();
+    let w0 = tys.first().and_then(|t| ftype(t)).map_or(0, |(c, pk, w)| if pk { 0 } else { let _ = c; w });
+    let op = |i: usize| cvt::fimm(ops[i].op.clone(), w0);
     if ALT4.contains(&tys[0]) {
         return alt4(opc, &tys, &mods, ops);
     }
@@ -269,10 +270,10 @@ fn divsqrt<'i>(base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
         Ok(c) => c | opc,
         Err(e) => return err(e),
     };
-    let b = if opc == 0 { ops.get(2)?.op.clone() } else { imm(0) };
+    let b = if opc == 0 { cvt::fimm(ops.get(2)?.op.clone(), 32) } else { imm(0) };
     Call::new("fdivsqrt_f32")
         .dst(ops[0].op.clone(), ScalarType::B32)
-        .src(ops[1].op.clone(), ScalarType::B32)
+        .src(cvt::fimm(ops[1].op.clone(), 32), ScalarType::B32)
         .src(b, ScalarType::B32)
         .imm(ctrl)
         .build()
@@ -291,9 +292,18 @@ pub(super) fn lower<'i>(_opcode: &str, base: &str, m: &[&str], ops: &[HOp<'i>]) 
 /// from the ISA there): see helper_table::preempts.
 pub(super) fn preempts(_opcode: &str, base: &str, m: &[&str]) -> bool {
     let half = |t: &&str| matches!(*t, "f16" | "bf16" | "f16x2" | "bf16x2");
+    let any = |l: &[&str]| l.iter().any(|x| m.contains(x));
     match base {
+        // half comparisons (.ftz, NaN, the pair destinations)
         "set" | "setp" => m.last().map_or(false, |t| half(t)),
-        "min" | "max" => m.contains(&"f64"),
+        // half arithmetic: NaN results, subnormals, directed roundings, .relu / .sat / .oob
+        "add" | "sub" | "mul" | "fma" => m.iter().any(half),
+        // min / max: .ftz .NaN .xorsign .abs (llvm.canonicalize is not available), halves, f64 NaN payloads
+        "min" | "max" => m.iter().any(half) || m.contains(&"f64") || any(&["ftz", "NaN", "xorsign", "abs"]),
+        // f32 division and square root with a directed rounding or .ftz (exact, with subnormals)
+        "div" | "sqrt" | "rcp" => {
+            m.last() == Some(&"f32") && !any(&["approx", "full"]) && any(&["rz", "rm", "rp", "ftz", "sat"])
+        }
         _ => false,
     }
 }

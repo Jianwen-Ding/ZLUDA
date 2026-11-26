@@ -78,6 +78,49 @@ impl CvtTy {
     }
 }
 
+/// A float literal operand as the bits of a `w`-bit float (helpers take float operands as bits)
+pub(crate) fn fimm<'i>(op: Op<'i>, w: u32) -> Op<'i> {
+    let v = match op {
+        ast::ParsedOperand::Imm(ast::ImmediateValue::F32(x)) => x as f64,
+        ast::ParsedOperand::Imm(ast::ImmediateValue::F64(x)) => x,
+        o => return o,
+    };
+    imm(match w {
+        64 => v.to_bits(),
+        32 => (v as f32).to_bits() as u64,
+        16 => f32_to_f16_bits(v as f32) as u64,
+        _ => v.to_bits(),
+    })
+}
+
+/// round-to-nearest-even f32 -> f16 bits (literals only)
+fn f32_to_f16_bits(x: f32) -> u16 {
+    let b = x.to_bits();
+    let s = ((b >> 16) & 0x8000) as u16;
+    let e = ((b >> 23) & 0xff) as i32;
+    let m = b & 0x7fffff;
+    if e == 255 {
+        return s | 0x7c00 | if m != 0 { 0x200 } else { 0 };
+    }
+    let ue = e - 127 + 15;
+    if ue >= 31 {
+        return s | 0x7c00;
+    }
+    let (mant, sh) = if ue <= 0 { (m | 0x800000, (14 - ue) as u32) } else { (m, 13u32) };
+    if sh > 24 {
+        return s;
+    }
+    let q = mant >> sh;
+    let r = mant & ((1 << sh) - 1);
+    let h = 1 << (sh - 1);
+    let q = if r > h || (r == h && q & 1 == 1) { q + 1 } else { q };
+    if ue <= 0 {
+        s | q as u16
+    } else {
+        s | ((((ue as u32) << 10) + q) as u16)
+    }
+}
+
 pub(crate) fn bits_ty(w: u32) -> ScalarType {
     match w {
         8 | 4 => ScalarType::B8,
@@ -155,7 +198,10 @@ pub(crate) fn lower_cvt<'i>(m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
     if dt.is_int() && !st.is_int() && mods & (1 << 13) == 0 {
         ctrl |= 1 << 10 | 1 << 13;
     }
-    let op = |i: usize| ops[i].op.clone();
+    let op = |i: usize| {
+        let w = if i == 0 { dt.bits() } else if st.n == 1 && !st.is_int() { st.bits() } else { 0 };
+        fimm(ops[i].op.clone(), w)
+    };
     // the scale operand: .ue8m0x2 (16 bits) for .scaled::n2, else one .ue8m0
     let (scw, sct) = if mods & (1 << 20) != 0 { (16, ScalarType::B16) } else { (8, ScalarType::B8) };
     match (dt.n, st.n, ops.len()) {

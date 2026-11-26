@@ -120,7 +120,11 @@ fn parse_hop<'a, 'input>(
         } else {
             h.op = sub_operand(text, &toks[..p])?;
         }
-        h.pair = Some(sub_operand(text, &toks[p + 1..])?);
+        // `p|_`: a sink second destination
+        h.pair = Some(match &toks[p + 1..] {
+            [(Token::Sink, _)] => ast::ParsedOperand::Reg("_"),
+            t => sub_operand(text, t)?,
+        });
         return Some(h);
     }
     if let [(Token::Ident(_), _), (Token::DotIdent(sel), _)] = toks {
@@ -138,6 +142,21 @@ fn parse_hop<'a, 'input>(
 pub(crate) fn helper_instruction<'a, 'input>(
     stream: &mut PtxParser<'a, 'input>,
 ) -> PResult<ast::Instruction<ParsedOperandStr<'input>>> {
+    helper_instruction_impl(stream, false)
+}
+
+/// Like `helper_instruction`, for the opcodes of `helper_table::preempts` only: tried before the
+/// grammar.
+pub(crate) fn preempt_instruction<'a, 'input>(
+    stream: &mut PtxParser<'a, 'input>,
+) -> PResult<ast::Instruction<ParsedOperandStr<'input>>> {
+    helper_instruction_impl(stream, true)
+}
+
+fn helper_instruction_impl<'a, 'input>(
+    stream: &mut PtxParser<'a, 'input>,
+    preempt: bool,
+) -> PResult<ast::Instruction<ParsedOperandStr<'input>>> {
     let text = stream.state.text;
     let toks = stream.input;
     let end = statement_end(toks).ok_or_else(|| ErrMode::from_error_kind(stream, ErrorKind::Verify))?;
@@ -151,6 +170,9 @@ pub(crate) fn helper_instruction<'a, 'input>(
     }
     let opcode = &text[toks[0].1.start..toks[k - 1].1.end];
     if !opcode.chars().next().map_or(false, |c| c.is_ascii_alphabetic()) {
+        return Err(ErrMode::from_error_kind(stream, ErrorKind::Verify));
+    }
+    if preempt && !crate::helper_table::preempts(opcode) {
         return Err(ErrMode::from_error_kind(stream, ErrorKind::Verify));
     }
     let mut ops = Vec::new();

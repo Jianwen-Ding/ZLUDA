@@ -81,6 +81,9 @@ fn insert_implicit_conversions_impl<'input>(
     {
         convert_to_texobj(resolver, type_, src_ptr)?;
     }
+    // helper operands (the fallback instructions) follow PTX's relaxed operand rules where the
+    // exact ones reject them: a helper's slot types do not know the register's width
+    let is_helper = matches!(stmt, ExpandedStatement::Instruction(ast::Instruction::Helper { .. }));
     let statement = stmt.visit_map::<SpirvWord, TranslateError>(
         &mut |operand,
               type_state: Option<(&ast::Type, ast::StateSpace)>,
@@ -100,11 +103,23 @@ fn insert_implicit_conversions_impl<'input>(
             } else {
                 default_implicit_conversion
             };
-            match conversion_fn(
+            let conv = conversion_fn(
                 (*operand_space, &operand_type),
                 (instruction_space, instr_type),
                 is_32bit,
-            )? {
+            );
+            let conv = match conv {
+                Err(_) if is_helper && !relaxed_type_check => {
+                    let relaxed = if is_dst {
+                        should_convert_relaxed_dst_wrapper
+                    } else {
+                        should_convert_relaxed_src_wrapper
+                    };
+                    relaxed((*operand_space, &operand_type), (instruction_space, instr_type), is_32bit)
+                }
+                c => c,
+            };
+            match conv? {
                 Some(conv_kind) => {
                     let conv_output = if is_dst { &mut post_conv } else { &mut *func };
                     let mut from_type = instr_type.clone();

@@ -304,6 +304,7 @@ pub(crate) fn rewrite(text: &str) -> String {
     let t = blank_comments(text);
     let t = link_weak(&t);
     let t = unroll_recursion(&t);
+    let t = size_unsized_formals(&t);
     let funcs = functions(&t);
     if funcs.is_empty() {
         return t;
@@ -332,6 +333,21 @@ pub(crate) fn rewrite(text: &str) -> String {
         last = be;
     }
     out.push_str(&replace_fn_names(&t[last..], &ids, false));
+    out
+}
+
+/// an unsized last .param array formal of a function (`.param .b8 va[]`, PTX ISA 11.2.2) gets the size of the
+/// argument a call may omit, `[1]` (decl_of)
+fn size_unsized_formals(t: &str) -> String {
+    let mut out = t.to_string();
+    for f in functions(t).iter().rev() {
+        if f.entry || !f.sig.params.iter().any(|p| p.array.as_deref() == Some("[]")) {
+            continue;
+        }
+        let hend = f.body.map(|(bs, _)| bs).unwrap_or(f.end);
+        let header = out[f.start..hend].replace("[]", "[1]");
+        out.replace_range(f.start..hend, &header);
+    }
     out
 }
 

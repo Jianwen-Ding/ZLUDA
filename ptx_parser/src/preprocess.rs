@@ -835,14 +835,18 @@ fn fold_expressions(t: &str) -> String {
     }
     // generic(var) -> var
     let mut r = out;
-    while let Some(p) = r.find("generic(") {
+    let mut from = 0;
+    while let Some(p) = r[from..].find("generic(").map(|p| p + from) {
         let before_ok = p == 0 || !is_word(r.as_bytes()[p - 1]);
         let Some(q) = r[p..].find(')') else { break };
         let inner = r[p + 8..p + q].trim().to_string();
         if !before_ok || inner.is_empty() || !inner.bytes().all(is_word) {
-            break;
+            // not an initializer (a comment, `generic()` text): look further
+            from = p + 8;
+            continue;
         }
         r.replace_range(p..p + q + 1, &inner);
+        from = p;
     }
     r
 }

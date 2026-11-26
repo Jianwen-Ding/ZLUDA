@@ -706,6 +706,15 @@ unsafe fn load_module_from_ptx(module: *mut *mut Module, ptx: &str) -> CUresult 
             host,
             compiled.globals_init.len(),
         );
+        // addresses of variables in initializers (PTX ISA 5.4.4)
+        for r in &compiled.globals_relocs {
+            let mut v = globals.wrapping_add(r.addend);
+            if r.mask != 0 {
+                v = (v & r.mask) >> r.mask.trailing_zeros();
+            }
+            let bytes = v.to_le_bytes();
+            ptr::copy_nonoverlapping(bytes.as_ptr(), host.add(r.at as usize), (r.size as usize).min(8));
+        }
     }
     let mut globals32 = vec![];
     if let Some(m32) = &compiled.module32 {

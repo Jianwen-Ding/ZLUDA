@@ -46,6 +46,16 @@ typedef struct ZludaAirGlobal
     uint64_t size;
 } ZludaAirGlobal;
 
+// An address in a device variable's initializer: the runtime writes the low `size` bytes of
+// (address of the device-globals buffer + addend), or with a mask, of (v & mask) >> ctz(mask), at offset `at`
+typedef struct ZludaAirReloc
+{
+    uint64_t at;
+    uint64_t size;
+    uint64_t addend;
+    uint64_t mask;
+} ZludaAirReloc;
+
 typedef struct ZludaAirOutput
 {
     ZludaAirKernel *kernels;
@@ -55,6 +65,8 @@ typedef struct ZludaAirOutput
     uint8_t *globals_init; // initial contents of the device-globals buffer
     uint64_t globals_size;
     char *module_text;
+    ZludaAirReloc *relocs;
+    size_t reloc_count;
 } ZludaAirOutput;
 
 int zluda_air_lower(const ZludaAirInput *input, ZludaAirOutput *output, char **error);

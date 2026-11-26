@@ -1192,6 +1192,13 @@ where
                                     (self)(ident, type_space, is_dst, relaxed_type_check)?,
                                 )),
                                 Some(RegOrImmediate::Imm(imm)) => Some(RegOrImmediate::Imm(imm)),
+                                Some(RegOrImmediate::SymOffset(ident, off, mask)) => {
+                                    Some(RegOrImmediate::SymOffset(
+                                        (self)(ident, type_space, is_dst, relaxed_type_check)?,
+                                        off,
+                                        mask,
+                                    ))
+                                }
                                 None => None,
                             })
                         })
@@ -1675,6 +1682,10 @@ pub struct ShfDetails {
 pub enum RegOrImmediate<Ident> {
     Reg(Ident),
     Imm(ImmediateValue),
+    /// a module-variable initializer `var+offset` or a mask of it `0xff00(var+offset)` (PTX ISA 5.4.4):
+    /// (variable, offset in bytes, mask; 0 is no mask)
+    #[display("{_1}({_0}+{_2})")]
+    SymOffset(Ident, i64, u64),
 }
 
 #[derive(Clone)]

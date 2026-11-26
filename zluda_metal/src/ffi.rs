@@ -45,6 +45,18 @@ pub struct ZludaAirOutput {
     pub globals_init: *mut u8,
     pub globals_size: u64,
     pub module_text: *mut c_char,
+    pub relocs: *mut ZludaAirReloc,
+    pub reloc_count: usize,
+}
+
+/// an address in a device variable's initializer (air_lower.h)
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ZludaAirReloc {
+    pub at: u64,
+    pub size: u64,
+    pub addend: u64,
+    pub mask: u64,
 }
 
 #[repr(C)]

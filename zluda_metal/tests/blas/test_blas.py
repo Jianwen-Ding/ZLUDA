@@ -882,6 +882,34 @@ for ta, tb in ((N, N), (T, T)):
         return e, tol(np.float32, k)
 
 
+for name, dt, m, n, k in (("S", np.float32, 32, 48, 16), ("S", np.float32, 13, 7, 5), ("S", np.float32, 70, 50, 60),
+                          ("D", np.float64, 20, 9, 11), ("Ex", np.float16, 64, 32, 40), ("Ex", np.float16, 33, 40, 100)):
+    @case
+    def gemm_batched_pointer_arrays(b, name=name, dt=dt, m=m, n=n, k=k):
+        """gemmBatched: the kernels read the matrices' addresses from device arrays (not in batch order in memory)"""
+        batch = 4
+        mats = [(rng.standard_normal((k, m + 1)).astype(dt), rng.standard_normal((n, k)).astype(dt),
+                 rng.standard_normal((n, m + 2)).astype(dt)) for _ in range(batch)]
+        devs = [(b.dev(A)[0], b.dev(B)[0], b.dev(C)) for A, B, C in mats][::-1]
+        devs = devs[::-1]
+        arr = lambda q: b.dev(np.array([d[q] if q < 2 else d[2][0] for d in devs], np.uint64))[0]
+        pa, pb, pc = arr(0), arr(1), arr(2)
+        if name == "Ex":
+            al, be = ptr(1.0, ctypes.c_float), ptr(0.5, ctypes.c_float)
+            b.call("cublasGemmBatchedEx", b.h, N, N, m, n, k, al[0], c_void_p(pa), 2, m + 1, c_void_p(pb), 2, k, be[0],
+                   c_void_p(pc), 2, m + 2, batch, 68, 0)
+        else:
+            al, be = ptr(1.0, ctype(dt)), ptr(0.5, ctype(dt))
+            b.call("cublas%sgemmBatched" % name, b.h, N, N, m, n, k, al[0], c_void_p(pa), m + 1, c_void_p(pb), k, be[0],
+                   c_void_p(pc), m + 2, batch)
+        e = 0.0
+        for (A, B, C), d in zip(mats, devs):
+            want = C.astype(np.float64).copy()
+            want[:, :m] = (A.astype(np.float64)[:, :m].T @ B.astype(np.float64).T + 0.5 * want[:, :m].T).T
+            e = max(e, rel(b.get(d[2][0], d[2][1]), want))
+        return e, (2e-3 if dt == np.float16 else tol(dt, k))
+
+
 @case
 def hgemm(b):
     m, n, k = 50, 30, 64

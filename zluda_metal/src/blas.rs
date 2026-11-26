@@ -340,6 +340,15 @@ unsafe fn gemv<T: Elem>(h: cublasHandle_t, trans: c_int, m: c_int, n: c_int, alp
 unsafe fn gemm_launch(name: &str, ta: c_int, tb: c_int, m: c_int, n: c_int, k: c_int, alpha: Vec<u8>, a: u64,
                       lda: c_int, sa: i64, b: u64, ldb: c_int, sb: i64, beta: Vec<u8>, c: u64, ldc: c_int, sc: i64,
                       batch: c_int) -> R {
+    gemm_launch_p(name, ta, tb, m, n, k, alpha, a, lda, sa, b, ldb, sb, beta, c, ldc, sc, batch, None)
+}
+
+/// gemm_launch, or with `parr` (device arrays of the A, B and C pointers of each batch: cublas<t>gemmBatched) the
+/// kernels read the batch's matrices from them: aligned shapes on the SIMD-group matrix kernel, small ones on the
+/// register-tiled kernel, one launch either way (large unaligned ones as one GEMM per batch)
+unsafe fn gemm_launch_p(name: &str, ta: c_int, tb: c_int, m: c_int, n: c_int, k: c_int, alpha: Vec<u8>, a: u64,
+                        lda: c_int, sa: i64, b: u64, ldb: c_int, sb: i64, beta: Vec<u8>, c: u64, ldc: c_int, sc: i64,
+                        batch: c_int, parr: Option<[u64; 3]>) -> R {
     if !op_ok(ta) || !op_ok(tb) || m < 0 || n < 0 || k < 0 || batch < 0 || ldc < m.max(1)
         || lda < (if ta == OP_N { m } else { k }).max(1) || ldb < (if tb == OP_N { k } else { n }).max(1)
     {
@@ -352,7 +361,7 @@ unsafe fn gemm_launch(name: &str, ta: c_int, tb: c_int, m: c_int, n: c_int, k: c
     if big(sa) || big(sb) || big(sc) || big(sc * batch as i64) || big(ldc as i64 * n as i64) {
         return Err(fail("matrices beyond 2^31 elements are not supported", CUBLAS_STATUS_NOT_SUPPORTED));
     }
-    let g = Gemm { ta, tb, a, lda, sa, b, ldb, sb, c, ldc, sc, batch };
+    let g = Gemm { ta, tb, a, lda, sa, b, ldb, sb, c, ldc, sc, batch, parr };
     // the SIMD-group matrix kernel: (kernel, operand type, f16 / bf16 C through f32)
     let mma = match name {
         "sgemm" => Some(("gemm_mma_f32", "f32", None)),
@@ -365,7 +374,17 @@ unsafe fn gemm_launch(name: &str, ta: c_int, tb: c_int, m: c_int, n: c_int, k: c
     let aligned = m % 16 == 0 && n % 16 == 0 && k % 8 == 0;
     // padded copies (and f32 staging of a half C) pay for themselves beyond small sizes
     let worth = (aligned && mma.is_some_and(|x| x.2.is_none())) || m as i64 * n as i64 * k as i64 >= 1 << 17;
-    if let Some((mk, at, half)) = mma.filter(|_| m >= 16 && n >= 16 && k >= 8 && worth && std::env::var_os("ZLUDA_BLAS_NO_MMA").is_none()) {
+    let use_mma = m >= 16 && n >= 16 && k >= 8 && worth && std::env::var_os("ZLUDA_BLAS_NO_MMA").is_none();
+    if let (Some(arr), Some(_)) = (parr, mma.filter(|x| use_mma && !(aligned && x.2.is_none()))) {
+        // padded copies per batch
+        for i in 0..batch {
+            let p = |q: u64| dev_read::<u64>(q + 8 * i as u64);
+            gemm_launch_p(name, ta, tb, m, n, k, alpha.clone(), p(arr[0])?, lda, 0, p(arr[1])?, ldb, 0, beta.clone(),
+                          p(arr[2])?, ldc, 0, 1, None)?;
+        }
+        return Ok(());
+    }
+    if let Some((mk, at, half)) = mma.filter(|_| use_mma) {
         return gemm_mma(mk, at, half, &g, m, n, k, &alpha, &beta);
     }
     gemm_generic(name, &g, m, n, k, &alpha, &beta, 0, 0, 0)
@@ -386,6 +405,17 @@ struct Gemm {
     ldc: c_int,
     sc: i64,
     batch: c_int,
+    parr: Option<[u64; 3]>,
+}
+
+impl Gemm {
+    /// the kernels' pointer-array arguments
+    fn parr_args(&self) -> [Arg<'static>; 4] {
+        match self.parr {
+            Some([a, b, c]) => [Arg::Addr(a), Arg::Addr(b), Arg::Addr(c), i32v(1)],
+            None => [Arg::Addr(self.a), Arg::Addr(self.b), Arg::Addr(self.c), i32v(0)],
+        }
+    }
 }
 
 fn round_up(v: i32, t: i32) -> i32 {
@@ -407,6 +437,8 @@ unsafe fn gemm_mma(mk: &str, at: &str, half: Option<&str>, g: &Gemm, m: i32, n: 
         Err(_) if t32 => 32,
         Err(_) => 16,
     };
+    // pointer arrays: no padded copies
+    let tile = if g.parr.is_some() && (m % tile != 0 || n % tile != 0) { 16 } else { tile };
     let (mp, np, kp) = (round_up(m, tile), round_up(n, tile), round_up(k, 8));
     let esz = if at == "f32" { 4 } else { 2 };
     let (ars, acs) = strides(g.ta, g.lda);
@@ -454,10 +486,12 @@ unsafe fn gemm_mma(mk: &str, at: &str, half: Option<&str>, g: &Gemm, m: i32, n: 
     let (p, _) = agx::host_pointer(d.0).ok_or(CUBLAS_STATUS_INTERNAL_ERROR)?;
     std::ptr::copy_nonoverlapping(diag.as_ptr() as *const u8, p, 512);
     let mk = if tile == 32 { mk.replace("gemm_mma_", "gemm_mma32_") } else { mk.to_string() };
+    let [x0, x1, x2, x3] = g.parr_args();
+    let pa_ = (x0, x1, x2, x3);
     launch(&mk, [(mp / tile) as u32, (np / tile) as u32, batch as u32], [32, 1, 1], &[
         i32v(mp), i32v(np), i32v(kp), Arg::Addr(d.0), Arg::Addr(pa), i32v(0), i32v(pars), i32v(pacs), i32v(psa as i32),
         Arg::Addr(pb), i32v(0), i32v(pbrs), i32v(pbcs), i32v(psb as i32), i32v((be != 0.0) as i32), Arg::Addr(pc),
-        i32v(0), i32v(pldc), i32v(psc as i32),
+        i32v(0), i32v(pldc), i32v(psc as i32), pa_.0, pa_.1, pa_.2, pa_.3,
     ])?;
     if let Some((t, per)) = &ct {
         match half {
@@ -498,10 +532,11 @@ unsafe fn gemm_generic(name: &str, g: &Gemm, m: i32, n: i32, k: i32, alpha: &[u8
     let bx = ((m as u32).div_ceil(t)).next_power_of_two().clamp(2, 16);
     let by = (if (m as u32) < 64 && (n as u32) < 64 { 64 } else { 256 }) / bx;
     let grid = [(m as u32).div_ceil(t * bx), (n as u32).div_ceil(t * by), g.batch as u32];
+    let [x0, x1, x2, x3] = g.parr_args();
     launch(name, grid, [bx, by, 1], &[
         i32v(m), i32v(n), i32v(k), Arg::Value(alpha.to_vec()), Arg::Addr(g.a), i32v(ao), i32v(ars), i32v(acs),
         i32v(g.sa as i32), Arg::Addr(g.b), i32v(bo), i32v(brs), i32v(bcs), i32v(g.sb as i32), Arg::Value(beta.to_vec()),
-        Arg::Addr(g.c), i32v(co), i32v(g.ldc), i32v(g.sc as i32),
+        Arg::Addr(g.c), i32v(co), i32v(g.ldc), i32v(g.sc as i32), x0, x1, x2, x3,
     ])
 }
 
@@ -515,7 +550,16 @@ unsafe fn gemm<T: Elem>(h: cublasHandle_t, ta: c_int, tb: c_int, m: c_int, n: c_
                 be.bytes(), c as u64, ldc, sc, batch)
 }
 
-/// The pointer arrays of a batched GEMM (device memory)
+/// gemmBatched: the pointer arrays (device memory) read by the kernels
+unsafe fn gemm_batched<T: Elem>(h: cublasHandle_t, ta: c_int, tb: c_int, m: c_int, n: c_int, k: c_int, alpha: *const T,
+                                a: u64, lda: c_int, b: u64, ldb: c_int, beta: *const T, c: u64, ldc: c_int, batch: c_int) -> R {
+    check(h)?;
+    let (al, be) = (scalar(h, alpha)?, scalar(h, beta)?);
+    gemm_launch_p(&format!("{}gemm", T::P), ta, tb, m, n, k, al.bytes(), a, lda, 0, b, ldb, 0, be.bytes(), c, ldc, 0,
+                  batch, Some([a, b, c]))
+}
+
+/// The pointer arrays of a batched routine (device memory)
 unsafe fn ptrs(p: *const *const c_void, i: c_int) -> Result<u64, cublasStatus_t> {
     dev_read::<u64>(p as u64 + 8 * i as u64)
 }
@@ -1464,16 +1508,10 @@ entry! {
         gemm(h, ta, tb, m, n, k, alpha, a, lda, sa, b, ldb, sb, beta, c, ldc, sc, batch)
     }
     fn cublasSgemmBatched(h: cublasHandle_t, ta: c_int, tb: c_int, m: c_int, n: c_int, k: c_int, alpha: *const f32, a: *const *const f32, lda: c_int, b: *const *const f32, ldb: c_int, beta: *const f32, c: *const *mut f32, ldc: c_int, batch: c_int) {
-        for i in 0..batch.max(0) {
-            gemm(h, ta, tb, m, n, k, alpha, ptrs(a as _, i)? as *const f32, lda, 0, ptrs(b as _, i)? as *const f32, ldb, 0, beta, ptrs(c as _, i)? as *mut f32, ldc, 0, 1)?;
-        }
-        Ok(())
+        gemm_batched(h, ta, tb, m, n, k, alpha, a as u64, lda, b as u64, ldb, beta, c as u64, ldc, batch)
     }
     fn cublasDgemmBatched(h: cublasHandle_t, ta: c_int, tb: c_int, m: c_int, n: c_int, k: c_int, alpha: *const f64, a: *const *const f64, lda: c_int, b: *const *const f64, ldb: c_int, beta: *const f64, c: *const *mut f64, ldc: c_int, batch: c_int) {
-        for i in 0..batch.max(0) {
-            gemm(h, ta, tb, m, n, k, alpha, ptrs(a as _, i)? as *const f64, lda, 0, ptrs(b as _, i)? as *const f64, ldb, 0, beta, ptrs(c as _, i)? as *mut f64, ldc, 0, 1)?;
-        }
-        Ok(())
+        gemm_batched(h, ta, tb, m, n, k, alpha, a as u64, lda, b as u64, ldb, beta, c as u64, ldc, batch)
     }
     fn cublasHgemm(h: cublasHandle_t, ta: c_int, tb: c_int, m: c_int, n: c_int, k: c_int, alpha: *const u16, a: *const u16, lda: c_int, b: *const u16, ldb: c_int, beta: *const u16, c: *mut u16, ldc: c_int) {
         check(h)?;
@@ -1498,10 +1536,7 @@ entry! {
     fn cublasGemmBatchedEx(h: cublasHandle_t, ta: c_int, tb: c_int, m: c_int, n: c_int, k: c_int, alpha: *const c_void, a: *const *const c_void, at: c_int, lda: c_int, b: *const *const c_void, bt: c_int, ldb: c_int, beta: *const c_void, c: *const *mut c_void, ct: c_int, ldc: c_int, batch: c_int, compute: c_int, _algo: c_int) {
         check(h)?;
         let (name, al, be) = gemm_ex_kernel(h, at, bt, ct, compute, alpha, beta)?;
-        for i in 0..batch.max(0) {
-            gemm_launch(&name, ta, tb, m, n, k, al.clone(), ptrs(a as _, i)?, lda, 0, ptrs(b as _, i)?, ldb, 0, be.clone(), ptrs(c as _, i)?, ldc, 0, 1)?;
-        }
-        Ok(())
+        gemm_launch_p(&name, ta, tb, m, n, k, al, a as u64, lda, 0, b as u64, ldb, 0, be, c as u64, ldc, 0, batch, Some([a as u64, b as u64, c as u64]))
     }
 }
 

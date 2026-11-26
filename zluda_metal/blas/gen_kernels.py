@@ -194,36 +194,43 @@ def amax(p, t):
            conv_inf="arith.extf %pinf : f32 to f64" if t == "f64" else "arith.addf %pinf, %pinf : f32")
 
 
-def gemv(p, t):
-    """y = alpha op(A) x + beta y; op(A) is m x n with A(i, j) = A[ao + i rs + j cs]; one thread per y element"""
-    return """    gpu.func @{p}gemv(%m: i32, %n: i32, %alpha: {t}, %a: memref<?x{t}, 1>, %ao: i32, %ars: i32, %acs: i32, %x: memref<?x{t}, 1>, %xo: i32, %xi: i32, %beta: {t}, %y: memref<?x{t}, 1>, %yo: i32, %yi: i32) kernel {{
-{gid}      %zero = arith.constant 0.0 : {t}
-      %c0 = arith.constant 0 : i32
-      %c1 = arith.constant 1 : i32
-      scf.for %r = %i to %m step %stride : i32 {{
-        %rr = arith.muli %r, %ars : i32
-        %rowbase = arith.addi %ao, %rr : i32
-        %acc = scf.for %j = %c0 to %n step %c1 iter_args(%s = %zero) -> ({t}) : i32 {{
-{ia}{ix}          %av = memref.load %a[%ia] : memref<?x{t}, 1>
-          %xv = memref.load %x[%ix] : memref<?x{t}, 1>
-          %ns = math.fma %av, %xv, %s : {t}
-          scf.yield %ns : {t}
-        }}
-{iy}        %bz = arith.cmpf oeq, %beta, %zero : {t}
-        %yv = scf.if %bz -> ({t}) {{
-          scf.yield %zero : {t}
-        }} else {{
-          %y0 = memref.load %y[%iy] : memref<?x{t}, 1>
-          %by = arith.mulf %beta, %y0 : {t}
-          scf.yield %by : {t}
-        }}
-        %res = math.fma %alpha, %acc, %yv : {t}
-        memref.store %res, %y[%iy] : memref<?x{t}, 1>
+DESC = "!llvm.struct<(ptr<1>, ptr<1>, i64, array<1 x i64>, array<1 x i64>)>"
+
+
+def parr(mems):
+    """Pointer arrays (cublas<t>gemmBatched): with %parr != 0 the matrices of batch z are at %p<x>[z] (device
+    addresses, i64) instead of %<x>_in + z s<x>. `mems` is (name, memref type) of each; the body uses %<x> and the
+    batch strides %s<x>_e (0 with pointer arrays). A memref of an address is an LLVM memref descriptor (aligned
+    pointer, offset 0, unit stride) cast to the memref type."""
+    w = ["""      %pz = gpu.block_id z
+      %c0_p = arith.constant 0 : i32
+      %parr_b = arith.cmpi ne, %parr, %c0_p : i32
+      %one_p = llvm.mlir.constant(1 : i64) : i64
+      %zero_p = llvm.mlir.constant(0 : i64) : i64
+      %big_p = llvm.mlir.constant({big} : i64) : i64
+      %true_p = arith.constant true""".format(big=BIG)]
+    for x, mt in mems:
+        w.append("""      %s{x}_e = arith.select %parr_b, %c0_p, %s{x} : i32
+      %{x}_ai = memref.extract_aligned_pointer_as_index %{x}_in : {st} -> index
+      %{x}_a0 = arith.index_cast %{x}_ai : index to i64
+      %{x}_addr = scf.if %parr_b -> (i64) {{
+        %{x}_pv = memref.load %p{x}[%pz] : memref<?xi64, 1>
+        scf.yield %{x}_pv : i64
+      }} else {{
+        scf.yield %{x}_a0 : i64
       }}
-      gpu.return
-    }}
-""".format(p=p, t=t, gid=gid(), ia=idx("ia", "rowbase", "j", "acs").replace("      %", "          %"),
-           ix=idx("ix", "xo", "j", "xi").replace("      %", "          %"), iy=idx("iy", "yo", "r", "yi"))
+      %{x}_p = llvm.inttoptr %{x}_addr : i64 to !llvm.ptr<1>
+      %{x}_u = llvm.mlir.undef : {d}
+      %{x}_d1 = llvm.insertvalue %{x}_p, %{x}_u[0] : {d}
+      %{x}_d2 = llvm.insertvalue %{x}_p, %{x}_d1[1] : {d}
+      %{x}_d3 = llvm.insertvalue %zero_p, %{x}_d2[2] : {d}
+      %{x}_d4 = llvm.insertvalue %big_p, %{x}_d3[3, 0] : {d}
+      %{x}_d5 = llvm.insertvalue %one_p, %{x}_d4[4, 0] : {d}
+      %{x}_s = builtin.unrealized_conversion_cast %{x}_d5 : {d} to {st}
+      %{x} = {cast}""".format(x=x, mt=mt, d=DESC, st=mt.replace("?x", BIG + "x"),
+                       cast=("memref.cast %{x}_s : {st} to {mt}" if "?" in mt else "arith.select %true_p, %{x}_s, %{x}_s : {mt}").format(x=x, st=mt.replace("?x", BIG + "x"), mt=mt)))
+    return "\n".join(w)
+
 
 
 def gemm(name, ta, tb, tc, tacc, T=4):
@@ -237,7 +244,8 @@ def gemm(name, ta, tb, tc, tacc, T=4):
     ext = lambda t: "" if t == tacc else ("arith.extf %{v} : " + t + " to " + tacc)
     lines = []
     w = lines.append
-    w("""    gpu.func @{n}(%m: i32, %n: i32, %k: i32, %alpha: {acc}, %a: memref<?x{ta}, 1>, %ao: i32, %ars: i32, %acs: i32, %sa: i32, %b: memref<?x{tb}, 1>, %bo: i32, %brs: i32, %bcs: i32, %sb: i32, %beta: {acc}, %c: memref<?x{tc}, 1>, %co: i32, %ldc: i32, %sc: i32) kernel {{
+    w("""    gpu.func @{n}(%m: i32, %n: i32, %k: i32, %alpha: {acc}, %a_in: memref<{big}x{ta}, 1>, %ao: i32, %ars: i32, %acs: i32, %sa: i32, %b_in: memref<{big}x{tb}, 1>, %bo: i32, %brs: i32, %bcs: i32, %sb: i32, %beta: {acc}, %c_in: memref<{big}x{tc}, 1>, %co: i32, %ldc: i32, %sc: i32, %pa: memref<?xi64, 1>, %pb: memref<?xi64, 1>, %pc: memref<?xi64, 1>, %parr: i32) kernel {{
+{parr}
       %tx = gpu.thread_id x
       %ty = gpu.thread_id y
       %bx = gpu.block_id x
@@ -263,12 +271,13 @@ def gemm(name, ta, tb, tc, tacc, T=4):
       %cb = arith.muli %byy, %dyi : i32
       %cb4 = arith.muli %cb, %c4 : i32
       %j0 = arith.addi %cb4, %tyi : i32
-      %zsa = arith.muli %bzi, %sa : i32
+      %zsa = arith.muli %bzi, %sa_e : i32
       %abase = arith.addi %ao, %zsa : i32
-      %zsb = arith.muli %bzi, %sb : i32
+      %zsb = arith.muli %bzi, %sb_e : i32
       %bbase = arith.addi %bo, %zsb : i32
-      %zsc = arith.muli %bzi, %sc : i32
-      %cbase = arith.addi %co, %zsc : i32""".format(n=name, ta=ta, tb=tb, tc=tc, acc=tacc, T=T))
+      %zsc = arith.muli %bzi, %sc_e : i32
+      %cbase = arith.addi %co, %zsc : i32""".format(n=name, ta=ta, tb=tb, tc=tc, acc=tacc, T=T, big=BIG,
+                                                 parr=parr([("a", "memref<?x%s, 1>" % ta), ("b", "memref<?x%s, 1>" % tb), ("c", "memref<?x%s, 1>" % tc)])))
     # rows and columns, clamped for the loads (results stored only in range)
     w("      %mm1 = arith.subi %m, %c1 : i32\n      %nm1 = arith.subi %n, %c1 : i32")
     for r in range(T):
@@ -348,7 +357,8 @@ def gemm_mma(name, ta, rb=2, qb=2):
     mmt = v + ", vector<64xf32>" if ta != "f32" else "vector<64xf32>"
     f = "vector<64xf32>"
     w = []
-    w.append("""    gpu.func @{n}(%m: i32, %n: i32, %k: i32, %diag: memref<128xf32, 1>, %a: memref<{big}x{ta}, 1>, %ao: i32, %ars: i32, %acs: i32, %sa: i32, %b: memref<{big}x{ta}, 1>, %bo: i32, %brs: i32, %bcs: i32, %sb: i32, %bnz: i32, %c: memref<{big}xf32, 1>, %co: i32, %ldc: i32, %sc: i32) kernel {{
+    w.append("""    gpu.func @{n}(%m: i32, %n: i32, %k: i32, %diag: memref<128xf32, 1>, %a_in: memref<{big}x{ta}, 1>, %ao: i32, %ars: i32, %acs: i32, %sa: i32, %b_in: memref<{big}x{ta}, 1>, %bo: i32, %brs: i32, %bcs: i32, %sb: i32, %bnz: i32, %c_in: memref<{big}xf32, 1>, %co: i32, %ldc: i32, %sc: i32, %pa: memref<?xi64, 1>, %pb: memref<?xi64, 1>, %pc: memref<?xi64, 1>, %parr: i32) kernel {{
+{parr}
       %bx = gpu.block_id x
       %by = gpu.block_id y
       %bz = gpu.block_id z
@@ -363,11 +373,11 @@ def gemm_mma(name, ta, rb=2, qb=2):
       %mi = arith.index_cast %m : i32 to index
       %ni = arith.index_cast %n : i32 to index
       %ki = arith.index_cast %k : i32 to index
-      %zsa = arith.muli %bzi, %sa : i32
+      %zsa = arith.muli %bzi, %sa_e : i32
       %ab = arith.addi %ao, %zsa : i32
-      %zsb = arith.muli %bzi, %sb : i32
+      %zsb = arith.muli %bzi, %sb_e : i32
       %bb = arith.addi %bo, %zsb : i32
-      %zsc = arith.muli %bzi, %sc : i32
+      %zsc = arith.muli %bzi, %sc_e : i32
       %cb = arith.addi %co, %zsc : i32
       %abi = arith.index_cast %ab : i32 to index
       %bbi = arith.index_cast %bb : i32 to index
@@ -383,6 +393,7 @@ def gemm_mma(name, ta, rb=2, qb=2):
       %D = memref.reinterpret_cast %diag to offset: [0], sizes: [16, 8], strides: [8, 1] : memref<128xf32, 1> to {dm}
       %zf = arith.constant 0.0 : f32
       %z = air.simdgroup_matrix_fill %zf : {f}""".format(n=name, ta=ta, big=BIG, am=am, cm=cm, dm=dm, f=f,
+                                                         parr=parr([("a", "memref<%sx%s, 1>" % (BIG, ta)), ("b", "memref<%sx%s, 1>" % (BIG, ta)), ("c", "memref<%sxf32, 1>" % BIG)]),
                                                          th=8 * rb, tw=8 * qb))
     for r in range(rb):
         w.append("      %%ro%d = arith.constant %d : index\n      %%i%d = arith.addi %%i0, %%ro%d : index" % (r, 8 * r, r + 1, r) if r else "      %i1 = arith.addi %i0, %c0 : index")

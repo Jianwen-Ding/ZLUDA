@@ -31,6 +31,8 @@ pub struct Kernel {
     /// Where the address of the module's device-globals buffer goes in the
     /// parameter buffer (if the kernel uses device globals)
     pub globals_param_offset: Option<u64>,
+    /// Where the launch's dynamic shared memory size (u32) goes in the parameter buffer (%dynamic_smem_size)
+    pub dyn_smem_param_offset: Option<u64>,
 }
 
 /// Writable module-scope device variable, a slice of the globals buffer
@@ -176,6 +178,7 @@ fn lower_to_air(main_bc: &[u8], attributes_bc: &[u8], want_text: bool, portable_
             air: unsafe { std::slice::from_raw_parts(k.air, k.air_len) }.to_vec(),
             globals_param_offset: (k.globals_param_offset != u64::MAX)
                 .then_some(k.globals_param_offset),
+            dyn_smem_param_offset: (k.dyn_smem_param_offset != u64::MAX).then_some(k.dyn_smem_param_offset),
         });
     }
     let globals = (0..output.global_count)

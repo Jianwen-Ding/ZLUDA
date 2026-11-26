@@ -1683,7 +1683,13 @@ struct KernelInfo
     bool dynamicShared = false;
     uint64_t staticShared = 0;
     uint64_t globalsParamOffset = UINT64_MAX;
+    // offset of the hidden u32 holding the launch's dynamic shared memory size (%dynamic_smem_size), or UINT64_MAX
+    uint64_t dynSmemParamOffset = UINT64_MAX;
 };
+
+// names of the PTX module's .shared variables (before the helper library is linked): the static shared memory of
+// %total_smem_size counts these only
+static std::set<std::string> g_ptxShared;
 
 struct DeviceGlobal
 {
@@ -1838,6 +1844,17 @@ KernelInfo buildKernelWrapper(Module &m, Function *body, const DeviceGlobals &gl
         info.globalsParamOffset = offset;
         offset += 8;
     }
+    bool usesDynSmemSize = false;
+    if (Function *ph = m.getFunction("__zluda_metal_dynamic_smem_size"))
+        for (User *u : ph->users())
+            if (auto *i = dyn_cast<Instruction>(u); i && i->getFunction() == body)
+                usesDynSmemSize = true;
+    if (usesDynSmemSize)
+    {
+        offset = alignTo(offset, 4);
+        info.dynSmemParamOffset = offset;
+        offset += 4;
+    }
     info.paramsSize = offset;
 
     // Does the kernel use dynamic shared memory?
@@ -1911,6 +1928,58 @@ KernelInfo buildKernelWrapper(Module &m, Function *body, const DeviceGlobals &gl
         }
     }
 
+    // %dynamic_smem_size / the static .shared bytes of %total_smem_size (ptx/lib/metal_impl/sreg.inc)
+    for (const char *name : {"__zluda_metal_dynamic_smem_size", "__zluda_metal_static_smem_size"})
+    {
+        Function *ph = m.getFunction(name);
+        if (!ph)
+            continue;
+        SmallVector<CallInst *, 4> calls;
+        for (User *u : ph->users())
+            if (auto *ci = dyn_cast<CallInst>(u); ci && ci->getFunction() == w)
+                calls.push_back(ci);
+        if (calls.empty())
+            continue;
+        Value *v;
+        if (StringRef(name) == "__zluda_metal_dynamic_smem_size")
+        {
+            IRBuilder<> gb(&*w->getEntryBlock().getFirstInsertionPt());
+            v = gb.CreateLoad(gb.getInt32Ty(),
+                              gb.CreateConstInBoundsGEP1_64(gb.getInt8Ty(), w->getArg(0), info.dynSmemParamOffset),
+                              "zluda_dynamic_smem_size");
+        }
+        else
+        {
+            uint64_t total = 0;
+            for (GlobalVariable &gv : m.globals())
+            {
+                if (gv.getAddressSpace() != air::Threadgroup || isDynamicSharedGlobal(gv))
+                    continue;
+                bool used = false;
+                for (User *u : gv.users())
+                    if (auto *i = dyn_cast<Instruction>(u); i && i->getFunction() == w)
+                        used = true;
+                if (!used)
+                    continue;
+                uint64_t size = dl.getTypeAllocSize(gv.getValueType());
+                if (gv.getName() == "__zluda_cta_shared")
+                {
+                    if (MDNode *md = gv.getMetadata("zluda.cluster"))
+                        size = mdconst::extract<ConstantInt>(md->getOperand(0))->getZExtValue();
+                }
+                else if (!g_ptxShared.count(gv.getName().str()))
+                    continue;
+                uint64_t al = gv.getAlign() ? gv.getAlign()->value() : 1;
+                total = alignTo(total, al) + size;
+            }
+            v = ConstantInt::get(Type::getInt32Ty(c), total);
+        }
+        for (CallInst *ci : calls)
+        {
+            ci->replaceAllUsesWith(v);
+            ci->eraseFromParent();
+        }
+    }
 
     // Builtins
     std::map<std::string, unsigned> builtinArg = {
@@ -2582,6 +2651,10 @@ extern "C" int zluda_air_lower(const ZludaAirInput *input, ZludaAirOutput *outpu
             if (Linker::linkModules(*main, std::move(attrs), Linker::LinkOnlyNeeded))
                 fail("failed to link attributes module");
         }
+        g_ptxShared.clear();
+        for (GlobalVariable &gv : main->globals())
+            if (gv.getAddressSpace() == amd::Shared)
+                g_ptxShared.insert(gv.getName().str());
         auto impl = parse(ctx, input->impl_bc, input->impl_len, "zluda_ptx_metal_impl");
         impl->setDataLayout(main->getDataLayout());
         impl->setTargetTriple(main->getTargetTriple());
@@ -2627,6 +2700,7 @@ extern "C" int zluda_air_lower(const ZludaAirInput *input, ZludaAirOutput *outpu
             k.dynamic_shared = kernels[i].dynamicShared;
             k.static_shared = kernels[i].staticShared;
             k.globals_param_offset = kernels[i].globalsParamOffset;
+            k.dyn_smem_param_offset = kernels[i].dynSmemParamOffset;
             std::string bc = writeBitcode(*extractKernel(*main, kernels[i].name));
             k.air_len = bc.size();
             k.air = (uint8_t *)malloc(bc.size());

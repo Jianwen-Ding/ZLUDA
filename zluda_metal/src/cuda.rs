@@ -1024,6 +1024,9 @@ pub unsafe extern "system" fn cuLaunchKernel(
     if let Some(off) = f.info.globals_param_offset {
         params[off as usize..off as usize + 8].copy_from_slice(&f.globals.to_ne_bytes());
     }
+    if let Some(off) = f.info.dyn_smem_param_offset {
+        params[off as usize..off as usize + 4].copy_from_slice(&shared_mem_bytes.to_ne_bytes());
+    }
     let dynamic_shared = if f.info.dynamic_shared {
         shared_mem_bytes.max(16)
     } else {

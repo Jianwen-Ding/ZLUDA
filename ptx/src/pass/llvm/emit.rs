@@ -174,6 +174,16 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                 }
             }
             unsafe { LLVMSetValueName2(value, name.as_ptr().cast(), name.len()) };
+            // the hidden address arguments of .const variables in 32-bit modules are marked (isspacep.const)
+            if let Some(n) = self.id_defs.ident_map.get(&param.name).and_then(|e| e.name.as_deref()) {
+                if n.starts_with("__zluda_const32_") {
+                    let key = "zluda-const32";
+                    let attr = unsafe {
+                        LLVMCreateStringAttribute(self.context, key.as_ptr().cast(), key.len() as u32, ptr::null(), 0)
+                    };
+                    unsafe { LLVMAddAttributeAtIndex(fn_, i as u32 + 1, attr) };
+                }
+            }
             self.resolver.register(param.name, value);
             if method.is_kernel() {
                 let attr_kind = unsafe {
@@ -287,8 +297,49 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
         if !var.info.array_init.is_empty() {
             let initializer = self.get_array_init(&var.info.v_type, &*var.info.array_init)?;
             unsafe { LLVMSetInitializer(global, initializer) };
+            // mask initializers of addresses (`0xff00(var+4)`, PTX ISA 5.4.4): LLVM has no constant `and` / `lshr`,
+            // the element holds the address and !zluda.init_masks the (element index, mask) pairs; the backend applies
+            // the masks when it relocates the address (zluda_metal/cpp/air_lower.cpp)
+            let masks = var
+                .info
+                .array_init
+                .iter()
+                .enumerate()
+                .filter_map(|(i, x)| match x {
+                    ast::RegOrImmediate::SymOffset(_, _, mask) if *mask != 0 => Some((i as u64, *mask)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if !masks.is_empty() {
+                let i64_type = unsafe { LLVMInt64TypeInContext(self.context) };
+                let mut mds = masks
+                    .iter()
+                    .flat_map(|&(i, m)| [i, m])
+                    .map(|x| unsafe { LLVMValueAsMetadata(LLVMConstInt(i64_type, x, 0)) })
+                    .collect::<Vec<_>>();
+                let kind = b"zluda.init_masks";
+                unsafe {
+                    let node = LLVMMDNodeInContext2(self.context, mds.as_mut_ptr(), mds.len());
+                    let kind_id =
+                        LLVMGetMDKindIDInContext(self.context, kind.as_ptr().cast(), kind.len() as u32);
+                    LLVMGlobalSetMetadata(global, kind_id, node);
+                }
+            }
         }
         Ok(())
+    }
+
+    /// the address of `sym` plus `offset` bytes as an integer of type `t` (an initializer `var+offset`)
+    fn symbol_address(&self, sym: SpirvWord, offset: i64, t: LLVMTypeRef) -> Result<LLVMValueRef, TranslateError> {
+        let base = self.resolver.value(sym)?;
+        unsafe {
+            let i8_type = LLVMInt8TypeInContext(self.context);
+            let i64_type = LLVMInt64TypeInContext(self.context);
+            let mut idx = LLVMConstInt(i64_type, offset as u64, 1);
+            let p = if offset != 0 { LLVMConstGEP2(i8_type, base, &mut idx, 1) } else { base };
+            let v = LLVMConstPtrToInt(p, i64_type);
+            Ok(if LLVMGetIntTypeWidth(t) < 64 { LLVMConstTrunc(v, t) } else { v })
+        }
     }
 
     fn get_array_init(
@@ -304,8 +355,9 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                 let mut elements = array_init
                     .iter()
                     .map(|elem| match elem {
-                        ast::RegOrImmediate::Reg(reg) => {
-                            Ok(unsafe { LLVMConstPtrToInt(self.resolver.value(*reg)?, elem_type) })
+                        ast::RegOrImmediate::Reg(reg) => self.symbol_address(*reg, 0, elem_type),
+                        ast::RegOrImmediate::SymOffset(reg, off, _) => {
+                            self.symbol_address(*reg, *off, elem_type)
                         }
                         ast::RegOrImmediate::Imm(imm) => {
                             Ok(get_immediate_value(self.context, scalar, imm))
@@ -315,20 +367,25 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                     .into_iter();
                 unsafe fn build(
                     t: LLVMTypeRef,
+                    elem_type: LLVMTypeRef,
                     elements: &mut impl Iterator<Item = LLVMValueRef>,
                 ) -> Result<LLVMValueRef, TranslateError> {
+                    // packed element types (.f16x2: <2 x half>) are one value each
+                    if t == elem_type {
+                        return Ok(elements.next().unwrap_or_else(|| LLVMConstNull(t)));
+                    }
                     match LLVMGetTypeKind(t) {
                         LLVMTypeKind::LLVMArrayTypeKind => {
                             let et = LLVMGetElementType(t);
                             let mut v = (0..LLVMGetArrayLength2(t))
-                                .map(|_| build(et, elements))
+                                .map(|_| build(et, elem_type, elements))
                                 .collect::<Result<Vec<_>, _>>()?;
                             Ok(LLVMConstArray2(et, v.as_mut_ptr(), v.len() as u64))
                         }
                         LLVMTypeKind::LLVMVectorTypeKind => {
                             let et = LLVMGetElementType(t);
                             let mut v = (0..LLVMGetVectorSize(t))
-                                .map(|_| build(et, elements))
+                                .map(|_| build(et, elem_type, elements))
                                 .collect::<Result<Vec<_>, _>>()?;
                             Ok(LLVMConstVector(v.as_mut_ptr(), v.len() as u32))
                         }
@@ -336,14 +393,21 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                     }
                 }
                 let llvm_type = get_type(self.context, type_)?;
-                unsafe { build(llvm_type, &mut elements)? }
+                unsafe { build(llvm_type, elem_type, &mut elements)? }
             }
             ast::Type::Scalar(scalar) => {
-                let initializer = match array_init {
-                    [ast::RegOrImmediate::Imm(init)] => init,
+                let t = get_scalar_type(self.context, *scalar);
+                match array_init {
+                    [ast::RegOrImmediate::Imm(init)] => get_immediate_value(self.context, scalar, init),
+                    // `.global .u64 p = var;`, `= var+4` (PTX ISA 5.4.4)
+                    [ast::RegOrImmediate::Reg(reg)] if scalar.kind() != ast::ScalarKind::Float => {
+                        self.symbol_address(*reg, 0, t)?
+                    }
+                    [ast::RegOrImmediate::SymOffset(reg, off, _)] if scalar.kind() != ast::ScalarKind::Float => {
+                        self.symbol_address(*reg, *off, t)?
+                    }
                     _ => return Err(error_mismatched_type()),
-                };
-                get_immediate_value(self.context, scalar, initializer)
+                }
             }
             _ => {
                 todo!()
@@ -4065,10 +4129,15 @@ fn get_or_create_struct_type<'a>(
         ("struct".to_string(), Vec::new()),
         |(mut name, mut types), t| {
             name.push('.');
-            if let ast::Type::Scalar(scalar) = t {
-                write!(name, "{}", LLVMTypeDisplay(*scalar)).ok();
-            } else {
-                return Err(error_unreachable());
+            match t {
+                ast::Type::Scalar(scalar) => {
+                    write!(name, "{}", LLVMTypeDisplay(*scalar)).ok();
+                }
+                // .reg .v2 / .v4 return values (PTX ISA 7.1)
+                ast::Type::Vector(n, scalar) => {
+                    write!(name, "v{}{}", n, LLVMTypeDisplay(*scalar)).ok();
+                }
+                _ => return Err(error_unreachable()),
             }
             types.push(get_type(context, t)?);
             Ok((name, types))

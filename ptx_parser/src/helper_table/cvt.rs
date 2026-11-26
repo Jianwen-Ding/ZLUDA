@@ -242,7 +242,7 @@ pub(crate) fn lower_cvt<'i>(m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
                 let o = match it {
                     Some(ast::RegOrImmediate::Reg(r)) => ast::ParsedOperand::Reg(*r),
                     Some(ast::RegOrImmediate::Imm(i)) => ast::ParsedOperand::Imm(*i),
-                    None => return err("cvt x4 sink source"),
+                    None | Some(ast::RegOrImmediate::SymOffset(..)) => return err("cvt x4 sink source"),
                 };
                 c = c.src(o, ScalarType::B32);
             }

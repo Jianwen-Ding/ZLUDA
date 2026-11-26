@@ -479,6 +479,9 @@ static void resolveLocalStack(Module &m)
 // stores of the function then test the windows at run time. Only functions with such an escaping address pay for the
 // test; ordinary global-memory code is unchanged. A local window access is relative to one private object of the
 // function (the one whose address escapes).
+// the PTX module's own .global and .const definitions (before the helper library is linked): they stay alive when
+// unused (the host reaches them with cuModuleGetGlobal), and the .const ones live in the device-globals buffer too
+static std::set<std::string> g_ptxVars;
 static const uint64_t GW_SHARED = 0x01000000, GW_LOCAL = 0x02000000, GW_SIZE = 0x01000000;
 static std::set<Function *> g_windowed;
 static void scanGenericWindows(Module &m)
@@ -605,6 +608,10 @@ static void resolveIsSpacep(Module &m)
     Function *f = m.getFunction("__zluda_metal_isspacep");
     if (!f)
         return;
+    bool hasConst = false;
+    for (GlobalVariable &gv : m.globals())
+        if (gv.getAddressSpace() == amd::Constant && !gv.isDeclaration() && g_ptxVars.count(gv.getName().str()))
+            hasConst = true;
     std::vector<CallInst *> calls;
     for (User *u : f->users())
         if (auto *ci = dyn_cast<CallInst>(u))
@@ -628,9 +635,59 @@ static void resolveIsSpacep(Module &m)
             space = 2;
         else if (as == amd::Constant || as == amd::Constant32)
             space = isa<Argument>(p) ? 4 : 3;
+        if (space == 0 && !isa<GlobalValue>(p) && !isa<Argument>(p))
+        {
+            // .address_size 32: a .const variable's address is the value of its hidden kernel argument
+            // (ptx/src/pass/convert_32bit_to_64bit.rs: parameter attribute "zluda-const32"), plus offsets
+            Value *v = p;
+            for (int guard = 0; guard < 64; guard++)
+            {
+                if (auto *o = dyn_cast<Operator>(v); o && (o->getOpcode() == Instruction::IntToPtr ||
+                                                           o->getOpcode() == Instruction::PtrToInt ||
+                                                           o->getOpcode() == Instruction::ZExt ||
+                                                           o->getOpcode() == Instruction::Trunc ||
+                                                           o->getOpcode() == Instruction::BitCast))
+                    v = o->getOperand(0);
+                else if (auto *bo = dyn_cast<BinaryOperator>(v);
+                         bo && (bo->getOpcode() == Instruction::Add || bo->getOpcode() == Instruction::Sub) &&
+                         isa<ConstantInt>(bo->getOperand(1)))
+                    v = bo->getOperand(0);
+                else if (auto *g = dyn_cast<GEPOperator>(v))
+                    v = g->getPointerOperand();
+                else
+                    break;
+            }
+            if (auto *ld = dyn_cast<LoadInst>(v))
+                if (auto *a = dyn_cast<Argument>(ld->getPointerOperand()->stripPointerCasts());
+                    a && a->getParent()->getAttributes().hasParamAttr(a->getArgNo(), "zluda-const32"))
+                    space = 3;
+        }
         uint64_t kind = cast<ConstantInt>(ci->getArgOperand(1))->getZExtValue();
-        bool r = kind == 5 ? space == 1 : (uint64_t)space == kind;
+        // the kernel-parameter window lies inside the .global window (PTX ISA 6.4.1.1)
+        bool r = kind == 5 ? space == 1 : kind == 0 ? space == 0 || space == 4 : (uint64_t)space == kind;
         Value *arg = ci->getArgOperand(0);
+        bool unknown = space == 0 && !isa<GlobalValue>(p) && !isa<Argument>(p);
+        if (space == 3)
+            r = kind == 3;
+        if (unknown && hasConst && (kind == 0 || kind == 3))
+        {
+            // an address of unknown origin: the module's .const variables are a range of the device-globals buffer
+            // (__zluda_metal_const_window, decided by the kernel wrappers)
+            IRBuilder<> b(ci);
+            Value *x = b.CreatePtrToInt(arg, b.getInt64Ty());
+            FunctionCallee cw = m.getOrInsertFunction("__zluda_metal_const_window", b.getInt1Ty(), b.getInt64Ty());
+            Value *in = b.CreateCall(cw, {x});
+            if (kind == 0)
+            {
+                in = b.CreateNot(in);
+                if (g_windowed.count(ci->getFunction()))
+                    for (uint64_t base : {GW_SHARED, GW_LOCAL})
+                        in = b.CreateAnd(in, b.CreateICmpUGE(b.CreateSub(x, b.getInt64(base)), b.getInt64(GW_SIZE)));
+            }
+            ci->replaceAllUsesWith(b.CreateZExt(in, ci->getType()));
+            ci->eraseFromParent();
+            continue;
+        }
         if (space == 0 && !isa<GlobalValue>(p) && !isa<Argument>(p) && g_windowed.count(ci->getFunction()) && kind <= 2)
         {
             // an address of unknown origin in a function with generic windows: test the windows
@@ -1964,19 +2021,83 @@ struct DeviceGlobal
     uint64_t size;
 };
 
+// an address in an initializer (`.global .u64 p = var + 4;`, mask forms `0xff00(var)`, PTX ISA 5.4.4): the buffer's
+// address is known at load time only, the runtime writes (base + addend), masked, at `at`
+struct DeviceReloc
+{
+    uint64_t at;
+    uint64_t size;
+    uint64_t addend;
+    uint64_t mask; // 0: none, else (v & mask) >> ctz(mask)
+};
+
 struct DeviceGlobals
 {
     std::vector<DeviceGlobal> vars;
     std::vector<uint8_t> init;
+    std::vector<DeviceReloc> relocs;
+    // the module's .const variables lie in [constStart, constEnd) of the buffer (isspacep.const)
+    uint64_t constStart = 0, constEnd = 0;
 };
+
+
+struct RelocContext
+{
+    const std::map<const GlobalVariable *, uint64_t> *offsets = nullptr;
+    std::vector<DeviceReloc> *relocs = nullptr;
+    uint8_t *bufferStart = nullptr;
+    std::map<uint64_t, uint64_t> masks; // flattened element index -> mask
+    uint64_t leaf = 0;
+};
+static RelocContext *g_reloc = nullptr;
 
 void constantToBytes(const DataLayout &dl, Constant *c, uint8_t *out)
 {
     Type *t = c->getType();
     uint64_t size = dl.getTypeStoreSize(t);
+    // the scalar leaves are counted in order: the initializer element index of a mask
+    bool aggregate = t->isArrayTy() || t->isStructTy() || t->isVectorTy();
+    if (!aggregate && g_reloc)
+        g_reloc->leaf++;
+    if (auto *ce = dyn_cast<ConstantExpr>(c); ce && g_reloc && t->isIntegerTy())
+    {
+        // ptrtoint (getelementptr (i8, @var, off)), possibly truncated
+        Constant *x = ce;
+        if (auto *tr = dyn_cast<ConstantExpr>(x); tr && tr->getOpcode() == Instruction::Trunc)
+            x = tr->getOperand(0);
+        auto *pi = dyn_cast<ConstantExpr>(x);
+        if (pi && pi->getOpcode() == Instruction::PtrToInt)
+        {
+            APInt off(64, 0);
+            const Value *base = pi->getOperand(0)->stripAndAccumulateConstantOffsets(dl, off, true);
+            auto *gv = dyn_cast<GlobalVariable>(base);
+            auto it = gv ? g_reloc->offsets->find(gv) : g_reloc->offsets->end();
+            if (it == g_reloc->offsets->end())
+                fail("an initializer holds the address of " + base->getName() +
+                     ", which is not a module .global / .const variable");
+            uint64_t mask = 0;
+            if (auto m = g_reloc->masks.find(g_reloc->leaf - 1); m != g_reloc->masks.end())
+                mask = m->second;
+            memset(out, 0, size);
+            g_reloc->relocs->push_back({(uint64_t)(out - g_reloc->bufferStart), size, it->second + off.getZExtValue(), mask});
+            return;
+        }
+    }
     if (isa<UndefValue>(c) || c->isNullValue())
     {
         memset(out, 0, size);
+        if (g_reloc && aggregate)
+        {
+            // the leaves of a zero aggregate (the element index of later masks)
+            uint64_t n = 1;
+            Type *e = t;
+            while (e->isArrayTy() || e->isVectorTy())
+            {
+                n *= e->isArrayTy() ? e->getArrayNumElements() : cast<FixedVectorType>(e)->getNumElements();
+                e = e->isArrayTy() ? e->getArrayElementType() : cast<VectorType>(e)->getElementType();
+            }
+            g_reloc->leaf += n;
+        }
         return;
     }
     if (auto *ci = dyn_cast<ConstantInt>(c))
@@ -2026,17 +2147,26 @@ DeviceGlobals collectDeviceGlobals(Module &m)
     const DataLayout &dl = m.getDataLayout();
     DeviceGlobals result;
     uint64_t offset = 0;
-    for (GlobalVariable &gv : m.globals())
+    for (int pass = 0; pass < 2; pass++)
     {
-        if (gv.getAddressSpace() != air::Device)
-            continue;
-        if (gv.isDeclaration())
-            fail("external device variable " + gv.getName() + " is not supported");
-        uint64_t align = std::max<uint64_t>(gv.getAlign().valueOrOne().value(), 16);
-        uint64_t size = dl.getTypeAllocSize(gv.getValueType());
-        offset = alignTo(offset, align);
-        result.vars.push_back({&gv, gv.getName().str(), offset, size});
-        offset += size;
+        // .global variables, then the module's .const ones (one range for isspacep.const)
+        if (pass == 1)
+            result.constStart = offset = alignTo(offset, 16);
+        for (GlobalVariable &gv : m.globals())
+        {
+            if (pass == 0 ? gv.getAddressSpace() != air::Device
+                          : gv.getAddressSpace() != air::Constant || gv.isDeclaration() || !g_ptxVars.count(gv.getName().str()))
+                continue;
+            if (gv.isDeclaration())
+                fail("external device variable " + gv.getName() + " is not supported");
+            uint64_t align = std::max<uint64_t>(gv.getAlign().valueOrOne().value(), 16);
+            uint64_t size = dl.getTypeAllocSize(gv.getValueType());
+            offset = alignTo(offset, align);
+            result.vars.push_back({&gv, gv.getName().str(), offset, size});
+            offset += size;
+        }
+        if (pass == 1)
+            result.constEnd = offset;
     }
     // uses inside constant expressions (getelementptr (@x, 8)) become instructions, which the
     // kernel wrappers rewrite to the device-globals buffer
@@ -2045,9 +2175,28 @@ DeviceGlobals collectDeviceGlobals(Module &m)
         cs.push_back(v.gv);
     convertUsersOfConstantsToInstructions(cs);
     result.init.assign(offset, 0);
+    std::map<const GlobalVariable *, uint64_t> offsets;
+    for (auto &v : result.vars)
+        offsets[v.gv] = v.offset;
     for (auto &v : result.vars)
         if (v.gv->hasInitializer())
+        {
+            RelocContext rc;
+            rc.offsets = &offsets;
+            rc.relocs = &result.relocs;
+            rc.bufferStart = result.init.data();
+            if (MDNode *md = v.gv->getMetadata("zluda.init_masks"))
+                for (unsigned i = 0; i + 1 < md->getNumOperands(); i += 2)
+                    rc.masks[mdconst::extract<ConstantInt>(md->getOperand(i))->getZExtValue()] =
+                        mdconst::extract<ConstantInt>(md->getOperand(i + 1))->getZExtValue();
+            g_reloc = &rc;
             constantToBytes(dl, v.gv->getInitializer(), result.init.data() + v.offset);
+            g_reloc = nullptr;
+        }
+    // the initializers' uses of other variables are in the bytes now
+    for (auto &v : result.vars)
+        if (v.gv->hasInitializer())
+            v.gv->setInitializer(Constant::getNullValue(v.gv->getValueType()));
     return result;
 }
 
@@ -2062,6 +2211,41 @@ bool isDynamicSharedGlobal(const GlobalVariable &gv)
     if (auto *at = dyn_cast<ArrayType>(t))
         return at->getNumElements() == 0;
     return false;
+}
+
+// `u` uses a pointer of another address space than `p` (a .const variable moved to the device-globals buffer): use
+// `p` instead, rebuilding the address computations above the accesses in p's address space
+static void retypePointerUse(Use &u, Value *p)
+{
+    auto *user = cast<Instruction>(u.getUser());
+    if ((isa<LoadInst>(user) && u.getOperandNo() == 0) || (isa<StoreInst>(user) && u.getOperandNo() == 1) ||
+        (isa<AtomicRMWInst>(user) && u.getOperandNo() == 0) || (isa<AtomicCmpXchgInst>(user) && u.getOperandNo() == 0) ||
+        isa<PtrToIntInst>(user))
+    {
+        u.set(p);
+        return;
+    }
+    if (auto *gep = dyn_cast<GetElementPtrInst>(user); gep && u.getOperandNo() == 0)
+    {
+        IRBuilder<> b(gep);
+        SmallVector<Value *, 4> idx(gep->idx_begin(), gep->idx_end());
+        Value *ng = b.CreateGEP(gep->getSourceElementType(), p, idx, gep->getName(), gep->isInBounds());
+        SmallVector<Use *, 8> uses;
+        for (Use &gu : gep->uses())
+            uses.push_back(&gu);
+        for (Use *gu : uses)
+            retypePointerUse(*gu, ng);
+        if (gep->use_empty())
+            gep->eraseFromParent();
+        return;
+    }
+    if (auto *asc = dyn_cast<AddrSpaceCastInst>(user); asc && asc->getType() == p->getType())
+    {
+        asc->replaceAllUsesWith(p);
+        asc->eraseFromParent();
+        return;
+    }
+    fail("unsupported use of a .const variable's address: " + toString(user));
 }
 
 KernelInfo buildKernelWrapper(Module &m, Function *body, const DeviceGlobals &globals)
@@ -2103,6 +2287,13 @@ KernelInfo buildKernelWrapper(Module &m, Function *body, const DeviceGlobals &gl
         for (User *u : g.gv->users())
             if (auto *i = dyn_cast<Instruction>(u); i && i->getFunction() == body)
                 usesGlobals = true;
+    SmallVector<CallInst *, 4> constWindow;
+    if (Function *cw = m.getFunction("__zluda_metal_const_window"))
+        for (User *u : cw->users())
+            if (auto *ci = dyn_cast<CallInst>(u); ci && ci->getFunction() == body)
+                constWindow.push_back(ci);
+    if (!constWindow.empty())
+        usesGlobals = true;
     if (usesGlobals)
     {
         offset = alignTo(offset, 8);
@@ -2200,6 +2391,19 @@ KernelInfo buildKernelWrapper(Module &m, Function *body, const DeviceGlobals &gl
                                     gb.CreateConstInBoundsGEP1_64(gb.getInt8Ty(), w->getArg(0), info.globalsParamOffset),
                                     "zluda_globals_address");
         Value *base = gb.CreateIntToPtr(addr, PointerType::get(c, air::Device), "zluda_globals");
+        // isspacep.const of an address of unknown origin: in the buffer's .const range
+        SmallVector<CallInst *, 4> cwCalls;
+        if (Function *cw = m.getFunction("__zluda_metal_const_window"))
+            for (User *u : cw->users())
+                if (auto *ci = dyn_cast<CallInst>(u); ci && ci->getFunction() == w)
+                    cwCalls.push_back(ci);
+        for (CallInst *ci : cwCalls)
+        {
+            IRBuilder<> cb(ci);
+            Value *rel = cb.CreateSub(ci->getArgOperand(0), cb.CreateAdd(addr, cb.getInt64(globals.constStart)));
+            ci->replaceAllUsesWith(cb.CreateICmpULT(rel, cb.getInt64(globals.constEnd - globals.constStart)));
+            ci->eraseFromParent();
+        }
         {
             std::vector<Constant *> cs;
             for (const DeviceGlobal &g : globals.vars)
@@ -2215,6 +2419,13 @@ KernelInfo buildKernelWrapper(Module &m, Function *body, const DeviceGlobals &gl
             if (uses.empty())
                 continue;
             Value *ptr = gb.CreateConstInBoundsGEP1_64(gb.getInt8Ty(), base, g.offset, g.name);
+            if (ptr->getType() != g.gv->getType())
+            {
+                // a .const variable: its uses become device-memory accesses (AIR has no address space casts)
+                for (Use *u : uses)
+                    retypePointerUse(*u, ptr);
+                continue;
+            }
             for (Use *u : uses)
                 u->set(ptr);
         }
@@ -2962,7 +3173,7 @@ void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals
             gv.setInitializer(UndefValue::get(gv.getValueType()));
             gv.setLinkage(GlobalValue::InternalLinkage);
         }
-        else if (!gv.isDeclaration())
+        else if (!gv.isDeclaration() && !g_ptxVars.count(gv.getName().str()))
         {
             gv.setLinkage(GlobalValue::InternalLinkage);
         }
@@ -3191,9 +3402,15 @@ extern "C" int zluda_air_lower(const ZludaAirInput *input, ZludaAirOutput *outpu
                 fail("failed to link attributes module");
         }
         g_ptxShared.clear();
+        g_ptxVars.clear();
         for (GlobalVariable &gv : main->globals())
+        {
             if (gv.getAddressSpace() == amd::Shared)
                 g_ptxShared.insert(gv.getName().str());
+            if ((gv.getAddressSpace() == amd::Global || gv.getAddressSpace() == amd::Constant) && !gv.isDeclaration() &&
+                gv.hasName() && !gv.getValueType()->isStructTy()) // not .texref / .surfref
+                g_ptxVars.insert(gv.getName().str());
+        }
         auto impl = parse(ctx, input->impl_bc, input->impl_len, "zluda_ptx_metal_impl");
         impl->setDataLayout(main->getDataLayout());
         impl->setTargetTriple(main->getTargetTriple());
@@ -3251,6 +3468,11 @@ extern "C" int zluda_air_lower(const ZludaAirInput *input, ZludaAirOutput *outpu
         output->globals = (ZludaAirGlobal *)calloc(globals.vars.size() + 1, sizeof(ZludaAirGlobal));
         for (size_t i = 0; i < globals.vars.size(); i++)
             output->globals[i] = {dupString(globals.vars[i].name), globals.vars[i].offset, globals.vars[i].size};
+        output->reloc_count = globals.relocs.size();
+        output->relocs = (ZludaAirReloc *)calloc(globals.relocs.size() + 1, sizeof(ZludaAirReloc));
+        for (size_t i = 0; i < globals.relocs.size(); i++)
+            output->relocs[i] = {globals.relocs[i].at, globals.relocs[i].size, globals.relocs[i].addend,
+                                 globals.relocs[i].mask};
         output->globals_size = globals.init.size();
         output->globals_init = (uint8_t *)malloc(globals.init.size() + 1);
         memcpy(output->globals_init, globals.init.data(), globals.init.size());
@@ -3277,6 +3499,7 @@ extern "C" void zluda_air_free(ZludaAirOutput *output)
         free(output->globals[i].name);
     free(output->globals);
     free(output->globals_init);
+    free(output->relocs);
     free(output->module_text);
     memset(output, 0, sizeof(*output));
 }

@@ -259,6 +259,9 @@ fn run_array_init<'input, 'b>(
         .map(|elem| match elem {
             ast::RegOrImmediate::Reg(name) => Ok(ast::RegOrImmediate::Reg(resolver.get(name)?)),
             ast::RegOrImmediate::Imm(imm) => Ok(ast::RegOrImmediate::Imm(*imm)),
+            ast::RegOrImmediate::SymOffset(name, off, mask) => {
+                Ok(ast::RegOrImmediate::SymOffset(resolver.get(name)?, *off, *mask))
+            }
         })
         .collect::<Result<Vec<_>, _>>()?)
 }

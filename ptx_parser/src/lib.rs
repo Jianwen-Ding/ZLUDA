@@ -432,6 +432,42 @@ fn reg_or_immediate<'a, 'input>(
     .parse_next(stream)
 }
 
+/// a value of a module-variable initializer (PTX ISA 5.4.4): a constant, a variable's address `var`, `var+offset`,
+/// or a mask of an address `0xff00(var+offset)`
+fn init_value<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<ast::RegOrImmediate<&'input str>> {
+    fn imm_i64(x: ast::ImmediateValue) -> i64 {
+        match x {
+            ast::ImmediateValue::U64(x) => x as i64,
+            ast::ImmediateValue::S64(x) => x,
+            _ => 0,
+        }
+    }
+    fn sym_offset<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<(&'input str, i64)> {
+        (
+            ident,
+            opt((alt((Token::Plus.value(1i64), Token::Minus.value(-1i64))), int_immediate)),
+        )
+            .map(|(id, off)| (id, off.map(|(sign, x)| sign * imm_i64(x)).unwrap_or(0)))
+            .parse_next(stream)
+    }
+    trace(
+        "init_value",
+        alt((
+            (int_immediate, Token::LParen, sym_offset, Token::RParen)
+                .map(|(m, _, (id, off), _)| ast::RegOrImmediate::SymOffset(id, off, imm_i64(m) as u64)),
+            sym_offset.map(|(id, off)| {
+                if off == 0 {
+                    ast::RegOrImmediate::Reg(id)
+                } else {
+                    ast::RegOrImmediate::SymOffset(id, off, 0)
+                }
+            }),
+            immediate_value.map(ast::RegOrImmediate::Imm),
+        )),
+    )
+    .parse_next(stream)
+}
+
 pub fn parse_for_errors<'input>(text: &'input str) -> Vec<PtxError<'input>> {
     let (tokens, mut errors) = lex_with_span_unchecked(text);
     let parse_result = {
@@ -1341,7 +1377,7 @@ fn shaped_initializer<'a, 'input>(
             Token::RBrace.parse_next(stream)?;
             Ok(Init::List(items))
         } else {
-            Ok(Init::Leaf(reg_or_immediate.parse_next(stream)?))
+            Ok(Init::Leaf(init_value.parse_next(stream)?))
         }
     }
     fn leaves<'i>(t: Init<'i>, out: &mut Vec<RegOrImmediate<&'i str>>) {
@@ -1461,7 +1497,7 @@ fn single_value_append<'b, 'a: 'b, 'input: 'a>(
     trace(
         "single_value_append",
         move |stream: &mut PtxParser<'a, 'input>| {
-            let value = reg_or_immediate.parse_next(stream)?;
+            let value = init_value.parse_next(stream)?;
             accumulator.push(value);
             Ok(())
         },

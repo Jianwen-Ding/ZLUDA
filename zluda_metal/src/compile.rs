@@ -61,6 +61,8 @@ pub struct CompiledModule {
     pub globals: Vec<DeviceGlobal>,
     /// Initial contents of the device-globals buffer
     pub globals_init: Vec<u8>,
+    /// addresses in the initializers, written when the buffer is allocated
+    pub globals_relocs: Vec<ffi::ZludaAirReloc>,
     pub metallib: Vec<u8>,
     /// Textual AIR of the whole module (only when requested)
     pub air_text: Option<String>,
@@ -151,6 +153,7 @@ pub fn compile_ptx(ptx: &str, opts: Options) -> Result<CompiledModule, String> {
         kernels: lowered.kernels,
         globals: lowered.globals,
         globals_init: lowered.globals_init,
+        globals_relocs: lowered.relocs,
         air_text: lowered.text,
         metallib,
         zluda_ir_text,
@@ -161,6 +164,7 @@ struct Lowered {
     kernels: Vec<Kernel>,
     globals: Vec<DeviceGlobal>,
     globals_init: Vec<u8>,
+    relocs: Vec<ffi::ZludaAirReloc>,
     text: Option<String>,
 }
 
@@ -192,6 +196,8 @@ fn lower_to_air(
         globals_init: ptr::null_mut(),
         globals_size: 0,
         module_text: ptr::null_mut(),
+        relocs: ptr::null_mut(),
+        reloc_count: 0,
     };
     let mut error = ptr::null_mut();
     let result = unsafe { ffi::zluda_air_lower(&input, &mut output, &mut error) };
@@ -240,6 +246,7 @@ fn lower_to_air(
     let globals_init =
         unsafe { std::slice::from_raw_parts(output.globals_init, output.globals_size as usize) }
             .to_vec();
+    let relocs = unsafe { std::slice::from_raw_parts(output.relocs, output.reloc_count) }.to_vec();
     let text = (!output.module_text.is_null()).then(|| {
         unsafe { CStr::from_ptr(output.module_text) }
             .to_string_lossy()
@@ -250,6 +257,7 @@ fn lower_to_air(
         kernels,
         globals,
         globals_init,
+        relocs,
         text,
     })
 }

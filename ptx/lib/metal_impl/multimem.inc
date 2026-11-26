@@ -381,3 +381,113 @@
         }
     }
     void FUNC(fabric_tx)(SHARED_SPACE uint64_t *mb, uint32_t n) { __zluda_ptx_impl_mbar_tx(mb, n, 1); }
+
+    // ---------------------------------------------------------------- spcompress / spdecompress (ptx_spc.sail)
+    typedef uint32_t SpU8 __attribute__((ext_vector_type(8)));
+    // the element of type t (sd bits 2-4) and size es as an XF value
+    static inline XF spc_val(uint32_t t, uint32_t es, uint64_t b)
+    {
+        if (t == 0 && es == 16)
+            return xdec_any(b, T_F16, false);
+        if (t == 1 && es == 16)
+            return xdec_any(b, T_BF16, false);
+        if (t == 0 && es == 8)
+            return xdec_int(b & 255, T_U8);
+        if (t == 1 && es == 8)
+            return xdec_int(b & 255, T_S8);
+        if (t == 6)
+            return xdec_any(b, T_F32, false);
+        if (t == 2)
+            return xdec_any(b & 255, T_E5M2, false);
+        if (t == 3)
+            return xdec_any(b & 255, T_E4M3, false);
+        if (t == 4)
+            return xdec_any(b & 63, T_E3M2, false);
+        if (t == 5)
+            return xdec_any(b & 63, T_E2M3, false);
+        return xf_fin(false, 0, 0);
+    }
+    // spcBefore: element j is selected before element i
+    static inline bool spc_before(uint32_t op, XF fj, XF fi, int j, int i)
+    {
+        if (op & 1)
+        {
+            fj = xf_abs(fj);
+            fi = xf_abs(fi);
+        }
+        bool nj = fj.c == XF_NAN, ni = fi.c == XF_NAN;
+        if (nj)
+            return !ni || j < i;
+        if (ni)
+            return false;
+        int c = xf_cmp(fj, fi);
+        return (op < 2 ? c > 0 : c < 0) || (c == 0 && j < i);
+    }
+    // ctrl: 0-4 element bits, 5-7 index bits, 8-11 data words, 12-15 metadata words, 16-19 compressed words
+    SpU8 FUNC(spcompress)(SpU8 d, uint32_t sd, uint32_t ctrl)
+    {
+        uint32_t es = ctrl & 31, ib = (ctrl >> 5) & 7, nd = (ctrl >> 8) & 15, nm = (ctrl >> 12) & 15, nc = (ctrl >> 16) & 15;
+        uint32_t op = sd & 3, t = (sd >> 2) & 7;
+        uint32_t ne = nd * 32 / es;
+        uint64_t em = (1ull << es) - 1;
+        uint32_t mw[8] = {0, 0, 0, 0, 0, 0, 0, 0}, cw[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        uint32_t km = 0, kc = 0; // bit positions in the metadata and compressed streams
+        for (uint32_t g = 0; g + 4 <= ne; g += 4)
+        {
+            uint64_t el[4];
+            XF fv[4];
+            for (int i = 0; i < 4; i++)
+            {
+                uint32_t bit = (g + i) * es;
+                el[i] = (d[bit / 32] >> (bit % 32)) & em;
+                fv[i] = spc_val(t, es, el[i]);
+            }
+            for (int i = 0; i < 4; i++)
+            {
+                int r = 0;
+                for (int j = 0; j < 4; j++)
+                    if (j != i && spc_before(op, fv[j], fv[i], j, i))
+                        r++;
+                if (r < 2)
+                {
+                    if (kc / 32 < 8)
+                        cw[kc / 32] |= (uint32_t)(el[i] << (kc % 32));
+                    kc += es;
+                    if (km / 32 < 8)
+                        mw[km / 32] |= (uint32_t)i << (km % 32);
+                    km += ib;
+                }
+            }
+        }
+        SpU8 r = {0, 0, 0, 0, 0, 0, 0, 0};
+        for (uint32_t i = 0; i < nm && i < 8; i++)
+            r[i] = mw[i];
+        for (uint32_t i = 0; i < nc && nm + i < 8; i++)
+            r[nm + i] = cw[i];
+        return r;
+    }
+    // ctrl: 0-4 element bits, 5-7 index bits, 8-11 destination words, 12-19 groups (.xN), 20-23 kept, 24-29 group size
+    SpU8 FUNC(spdecompress)(TxU4 mv, TxU4 cv, uint32_t ctrl)
+    {
+        uint32_t es = ctrl & 31, ib = (ctrl >> 5) & 7, nd = (ctrl >> 8) & 15, num = (ctrl >> 12) & 255, ns = (ctrl >> 20) & 15,
+                 nt = (ctrl >> 24) & 63;
+        uint32_t out[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        uint64_t em = (1ull << es) - 1, im = (1ull << ib) - 1;
+        for (uint32_t n = 0; n < num; n++)
+            for (uint32_t s = 0; s < ns; s++)
+            {
+                uint32_t k = n * ns + s;
+                uint32_t cb = k * es, mb = k * ib;
+                if (cb / 32 >= 4 || mb / 32 >= 4)
+                    continue;
+                uint64_t v = (cv[cb / 32] >> (cb % 32)) & em;
+                uint32_t idx = (uint32_t)((mv[mb / 32] >> (mb % 32)) & im);
+                uint32_t pos = (n * nt + idx) * es;
+                if (pos / 32 < 8)
+                    out[pos / 32] |= (uint32_t)(v << (pos % 32));
+            }
+        SpU8 r = {0, 0, 0, 0, 0, 0, 0, 0};
+        for (uint32_t i = 0; i < nd && i < 8; i++)
+            r[i] = out[i];
+        return r;
+    }

@@ -142,6 +142,7 @@ pub(super) fn lower<'i>(_opcode: &str, base: &str, m: &[&str], ops: &[HOp<'i>]) 
                 .imm(ctrl)
                 .build()
         }
+        "spcompress" | "spdecompress" => spc(base, m, ops),
         "clmad" => {
             let [d, a, b, c] = ops else { return err("clmad operands") };
             Call::new("clmad")
@@ -294,4 +295,67 @@ pub(super) fn lower<'i>(_opcode: &str, base: &str, m: &[&str], ops: &[HOp<'i>]) 
         }
         _ => None,
     }
+}
+
+fn vec_items<'i>(o: &Op<'i>) -> Vec<Option<ast::RegOrImmediate<&'i str>>> {
+    match o {
+        ast::ParsedOperand::VecPack(v) => v.clone(),
+        ast::ParsedOperand::Reg(r) => vec![Some(ast::RegOrImmediate::Reg(*r))],
+        _ => Vec::new(),
+    }
+}
+
+/// spcompress / spdecompress (Sail: ptx_spc.sail): the destinations of the instruction form one vector of the helper
+/// (spcompress: the metadata words, then the compressed words)
+fn spc<'i>(base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
+    let es: u64 = if m.contains(&"b16") { 16 } else { 8 };
+    let ib: u64 = if m.contains(&"b4") { 4 } else { 2 };
+    let num = ["x1", "x2", "x4", "x8", "x16", "x32", "x64"].iter().position(|x| m.contains(x)).map_or(1, |i| 1u64 << i);
+    let sp = m.iter().find(|x| x.starts_with("sp::")).copied().unwrap_or("sp::2:4");
+    let (ns, nt) = match sp {
+        "sp::1:2" => (1, 2),
+        "sp::1:4" => (1, 4),
+        "sp::1:8" => (1, 8),
+        "sp::1:16" => (1, 16),
+        "sp::2:8" => (2, 8),
+        "sp::2:16" => (2, 16),
+        "sp::4:8" => (4, 8),
+        "sp::4:16" => (4, 16),
+        _ => (2, 4),
+    };
+    if base == "spcompress" {
+        let [mv, cv, dv, sd] = ops else { return err("spcompress operands") };
+        let (mi, ci, di) = (vec_items(&mv.op), vec_items(&cv.op), vec_items(&dv.op));
+        if mi.len() + ci.len() > 8 || di.len() > 8 {
+            return err("spcompress vector sizes");
+        }
+        let ctrl = es | ib << 5 | (di.len() as u64) << 8 | (mi.len() as u64) << 12 | (ci.len() as u64) << 16;
+        let mut out = mi;
+        out.extend(ci);
+        while out.len() < 8 {
+            out.push(None);
+        }
+        return Call::new("spcompress")
+            .dst_vec(ast::ParsedOperand::VecPack(out), 8, ScalarType::B32)
+            .src_vec(ast::ParsedOperand::VecPack(di), 8, ScalarType::B32)
+            .src(sd.op.clone(), ScalarType::B32)
+            .imm(ctrl)
+            .build();
+    }
+    let [dv, mv, cv] = ops else { return err("spdecompress operands") };
+    let (di, mi, ci) = (vec_items(&dv.op), vec_items(&mv.op), vec_items(&cv.op));
+    if di.len() > 8 || mi.len() > 4 || ci.len() > 4 {
+        return err("spdecompress vector sizes");
+    }
+    let ctrl = es | ib << 5 | (di.len() as u64) << 8 | num << 12 | ns << 20 | nt << 24;
+    let mut d = di;
+    while d.len() < 8 {
+        d.push(None);
+    }
+    Call::new("spdecompress")
+        .dst_vec(ast::ParsedOperand::VecPack(d), 8, ScalarType::B32)
+        .src_vec(ast::ParsedOperand::VecPack(mi), 4, ScalarType::B32)
+        .src_vec(ast::ParsedOperand::VecPack(ci), 4, ScalarType::B32)
+        .imm(ctrl)
+        .build()
 }

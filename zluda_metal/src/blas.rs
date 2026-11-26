@@ -328,22 +328,7 @@ fn strides(op: c_int, ld: c_int) -> (i32, i32) {
 
 unsafe fn gemv<T: Elem>(h: cublasHandle_t, trans: c_int, m: c_int, n: c_int, alpha: *const T, a: *const T, lda: c_int,
                         x: *const T, incx: c_int, beta: *const T, y: *mut T, incy: c_int) -> R {
-    check(h)?;
-    if !op_ok(trans) || m < 0 || n < 0 || lda < m.max(1) || incx == 0 || incy == 0 {
-        return Err(CUBLAS_STATUS_INVALID_VALUE);
-    }
-    let (al, be) = (scalar(h, alpha)?, scalar(h, beta)?);
-    let (rows, cols) = if trans == OP_N { (m, n) } else { (n, m) };
-    if rows == 0 {
-        return Ok(());
-    }
-    let (rs, cs) = strides(trans, lda);
-    let (xo, xi) = vec_of(cols, incx);
-    let (yo, yi) = vec_of(rows, incy);
-    launch(&format!("{}gemv", T::P), [grid1(rows, 64), 1, 1], [64, 1, 1], &[
-        i32v(rows), i32v(cols), Arg::Value(al.bytes()), Arg::Addr(a as u64), i32v(0), i32v(rs), i32v(cs),
-        Arg::Addr(x as u64), i32v(xo), i32v(xi), Arg::Value(be.bytes()), Arg::Addr(y as u64), i32v(yo), i32v(yi),
-    ])
+    gemv_sb(h, trans, m, n, alpha, a, lda, 0, x, incx, 0, beta, y, incy, 0, 1)
 }
 
 /// One GEMM launch (a batch of `batch` matrices `sa` / `sb` / `sc` elements apart): kernel `name`, alpha and beta
@@ -473,6 +458,574 @@ unsafe fn gemm_ex_kernel(h: cublasHandle_t, at: c_int, bt: c_int, ct: c_int, com
         _ => return Err(fail(format!("GemmEx types A {at} C {ct}"), CUBLAS_STATUS_NOT_SUPPORTED)),
     };
     Ok((name, f32s(alpha)?, f32s(beta)?))
+}
+
+// ------------------------------------------------------------------------------------------------- structured
+
+const FILL_LOWER: c_int = 0;
+const FILL_UPPER: c_int = 1;
+const DIAG_NON_UNIT: c_int = 0;
+const DIAG_UNIT: c_int = 1;
+const SIDE_LEFT: c_int = 0;
+const SIDE_RIGHT: c_int = 1;
+
+// geam kernel modes (blas/gen_kernels.py): A's storage, its structure, products, the triangle written
+const G_FULL: i32 = 1;
+const G_BAND: i32 = 2;
+const G_PACKED: i32 = 3;
+const G_SYM: i32 = 4;
+const G_TRI: i32 = 8;
+const G_UPPER: i32 = 16;
+const G_UNIT: i32 = 32;
+const G_PROD: i32 = 64;
+const G_WRITE_UPPER: i32 = 128;
+const G_WRITE_LOWER: i32 = 256;
+
+fn uplo_ok(u: c_int) -> bool {
+    matches!(u, FILL_LOWER | FILL_UPPER)
+}
+fn diag_ok(d: c_int) -> bool {
+    matches!(d, DIAG_NON_UNIT | DIAG_UNIT)
+}
+fn side_ok(s: c_int) -> bool {
+    matches!(s, SIDE_LEFT | SIDE_RIGHT)
+}
+
+/// The structure bits of a symmetric / triangular A
+fn smode(sym: bool, uplo: c_int, diag: c_int) -> i32 {
+    (if sym { G_SYM } else { G_TRI }) | if uplo == FILL_UPPER { G_UPPER } else { 0 } | if !sym && diag == DIAG_UNIT { G_UNIT } else { 0 }
+}
+
+/// One launch of the elementwise kernel (C(i, j) = c[co + i crs + j ccs] for m x n)
+unsafe fn geam_launch<T: Elem>(m: i32, n: i32, mode: i32, alpha: T, a: u64, ao: i32, ars: i32, acs: i32, kl: i32, ku: i32,
+                               beta: T, b: u64, bo: i32, brs: i32, bcs: i32, c: u64, co: i32, crs: i32, ccs: i32) -> R {
+    if m <= 0 || n <= 0 {
+        return Ok(());
+    }
+    let gy = ((n as u32).div_ceil(4)).clamp(1, 1024);
+    launch(&format!("{}geam", T::P), [(m as u32).div_ceil(64), gy, 1], [64, 4, 1], &[
+        i32v(m), i32v(n), i32v(mode), Arg::Value(alpha.bytes()), Arg::Addr(a), i32v(ao), i32v(ars), i32v(acs), i32v(kl),
+        i32v(ku), Arg::Value(beta.bytes()), Arg::Addr(b), i32v(bo), i32v(brs), i32v(bcs), Arg::Addr(c), i32v(co),
+        i32v(crs), i32v(ccs),
+    ])
+}
+
+fn elems(rows: i32, cols: i32) -> Result<i32, cublasStatus_t> {
+    let v = rows as i64 * cols as i64;
+    if v > i32::MAX as i64 {
+        Err(fail("matrices beyond 2^31 elements are not supported", CUBLAS_STATUS_NOT_SUPPORTED))
+    } else {
+        Ok(v as i32)
+    }
+}
+
+/// A rows x cols dense copy (leading dimension rows) of the structured / banded / packed matrix `a`
+unsafe fn expand<T: Elem>(rows: i32, cols: i32, mode: i32, a: u64, lda: i32, kl: i32, ku: i32) -> Result<Tmp, cublasStatus_t> {
+    let t = Tmp::new(elems(rows, cols)? as u64 * std::mem::size_of::<T>() as u64)?;
+    geam_launch::<T>(rows, cols, mode, T::from_f64(1.0), a, 0, 1, lda, kl, ku, T::default(), a, 0, 0, 0, t.0, 0, 1, rows)?;
+    Ok(t)
+}
+
+/// A contiguous copy of a vector
+unsafe fn vec_copy<T: Elem>(n: i32, x: u64, incx: i32) -> Result<Tmp, cublasStatus_t> {
+    let t = Tmp::new(n.max(1) as u64 * std::mem::size_of::<T>() as u64)?;
+    let (xo, xi) = vec_of(n, incx);
+    launch(&format!("{}copy", T::P), [grid1(n, 256), 1, 1], [256, 1, 1], &[
+        i32v(n), i32v(0), Arg::Addr(x), i32v(xo), i32v(xi), Arg::Addr(t.0), i32v(0), i32v(1),
+    ])?;
+    Ok(t)
+}
+
+unsafe fn rot<T: Elem>(h: cublasHandle_t, n: c_int, x: *mut T, incx: c_int, y: *mut T, incy: c_int, hm: [T; 4]) -> R {
+    if n <= 0 {
+        return Ok(());
+    }
+    let (xo, xi) = vec_of(n, incx);
+    let (yo, yi) = vec_of(n, incy);
+    let _ = h;
+    launch(&format!("{}rot", T::P), [grid1(n, 256), 1, 1], [256, 1, 1], &[
+        i32v(n), Arg::Value(hm[0].bytes()), Arg::Value(hm[1].bytes()), Arg::Value(hm[2].bytes()), Arg::Value(hm[3].bytes()),
+        Arg::Addr(x as u64), i32v(xo), i32v(xi), Arg::Addr(y as u64), i32v(yo), i32v(yi),
+    ])
+}
+
+/// rotg's results (a, b, c, s) for (a, b) (reference BLAS)
+fn rotg_f64(a: f64, b: f64) -> (f64, f64, f64, f64) {
+    let roe = if a.abs() > b.abs() { a } else { b };
+    let scale = a.abs() + b.abs();
+    if scale == 0.0 {
+        return (0.0, 0.0, 1.0, 0.0);
+    }
+    let r = scale * ((a / scale).powi(2) + (b / scale).powi(2)).sqrt();
+    let r = if roe < 0.0 { -r } else { r };
+    let (c, s) = (a / r, b / r);
+    let mut z = 1.0;
+    if a.abs() > b.abs() {
+        z = s;
+    }
+    if b.abs() >= a.abs() && c != 0.0 {
+        z = 1.0 / c;
+    }
+    (r, z, c, s)
+}
+
+/// rotmg (reference BLAS): (d1, d2, x1, param) for (d1, d2, x1, y1)
+fn rotmg_f64(mut d1: f64, mut d2: f64, mut x1: f64, y1: f64) -> (f64, f64, f64, [f64; 5]) {
+    let (gam, gamsq, rgamsq) = (4096.0f64, 16777216.0f64, 5.9604645e-8f64);
+    let (mut h11, mut h12, mut h21, mut h22) = (0.0, 0.0, 0.0, 0.0);
+    let flag: f64;
+    if d1 < 0.0 {
+        return (0.0, 0.0, 0.0, [-1.0, 0.0, 0.0, 0.0, 0.0]);
+    }
+    let p2 = d2 * y1;
+    if p2 == 0.0 {
+        return (d1, d2, x1, [-2.0, 0.0, 0.0, 0.0, 0.0]);
+    }
+    let p1 = d1 * x1;
+    let q2 = p2 * y1;
+    let q1 = p1 * x1;
+    let mut fl;
+    if q1.abs() > q2.abs() {
+        h21 = -y1 / x1;
+        h12 = p2 / p1;
+        let u = 1.0 - h12 * h21;
+        if u > 0.0 {
+            fl = 0.0;
+            d1 /= u;
+            d2 /= u;
+            x1 *= u;
+        } else {
+            return (0.0, 0.0, 0.0, [-1.0, 0.0, 0.0, 0.0, 0.0]);
+        }
+    } else if q2 < 0.0 {
+        return (0.0, 0.0, 0.0, [-1.0, 0.0, 0.0, 0.0, 0.0]);
+    } else {
+        fl = 1.0;
+        h11 = p1 / p2;
+        h22 = x1 / y1;
+        let u = 1.0 + h11 * h22;
+        let t = d2 / u;
+        d2 = d1 / u;
+        d1 = t;
+        x1 = y1 * u;
+    }
+    if d1 != 0.0 {
+        while d1 <= rgamsq || d1 >= gamsq {
+            if fl == 0.0 {
+                h11 = 1.0;
+                h22 = 1.0;
+                fl = -1.0;
+            } else {
+                h21 = -1.0;
+                h12 = 1.0;
+                fl = -1.0;
+            }
+            if d1 <= rgamsq {
+                d1 *= gam * gam;
+                x1 /= gam;
+                h11 /= gam;
+                h12 /= gam;
+            } else {
+                d1 /= gam * gam;
+                x1 *= gam;
+                h11 *= gam;
+                h12 *= gam;
+            }
+        }
+    }
+    if d2 != 0.0 {
+        while d2.abs() <= rgamsq || d2.abs() >= gamsq {
+            if fl == 0.0 {
+                h11 = 1.0;
+                h22 = 1.0;
+                fl = -1.0;
+            } else {
+                h21 = -1.0;
+                h12 = 1.0;
+                fl = -1.0;
+            }
+            if d2.abs() <= rgamsq {
+                d2 *= gam * gam;
+                h21 /= gam;
+                h22 /= gam;
+            } else {
+                d2 /= gam * gam;
+                h21 *= gam;
+                h22 *= gam;
+            }
+        }
+    }
+    flag = fl;
+    let param = if flag < 0.0 {
+        [flag, h11, h21, h12, h22]
+    } else if flag == 0.0 {
+        [flag, 0.0, h21, h12, 0.0]
+    } else {
+        [flag, h11, 0.0, 0.0, h22]
+    };
+    (d1, d2, x1, param)
+}
+
+/// A scalar argument that is also a result (rotg, rotmg), in the handle's pointer mode
+unsafe fn sread<T: Copy>(h: cublasHandle_t, p: *const T) -> Result<T, cublasStatus_t> {
+    scalar(h, p)
+}
+
+unsafe fn rotm<T: Elem>(h: cublasHandle_t, n: c_int, x: *mut T, incx: c_int, y: *mut T, incy: c_int, param: *const T) -> R {
+    check(h)?;
+    if param.is_null() {
+        return Err(CUBLAS_STATUS_INVALID_VALUE);
+    }
+    let p: Vec<f64> = (0..5).map(|i| sread(h, param.add(i)).map(|v| v.to_f64())).collect::<Result<_, _>>()?;
+    let f = T::from_f64;
+    let hm = match p[0] {
+        v if v == -2.0 => return Ok(()),
+        v if v == -1.0 => [f(p[1]), f(p[2]), f(p[3]), f(p[4])],
+        v if v == 0.0 => [f(1.0), f(p[2]), f(p[3]), f(1.0)],
+        v if v == 1.0 => [f(p[1]), f(-1.0), f(1.0), f(p[4])],
+        _ => return Err(CUBLAS_STATUS_INVALID_VALUE),
+    };
+    rot(h, n, x, incx, y, incy, hm)
+}
+
+unsafe fn rotg<T: Elem>(h: cublasHandle_t, a: *mut T, b: *mut T, c: *mut T, s: *mut T) -> R {
+    check(h)?;
+    let (r, z, cv, sv) = rotg_f64(sread(h, a)?.to_f64(), sread(h, b)?.to_f64());
+    result(h, a, T::from_f64(r))?;
+    result(h, b, T::from_f64(z))?;
+    result(h, c, T::from_f64(cv))?;
+    result(h, s, T::from_f64(sv))
+}
+
+unsafe fn rotmg<T: Elem>(h: cublasHandle_t, d1: *mut T, d2: *mut T, x1: *mut T, y1: *const T, param: *mut T) -> R {
+    check(h)?;
+    let (a, b, c, p) = rotmg_f64(sread(h, d1)?.to_f64(), sread(h, d2)?.to_f64(), sread(h, x1)?.to_f64(), sread(h, y1)?.to_f64());
+    result(h, d1, T::from_f64(a))?;
+    result(h, d2, T::from_f64(b))?;
+    result(h, x1, T::from_f64(c))?;
+    for (i, v) in p.iter().enumerate() {
+        result(h, param.add(i), T::from_f64(*v))?;
+    }
+    Ok(())
+}
+
+/// A += alpha x y^T, masked to a triangle (1 upper, 2 lower)
+unsafe fn ger_launch<T: Elem>(m: i32, n: i32, mask: i32, alpha: T, x: u64, incx: i32, y: u64, incy: i32, a: u64, lda: i32) -> R {
+    if m <= 0 || n <= 0 {
+        return Ok(());
+    }
+    let (xo, xi) = vec_of(m, incx);
+    let (yo, yi) = vec_of(n, incy);
+    let gy = ((n as u32).div_ceil(4)).clamp(1, 1024);
+    launch(&format!("{}ger", T::P), [(m as u32).div_ceil(64), gy, 1], [64, 4, 1], &[
+        i32v(m), i32v(n), i32v(mask), Arg::Value(alpha.bytes()), Arg::Addr(x), i32v(xo), i32v(xi), Arg::Addr(y), i32v(yo),
+        i32v(yi), Arg::Addr(a), i32v(0), i32v(lda),
+    ])
+}
+
+unsafe fn ger<T: Elem>(h: cublasHandle_t, m: c_int, n: c_int, alpha: *const T, x: *const T, incx: c_int, y: *const T,
+                       incy: c_int, a: *mut T, lda: c_int) -> R {
+    check(h)?;
+    if m < 0 || n < 0 || incx == 0 || incy == 0 || lda < m.max(1) {
+        return Err(CUBLAS_STATUS_INVALID_VALUE);
+    }
+    let al = scalar(h, alpha)?;
+    elems(lda, n)?;
+    ger_launch(m, n, 0, al, x as u64, incx, y as u64, incy, a as u64, lda)
+}
+
+unsafe fn syr<T: Elem>(h: cublasHandle_t, uplo: c_int, n: c_int, alpha: *const T, x: *const T, incx: c_int, y: *const T,
+                       incy: c_int, a: *mut T, lda: c_int, two: bool) -> R {
+    check(h)?;
+    if !uplo_ok(uplo) || n < 0 || incx == 0 || (two && incy == 0) || lda < n.max(1) {
+        return Err(CUBLAS_STATUS_INVALID_VALUE);
+    }
+    let al = scalar(h, alpha)?;
+    elems(lda, n)?;
+    let mask = if uplo == FILL_UPPER { 1 } else { 2 };
+    if two {
+        ger_launch(n, n, mask, al, x as u64, incx, y as u64, incy, a as u64, lda)?;
+        ger_launch(n, n, mask, al, y as u64, incy, x as u64, incx, a as u64, lda)
+    } else {
+        ger_launch(n, n, mask, al, x as u64, incx, x as u64, incx, a as u64, lda)
+    }
+}
+
+/// y = alpha op(A) x + beta y for op(A) rows x cols with A(i, j) = a[i rs + j cs], batched (strides in elements)
+unsafe fn gemv_launch<T: Elem>(rows: i32, cols: i32, al: T, a: u64, rs: i32, cs: i32, sa: i64, x: u64, incx: i32, sx: i64,
+                               be: T, y: u64, incy: i32, sy: i64, batch: i32) -> R {
+    if rows <= 0 || batch <= 0 {
+        return Ok(());
+    }
+    let big = |v: i64| v > i32::MAX as i64 || v < i32::MIN as i64;
+    if big(sa) || big(sx) || big(sy) || big(sa * batch as i64) {
+        return Err(fail("matrices beyond 2^31 elements are not supported", CUBLAS_STATUS_NOT_SUPPORTED));
+    }
+    let (xo, xi) = vec_of(cols, incx);
+    let (yo, yi) = vec_of(rows, incy);
+    // a SIMD group per row where rows are contiguous or few, else 32 rows (lanes) by 8 column groups per block
+    let (name, grid, block) = if cs == 1 || rows < 64 || std::env::var_os("ZLUDA_BLAS_GEMV_T").is_some() {
+        ("gemv_t", [(rows as u32).div_ceil(8).min(8192), batch as u32, 1], [256, 1, 1])
+    } else {
+        ("gemv_n", [(rows as u32).div_ceil(32).min(4096), batch as u32, 1], [32, 8, 1])
+    };
+    launch(&format!("{}{}", T::P, name), grid, block, &[
+        i32v(rows), i32v(cols), Arg::Value(al.bytes()), Arg::Addr(a), i32v(0), i32v(rs), i32v(cs), i32v(sa as i32),
+        Arg::Addr(x), i32v(xo), i32v(xi), i32v(sx as i32), Arg::Value(be.bytes()), Arg::Addr(y), i32v(yo), i32v(yi),
+        i32v(sy as i32),
+    ])
+}
+
+unsafe fn gemv_sb<T: Elem>(h: cublasHandle_t, trans: c_int, m: c_int, n: c_int, alpha: *const T, a: *const T, lda: c_int,
+                           sa: i64, x: *const T, incx: c_int, sx: i64, beta: *const T, y: *mut T, incy: c_int, sy: i64,
+                           batch: c_int) -> R {
+    check(h)?;
+    if !op_ok(trans) || m < 0 || n < 0 || lda < m.max(1) || incx == 0 || incy == 0 || batch < 0 {
+        return Err(CUBLAS_STATUS_INVALID_VALUE);
+    }
+    let (al, be) = (scalar(h, alpha)?, scalar(h, beta)?);
+    let (rows, cols) = if trans == OP_N { (m, n) } else { (n, m) };
+    elems(lda, n)?;
+    let (rs, cs) = strides(trans, lda);
+    gemv_launch(rows, cols, al, a as u64, rs, cs, sa, x as u64, incx, sx, be, y as u64, incy, sy, batch)
+}
+
+/// symv / sbmv / spmv: y = alpha A x + beta y for A n x n symmetric, expanded (mode: storage) to a dense copy
+unsafe fn symv<T: Elem>(h: cublasHandle_t, kind: i32, uplo: c_int, n: c_int, k: c_int, alpha: *const T, a: *const T,
+                        lda: c_int, x: *const T, incx: c_int, beta: *const T, y: *mut T, incy: c_int) -> R {
+    check(h)?;
+    let ldmin = match kind {
+        G_FULL => n.max(1),
+        G_BAND => (k + 1).max(1),
+        _ => 0,
+    };
+    if !uplo_ok(uplo) || n < 0 || k < 0 || lda < ldmin || incx == 0 || incy == 0 {
+        return Err(CUBLAS_STATUS_INVALID_VALUE);
+    }
+    let (al, be) = (scalar(h, alpha)?, scalar(h, beta)?);
+    if n == 0 {
+        return Ok(());
+    }
+    let t = expand::<T>(n, n, kind | smode(true, uplo, 0), a as u64, lda, k, k)?;
+    gemv_launch(n, n, al, t.0, 1, n, 0, x as u64, incx, 0, be, y as u64, incy, 0, 1)
+}
+
+/// gbmv: y = alpha op(A) x + beta y for A m x n banded (kl, ku)
+unsafe fn gbmv<T: Elem>(h: cublasHandle_t, trans: c_int, m: c_int, n: c_int, kl: c_int, ku: c_int, alpha: *const T,
+                        a: *const T, lda: c_int, x: *const T, incx: c_int, beta: *const T, y: *mut T, incy: c_int) -> R {
+    check(h)?;
+    if !op_ok(trans) || m < 0 || n < 0 || kl < 0 || ku < 0 || lda < kl + ku + 1 || incx == 0 || incy == 0 {
+        return Err(CUBLAS_STATUS_INVALID_VALUE);
+    }
+    let (al, be) = (scalar(h, alpha)?, scalar(h, beta)?);
+    if m == 0 || n == 0 {
+        return Ok(());
+    }
+    let t = expand::<T>(m, n, G_BAND, a as u64, lda, kl, ku)?;
+    let (rows, cols) = if trans == OP_N { (m, n) } else { (n, m) };
+    let (rs, cs) = strides(trans, m);
+    gemv_launch(rows, cols, al, t.0, rs, cs, 0, x as u64, incx, 0, be, y as u64, incy, 0, 1)
+}
+
+/// trmv / tbmv / tpmv: x = op(A) x
+unsafe fn trmv<T: Elem>(h: cublasHandle_t, kind: i32, uplo: c_int, trans: c_int, diag: c_int, n: c_int, k: c_int,
+                        a: *const T, lda: c_int, x: *mut T, incx: c_int) -> R {
+    check(h)?;
+    let ldmin = match kind {
+        G_FULL => n.max(1),
+        G_BAND => (k + 1).max(1),
+        _ => 0,
+    };
+    if !uplo_ok(uplo) || !op_ok(trans) || !diag_ok(diag) || n < 0 || k < 0 || lda < ldmin || incx == 0 {
+        return Err(CUBLAS_STATUS_INVALID_VALUE);
+    }
+    if n == 0 {
+        return Ok(());
+    }
+    let t = expand::<T>(n, n, kind | smode(false, uplo, diag), a as u64, lda, k, k)?;
+    let xc = vec_copy::<T>(n, x as u64, incx)?;
+    let (rs, cs) = strides(trans, n);
+    gemv_launch(n, n, T::from_f64(1.0), t.0, rs, cs, 0, xc.0, 1, 0, T::default(), x as u64, incx, 0, 1)
+}
+
+/// The triangular solve kernel: nvec vectors (x + xo + v xb, increment xi) of n elements, M(i, j) = a[i rs + j cs]
+unsafe fn trsv_launch<T: Elem>(n: i32, a: u64, rs: i32, cs: i32, lower: bool, unit: bool, alpha: T, x: u64, xo: i32, xi: i32,
+                               xb: i32, nvec: i32) -> R {
+    if n <= 0 || nvec <= 0 {
+        return Ok(());
+    }
+    launch(&format!("{}trsv", T::P), [nvec as u32, 1, 1], [32, 1, 1], &[
+        i32v(n), Arg::Addr(a), i32v(0), i32v(rs), i32v(cs), i32v(lower as i32), i32v(unit as i32), Arg::Value(alpha.bytes()),
+        Arg::Addr(x), i32v(xo), i32v(xi), i32v(xb),
+    ])
+}
+
+/// trsv / tbsv / tpsv: solves op(A) x = b
+unsafe fn trsv<T: Elem>(h: cublasHandle_t, kind: i32, uplo: c_int, trans: c_int, diag: c_int, n: c_int, k: c_int,
+                        a: *const T, lda: c_int, x: *mut T, incx: c_int) -> R {
+    check(h)?;
+    let ldmin = match kind {
+        G_FULL => n.max(1),
+        G_BAND => (k + 1).max(1),
+        _ => 0,
+    };
+    if !uplo_ok(uplo) || !op_ok(trans) || !diag_ok(diag) || n < 0 || k < 0 || lda < ldmin || incx == 0 {
+        return Err(CUBLAS_STATUS_INVALID_VALUE);
+    }
+    if n == 0 {
+        return Ok(());
+    }
+    let (xo, xi) = vec_of(n, incx);
+    let lower = (uplo == FILL_LOWER) != (trans != OP_N);
+    if kind == G_FULL {
+        elems(lda, n)?;
+        let (rs, cs) = strides(trans, lda);
+        return trsv_launch(n, a as u64, rs, cs, lower, diag == DIAG_UNIT, T::from_f64(1.0), x as u64, xo, xi, 0, 1);
+    }
+    let t = expand::<T>(n, n, kind | smode(false, uplo, diag), a as u64, lda, k, k)?;
+    let (rs, cs) = strides(trans, n);
+    trsv_launch(n, t.0, rs, cs, lower, diag == DIAG_UNIT, T::from_f64(1.0), x as u64, xo, xi, 0, 1)
+}
+
+/// trsm: op(A) X = alpha B (left) or X op(A) = alpha B (right), X over B
+unsafe fn trsm<T: Elem>(h: cublasHandle_t, side: c_int, uplo: c_int, trans: c_int, diag: c_int, m: c_int, n: c_int,
+                        alpha: *const T, a: *const T, lda: c_int, b: *mut T, ldb: c_int) -> R {
+    check(h)?;
+    let k = if side == SIDE_LEFT { m } else { n };
+    if !side_ok(side) || !uplo_ok(uplo) || !op_ok(trans) || !diag_ok(diag) || m < 0 || n < 0 || lda < k.max(1) || ldb < m.max(1) {
+        return Err(CUBLAS_STATUS_INVALID_VALUE);
+    }
+    let al = scalar(h, alpha)?;
+    if m == 0 || n == 0 {
+        return Ok(());
+    }
+    elems(lda, k)?;
+    elems(ldb, n)?;
+    let unit = diag == DIAG_UNIT;
+    if side == SIDE_LEFT {
+        // each column of B: op(A) x = alpha b
+        let (rs, cs) = strides(trans, lda);
+        trsv_launch(m, a as u64, rs, cs, (uplo == FILL_LOWER) != (trans != OP_N), unit, al, b as u64, 0, 1, ldb, n)
+    } else {
+        // each row of B: op(A)^T x = alpha b
+        let (rs, cs) = strides(if trans == OP_N { OP_T } else { OP_N }, lda);
+        trsv_launch(n, a as u64, rs, cs, (uplo == FILL_LOWER) != (trans == OP_N), unit, al, b as u64, 0, ldb, 1, m)
+    }
+}
+
+/// symm: C = alpha A B + beta C (left) or alpha B A + beta C (right), A symmetric: a dense copy and a GEMM
+unsafe fn symm<T: Elem>(h: cublasHandle_t, side: c_int, uplo: c_int, m: c_int, n: c_int, alpha: *const T, a: *const T,
+                        lda: c_int, b: *const T, ldb: c_int, beta: *const T, c: *mut T, ldc: c_int) -> R {
+    check(h)?;
+    let k = if side == SIDE_LEFT { m } else { n };
+    if !side_ok(side) || !uplo_ok(uplo) || m < 0 || n < 0 || lda < k.max(1) || ldb < m.max(1) || ldc < m.max(1) {
+        return Err(CUBLAS_STATUS_INVALID_VALUE);
+    }
+    let (al, be) = (scalar(h, alpha)?, scalar(h, beta)?);
+    if m == 0 || n == 0 {
+        return Ok(());
+    }
+    let t = expand::<T>(k, k, G_FULL | smode(true, uplo, 0), a as u64, lda, 0, 0)?;
+    let name = format!("{}gemm", T::P);
+    if side == SIDE_LEFT {
+        gemm_launch(&name, OP_N, OP_N, m, n, m, al.bytes(), t.0, k, 0, b as u64, ldb, 0, be.bytes(), c as u64, ldc, 0, 1)
+    } else {
+        gemm_launch(&name, OP_N, OP_N, m, n, n, al.bytes(), b as u64, ldb, 0, t.0, k, 0, be.bytes(), c as u64, ldc, 0, 1)
+    }
+}
+
+/// syrk / syr2k / syrkx: the triangle uplo of C = alpha op(A) op(B)^T [+ alpha op(B) op(A)^T] + beta C, by GEMMs
+/// into a copy of C and a copy of its triangle back
+unsafe fn syrk<T: Elem>(h: cublasHandle_t, uplo: c_int, trans: c_int, n: c_int, k: c_int, alpha: *const T, a: *const T,
+                        lda: c_int, b: *const T, ldb: c_int, beta: *const T, c: *mut T, ldc: c_int, two: bool) -> R {
+    check(h)?;
+    let rows = if trans == OP_N { n } else { k };
+    if !uplo_ok(uplo) || !op_ok(trans) || n < 0 || k < 0 || lda < rows.max(1) || ldb < rows.max(1) || ldc < n.max(1) {
+        return Err(CUBLAS_STATUS_INVALID_VALUE);
+    }
+    let (al, be) = (scalar(h, alpha)?, scalar(h, beta)?);
+    if n == 0 {
+        return Ok(());
+    }
+    elems(ldc, n)?;
+    let w = Tmp::new(elems(n, n)? as u64 * std::mem::size_of::<T>() as u64)?;
+    let zero = be.to_f64() == 0.0;
+    if !zero {
+        geam_launch::<T>(n, n, 0, T::from_f64(1.0), c as u64, 0, 1, ldc, 0, 0, T::default(), c as u64, 0, 0, 0, w.0, 0, 1, n)?;
+    }
+    let (ta, tb) = if trans == OP_N { (OP_N, OP_T) } else { (OP_T, OP_N) };
+    let name = format!("{}gemm", T::P);
+    gemm_launch(&name, ta, tb, n, n, k, al.bytes(), a as u64, lda, 0, b as u64, ldb, 0, be.bytes(), w.0, n, 0, 1)?;
+    if two {
+        gemm_launch(&name, ta, tb, n, n, k, al.bytes(), b as u64, ldb, 0, a as u64, lda, 0, T::from_f64(1.0).bytes(), w.0, n, 0, 1)?;
+    }
+    let mask = if uplo == FILL_UPPER { G_WRITE_UPPER } else { G_WRITE_LOWER };
+    geam_launch::<T>(n, n, mask, T::from_f64(1.0), w.0, 0, 1, n, 0, 0, T::default(), w.0, 0, 0, 0, c as u64, 0, 1, ldc)
+}
+
+/// trmm: C = alpha op(A) B (left) or alpha B op(A) (right), A triangular
+unsafe fn trmm<T: Elem>(h: cublasHandle_t, side: c_int, uplo: c_int, trans: c_int, diag: c_int, m: c_int, n: c_int,
+                        alpha: *const T, a: *const T, lda: c_int, b: *const T, ldb: c_int, c: *mut T, ldc: c_int) -> R {
+    check(h)?;
+    let k = if side == SIDE_LEFT { m } else { n };
+    if !side_ok(side) || !uplo_ok(uplo) || !op_ok(trans) || !diag_ok(diag) || m < 0 || n < 0 || lda < k.max(1)
+        || ldb < m.max(1) || ldc < m.max(1)
+    {
+        return Err(CUBLAS_STATUS_INVALID_VALUE);
+    }
+    let al = scalar(h, alpha)?;
+    if m == 0 || n == 0 {
+        return Ok(());
+    }
+    let t = expand::<T>(k, k, G_FULL | smode(false, uplo, diag), a as u64, lda, 0, 0)?;
+    // in place (C = B): B through a copy
+    let bc;
+    let (bp, ldbp) = if b as u64 == c as u64 {
+        bc = Tmp::new(elems(m, n)? as u64 * std::mem::size_of::<T>() as u64)?;
+        geam_launch::<T>(m, n, 0, T::from_f64(1.0), b as u64, 0, 1, ldb, 0, 0, T::default(), b as u64, 0, 0, 0, bc.0, 0, 1, m)?;
+        (bc.0, m)
+    } else {
+        (b as u64, ldb)
+    };
+    let name = format!("{}gemm", T::P);
+    let zero = T::default().bytes();
+    if side == SIDE_LEFT {
+        gemm_launch(&name, trans, OP_N, m, n, m, al.bytes(), t.0, k, 0, bp, ldbp, 0, zero, c as u64, ldc, 0, 1)
+    } else {
+        gemm_launch(&name, OP_N, trans, m, n, n, al.bytes(), bp, ldbp, 0, t.0, k, 0, zero, c as u64, ldc, 0, 1)
+    }
+}
+
+/// geam: C = alpha op(A) + beta op(B)
+unsafe fn geam<T: Elem>(h: cublasHandle_t, ta: c_int, tb: c_int, m: c_int, n: c_int, alpha: *const T, a: *const T, lda: c_int,
+                        beta: *const T, b: *const T, ldb: c_int, c: *mut T, ldc: c_int) -> R {
+    check(h)?;
+    let need = |t: c_int| if t == OP_N { m } else { n };
+    if !op_ok(ta) || !op_ok(tb) || m < 0 || n < 0 || lda < need(ta).max(1) || ldb < need(tb).max(1) || ldc < m.max(1) {
+        return Err(CUBLAS_STATUS_INVALID_VALUE);
+    }
+    // in place only as the same matrix
+    if (c as u64 == a as u64 && (ta != OP_N || lda != ldc)) || (c as u64 == b as u64 && (tb != OP_N || ldb != ldc)) {
+        return Err(CUBLAS_STATUS_INVALID_VALUE);
+    }
+    let (al, be) = (scalar(h, alpha)?, scalar(h, beta)?);
+    elems(ldc, n)?;
+    let (ars, acs) = strides(ta, lda);
+    let (brs, bcs) = strides(tb, ldb);
+    geam_launch(m, n, 0, al, a as u64, 0, ars, acs, 0, 0, be, b as u64, 0, brs, bcs, c as u64, 0, 1, ldc)
+}
+
+/// dgmm: C = A diag(x) (right) or diag(x) A (left)
+unsafe fn dgmm<T: Elem>(h: cublasHandle_t, side: c_int, m: c_int, n: c_int, a: *const T, lda: c_int, x: *const T, incx: c_int,
+                        c: *mut T, ldc: c_int) -> R {
+    check(h)?;
+    if !side_ok(side) || m < 0 || n < 0 || lda < m.max(1) || ldc < m.max(1) {
+        return Err(CUBLAS_STATUS_INVALID_VALUE);
+    }
+    elems(ldc.max(lda), n)?;
+    let (xo, xi) = vec_of(if side == SIDE_LEFT { m } else { n }, incx);
+    let (brs, bcs) = if side == SIDE_LEFT { (xi, 0) } else { (0, xi) };
+    geam_launch(m, n, G_PROD, T::from_f64(1.0), a as u64, 0, 1, lda, 0, 0, T::default(), x as u64, xo, brs, bcs, c as u64, 0, 1, ldc)
 }
 
 // ================================================================================================= entry points
@@ -631,6 +1184,65 @@ entry! {
         }
         Ok(())
     }
+}
+
+entry! {
+    fn cublasSrot_v2(h: cublasHandle_t, n: c_int, x: *mut f32, incx: c_int, y: *mut f32, incy: c_int, c: *const f32, s: *const f32) { check(h)?; let (c, s) = (scalar(h, c)?, scalar(h, s)?); rot(h, n, x, incx, y, incy, [c, -s, s, c]) }
+    fn cublasSrotg_v2(h: cublasHandle_t, a: *mut f32, b: *mut f32, c: *mut f32, s: *mut f32) { rotg(h, a, b, c, s) }
+    fn cublasSrotm_v2(h: cublasHandle_t, n: c_int, x: *mut f32, incx: c_int, y: *mut f32, incy: c_int, param: *const f32) { rotm(h, n, x, incx, y, incy, param) }
+    fn cublasSrotmg_v2(h: cublasHandle_t, d1: *mut f32, d2: *mut f32, x1: *mut f32, y1: *const f32, param: *mut f32) { rotmg(h, d1, d2, x1, y1, param) }
+    fn cublasSger_v2(h: cublasHandle_t, m: c_int, n: c_int, alpha: *const f32, x: *const f32, incx: c_int, y: *const f32, incy: c_int, a: *mut f32, lda: c_int) { ger(h, m, n, alpha, x, incx, y, incy, a, lda) }
+    fn cublasSsyr_v2(h: cublasHandle_t, uplo: c_int, n: c_int, alpha: *const f32, x: *const f32, incx: c_int, a: *mut f32, lda: c_int) { syr(h, uplo, n, alpha, x, incx, x, incx, a, lda, false) }
+    fn cublasSsyr2_v2(h: cublasHandle_t, uplo: c_int, n: c_int, alpha: *const f32, x: *const f32, incx: c_int, y: *const f32, incy: c_int, a: *mut f32, lda: c_int) { syr(h, uplo, n, alpha, x, incx, y, incy, a, lda, true) }
+    fn cublasSgemvStridedBatched(h: cublasHandle_t, t: c_int, m: c_int, n: c_int, alpha: *const f32, a: *const f32, lda: c_int, sa: i64, x: *const f32, incx: c_int, sx: i64, beta: *const f32, y: *mut f32, incy: c_int, sy: i64, batch: c_int) { gemv_sb(h, t, m, n, alpha, a, lda, sa, x, incx, sx, beta, y, incy, sy, batch) }
+    fn cublasSgemvBatched(h: cublasHandle_t, t: c_int, m: c_int, n: c_int, alpha: *const f32, a: *const *const f32, lda: c_int, x: *const *const f32, incx: c_int, beta: *const f32, y: *const *mut f32, incy: c_int, batch: c_int) { for i in 0..batch.max(0) { gemv_sb(h, t, m, n, alpha, ptrs(a as _, i)? as *const f32, lda, 0, ptrs(x as _, i)? as *const f32, incx, 0, beta, ptrs(y as _, i)? as *mut f32, incy, 0, 1)?; } if batch < 0 { return Err(CUBLAS_STATUS_INVALID_VALUE); } Ok(()) }
+    fn cublasSsymv_v2(h: cublasHandle_t, uplo: c_int, n: c_int, alpha: *const f32, a: *const f32, lda: c_int, x: *const f32, incx: c_int, beta: *const f32, y: *mut f32, incy: c_int) { symv(h, G_FULL, uplo, n, 0, alpha, a, lda, x, incx, beta, y, incy) }
+    fn cublasSsbmv_v2(h: cublasHandle_t, uplo: c_int, n: c_int, k: c_int, alpha: *const f32, a: *const f32, lda: c_int, x: *const f32, incx: c_int, beta: *const f32, y: *mut f32, incy: c_int) { symv(h, G_BAND, uplo, n, k, alpha, a, lda, x, incx, beta, y, incy) }
+    fn cublasSspmv_v2(h: cublasHandle_t, uplo: c_int, n: c_int, alpha: *const f32, ap: *const f32, x: *const f32, incx: c_int, beta: *const f32, y: *mut f32, incy: c_int) { symv(h, G_PACKED, uplo, n, 0, alpha, ap, 1, x, incx, beta, y, incy) }
+    fn cublasSgbmv_v2(h: cublasHandle_t, t: c_int, m: c_int, n: c_int, kl: c_int, ku: c_int, alpha: *const f32, a: *const f32, lda: c_int, x: *const f32, incx: c_int, beta: *const f32, y: *mut f32, incy: c_int) { gbmv(h, t, m, n, kl, ku, alpha, a, lda, x, incx, beta, y, incy) }
+    fn cublasStrmv_v2(h: cublasHandle_t, uplo: c_int, t: c_int, diag: c_int, n: c_int, a: *const f32, lda: c_int, x: *mut f32, incx: c_int) { trmv(h, G_FULL, uplo, t, diag, n, 0, a, lda, x, incx) }
+    fn cublasStbmv_v2(h: cublasHandle_t, uplo: c_int, t: c_int, diag: c_int, n: c_int, k: c_int, a: *const f32, lda: c_int, x: *mut f32, incx: c_int) { trmv(h, G_BAND, uplo, t, diag, n, k, a, lda, x, incx) }
+    fn cublasStpmv_v2(h: cublasHandle_t, uplo: c_int, t: c_int, diag: c_int, n: c_int, ap: *const f32, x: *mut f32, incx: c_int) { trmv(h, G_PACKED, uplo, t, diag, n, 0, ap, 1, x, incx) }
+    fn cublasStrsv_v2(h: cublasHandle_t, uplo: c_int, t: c_int, diag: c_int, n: c_int, a: *const f32, lda: c_int, x: *mut f32, incx: c_int) { trsv(h, G_FULL, uplo, t, diag, n, 0, a, lda, x, incx) }
+    fn cublasStbsv_v2(h: cublasHandle_t, uplo: c_int, t: c_int, diag: c_int, n: c_int, k: c_int, a: *const f32, lda: c_int, x: *mut f32, incx: c_int) { trsv(h, G_BAND, uplo, t, diag, n, k, a, lda, x, incx) }
+    fn cublasStpsv_v2(h: cublasHandle_t, uplo: c_int, t: c_int, diag: c_int, n: c_int, ap: *const f32, x: *mut f32, incx: c_int) { trsv(h, G_PACKED, uplo, t, diag, n, 0, ap, 1, x, incx) }
+    fn cublasSsymm_v2(h: cublasHandle_t, side: c_int, uplo: c_int, m: c_int, n: c_int, alpha: *const f32, a: *const f32, lda: c_int, b: *const f32, ldb: c_int, beta: *const f32, c: *mut f32, ldc: c_int) { symm(h, side, uplo, m, n, alpha, a, lda, b, ldb, beta, c, ldc) }
+    fn cublasSsyrk_v2(h: cublasHandle_t, uplo: c_int, t: c_int, n: c_int, k: c_int, alpha: *const f32, a: *const f32, lda: c_int, beta: *const f32, c: *mut f32, ldc: c_int) { syrk(h, uplo, t, n, k, alpha, a, lda, a, lda, beta, c, ldc, false) }
+    fn cublasSsyr2k_v2(h: cublasHandle_t, uplo: c_int, t: c_int, n: c_int, k: c_int, alpha: *const f32, a: *const f32, lda: c_int, b: *const f32, ldb: c_int, beta: *const f32, c: *mut f32, ldc: c_int) { syrk(h, uplo, t, n, k, alpha, a, lda, b, ldb, beta, c, ldc, true) }
+    fn cublasSsyrkx(h: cublasHandle_t, uplo: c_int, t: c_int, n: c_int, k: c_int, alpha: *const f32, a: *const f32, lda: c_int, b: *const f32, ldb: c_int, beta: *const f32, c: *mut f32, ldc: c_int) { syrk(h, uplo, t, n, k, alpha, a, lda, b, ldb, beta, c, ldc, false) }
+    fn cublasStrmm_v2(h: cublasHandle_t, side: c_int, uplo: c_int, t: c_int, diag: c_int, m: c_int, n: c_int, alpha: *const f32, a: *const f32, lda: c_int, b: *const f32, ldb: c_int, c: *mut f32, ldc: c_int) { trmm(h, side, uplo, t, diag, m, n, alpha, a, lda, b, ldb, c, ldc) }
+    fn cublasStrsm_v2(h: cublasHandle_t, side: c_int, uplo: c_int, t: c_int, diag: c_int, m: c_int, n: c_int, alpha: *const f32, a: *const f32, lda: c_int, b: *mut f32, ldb: c_int) { trsm(h, side, uplo, t, diag, m, n, alpha, a, lda, b, ldb) }
+    fn cublasStrsmBatched(h: cublasHandle_t, side: c_int, uplo: c_int, t: c_int, diag: c_int, m: c_int, n: c_int, alpha: *const f32, a: *const *const f32, lda: c_int, b: *const *mut f32, ldb: c_int, batch: c_int) { if batch < 0 { return Err(CUBLAS_STATUS_INVALID_VALUE); } for i in 0..batch { trsm(h, side, uplo, t, diag, m, n, alpha, ptrs(a as _, i)? as *const f32, lda, ptrs(b as _, i)? as *mut f32, ldb)?; } Ok(()) }
+    fn cublasSgeam(h: cublasHandle_t, ta: c_int, tb: c_int, m: c_int, n: c_int, alpha: *const f32, a: *const f32, lda: c_int, beta: *const f32, b: *const f32, ldb: c_int, c: *mut f32, ldc: c_int) { geam(h, ta, tb, m, n, alpha, a, lda, beta, b, ldb, c, ldc) }
+    fn cublasSdgmm(h: cublasHandle_t, side: c_int, m: c_int, n: c_int, a: *const f32, lda: c_int, x: *const f32, incx: c_int, c: *mut f32, ldc: c_int) { dgmm(h, side, m, n, a, lda, x, incx, c, ldc) }
+    fn cublasDrot_v2(h: cublasHandle_t, n: c_int, x: *mut f64, incx: c_int, y: *mut f64, incy: c_int, c: *const f64, s: *const f64) { check(h)?; let (c, s) = (scalar(h, c)?, scalar(h, s)?); rot(h, n, x, incx, y, incy, [c, -s, s, c]) }
+    fn cublasDrotg_v2(h: cublasHandle_t, a: *mut f64, b: *mut f64, c: *mut f64, s: *mut f64) { rotg(h, a, b, c, s) }
+    fn cublasDrotm_v2(h: cublasHandle_t, n: c_int, x: *mut f64, incx: c_int, y: *mut f64, incy: c_int, param: *const f64) { rotm(h, n, x, incx, y, incy, param) }
+    fn cublasDrotmg_v2(h: cublasHandle_t, d1: *mut f64, d2: *mut f64, x1: *mut f64, y1: *const f64, param: *mut f64) { rotmg(h, d1, d2, x1, y1, param) }
+    fn cublasDger_v2(h: cublasHandle_t, m: c_int, n: c_int, alpha: *const f64, x: *const f64, incx: c_int, y: *const f64, incy: c_int, a: *mut f64, lda: c_int) { ger(h, m, n, alpha, x, incx, y, incy, a, lda) }
+    fn cublasDsyr_v2(h: cublasHandle_t, uplo: c_int, n: c_int, alpha: *const f64, x: *const f64, incx: c_int, a: *mut f64, lda: c_int) { syr(h, uplo, n, alpha, x, incx, x, incx, a, lda, false) }
+    fn cublasDsyr2_v2(h: cublasHandle_t, uplo: c_int, n: c_int, alpha: *const f64, x: *const f64, incx: c_int, y: *const f64, incy: c_int, a: *mut f64, lda: c_int) { syr(h, uplo, n, alpha, x, incx, y, incy, a, lda, true) }
+    fn cublasDgemvStridedBatched(h: cublasHandle_t, t: c_int, m: c_int, n: c_int, alpha: *const f64, a: *const f64, lda: c_int, sa: i64, x: *const f64, incx: c_int, sx: i64, beta: *const f64, y: *mut f64, incy: c_int, sy: i64, batch: c_int) { gemv_sb(h, t, m, n, alpha, a, lda, sa, x, incx, sx, beta, y, incy, sy, batch) }
+    fn cublasDgemvBatched(h: cublasHandle_t, t: c_int, m: c_int, n: c_int, alpha: *const f64, a: *const *const f64, lda: c_int, x: *const *const f64, incx: c_int, beta: *const f64, y: *const *mut f64, incy: c_int, batch: c_int) { for i in 0..batch.max(0) { gemv_sb(h, t, m, n, alpha, ptrs(a as _, i)? as *const f64, lda, 0, ptrs(x as _, i)? as *const f64, incx, 0, beta, ptrs(y as _, i)? as *mut f64, incy, 0, 1)?; } if batch < 0 { return Err(CUBLAS_STATUS_INVALID_VALUE); } Ok(()) }
+    fn cublasDsymv_v2(h: cublasHandle_t, uplo: c_int, n: c_int, alpha: *const f64, a: *const f64, lda: c_int, x: *const f64, incx: c_int, beta: *const f64, y: *mut f64, incy: c_int) { symv(h, G_FULL, uplo, n, 0, alpha, a, lda, x, incx, beta, y, incy) }
+    fn cublasDsbmv_v2(h: cublasHandle_t, uplo: c_int, n: c_int, k: c_int, alpha: *const f64, a: *const f64, lda: c_int, x: *const f64, incx: c_int, beta: *const f64, y: *mut f64, incy: c_int) { symv(h, G_BAND, uplo, n, k, alpha, a, lda, x, incx, beta, y, incy) }
+    fn cublasDspmv_v2(h: cublasHandle_t, uplo: c_int, n: c_int, alpha: *const f64, ap: *const f64, x: *const f64, incx: c_int, beta: *const f64, y: *mut f64, incy: c_int) { symv(h, G_PACKED, uplo, n, 0, alpha, ap, 1, x, incx, beta, y, incy) }
+    fn cublasDgbmv_v2(h: cublasHandle_t, t: c_int, m: c_int, n: c_int, kl: c_int, ku: c_int, alpha: *const f64, a: *const f64, lda: c_int, x: *const f64, incx: c_int, beta: *const f64, y: *mut f64, incy: c_int) { gbmv(h, t, m, n, kl, ku, alpha, a, lda, x, incx, beta, y, incy) }
+    fn cublasDtrmv_v2(h: cublasHandle_t, uplo: c_int, t: c_int, diag: c_int, n: c_int, a: *const f64, lda: c_int, x: *mut f64, incx: c_int) { trmv(h, G_FULL, uplo, t, diag, n, 0, a, lda, x, incx) }
+    fn cublasDtbmv_v2(h: cublasHandle_t, uplo: c_int, t: c_int, diag: c_int, n: c_int, k: c_int, a: *const f64, lda: c_int, x: *mut f64, incx: c_int) { trmv(h, G_BAND, uplo, t, diag, n, k, a, lda, x, incx) }
+    fn cublasDtpmv_v2(h: cublasHandle_t, uplo: c_int, t: c_int, diag: c_int, n: c_int, ap: *const f64, x: *mut f64, incx: c_int) { trmv(h, G_PACKED, uplo, t, diag, n, 0, ap, 1, x, incx) }
+    fn cublasDtrsv_v2(h: cublasHandle_t, uplo: c_int, t: c_int, diag: c_int, n: c_int, a: *const f64, lda: c_int, x: *mut f64, incx: c_int) { trsv(h, G_FULL, uplo, t, diag, n, 0, a, lda, x, incx) }
+    fn cublasDtbsv_v2(h: cublasHandle_t, uplo: c_int, t: c_int, diag: c_int, n: c_int, k: c_int, a: *const f64, lda: c_int, x: *mut f64, incx: c_int) { trsv(h, G_BAND, uplo, t, diag, n, k, a, lda, x, incx) }
+    fn cublasDtpsv_v2(h: cublasHandle_t, uplo: c_int, t: c_int, diag: c_int, n: c_int, ap: *const f64, x: *mut f64, incx: c_int) { trsv(h, G_PACKED, uplo, t, diag, n, 0, ap, 1, x, incx) }
+    fn cublasDsymm_v2(h: cublasHandle_t, side: c_int, uplo: c_int, m: c_int, n: c_int, alpha: *const f64, a: *const f64, lda: c_int, b: *const f64, ldb: c_int, beta: *const f64, c: *mut f64, ldc: c_int) { symm(h, side, uplo, m, n, alpha, a, lda, b, ldb, beta, c, ldc) }
+    fn cublasDsyrk_v2(h: cublasHandle_t, uplo: c_int, t: c_int, n: c_int, k: c_int, alpha: *const f64, a: *const f64, lda: c_int, beta: *const f64, c: *mut f64, ldc: c_int) { syrk(h, uplo, t, n, k, alpha, a, lda, a, lda, beta, c, ldc, false) }
+    fn cublasDsyr2k_v2(h: cublasHandle_t, uplo: c_int, t: c_int, n: c_int, k: c_int, alpha: *const f64, a: *const f64, lda: c_int, b: *const f64, ldb: c_int, beta: *const f64, c: *mut f64, ldc: c_int) { syrk(h, uplo, t, n, k, alpha, a, lda, b, ldb, beta, c, ldc, true) }
+    fn cublasDsyrkx(h: cublasHandle_t, uplo: c_int, t: c_int, n: c_int, k: c_int, alpha: *const f64, a: *const f64, lda: c_int, b: *const f64, ldb: c_int, beta: *const f64, c: *mut f64, ldc: c_int) { syrk(h, uplo, t, n, k, alpha, a, lda, b, ldb, beta, c, ldc, false) }
+    fn cublasDtrmm_v2(h: cublasHandle_t, side: c_int, uplo: c_int, t: c_int, diag: c_int, m: c_int, n: c_int, alpha: *const f64, a: *const f64, lda: c_int, b: *const f64, ldb: c_int, c: *mut f64, ldc: c_int) { trmm(h, side, uplo, t, diag, m, n, alpha, a, lda, b, ldb, c, ldc) }
+    fn cublasDtrsm_v2(h: cublasHandle_t, side: c_int, uplo: c_int, t: c_int, diag: c_int, m: c_int, n: c_int, alpha: *const f64, a: *const f64, lda: c_int, b: *mut f64, ldb: c_int) { trsm(h, side, uplo, t, diag, m, n, alpha, a, lda, b, ldb) }
+    fn cublasDtrsmBatched(h: cublasHandle_t, side: c_int, uplo: c_int, t: c_int, diag: c_int, m: c_int, n: c_int, alpha: *const f64, a: *const *const f64, lda: c_int, b: *const *mut f64, ldb: c_int, batch: c_int) { if batch < 0 { return Err(CUBLAS_STATUS_INVALID_VALUE); } for i in 0..batch { trsm(h, side, uplo, t, diag, m, n, alpha, ptrs(a as _, i)? as *const f64, lda, ptrs(b as _, i)? as *mut f64, ldb)?; } Ok(()) }
+    fn cublasDgeam(h: cublasHandle_t, ta: c_int, tb: c_int, m: c_int, n: c_int, alpha: *const f64, a: *const f64, lda: c_int, beta: *const f64, b: *const f64, ldb: c_int, c: *mut f64, ldc: c_int) { geam(h, ta, tb, m, n, alpha, a, lda, beta, b, ldb, c, ldc) }
+    fn cublasDdgmm(h: cublasHandle_t, side: c_int, m: c_int, n: c_int, a: *const f64, lda: c_int, x: *const f64, incx: c_int, c: *mut f64, ldc: c_int) { dgmm(h, side, m, n, a, lda, x, incx, c, ldc) }
 }
 
 /// rows x cols elements of `elem` bytes, element (i, j) at i * inc + j * ld (in elements) on both sides; the

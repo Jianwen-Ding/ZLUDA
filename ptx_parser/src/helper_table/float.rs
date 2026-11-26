@@ -279,11 +279,26 @@ fn divsqrt<'i>(base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
         .build()
 }
 
+/// neg / abs{.ftz}.{f32,f16,bf16,f16x2,bf16x2}: flush, then the sign bit
+fn negabs<'i>(base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
+    let (code, pk, w) = ftype(m.last()?)?;
+    if code == 0 || ops.len() != 2 || m.iter().any(|x| *x != "ftz" && ftype(x).is_none()) {
+        return None;
+    }
+    let ctrl = (base == "abs") as u64 | code << 4 | (pk as u64) << 8 | (m.contains(&"ftz") as u64) << 12;
+    Call::new(format!("fnegabs_{w}"))
+        .dst(ops[0].op.clone(), bits(w))
+        .src(cvt::fimm(ops[1].op.clone(), if pk { 0 } else { w }), bits(w))
+        .imm(ctrl)
+        .build()
+}
+
 pub(super) fn lower<'i>(_opcode: &str, base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
     match base {
         "add" | "sub" | "mul" | "fma" | "min" | "max" => arith(base, m, ops),
         "set" | "setp" => compare(base, m, ops),
         "div" | "sqrt" | "rcp" => divsqrt(base, m, ops),
+        "neg" | "abs" => negabs(base, m, ops),
         _ => None,
     }
 }
@@ -300,6 +315,8 @@ pub(super) fn preempts(_opcode: &str, base: &str, m: &[&str]) -> bool {
         "add" | "sub" | "mul" | "fma" => m.iter().any(half),
         // min / max: .ftz .NaN .xorsign .abs (llvm.canonicalize is not available), halves, f64 NaN payloads
         "min" | "max" => m.iter().any(half) || m.contains(&"f64") || any(&["ftz", "NaN", "xorsign", "abs"]),
+        // neg / abs .ftz (llvm.canonicalize is not available)
+        "neg" | "abs" => m.contains(&"ftz"),
         // f32 division and square root with a directed rounding or .ftz (exact, with subnormals)
         "div" | "sqrt" | "rcp" => {
             m.last() == Some(&"f32") && !any(&["approx", "full"]) && any(&["rz", "rm", "rp", "ftz", "sat"])

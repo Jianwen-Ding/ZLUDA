@@ -482,3 +482,20 @@
         XF v = op == 1 ? xf_sqrt(x, 24) : xf_div(x, y, 24);
         return (uint32_t)xfin(v, T_F32, rm, f_pf(ctrl, T_F32), 0, 0, false);
     }
+
+    // neg / abs{.ftz}: ctrl 0 abs, 4-7 type, 8 packed, 12 .ftz
+    static inline uint64_t f_negabs(uint64_t a, uint32_t ctrl)
+    {
+        uint32_t t = (ctrl >> 4) & 15;
+        if (ctrl & F_FTZ)
+            a = flush_bits(a, t);
+        return (ctrl & 1) ? a & (t_signbit(t) - 1) : a ^ t_signbit(t);
+    }
+    static inline uint64_t f_negabs_v(uint64_t a, uint32_t ctrl)
+    {
+        if (!(ctrl & F_PK))
+            return f_negabs(a, ctrl);
+        return f_negabs(a & 0xFFFF, ctrl) | (f_negabs(a >> 16, ctrl) << 16);
+    }
+    uint16_t FUNC(fnegabs_16)(uint16_t a, uint32_t ctrl) { return (uint16_t)f_negabs_v(a, ctrl); }
+    uint32_t FUNC(fnegabs_32)(uint32_t a, uint32_t ctrl) { return (uint32_t)f_negabs_v(a, ctrl); }

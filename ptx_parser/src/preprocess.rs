@@ -11,13 +11,14 @@
 use std::borrow::Cow;
 
 pub fn preprocess(text: &str) -> Cow<'_, str> {
-    if !needs_work(text) {
+    if !needs_work(text) && !super::preprocess_calls::needs_work(text) {
         return Cow::Borrowed(text);
     }
     let s = drop_directives(text);
     let s = fold_expressions(&s);
     let s = expand_param_names(&s);
     let s = array_operands(&s);
+    let s = if super::preprocess_calls::needs_work(&s) { super::preprocess_calls::rewrite(&s) } else { s };
     Cow::Owned(s)
 }
 

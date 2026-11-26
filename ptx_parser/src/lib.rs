@@ -23,6 +23,7 @@ mod ast;
 mod helper_table;
 mod helpers;
 mod preprocess;
+mod preprocess_calls;
 pub use preprocess::preprocess;
 pub use ast::*;
 

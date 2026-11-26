@@ -226,11 +226,11 @@ def gemv(p, t):
            ix=idx("ix", "xo", "j", "xi").replace("      %", "          %"), iy=idx("iy", "yo", "r", "yi"))
 
 
-def gemm(name, ta, tb, tc, tacc):
+def gemm(name, ta, tb, tc, tacc, T=4):
     """C = alpha op(A) op(B) + beta C, column-major, batched over grid z (strides in elements between matrices).
     op(A) is m x k: A(i, l) = A[ao + i ars + l acs]; op(B) k x n: B(l, j) = B[bo + l brs + j bcs];
-    C(i, j) = C[co + i + j ldc]. 2D blocks; each thread computes a 4 x 4 tile of C (rows i0 + 0..3 * by, columns
-    j0 + 0..3 * bx... see below), accumulating in tacc."""
+    C(i, j) = C[co + i + j ldc]. 2D blocks; each thread computes a T x T tile of C (rows i0 + r dx, columns j0 + q dy
+    for r, q < T), accumulating in tacc."""
     def ld(mem, t, i):
         v = "memref.load %{m}[%{i}] : memref<?x{t}, 1>".format(m=mem, i=i, t=t)
         return v
@@ -254,9 +254,9 @@ def gemm(name, ta, tb, tc, tacc):
       %dyi = arith.index_cast %dy : index to i32
       %c0 = arith.constant 0 : i32
       %c1 = arith.constant 1 : i32
-      %c4 = arith.constant 4 : i32
+      %c4 = arith.constant {T} : i32
       %zero = arith.constant 0.0 : {acc}
-      // the block covers 4 dx rows and 4 dy columns; thread (tx, ty) rows i0 + r dx, columns j0 + q dy
+      // the block covers T dx rows and T dy columns; thread (tx, ty) rows i0 + r dx, columns j0 + q dy
       %rb = arith.muli %bxi, %dxi : i32
       %rb4 = arith.muli %rb, %c4 : i32
       %i0 = arith.addi %rb4, %txi : i32
@@ -268,10 +268,10 @@ def gemm(name, ta, tb, tc, tacc):
       %zsb = arith.muli %bzi, %sb : i32
       %bbase = arith.addi %bo, %zsb : i32
       %zsc = arith.muli %bzi, %sc : i32
-      %cbase = arith.addi %co, %zsc : i32""".format(n=name, ta=ta, tb=tb, tc=tc, acc=tacc))
+      %cbase = arith.addi %co, %zsc : i32""".format(n=name, ta=ta, tb=tb, tc=tc, acc=tacc, T=T))
     # rows and columns, clamped for the loads (results stored only in range)
     w("      %mm1 = arith.subi %m, %c1 : i32\n      %nm1 = arith.subi %n, %c1 : i32")
-    for r in range(4):
+    for r in range(T):
         w("""      %cr{r} = arith.constant {r} : i32
       %ro{r} = arith.muli %cr{r}, %dxi : i32
       %row{r} = arith.addi %i0, %ro{r} : i32
@@ -283,11 +283,11 @@ def gemm(name, ta, tb, tc, tacc):
       %colc{r} = arith.minsi %col{r}, %nm1 : i32
       %cofs{r} = arith.muli %colc{r}, %bcs : i32
       %bcol{r} = arith.addi %bbase, %cofs{r} : i32""".format(r=r))
-    accs = ["%%acc%d%d" % (r, q) for r in range(4) for q in range(4)]
-    w("      %%res:16 = scf.for %%l = %%c0 to %%k step %%c1 iter_args(%s) -> (%s) : i32 {" % (
-        ", ".join("%s = %%zero" % a.replace("%acc", "%s") for a in accs), ", ".join([tacc] * 16)))
+    accs = ["%%acc%d%d" % (r, q) for r in range(T) for q in range(T)]
+    w("      %%res:%d = scf.for %%l = %%c0 to %%k step %%c1 iter_args(%s) -> (%s) : i32 {" % (
+        T * T, ", ".join("%s = %%zero" % a.replace("%acc", "%s") for a in accs), ", ".join([tacc] * (T * T))))
     w("        %la = arith.muli %l, %acs : i32\n        %lb = arith.muli %l, %brs : i32")
-    for r in range(4):
+    for r in range(T):
         w("        %%ai%d = arith.addi %%arow%d, %%la : i32\n        %%aix%d = arith.index_cast %%ai%d : i32 to index" % (r, r, r, r))
         w("        %%av%d_ = %s" % (r, ld("a", ta, "aix%d" % r)))
         w("        %%av%d = %s" % (r, ext(ta).format(v="av%d_" % r)) if ext(ta) else "        %%av%d = arith.addf %%av%d_, %%zero : %s" % (r, r, tacc))
@@ -295,15 +295,15 @@ def gemm(name, ta, tb, tc, tacc):
         w("        %%bv%d_ = %s" % (r, ld("b", tb, "bix%d" % r)))
         w("        %%bv%d = %s" % (r, ext(tb).format(v="bv%d_" % r)) if ext(tb) else "        %%bv%d = arith.addf %%bv%d_, %%zero : %s" % (r, r, tacc))
     outs = []
-    for r in range(4):
-        for q in range(4):
+    for r in range(T):
+        for q in range(T):
             w("        %%n%d%d = math.fma %%av%d, %%bv%d, %%s%d%d : %s" % (r, q, r, q, r, q, tacc))
             outs.append("%%n%d%d" % (r, q))
-    w("        scf.yield %s : %s\n      }" % (", ".join(outs), ", ".join([tacc] * 16)))
+    w("        scf.yield %s : %s\n      }" % (", ".join(outs), ", ".join([tacc] * (T * T))))
     w("      %bzero = arith.cmpf oeq, %beta, %zero : " + tacc)
-    for r in range(4):
-        for q in range(4):
-            j = r * 4 + q
+    for r in range(T):
+        for q in range(T):
+            j = r * T + q
             w("""      %inr{r}{q} = arith.cmpi slt, %row{r}, %m : i32
       %inc{r}{q} = arith.cmpi slt, %col{q}, %n : i32
       %in{r}{q} = arith.andi %inr{r}{q}, %inc{r}{q} : i1
@@ -1105,12 +1105,81 @@ def cgemm(p, t, tile):
     return "\n".join(w)
 
 
+def cvt(a, b):
+    """dst (b) = src (a) for an m x n matrix: src(i, j) = src[so + i + j sld], likewise dst (f16 / bf16 <-> f32),
+    batched over grid z (ss / ds elements apart)"""
+    conv = ("arith.extf %v : {a} to {b}" if a != "f32" else "arith.truncf %v : {a} to {b}").format(a=a, b=b)
+    return """    gpu.func @cvt_{a}_{b}(%m: i32, %n: i32, %s: memref<?x{a}, 1>, %so: i32, %sld: i32, %ss: i32, %d: memref<?x{b}, 1>, %do: i32, %dld: i32, %ds: i32) kernel {{
+{g2d}{bz}      %inm = arith.cmpi slt, %i, %m : i32
+      scf.if %inm {{
+        %si = arith.addi %sb, %i : i32
+        %di = arith.addi %db, %i : i32
+        scf.for %j = %j0 to %n step %js : i32 {{
+          %sj = arith.muli %j, %sld : i32
+          %s1 = arith.addi %si, %sj : i32
+          %sx = arith.index_cast %s1 : i32 to index
+          %v = memref.load %s[%sx] : memref<?x{a}, 1>
+          %r = {conv}
+          %dj = arith.muli %j, %dld : i32
+          %d1 = arith.addi %di, %dj : i32
+          %dx_ = arith.index_cast %d1 : i32 to index
+          memref.store %r, %d[%dx_] : memref<?x{b}, 1>
+        }}
+      }}
+      gpu.return
+    }}
+""".format(a=a, b=b, g2d=g2d(), conv=conv, bz=BZ)
+
+
+BZ = """      %bzx = gpu.block_id z
+      %bzz = arith.index_cast %bzx : index to i32
+      %zs = arith.muli %bzz, %ss : i32
+      %sb = arith.addi %so, %zs : i32
+      %zd = arith.muli %bzz, %ds : i32
+      %db = arith.addi %do, %zd : i32
+"""
+
+
+def pad(t):
+    """dst (mp x np, dst(i, j) = dst[do + i + j dld]) = the m x n src (src(i, j) = src[so + i srs + j scs]) and zeros
+    beyond it: a GEMM operand padded to the SIMD-group matrix kernel's tiles; batched over grid z"""
+    return """    gpu.func @pad_{t}(%mp: i32, %np: i32, %m: i32, %n: i32, %s: memref<?x{t}, 1>, %so: i32, %srs: i32, %scs: i32, %ss: i32, %d: memref<?x{t}, 1>, %do: i32, %dld: i32, %ds: i32) kernel {{
+{g2d}{bz}      %zero = arith.constant 0.0 : {t}
+      %inm = arith.cmpi slt, %i, %mp : i32
+      %inr = arith.cmpi slt, %i, %m : i32
+      scf.if %inm {{
+        %ir = arith.muli %i, %srs : i32
+        %si = arith.addi %sb, %ir : i32
+        %di = arith.addi %db, %i : i32
+        scf.for %j = %j0 to %np step %js : i32 {{
+          %inc = arith.cmpi slt, %j, %n : i32
+          %in = arith.andi %inr, %inc : i1
+          %v = scf.if %in -> ({t}) {{
+            %sj = arith.muli %j, %scs : i32
+            %s1 = arith.addi %si, %sj : i32
+            %sx = arith.index_cast %s1 : i32 to index
+            %lv = memref.load %s[%sx] : memref<?x{t}, 1>
+            scf.yield %lv : {t}
+          }} else {{
+            scf.yield %zero : {t}
+          }}
+          %dj = arith.muli %j, %dld : i32
+          %d1 = arith.addi %di, %dj : i32
+          %dx_ = arith.index_cast %d1 : i32 to index
+          memref.store %v, %d[%dx_] : memref<?x{t}, 1>
+        }}
+      }}
+      gpu.return
+    }}
+""".format(t=t, g2d=g2d(), bz=BZ)
+
+
 def main():
     out = [hdr()]
     for p, t in TYPES.items():
         for f in (axpy, scal, copy_swap, reduce, amax, rot, ger, geam, trsv, gemv_n, gemv_t):
             out.append(f(p, t))
-        out.append(gemm(p + "gemm", t, t, t, t))
+        out.append(gemm(p + "gemm", t, t, t, t, 2 if t == "f64" else 4))
     for p, t, tile in (("c", "f32", 2), ("z", "f64", 1)):
         for f in (caxpy, creduce, cgemv):
             out.append(f(p, t))
@@ -1119,6 +1188,11 @@ def main():
     for a in ("f16", "bf16"):
         for c in (a, "f32"):
             out.append(gemm("gemm_%s_%s" % (a, c), a, a, c, "f32"))
+    for h in ("f16", "bf16"):
+        out.append(cvt(h, "f32"))
+        out.append(cvt("f32", h))
+    for t in ("f32", "f16", "bf16"):
+        out.append(pad(t))
     for a in ("f32", "f16", "bf16"):
         out.append(gemm_mma("gemm_mma_%s" % a, a))
         out.append(gemm_mma("gemm_mma32_%s" % a, a, 4, 4))

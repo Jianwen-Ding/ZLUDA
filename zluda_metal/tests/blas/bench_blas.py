@@ -110,13 +110,14 @@ class B:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--lib", default=os.path.join(HERE, "..", "..", "target", "release", "libzluda_metal.so"))
-    ap.add_argument("-k")
+    ap.add_argument("-k", action="append", help="only the cases containing one of these")
+    ap.add_argument("-x", action="append", help="not the cases containing one of these")
     ap.add_argument("--json")
     a = ap.parse_args()
     b = B(a.lib)
     res = {}
     for name, run in cases():
-        if a.k and a.k not in name:
+        if (a.k and not any(k in name for k in a.k)) or (a.x and any(x in name for x in a.x)):
             continue
         open(STATS, "w").close()
         st = run(b)

@@ -333,8 +333,10 @@ unsafe fn gemv<T: Elem>(h: cublasHandle_t, trans: c_int, m: c_int, n: c_int, alp
     gemv_sb(h, trans, m, n, alpha, a, lda, 0, x, incx, 0, beta, y, incy, 0, 1)
 }
 
-/// One GEMM launch (a batch of `batch` matrices `sa` / `sb` / `sc` elements apart): kernel `name`, alpha and beta
-/// as the accumulation type's bytes
+/// A GEMM (a batch of `batch` matrices `sa` / `sb` / `sc` elements apart): kernel `name`, alpha and beta as the
+/// accumulation type's bytes. Float outputs run on the SIMD-group matrix kernel for the part of C that is a
+/// multiple of its tile (and k of 8), the register-tiled kernel on the rest (the remaining k, the bottom rows and
+/// the right columns); f16 / bf16 outputs through an f32 copy of C.
 unsafe fn gemm_launch(name: &str, ta: c_int, tb: c_int, m: c_int, n: c_int, k: c_int, alpha: Vec<u8>, a: u64,
                       lda: c_int, sa: i64, b: u64, ldb: c_int, sb: i64, beta: Vec<u8>, c: u64, ldc: c_int, sc: i64,
                       batch: c_int) -> R {
@@ -350,50 +352,159 @@ unsafe fn gemm_launch(name: &str, ta: c_int, tb: c_int, m: c_int, n: c_int, k: c
     if big(sa) || big(sb) || big(sc) || big(sc * batch as i64) || big(ldc as i64 * n as i64) {
         return Err(fail("matrices beyond 2^31 elements are not supported", CUBLAS_STATUS_NOT_SUPPORTED));
     }
-    let (ars, acs) = strides(ta, lda);
-    let (brs, bcs) = strides(tb, ldb);
-    // the SIMD-group matrix kernel (float C, m and n multiples of 16, k of 8): alpha I and beta I in a buffer
+    let g = Gemm { ta, tb, a, lda, sa, b, ldb, sb, c, ldc, sc, batch };
+    // the SIMD-group matrix kernel: (kernel, operand type, f16 / bf16 C through f32)
     let mma = match name {
-        "sgemm" => Some("gemm_mma_f32"),
-        "gemm_f16_f32" => Some("gemm_mma_f16"),
-        "gemm_bf16_f32" => Some("gemm_mma_bf16"),
+        "sgemm" => Some(("gemm_mma_f32", "f32", None)),
+        "gemm_f16_f32" => Some(("gemm_mma_f16", "f16", None)),
+        "gemm_bf16_f32" => Some(("gemm_mma_bf16", "bf16", None)),
+        "gemm_f16_f16" => Some(("gemm_mma_f16", "f16", Some("f16"))),
+        "gemm_bf16_bf16" => Some(("gemm_mma_bf16", "bf16", Some("bf16"))),
         _ => None,
     };
-    if let Some(mk) = mma.filter(|_| m % 16 == 0 && n % 16 == 0 && k % 8 == 0 && std::env::var_os("ZLUDA_BLAS_NO_MMA").is_none()) {
-        let (al, be) = (f32::from_le_bytes(alpha[..4].try_into().unwrap()), f32::from_le_bytes(beta[..4].try_into().unwrap()));
-        let mut diag = [0f32; 128];
-        for i in 0..8 {
-            diag[i * 9] = al;
-            diag[64 + i * 9] = be;
-        }
-        let d = Tmp::new(512)?;
-        let (p, _) = agx::host_pointer(d.0).ok_or(CUBLAS_STATUS_INTERNAL_ERROR)?;
-        std::ptr::copy_nonoverlapping(diag.as_ptr() as *const u8, p, 512);
-        // 32 x 32 tiles (twice the reuse of each loaded block) where they divide C and still give at least 256
-        // SIMD groups (simulated M2 Max: 256^3 17.3 us with 16 x 16 tiles, 22.3 us with 32 x 32; 512^3 60.1 us /
-        // 46.4 us), else 16 x 16; ZLUDA_BLAS_MMA_TILE=16 / 32 overrides
-        let fits32 = m % 32 == 0 && n % 32 == 0;
-        let tile = match std::env::var("ZLUDA_BLAS_MMA_TILE").as_deref() {
-            Ok("16") => 16,
-            Ok("32") if fits32 => 32,
-            Ok(_) => 16,
-            Err(_) if fits32 && (m as i64 / 32) * (n as i64 / 32) * batch as i64 >= 256 => 32,
-            Err(_) => 16,
-        };
-        let mk = if tile == 32 { mk.replace("gemm_mma_", "gemm_mma32_") } else { mk.to_string() };
-        return launch(&mk, [(m / tile) as u32, (n / tile) as u32, batch as u32], [32, 1, 1], &[
-            i32v(m), i32v(n), i32v(k), Arg::Addr(d.0), Arg::Addr(a), i32v(0), i32v(ars), i32v(acs), i32v(sa as i32),
-            Arg::Addr(b), i32v(0), i32v(brs), i32v(bcs), i32v(sb as i32), i32v((be != 0.0) as i32), Arg::Addr(c),
-            i32v(0), i32v(ldc), i32v(sc as i32),
-        ]);
+    let aligned = m % 16 == 0 && n % 16 == 0 && k % 8 == 0;
+    // padded copies (and f32 staging of a half C) pay for themselves beyond small sizes
+    let worth = (aligned && mma.is_some_and(|x| x.2.is_none())) || m as i64 * n as i64 * k as i64 >= 1 << 17;
+    if let Some((mk, at, half)) = mma.filter(|_| m >= 16 && n >= 16 && k >= 8 && worth && std::env::var_os("ZLUDA_BLAS_NO_MMA").is_none()) {
+        return gemm_mma(mk, at, half, &g, m, n, k, &alpha, &beta);
     }
-    let grid = [(m as u32).div_ceil(64), (n as u32).div_ceil(64), batch as u32];
-    launch(name, grid, [16, 16, 1], &[
-        i32v(m), i32v(n), i32v(k), Arg::Value(alpha), Arg::Addr(a), i32v(0), i32v(ars), i32v(acs), i32v(sa as i32),
-        Arg::Addr(b), i32v(0), i32v(brs), i32v(bcs), i32v(sb as i32), Arg::Value(beta), Arg::Addr(c), i32v(0),
-        i32v(ldc), i32v(sc as i32),
+    gemm_generic(name, &g, m, n, k, &alpha, &beta, 0, 0, 0)
+}
+
+/// The operands of a GEMM (pointers, leading dimensions, batch strides)
+#[derive(Clone, Copy)]
+struct Gemm {
+    ta: c_int,
+    tb: c_int,
+    a: u64,
+    lda: c_int,
+    sa: i64,
+    b: u64,
+    ldb: c_int,
+    sb: i64,
+    c: u64,
+    ldc: c_int,
+    sc: i64,
+    batch: c_int,
+}
+
+fn round_up(v: i32, t: i32) -> i32 {
+    (v + t - 1) / t * t
+}
+
+/// The SIMD-group matrix kernel (air.simdgroup_matrix_*: one SIMD group per 16 x 16 or 32 x 32 tile of an f32 C,
+/// k in steps of 8; alpha and beta as products with alpha I / beta I). Shapes it does not tile run on copies padded
+/// with zeros (op(A) to mp x kp, op(B) to kp x np, C to mp x np in f32, also the f32 copy of an f16 / bf16 C).
+unsafe fn gemm_mma(mk: &str, at: &str, half: Option<&str>, g: &Gemm, m: i32, n: i32, k: i32, alpha: &[u8], beta: &[u8]) -> R {
+    let batch = g.batch;
+    // 32 x 32 tiles (twice the reuse of each loaded block) where they still give at least 256 SIMD groups
+    // (simulated M2 Max: 256^3 17.3 us with 16 x 16 tiles, 22.3 us with 32 x 32; 512^3 60.1 us / 46.4 us), else
+    // 16 x 16; ZLUDA_BLAS_MMA_TILE=16 / 32 overrides
+    let t32 = (round_up(m, 32) as i64 / 32) * (round_up(n, 32) as i64 / 32) * batch as i64 >= 256;
+    let tile = match std::env::var("ZLUDA_BLAS_MMA_TILE").as_deref() {
+        Ok("32") => 32,
+        Ok(_) => 16,
+        Err(_) if t32 => 32,
+        Err(_) => 16,
+    };
+    let (mp, np, kp) = (round_up(m, tile), round_up(n, tile), round_up(k, 8));
+    let esz = if at == "f32" { 4 } else { 2 };
+    let (ars, acs) = strides(g.ta, g.lda);
+    let (brs, bcs) = strides(g.tb, g.ldb);
+    // op(A), op(B): as they are, or padded copies (column-major, batch after batch)
+    let operand = |p: u64, rows: i32, cols: i32, rp: i32, cp: i32, rs: i32, cs: i32, st: i64| -> Result<(u64, i32, i32, i64, Option<Tmp>), cublasStatus_t> {
+        if rows == rp && cols == cp {
+            return Ok((p, rs, cs, st, None));
+        }
+        let per = elems(rp, cp)?;
+        elems(per, batch)?;
+        let t = Tmp::new(per as u64 * batch as u64 * esz)?;
+        pad_launch(&format!("pad_{at}"), rp, cp, rows, cols, p, rs, cs, st as i32, t.0, rp, per, batch)?;
+        Ok((t.0, 1, rp, per as i64, Some(t)))
+    };
+    let (pa, pars, pacs, psa, _ka) = operand(g.a, m, k, mp, kp, ars, acs, g.sa)?;
+    let (pb, pbrs, pbcs, psb, _kb) = operand(g.b, k, n, kp, np, brs, bcs, g.sb)?;
+    let (al, be) = (f32::from_le_bytes(alpha[..4].try_into().unwrap()), f32::from_le_bytes(beta[..4].try_into().unwrap()));
+    // C: in place, or an f32 copy (mp x np; its padding is never read back)
+    let staged = half.is_some() || mp != m || np != n;
+    let ct = if staged {
+        let per = elems(mp, np)?;
+        elems(per, batch)?;
+        let t = Tmp::new(per as u64 * batch as u64 * 4)?;
+        if be != 0.0 {
+            match half {
+                Some(h) => cvt_launch(&format!("cvt_{h}_f32"), m, n, g.c, g.ldc, g.sc as i32, t.0, mp, per, batch)?,
+                None => pad_launch("pad_f32", m, n, m, n, g.c, 1, g.ldc, g.sc as i32, t.0, mp, per, batch)?,
+            }
+        }
+        Some((t, per))
+    } else {
+        None
+    };
+    let (pc, pldc, psc) = match &ct {
+        Some((t, per)) => (t.0, mp, *per as i64),
+        None => (g.c, g.ldc, g.sc),
+    };
+    let mut diag = [0f32; 128];
+    for i in 0..8 {
+        diag[i * 9] = al;
+        diag[64 + i * 9] = be;
+    }
+    let d = Tmp::new(512)?;
+    let (p, _) = agx::host_pointer(d.0).ok_or(CUBLAS_STATUS_INTERNAL_ERROR)?;
+    std::ptr::copy_nonoverlapping(diag.as_ptr() as *const u8, p, 512);
+    let mk = if tile == 32 { mk.replace("gemm_mma_", "gemm_mma32_") } else { mk.to_string() };
+    launch(&mk, [(mp / tile) as u32, (np / tile) as u32, batch as u32], [32, 1, 1], &[
+        i32v(mp), i32v(np), i32v(kp), Arg::Addr(d.0), Arg::Addr(pa), i32v(0), i32v(pars), i32v(pacs), i32v(psa as i32),
+        Arg::Addr(pb), i32v(0), i32v(pbrs), i32v(pbcs), i32v(psb as i32), i32v((be != 0.0) as i32), Arg::Addr(pc),
+        i32v(0), i32v(pldc), i32v(psc as i32),
+    ])?;
+    if let Some((t, per)) = &ct {
+        match half {
+            Some(h) => cvt_launch(&format!("cvt_f32_{h}"), m, n, t.0, mp, *per, g.c, g.ldc, g.sc as i32, batch)?,
+            None => pad_launch("pad_f32", m, n, m, n, t.0, 1, mp, *per, g.c, g.ldc, g.sc as i32, batch)?,
+        }
+    }
+    Ok(())
+}
+
+fn grid2(m: i32, n: i32, batch: i32) -> [u32; 3] {
+    [(m as u32).div_ceil(64), ((n as u32).div_ceil(4)).clamp(1, 1024), batch as u32]
+}
+
+/// dst (mp x np, leading dimension dld) = src (m x n, strides srs / scs) and zeros beyond it, per batch
+unsafe fn pad_launch(name: &str, mp: i32, np: i32, m: i32, n: i32, src: u64, srs: i32, scs: i32, ss: i32, dst: u64, dld: i32,
+                     ds: i32, batch: i32) -> R {
+    launch(name, grid2(mp, np, batch), [64, 4, 1], &[
+        i32v(mp), i32v(np), i32v(m), i32v(n), Arg::Addr(src), i32v(0), i32v(srs), i32v(scs), i32v(ss), Arg::Addr(dst),
+        i32v(0), i32v(dld), i32v(ds),
     ])
 }
+
+/// f16 / bf16 <-> f32 copy of an m x n matrix, per batch
+unsafe fn cvt_launch(name: &str, m: i32, n: i32, src: u64, sld: i32, ss: i32, dst: u64, dld: i32, ds: i32, batch: i32) -> R {
+    launch(name, grid2(m, n, batch), [64, 4, 1], &[
+        i32v(m), i32v(n), Arg::Addr(src), i32v(0), i32v(sld), i32v(ss), Arg::Addr(dst), i32v(0), i32v(dld), i32v(ds),
+    ])
+}
+
+/// The register-tiled kernel (4 x 4 elements per thread) on the m x n part of C at element offset co, A and B at
+/// ao / bo; narrow parts get narrower blocks (more of them)
+unsafe fn gemm_generic(name: &str, g: &Gemm, m: i32, n: i32, k: i32, alpha: &[u8], beta: &[u8], ao: i32, bo: i32, co: i32) -> R {
+    let (ars, acs) = strides(g.ta, g.lda);
+    let (brs, bcs) = strides(g.tb, g.ldb);
+    let t = if name == "dgemm" { 2 } else { 4 };
+    // threads along the rows: enough for m (powers of two, 2 to 16), the rest of 256 along the columns
+    let bx = ((m as u32).div_ceil(t)).next_power_of_two().clamp(2, 16);
+    let by = (if (m as u32) < 64 && (n as u32) < 64 { 64 } else { 256 }) / bx;
+    let grid = [(m as u32).div_ceil(t * bx), (n as u32).div_ceil(t * by), g.batch as u32];
+    launch(name, grid, [bx, by, 1], &[
+        i32v(m), i32v(n), i32v(k), Arg::Value(alpha.to_vec()), Arg::Addr(g.a), i32v(ao), i32v(ars), i32v(acs),
+        i32v(g.sa as i32), Arg::Addr(g.b), i32v(bo), i32v(brs), i32v(bcs), i32v(g.sb as i32), Arg::Value(beta.to_vec()),
+        Arg::Addr(g.c), i32v(co), i32v(g.ldc), i32v(g.sc as i32),
+    ])
+}
+
 
 unsafe fn gemm<T: Elem>(h: cublasHandle_t, ta: c_int, tb: c_int, m: c_int, n: c_int, k: c_int, alpha: *const T,
                         a: *const T, lda: c_int, sa: i64, b: *const T, ldb: c_int, sb: i64, beta: *const T, c: *mut T,

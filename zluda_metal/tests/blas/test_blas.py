@@ -846,6 +846,42 @@ for at, ct, m, n, k in (("f16", "f16", 72, 40, 96), ("f16", "f32", 72, 40, 96), 
         return rel(got, want), (2e-5 * np.sqrt(k) if ct == "f32" else (2e-3 if at == "f16" else 1.6e-2))
 
 
+for ta, tb in ((N, N), (T, T)):
+    @case
+    def gemm_padded_batched(b, ta=ta, tb=tb):
+        """odd shapes, transposes and batches through the SIMD-group matrix kernel's padded copies (S, H)"""
+        m, n, k, batch = 50, 41, 70, 3
+        e = 0.0
+        for h in (False, True):
+            dt = np.float16 if h else np.float32
+            ra, ca = (m, k) if ta == N else (k, m)
+            rb, cb = (k, n) if tb == N else (n, k)
+            lda, ldb, ldc = ra + 1, rb + 3, m + 2
+            sa, sb, sc = ca * lda + 5, cb * ldb, n * ldc + 1
+            A = rng.standard_normal(sa * batch).astype(dt)
+            B = rng.standard_normal(sb * batch).astype(dt)
+            C = rng.standard_normal(sc * batch).astype(dt)
+            pa, _ = b.dev(A)
+            pb, _ = b.dev(B)
+            pc, c0 = b.dev(C)
+            if h:
+                al, be = ptr(0x3800, ctypes.c_uint16), ptr(0xB800, ctypes.c_uint16)  # 0.5, -0.5
+                b.call("cublasHgemmStridedBatched", b.h, ta, tb, m, n, k, al[0], c_void_p(pa), lda, c_int64(sa), c_void_p(pb), ldb,
+                       c_int64(sb), be[0], c_void_p(pc), ldc, c_int64(sc), batch)
+            else:
+                al, be = ptr(0.5, ctypes.c_float), ptr(-0.5, ctypes.c_float)
+                b.call("cublasSgemmStridedBatched", b.h, ta, tb, m, n, k, al[0], c_void_p(pa), lda, c_int64(sa), c_void_p(pb), ldb,
+                       c_int64(sb), be[0], c_void_p(pc), ldc, c_int64(sc), batch)
+            want = c0.astype(np.float64).copy()
+            for q in range(batch):
+                Am = A[q * sa:q * sa + ca * lda].astype(np.float64).reshape(ca, lda)[:, :ra].T
+                Bm = B[q * sb:q * sb + cb * ldb].astype(np.float64).reshape(cb, ldb)[:, :rb].T
+                Cv = want[q * sc:q * sc + n * ldc].reshape(n, ldc)
+                Cv[:, :m] = (0.5 * (Am if ta == N else Am.T) @ (Bm if tb == N else Bm.T) - 0.5 * Cv[:, :m].T).T
+            e = max(e, rel(b.get(pc, c0), want) / (100 if h else 1))
+        return e, tol(np.float32, k)
+
+
 @case
 def hgemm(b):
     m, n, k = 50, 30, 64

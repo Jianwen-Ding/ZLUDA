@@ -567,7 +567,12 @@ fn run_instruction<'input>(
             to_call(resolver, fn_declarations, "bmsk_clamp_b32".into(), i)?
         }
         i @ ptx_parser::Instruction::Bar { .. } => {
-            to_call(resolver, fn_declarations, "bar_sync".into(), i)?
+            // bar.sync a, b: the thread count is a second argument
+            let name = match &i {
+                ptx_parser::Instruction::Bar { arguments, .. } if arguments.src2.is_some() => "bar_sync_count",
+                _ => "bar_sync",
+            };
+            to_call(resolver, fn_declarations, name.into(), i)?
         }
         ptx_parser::Instruction::BarRed { data, arguments } => {
             if arguments.src_threadcount.is_some() {

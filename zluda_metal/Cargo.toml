@@ -12,6 +12,7 @@ ptx = { path = "../ptx" }
 ptx_parser = { path = "../ptx_parser" }
 llvm_zluda = { path = "../llvm_zluda" }
 cuda_types = { path = "../cuda_types" }
+agx-sim = { path = "../../AGX-Performance-Simulator/rust" }
 
 [build-dependencies]
 cc = "1.0.69"

@@ -20,6 +20,8 @@ use winnow::{
 use winnow::{prelude::*, Stateful};
 
 mod ast;
+mod helper_table;
+mod helpers;
 pub use ast::*;
 
 impl From<RawMulIntControl> for ast::MulIntControl {
@@ -882,6 +884,9 @@ fn statement<'a, 'input>(
                 Token::Semicolon,
             ),
             predicated_instruction.map(Some),
+            // instructions outside the grammar: helpers.rs / helper_table.rs
+            (opt(pred_at), helpers::helper_instruction, Token::Semicolon)
+                .map(|(p, i, _)| Some(ast::Statement::Instruction(p, i))),
             pragma.map(|_| None),
             block_statement.map(Some),
         )),
@@ -1103,36 +1108,18 @@ fn multi_variable<'a, 'input: 'a>(
     trace(
         "multi_variable",
         move |stream: &mut PtxParser<'a, 'input>| {
-            let (parsed_type, names, count): (_, Vec<_>, _) = (
-                variable_info(state_space),
-                separated(1.., ident, Token::Comma),
-                // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parameterized-variable-names
-                opt(delimited(Token::Lt, u32.verify(|x| *x != 0), Token::Gt)),
-            )
-                .parse_next(stream)?;
+            let parsed_type = variable_info(state_space).parse_next(stream)?;
             let (align, vector, type_) = match parsed_type {
-                ParsedType::Texref => {
-                    if count.is_some() {
-                        return Err(ErrMode::from_error_kind(stream, ErrorKind::Verify));
-                    }
+                ParsedType::Texref | ParsedType::Surfref => {
+                    let names: Vec<_> = separated(1.., ident, Token::Comma).parse_next(stream)?;
                     return Ok(MultiVariable::Names {
                         info: VariableInfo {
                             align: None,
-                            v_type: Type::Texref,
-                            state_space,
-                            array_init: Vec::new(),
-                        },
-                        names,
-                    });
-                }
-                ParsedType::Surfref => {
-                    if count.is_some() {
-                        return Err(ErrMode::from_error_kind(stream, ErrorKind::Verify));
-                    }
-                    return Ok(MultiVariable::Names {
-                        info: VariableInfo {
-                            align: None,
-                            v_type: Type::Surfref,
+                            v_type: if matches!(parsed_type, ParsedType::Texref) {
+                                Type::Texref
+                            } else {
+                                Type::Surfref
+                            },
                             state_space,
                             array_init: Vec::new(),
                         },
@@ -1145,50 +1132,71 @@ fn multi_variable<'a, 'input: 'a>(
                     scalar,
                 } => (align, vector, scalar),
             };
-            if let Some(count) = count {
-                if names.len() > 1 {
-                    // nvcc does not support parameterized variable names in comma-separated lists of names.
-                    return Err(ErrMode::from_error_kind(stream, ErrorKind::Verify));
-                }
-                let name = names[0];
-                return Ok(MultiVariable::Parameterized {
-                    info: VariableInfo {
-                        align,
-                        v_type: Type::maybe_vector_parsed(vector, type_),
-                        state_space,
-                        array_init: Vec::new(),
-                    },
-                    name,
-                    count,
-                });
-            }
-            let array_dimensions = if state_space != StateSpace::Reg {
-                opt(array_dimensions).parse_next(stream)?
-            } else {
-                None
-            };
-            let initializer = match state_space {
-                StateSpace::Global | StateSpace::Const => match array_dimensions {
-                    Some(ref dimensions) => {
-                        array_initializer(type_, vector, dimensions).parse_next(stream)?
+            // A comma-separated list of names, each with its own parameterized count
+            // (`%r<4>`), array dimensions and initializer:
+            // `.reg .b32 %r<4>, %x<2>, t;` `.shared .u32 a[4], b;`
+            let mut items: Vec<MultiVariable<&'input str>> = Vec::new();
+            loop {
+                let name = ident.parse_next(stream)?;
+                // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parameterized-variable-names
+                let count =
+                    opt(delimited(Token::Lt, u32.verify(|x| *x != 0), Token::Gt)).parse_next(stream)?;
+                if let Some(count) = count {
+                    items.push(MultiVariable::Parameterized {
+                        info: VariableInfo {
+                            align,
+                            v_type: Type::maybe_vector_parsed(vector, type_),
+                            state_space,
+                            array_init: Vec::new(),
+                        },
+                        name,
+                        count,
+                    });
+                } else {
+                    let array_dimensions = opt(array_dimensions).parse_next(stream)?;
+                    let initializer = match state_space {
+                        StateSpace::Global | StateSpace::Const => match array_dimensions {
+                            Some(ref dimensions) => {
+                                array_initializer(type_, vector, dimensions).parse_next(stream)?
+                            }
+                            None => value_initializer(type_, vector).parse_next(stream)?,
+                        },
+                        _ => Vec::new(),
+                    };
+                    if let Some(ref dims) = array_dimensions {
+                        if !extern_ && dims[0] == 0 {
+                            return Err(ErrMode::from_error_kind(stream, ErrorKind::Verify));
+                        }
                     }
-                    None => value_initializer(type_, vector).parse_next(stream)?,
-                },
-                _ => Vec::new(),
-            };
-            if let Some(ref dims) = array_dimensions {
-                if !extern_ && dims[0] == 0 {
-                    return Err(ErrMode::from_error_kind(stream, ErrorKind::Verify));
+                    let info = VariableInfo {
+                        align,
+                        v_type: Type::maybe_array(vector, type_, array_dimensions),
+                        state_space,
+                        array_init: initializer,
+                    };
+                    // merge plain names of one type into one Names entry
+                    match items.last_mut() {
+                        Some(MultiVariable::Names { info: prev, names })
+                            if prev.array_init.is_empty()
+                                && info.array_init.is_empty()
+                                && prev.v_type == info.v_type =>
+                        {
+                            names.push(name)
+                        }
+                        _ => items.push(MultiVariable::Names {
+                            info,
+                            names: vec![name],
+                        }),
+                    }
+                }
+                if opt(Token::Comma).parse_next(stream)?.is_none() {
+                    break;
                 }
             }
-            Ok(MultiVariable::Names {
-                info: VariableInfo {
-                    align,
-                    v_type: Type::maybe_array(vector, type_, array_dimensions),
-                    state_space,
-                    array_init: initializer,
-                },
-                names,
+            Ok(if items.len() == 1 {
+                items.pop().unwrap()
+            } else {
+                MultiVariable::List(items)
             })
         },
     )

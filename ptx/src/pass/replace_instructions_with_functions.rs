@@ -694,6 +694,15 @@ fn run_instruction<'input>(
                 i,
             )?
         }
+        ptx_parser::Instruction::Helper { data, arguments } => {
+            let name = data.name.clone();
+            to_call(
+                resolver,
+                fn_declarations,
+                name.into(),
+                ptx_parser::Instruction::Helper { data, arguments },
+            )?
+        }
         i @ ptx_parser::Instruction::Prmt { .. } => {
             to_call(resolver, fn_declarations, "prmt_b32".into(), i)?
         }

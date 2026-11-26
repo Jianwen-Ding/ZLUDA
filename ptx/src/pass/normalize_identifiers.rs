@@ -170,6 +170,11 @@ fn run_multivariable<'input, 'b>(
     variable: ast::MultiVariable<&'input str>,
 ) -> Result<(), TranslateError> {
     match variable {
+        ptx_parser::MultiVariable::List(items) => {
+            for item in items {
+                run_multivariable(resolver, result, item)?;
+            }
+        }
         ptx_parser::MultiVariable::Parameterized { info, name, count } => {
             for i in 0..count {
                 let name = Cow::Owned(format!("{}{}", name, i));

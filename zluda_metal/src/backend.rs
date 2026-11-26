@@ -74,6 +74,82 @@ fn check(r: c_int, e: *mut c_char) -> Result<(), String> {
     }
 }
 
+
+/// `ZLUDA_METAL_BACKEND=agx`: run kernels on the AGX simulator (src/agx.rs)
+/// instead of the metal-cpp device.
+pub fn use_agx() -> bool {
+    static AGX: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AGX.get_or_init(|| std::env::var("ZLUDA_METAL_BACKEND").map(|v| v == "agx").unwrap_or(false))
+}
+
+pub fn init() -> Result<DeviceInfo, String> {
+    if use_agx() {
+        return Ok(DeviceInfo {
+            name: format!("Apple AGX {} (AGX Performance Simulator)", crate::agx::mcpu()),
+            total_memory: 32 << 30,
+            max_threads_per_threadgroup: 1024,
+            max_threadgroup_memory: 65536,
+            simd_width: 32,
+            unified_memory: true,
+        });
+    }
+    metal_init()
+}
+pub fn alloc(size: u64) -> Result<u64, String> {
+    if use_agx() { crate::agx::alloc(size) } else { metal_alloc(size) }
+}
+pub fn free(addr: u64) -> bool {
+    if use_agx() { crate::agx::free(addr) } else { metal_free(addr) }
+}
+pub fn host_pointer(addr: u64) -> Option<(*mut u8, u64)> {
+    if use_agx() { crate::agx::host_pointer(addr) } else { metal_host_pointer(addr) }
+}
+pub fn range(addr: u64) -> Option<(u64, u64)> {
+    if use_agx() { crate::agx::range(addr) } else { metal_range(addr) }
+}
+pub fn synchronize() -> Result<(), String> {
+    if use_agx() { Ok(()) } else { metal_synchronize() }
+}
+
+pub enum Library {
+    Metal(MetalLibrary),
+    Agx(crate::agx::Library),
+}
+impl Library {
+    pub fn new(metallib: &[u8]) -> Result<Self, String> {
+        if use_agx() {
+            crate::agx::Library::new(metallib).map(Library::Agx)
+        } else {
+            MetalLibrary::new(metallib).map(Library::Metal)
+        }
+    }
+    pub fn kernel(&self, name: &str) -> Result<Kernel, String> {
+        match self {
+            Library::Metal(l) => l.kernel(name).map(|k| Kernel { max_threads: k.max_threads, static_shared: k.static_shared, imp: KernelImpl::Metal(k) }),
+            Library::Agx(l) => l.kernel(name).map(|k| Kernel { max_threads: k.max_threads(), static_shared: k.static_shared(), imp: KernelImpl::Agx(k) }),
+        }
+    }
+}
+enum KernelImpl {
+    Metal(MetalKernel),
+    Agx(crate::agx::Kernel),
+}
+pub struct Kernel {
+    imp: KernelImpl,
+    pub max_threads: u64,
+    pub static_shared: u64,
+}
+unsafe impl Send for Kernel {}
+unsafe impl Sync for Kernel {}
+impl Kernel {
+    pub fn launch(&self, grid: [u32; 3], block: [u32; 3], params: &[u8], dynamic_shared: u32) -> Result<(), String> {
+        match &self.imp {
+            KernelImpl::Metal(k) => k.launch(grid, block, params, dynamic_shared),
+            KernelImpl::Agx(k) => k.launch(grid, block, params, dynamic_shared),
+        }
+    }
+}
+
 pub struct DeviceInfo {
     pub name: String,
     pub total_memory: u64,
@@ -83,7 +159,7 @@ pub struct DeviceInfo {
     pub unified_memory: bool,
 }
 
-pub fn init() -> Result<DeviceInfo, String> {
+fn metal_init() -> Result<DeviceInfo, String> {
     let mut info: ZmtlDeviceInfo = unsafe { std::mem::zeroed() };
     let mut e = ptr::null_mut();
     check(unsafe { zmtl_init(&mut info, &mut e) }, e)?;
@@ -99,40 +175,40 @@ pub fn init() -> Result<DeviceInfo, String> {
     })
 }
 
-pub fn alloc(size: u64) -> Result<u64, String> {
+fn metal_alloc(size: u64) -> Result<u64, String> {
     let mut addr = 0;
     let mut e = ptr::null_mut();
     check(unsafe { zmtl_mem_alloc(size, &mut addr, &mut e) }, e)?;
     Ok(addr)
 }
 
-pub fn free(addr: u64) -> bool {
+fn metal_free(addr: u64) -> bool {
     unsafe { zmtl_mem_free(addr) == 0 }
 }
 
 /// Host view of device memory: (pointer, bytes until the end of the allocation)
-pub fn host_pointer(addr: u64) -> Option<(*mut u8, u64)> {
+fn metal_host_pointer(addr: u64) -> Option<(*mut u8, u64)> {
     let mut left = 0;
     let p = unsafe { zmtl_host_pointer(addr, &mut left) };
     (!p.is_null()).then_some((p as *mut u8, left))
 }
 
 /// Allocation containing `addr`: (base address, size)
-pub fn range(addr: u64) -> Option<(u64, u64)> {
+fn metal_range(addr: u64) -> Option<(u64, u64)> {
     let (mut base, mut size) = (0, 0);
     (unsafe { zmtl_mem_range(addr, &mut base, &mut size) } == 0).then_some((base, size))
 }
 
-pub fn synchronize() -> Result<(), String> {
+fn metal_synchronize() -> Result<(), String> {
     let mut e = ptr::null_mut();
     check(unsafe { zmtl_synchronize(&mut e) }, e)
 }
 
-pub struct Library(*mut ZmtlLibrary);
-unsafe impl Send for Library {}
-unsafe impl Sync for Library {}
+pub struct MetalLibrary(*mut ZmtlLibrary);
+unsafe impl Send for MetalLibrary {}
+unsafe impl Sync for MetalLibrary {}
 
-impl Library {
+impl MetalLibrary {
     pub fn new(metallib: &[u8]) -> Result<Self, String> {
         let mut lib = ptr::null_mut();
         let mut e = ptr::null_mut();
@@ -140,10 +216,10 @@ impl Library {
             unsafe { zmtl_library_create(metallib.as_ptr(), metallib.len(), &mut lib, &mut e) },
             e,
         )?;
-        Ok(Library(lib))
+        Ok(MetalLibrary(lib))
     }
 
-    pub fn kernel(&self, name: &str) -> Result<Kernel, String> {
+    pub fn kernel(&self, name: &str) -> Result<MetalKernel, String> {
         let cname = CString::new(name).map_err(|_| "invalid kernel name".to_string())?;
         let mut k = ptr::null_mut();
         let mut max_threads = 0;
@@ -162,7 +238,7 @@ impl Library {
             },
             e,
         )?;
-        Ok(Kernel {
+        Ok(MetalKernel {
             raw: k,
             max_threads,
             static_shared,
@@ -170,21 +246,21 @@ impl Library {
     }
 }
 
-impl Drop for Library {
+impl Drop for MetalLibrary {
     fn drop(&mut self) {
         unsafe { zmtl_library_destroy(self.0) }
     }
 }
 
-pub struct Kernel {
+pub struct MetalKernel {
     raw: *mut ZmtlKernel,
     pub max_threads: u64,
     pub static_shared: u64,
 }
-unsafe impl Send for Kernel {}
-unsafe impl Sync for Kernel {}
+unsafe impl Send for MetalKernel {}
+unsafe impl Sync for MetalKernel {}
 
-impl Kernel {
+impl MetalKernel {
     pub fn launch(
         &self,
         grid: [u32; 3],
@@ -210,7 +286,7 @@ impl Kernel {
     }
 }
 
-impl Drop for Kernel {
+impl Drop for MetalKernel {
     fn drop(&mut self) {
         unsafe { zmtl_kernel_destroy(self.raw) }
     }

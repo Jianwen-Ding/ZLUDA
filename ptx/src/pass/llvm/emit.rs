@@ -734,6 +734,7 @@ impl<'a> MethodEmitContext<'a> {
             | ast::Instruction::ReduxSync { .. }
             | ast::Instruction::LdMatrix { .. }
             | ast::Instruction::Prmt { .. }
+        | ast::Instruction::Helper { .. }
             | ast::Instruction::Mma { .. }
             | ast::Instruction::Dp2a { .. }
             | ast::Instruction::Tanh { .. }

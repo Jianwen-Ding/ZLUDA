@@ -514,6 +514,53 @@ ptx_parser_macros::generate_instruction_type!(
                 src: T
             }
         },
+        // An instruction implemented by a helper function `__zluda_ptx_impl_<name>` (see HelperData):
+        // up to two destinations and six sources, each with its own type and state space.
+        Helper {
+            data: HelperData,
+            arguments<T>: {
+                dst: {
+                    repr: Option<T>,
+                    type: { data.ty(0) },
+                    space: { data.space(0) },
+                },
+                dst2: {
+                    repr: Option<T>,
+                    type: { data.ty(1) },
+                    space: { data.space(1) },
+                },
+                src1: {
+                    repr: Option<T>,
+                    type: { data.ty(2) },
+                    space: { data.space(2) },
+                },
+                src2: {
+                    repr: Option<T>,
+                    type: { data.ty(3) },
+                    space: { data.space(3) },
+                },
+                src3: {
+                    repr: Option<T>,
+                    type: { data.ty(4) },
+                    space: { data.space(4) },
+                },
+                src4: {
+                    repr: Option<T>,
+                    type: { data.ty(5) },
+                    space: { data.space(5) },
+                },
+                src5: {
+                    repr: Option<T>,
+                    type: { data.ty(6) },
+                    space: { data.space(6) },
+                },
+                src6: {
+                    repr: Option<T>,
+                    type: { data.ty(7) },
+                    space: { data.space(7) },
+                },
+            }
+        },
         Prmt {
             type: Type::Scalar(ScalarType::B32),
             arguments<T>: {
@@ -1288,6 +1335,8 @@ pub enum MultiVariable<ID> {
         info: VariableInfo<ID>,
         names: Vec<ID>,
     },
+    /// several declarations of one statement (`.reg .b32 %r<4>, %x<2>;`)
+    List(Vec<MultiVariable<ID>>),
 }
 
 #[derive(Clone)]
@@ -3003,5 +3052,36 @@ impl SuldData {
             TexDimensions::D3 => 4,
         };
         Type::Vector(dims, ScalarType::S32)
+    }
+}
+
+
+/// Operand slots of `Instruction::Helper`: 0 = dst, 1 = dst2, 2.. = src1..src6.
+#[derive(Clone, PartialEq)]
+pub struct HelperData {
+    pub name: String,
+    pub operands: Vec<(Type, StateSpace)>,
+}
+
+impl HelperData {
+    pub fn new(name: impl Into<String>) -> Self {
+        HelperData {
+            name: name.into(),
+            operands: vec![(Type::Scalar(ScalarType::B32), StateSpace::Reg); 8],
+        }
+    }
+    pub fn with(mut self, slot: usize, t: ScalarType) -> Self {
+        self.operands[slot] = (Type::Scalar(t), StateSpace::Reg);
+        self
+    }
+    pub fn with_type(mut self, slot: usize, t: Type, space: StateSpace) -> Self {
+        self.operands[slot] = (t, space);
+        self
+    }
+    pub fn ty(&self, slot: usize) -> Type {
+        self.operands[slot].0.clone()
+    }
+    pub fn space(&self, slot: usize) -> StateSpace {
+        self.operands[slot].1
     }
 }

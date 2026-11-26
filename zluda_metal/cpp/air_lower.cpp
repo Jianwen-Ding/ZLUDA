@@ -1578,6 +1578,95 @@ void stripTargetAttributes(Module &m)
         f->eraseFromParent();
 }
 
+
+// The translator declares a helper with PTX's types ({i32, i1} for `d|p`, i1 predicates)
+// while C++ spells them with its own ({i32, i8} or <2 x i32>, i8 / i1 booleans): calls whose
+// type differs from the linked definition are rewritten with element-wise conversions, so
+// that the definitions inline.
+static Value *adaptValue(IRBuilder<> &b, Value *v, Type *to)
+{
+    Type *from = v->getType();
+    if (from == to)
+        return v;
+    if (from->isIntegerTy() && to->isIntegerTy())
+    {
+        if (from->getIntegerBitWidth() == 1)
+            return b.CreateZExt(v, to);
+        if (to->getIntegerBitWidth() == 1)
+            return b.CreateICmpNE(v, ConstantInt::get(from, 0));
+        return b.CreateZExtOrTrunc(v, to);
+    }
+    if (from->isPointerTy() && to->isPointerTy())
+        return b.CreateAddrSpaceCast(v, to);
+    auto elems = [](Type *t) -> unsigned {
+        if (auto *st = dyn_cast<StructType>(t))
+            return st->getNumElements();
+        if (auto *vt = dyn_cast<FixedVectorType>(t))
+            return vt->getNumElements();
+        return 0;
+    };
+    auto elemType = [](Type *t, unsigned i) -> Type * {
+        if (auto *st = dyn_cast<StructType>(t))
+            return st->getElementType(i);
+        return cast<FixedVectorType>(t)->getElementType();
+    };
+    if (elems(from) && elems(from) == elems(to))
+    {
+        Value *r = PoisonValue::get(to);
+        for (unsigned i = 0; i < elems(from); i++)
+        {
+            Value *e = from->isStructTy() ? b.CreateExtractValue(v, i) : b.CreateExtractElement(v, (uint64_t)i);
+            e = adaptValue(b, e, elemType(to, i));
+            r = to->isStructTy() ? b.CreateInsertValue(r, e, i) : b.CreateInsertElement(r, e, (uint64_t)i);
+        }
+        return r;
+    }
+    if (from->getPrimitiveSizeInBits() == to->getPrimitiveSizeInBits() && from->getPrimitiveSizeInBits() != 0)
+        return b.CreateBitCast(v, to);
+    return nullptr;
+}
+
+static void adaptHelperCalls(Module &m)
+{
+    std::vector<CallInst *> calls;
+    for (Function &f : m)
+        for (Instruction &i : instructions(f))
+            if (auto *ci = dyn_cast<CallInst>(&i))
+                if (auto *callee = dyn_cast<Function>(ci->getCalledOperand()->stripPointerCasts()))
+                    if (!callee->isDeclaration() && ci->getFunctionType() != callee->getFunctionType())
+                        calls.push_back(ci);
+    for (CallInst *ci : calls)
+    {
+        auto *callee = cast<Function>(ci->getCalledOperand()->stripPointerCasts());
+        FunctionType *ft = callee->getFunctionType();
+        if (ft->getNumParams() != ci->arg_size())
+            continue;
+        IRBuilder<> b(ci);
+        std::vector<Value *> args;
+        bool ok = true;
+        for (unsigned i = 0; i < ci->arg_size() && ok; i++)
+        {
+            Value *a = adaptValue(b, ci->getArgOperand(i), ft->getParamType(i));
+            ok = a != nullptr;
+            args.push_back(a);
+        }
+        if (!ok)
+            continue;
+        CallInst *nc = b.CreateCall(ft, callee, args);
+        if (!ci->getType()->isVoidTy())
+        {
+            Value *r = ft->getReturnType()->isVoidTy() ? nullptr : adaptValue(b, nc, ci->getType());
+            if (!r)
+            {
+                nc->eraseFromParent();
+                continue;
+            }
+            ci->replaceAllUsesWith(r);
+        }
+        ci->eraseFromParent();
+    }
+}
+
 void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals &globals)
 {
     // ---- Phase 1: AMDGPU-numbered cleanup ----
@@ -1804,6 +1893,9 @@ extern "C" int zluda_air_lower(const ZludaAirInput *input, ZludaAirOutput *outpu
         impl->setTargetTriple(main->getTargetTriple());
         if (Linker::linkModules(*main, std::move(impl), Linker::LinkOnlyNeeded))
             fail("failed to link Metal implementation library");
+        adaptHelperCalls(*main);
+        if (getenv("ZLUDA_AIR_DEBUG"))
+            main->print(errs(), nullptr);
         std::vector<KernelInfo> kernels;
         DeviceGlobals globals;
         lowerModuleToAir(*main, kernels, globals);

@@ -268,6 +268,8 @@ extern "C"
 
     uint64_t FUNC(bfe_u64)(uint64_t base, uint32_t pos, uint32_t len)
     {
+        pos &= 0xFFU;
+        len &= 0xFFU;
         if (pos >= 64 || len == 0)
             return 0;
         if (len >= 64 || pos + len >= 64)
@@ -290,6 +292,8 @@ extern "C"
 
     int64_t FUNC(bfe_s64)(int64_t base, uint32_t pos, uint32_t len)
     {
+        pos &= 0xFFU;
+        len &= 0xFFU;
         if (len == 0)
             return 0;
         if (pos >= 64)
@@ -311,6 +315,8 @@ extern "C"
 
     uint64_t FUNC(bfi_b64)(uint64_t insert, uint64_t base, uint32_t pos, uint32_t len)
     {
+        pos &= 0xFFU;
+        len &= 0xFFU;
         if (pos >= 64)
             return base;
         uint64_t mask = len >= 64 ? (UINT64_MAX << pos) : (((1UL << len) - 1UL) << pos);

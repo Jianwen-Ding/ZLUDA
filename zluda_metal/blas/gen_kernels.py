@@ -781,9 +781,9 @@ def gemv_head(t):
 
 def gemv_n(p, t):
     """y = alpha op(A) x + beta y, op(A) m x n (A(i, j) = a[ao + i ars + j acs]), for row-contiguous columns
-    (ars 1): blocks of 32 x 8 threads, 32 rows (a SIMD group's lanes, coalesced) by 8 SIMD groups that split the
-    columns; their partial sums are added in threadgroup memory (in a fixed order). Batched over grid y."""
-    return """    gpu.func @{p}gemv_n({args}) workgroup(%part: memref<256x{t}, 3>) kernel {{
+    (ars 1): blocks of 32 x dy threads (dy <= 32), 32 rows (a SIMD group's lanes, coalesced) by dy SIMD groups that
+    split the columns; their partial sums are added in threadgroup memory (in a fixed order). Batched over grid y."""
+    return """    gpu.func @{p}gemv_n({args}) workgroup(%part: memref<1024x{t}, 3>) kernel {{
 {head}      %tx = gpu.thread_id x
       %ty = gpu.thread_id y
       %bx = gpu.block_id x
@@ -792,7 +792,8 @@ def gemv_n(p, t):
       %tyi = arith.index_cast %ty : index to i32
       %bxi = arith.index_cast %bx : index to i32
       %gxi = arith.index_cast %gx : index to i32
-      %c8 = arith.constant 8 : i32
+      %dy = gpu.block_dim y
+      %c8 = arith.index_cast %dy : index to i32
       %c32 = arith.constant 32 : i32
       %r0b = arith.muli %bxi, %c32 : i32
       %r0 = arith.addi %r0b, %txi : i32
@@ -819,7 +820,7 @@ def gemv_n(p, t):
           %ns = math.fma %av, %xv, %s : {t}
           scf.yield %ns : {t}
         }}
-        memref.store %acc, %part[%slot] : memref<256x{t}, 3>
+        memref.store %acc, %part[%slot] : memref<1024x{t}, 3>
         gpu.barrier
         %inm = arith.cmpi slt, %r, %m : i32
         %fin = arith.andi %is0, %inm : i1
@@ -828,7 +829,7 @@ def gemv_n(p, t):
             %q32 = arith.muli %q, %c32 : i32
             %qs_ = arith.addi %q32, %txi : i32
             %qs = arith.index_cast %qs_ : i32 to index
-            %pv = memref.load %part[%qs] : memref<256x{t}, 3>
+            %pv = memref.load %part[%qs] : memref<1024x{t}, 3>
             %ns2 = arith.addf %s2, %pv : {t}
             scf.yield %ns2 : {t}
           }}
@@ -1174,10 +1175,171 @@ def pad(t):
 """.format(t=t, g2d=g2d(), bz=BZ)
 
 
+def reduce1(p, t):
+    """single-pass sums: op 0 x . y, 1 sum of squares (nrm2: its square root), 2 sum of |x| (nrm2 takes the square root); blocks of 256 threads
+    (8 SIMD groups, their sums added in threadgroup memory) write a partial sum each; the last block to finish (an
+    atomic count, cnt[0] starts at 0) adds the partials in block order (deterministic) into out[0]."""
+    return """    gpu.func @{p}sum(%n: i32, %op: i32, %x: memref<?x{t}, 1>, %xo: i32, %xi: i32, %y: memref<?x{t}, 1>, %yo: i32, %yi: i32, %part: memref<?x{t}, 1>, %cnt: memref<?xi32, 1>, %out: memref<?x{t}, 1>) workgroup(%sg: memref<8x{t}, 3>, %last: memref<1xi32, 3>) kernel {{
+{gid}      %zero = arith.constant 0.0 : {t}
+      %c0 = arith.constant 0 : i32
+      %c1 = arith.constant 1 : i32
+      %c2 = arith.constant 2 : i32
+      %isdot = arith.cmpi eq, %op, %c0 : i32
+      %issq = arith.cmpi eq, %op, %c1 : i32
+      %isabs = arith.cmpi eq, %op, %c2 : i32
+      %acc = scf.for %k = %i to %n step %stride iter_args(%a = %zero) -> ({t}) : i32 {{
+{ix}        %xv = memref.load %x[%ix] : memref<?x{t}, 1>
+        %v = scf.if %isdot -> ({t}) {{
+{iy}          %yv = memref.load %y[%iy] : memref<?x{t}, 1>
+          %m = arith.mulf %xv, %yv : {t}
+          scf.yield %m : {t}
+        }} else {{
+          %sq = arith.mulf %xv, %xv : {t}
+          %ab = math.absf %xv : {t}
+          %w0 = arith.select %isabs, %ab, %xv : {t}
+          %w = arith.select %issq, %sq, %w0 : {t}
+          scf.yield %w : {t}
+        }}
+        %na = arith.addf %a, %v : {t}
+        scf.yield %na : {t}
+      }}
+      %s = gpu.subgroup_reduce add %acc : ({t}) -> {t}
+      %lane = gpu.lane_id
+      %sid = gpu.subgroup_id : index
+      %c0i = arith.constant 0 : index
+      %c8i = arith.constant 8 : index
+      %c1i = arith.constant 1 : index
+      %first = arith.cmpi eq, %lane, %c0i : index
+      scf.if %first {{
+        memref.store %s, %sg[%sid] : memref<8x{t}, 3>
+      }}
+      gpu.barrier
+      %t0 = arith.cmpi eq, %tid, %c0i : index
+      scf.if %t0 {{
+        %bs = scf.for %q = %c0i to %c8i step %c1i iter_args(%b = %zero) -> ({t}) {{
+          %pv = memref.load %sg[%q] : memref<8x{t}, 3>
+          %nb = arith.addf %b, %pv : {t}
+          scf.yield %nb : {t}
+        }}
+        memref.store %bs, %part[%bid] : memref<?x{t}, 1>
+      }}
+      // the partial is visible on the device before the count says so
+      gpu.barrier
+      scf.if %t0 {{
+        %old = memref.atomic_rmw addi %c1, %cnt[%c0i] : (i32, memref<?xi32, 1>) -> i32
+        memref.store %old, %last[%c0i] : memref<1xi32, 3>
+      }}
+      gpu.barrier
+      %done = memref.load %last[%c0i] : memref<1xi32, 3>
+      %gl = arith.index_cast %gdim : index to i32
+      %gl1 = arith.subi %gl, %c1 : i32
+      %islast = arith.cmpi eq, %done, %gl1 : i32
+      %fin = arith.andi %islast, %t0 : i1
+      scf.if %fin {{
+        %tot = scf.for %q = %c0i to %gdim step %c1i iter_args(%b = %zero) -> ({t}) {{
+          %pv = memref.load %part[%q] : memref<?x{t}, 1>
+          %nb = arith.addf %b, %pv : {t}
+          scf.yield %nb : {t}
+        }}
+        memref.store %tot, %out[%c0i] : memref<?x{t}, 1>
+      }}
+      gpu.return
+    }}
+""".format(p=p, t=t, gid=gid(), ix=idx("ix", "xo", "k", "xi"), iy=idx("iy", "yo", "k", "yi").replace("      %", "          %"))
+
+
+def amax1(p, t):
+    """single-pass amax (op 0) / amin (op 1): the 1-based index of the first element of largest / smallest |x|. Each
+    thread's best (|x|, index), the SIMD group's best (then its smallest index), the block's from its 8 SIMD groups
+    (threadgroup memory), per block in pv / pi; the last block to finish (cnt) combines them into outi[0]."""
+    return """    gpu.func @{p}amax1(%n: i32, %op: i32, %x: memref<?x{t}, 1>, %xo: i32, %xi: i32, %pv: memref<?x{t}, 1>, %pi: memref<?xi32, 1>, %cnt: memref<?xi32, 1>, %outi: memref<?xi32, 1>) workgroup(%sv: memref<8x{t}, 3>, %si: memref<8xi32, 3>, %last: memref<1xi32, 3>) kernel {{
+{gid}      %c0 = arith.constant 0 : i32
+      %c1 = arith.constant 1 : i32
+      %ismin = arith.cmpi ne, %op, %c0 : i32
+      %inf = arith.constant 0x7F800000 : i32
+      %pinf = arith.bitcast %inf : i32 to f32
+      %pinft = {conv_inf}
+      %neg1 = arith.constant -1.0 : {t}
+      %start = arith.select %ismin, %pinft, %neg1 : {t}
+      %big = arith.constant 2147483647 : i32
+      %r:2 = scf.for %k = %i to %n step %stride iter_args(%bv = %start, %bi = %big) -> ({t}, i32) : i32 {{
+{ix}        %xv = memref.load %x[%ix] : memref<?x{t}, 1>
+        %av = math.absf %xv : {t}
+        %k1 = arith.addi %k, %c1 : i32
+        %gt = arith.cmpf ogt, %av, %bv : {t}
+        %lt = arith.cmpf olt, %av, %bv : {t}
+        %better = arith.select %ismin, %lt, %gt : i1
+        %nv = arith.select %better, %av, %bv : {t}
+        %ni = arith.select %better, %k1, %bi : i32
+        scf.yield %nv, %ni : {t}, i32
+      }}
+{sgbest}      %lane = gpu.lane_id
+      %sid = gpu.subgroup_id : index
+      %c0i = arith.constant 0 : index
+      %c1i = arith.constant 1 : index
+      %c8i = arith.constant 8 : index
+      %first = arith.cmpi eq, %lane, %c0i : index
+      scf.if %first {{
+        memref.store %bestv, %sv[%sid] : memref<8x{t}, 3>
+        memref.store %besti, %si[%sid] : memref<8xi32, 3>
+      }}
+      gpu.barrier
+      %t0 = arith.cmpi eq, %tid, %c0i : index
+      scf.if %t0 {{
+{comb8}        memref.store %cb#0, %pv[%bid] : memref<?x{t}, 1>
+        memref.store %cb#1, %pi[%bid] : memref<?xi32, 1>
+      }}
+      gpu.barrier
+      scf.if %t0 {{
+        %old = memref.atomic_rmw addi %c1, %cnt[%c0i] : (i32, memref<?xi32, 1>) -> i32
+        memref.store %old, %last[%c0i] : memref<1xi32, 3>
+      }}
+      gpu.barrier
+      %done = memref.load %last[%c0i] : memref<1xi32, 3>
+      %gl = arith.index_cast %gdim : index to i32
+      %gl1 = arith.subi %gl, %c1 : i32
+      %islast = arith.cmpi eq, %done, %gl1 : i32
+      %fin = arith.andi %islast, %t0 : i1
+      scf.if %fin {{
+{combg}        memref.store %cg#1, %outi[%c0i] : memref<?xi32, 1>
+      }}
+      gpu.return
+    }}
+""".format(p=p, t=t, gid=gid(), ix=idx("ix", "xo", "k", "xi"),
+           conv_inf="arith.extf %pinf : f32 to f64" if t == "f64" else "arith.addf %pinf, %pinf : f32",
+           sgbest="""      %mx = gpu.subgroup_reduce maxnumf %r#0 : ({t}) -> {t}
+      %mn = gpu.subgroup_reduce minnumf %r#0 : ({t}) -> {t}
+      %bestv = arith.select %ismin, %mn, %mx : {t}
+      %has = arith.cmpf oeq, %r#0, %bestv : {t}
+      %cand = arith.select %has, %r#1, %big : i32
+      %besti = gpu.subgroup_reduce minsi %cand : (i32) -> i32
+""".format(t=t), comb8=comb("cb", "%sv", "%si", "memref<8x{t}, 3>".format(t=t), "memref<8xi32, 3>", "%c8i", t),
+           combg=comb("cg", "%pv", "%pi", "memref<?x{t}, 1>".format(t=t), "memref<?xi32, 1>", "%gdim", t))
+
+
+def comb(name, vm, im, vt, it, count, t):
+    """%name:2 = the best (value, index) of count pairs (ties: the smaller index)"""
+    return """        %{n}:2 = scf.for %{n}_q = %c0i to {cnt} step %c1i iter_args(%{n}_bv = %start, %{n}_bi = %big) -> ({t}, i32) {{
+          %{n}_v = memref.load {vm}[%{n}_q] : {vt}
+          %{n}_ix_ = memref.load {im}[%{n}_q] : {it}
+          %{n}_gt = arith.cmpf ogt, %{n}_v, %{n}_bv : {t}
+          %{n}_lt = arith.cmpf olt, %{n}_v, %{n}_bv : {t}
+          %{n}_eq = arith.cmpf oeq, %{n}_v, %{n}_bv : {t}
+          %{n}_sm = arith.cmpi slt, %{n}_ix_, %{n}_bi : i32
+          %{n}_tie = arith.andi %{n}_eq, %{n}_sm : i1
+          %{n}_b0 = arith.select %ismin, %{n}_lt, %{n}_gt : i1
+          %{n}_better = arith.ori %{n}_b0, %{n}_tie : i1
+          %{n}_nv = arith.select %{n}_better, %{n}_v, %{n}_bv : {t}
+          %{n}_ni = arith.select %{n}_better, %{n}_ix_, %{n}_bi : i32
+          scf.yield %{n}_nv, %{n}_ni : {t}, i32
+        }}
+""".format(n=name, vm=vm, im=im, vt=vt, it=it, cnt=count, t=t)
+
+
 def main():
     out = [hdr()]
     for p, t in TYPES.items():
-        for f in (axpy, scal, copy_swap, reduce, amax, rot, ger, geam, trsv, gemv_n, gemv_t):
+        for f in (axpy, scal, copy_swap, reduce1, amax1, rot, ger, geam, trsv, gemv_n, gemv_t):
             out.append(f(p, t))
         out.append(gemm(p + "gemm", t, t, t, t, 2 if t == "f64" else 4))
     for p, t, tile in (("c", "f32", 2), ("z", "f64", 1)):

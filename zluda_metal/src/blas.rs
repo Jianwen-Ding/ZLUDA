@@ -251,22 +251,26 @@ unsafe fn copy_swap<T: Elem>(h: cublasHandle_t, n: c_int, x: *mut T, incx: c_int
     ])
 }
 
-/// op 0 dot, 1 sum of squares, 2 sum of |x|: the sum, by blocks of 32 then one block
+/// op 0 dot, 1 sum of squares, 2 sum of |x|: the sum, in one launch (blocks of 256 threads; the last block to
+/// finish adds the blocks' partial sums)
 unsafe fn reduce<T: Elem>(n: c_int, op: i32, x: u64, incx: c_int, y: u64, incy: c_int) -> Result<T, cublasStatus_t> {
     let sz = std::mem::size_of::<T>() as u64;
-    let g = ((n as u32).div_ceil(32)).clamp(1, 256);
+    let g = ((n as u32).div_ceil(256)).clamp(1, reduce_blocks());
     let part = Tmp::new(g as u64 * sz)?;
     let res = Tmp::new(sz)?;
+    let cnt = Tmp::new(16)?;
+    dev_write::<u32>(cnt.0, 0)?;
     let (xo, xi) = vec_of(n, incx);
     let (yo, yi) = vec_of(n, incy);
-    let k = format!("{}reduce", T::P);
-    launch(&k, [g, 1, 1], [32, 1, 1], &[
+    launch(&format!("{}sum", T::P), [g, 1, 1], [256, 1, 1], &[
         i32v(n), i32v(op), Arg::Addr(x), i32v(xo), i32v(xi), Arg::Addr(y), i32v(yo), i32v(yi), Arg::Addr(part.0),
-    ])?;
-    launch(&k, [1, 1, 1], [32, 1, 1], &[
-        i32v(g as i32), i32v(3), Arg::Addr(part.0), i32v(0), i32v(1), Arg::Addr(part.0), i32v(0), i32v(1), Arg::Addr(res.0),
+        Arg::Addr(cnt.0), Arg::Addr(res.0),
     ])?;
     dev_read::<T>(res.0)
+}
+
+fn reduce_blocks() -> u32 {
+    std::env::var("ZLUDA_BLAS_REDUCE_BLOCKS").ok().and_then(|s| s.parse().ok()).unwrap_or(128)
 }
 
 unsafe fn dot<T: Elem>(h: cublasHandle_t, n: c_int, x: *const T, incx: c_int, y: *const T, incy: c_int, r: *mut T) -> R {
@@ -291,26 +295,22 @@ unsafe fn asum<T: Elem>(h: cublasHandle_t, n: c_int, x: *const T, incx: c_int, r
     result(h, r, v)
 }
 
-/// the 1-based index of the first element of largest (min false) / smallest |x|
+/// the 1-based index of the first element of largest (min false) / smallest |x|, in one launch
 unsafe fn amax<T: Elem>(h: cublasHandle_t, n: c_int, x: *const T, incx: c_int, r: *mut c_int, min: bool) -> R {
     check(h)?;
     if n <= 0 || incx <= 0 {
         return result(h, r, 0);
     }
     let sz = std::mem::size_of::<T>() as u64;
-    let g = ((n as u32).div_ceil(32)).clamp(1, 256);
-    let (pv, pi) = (Tmp::new(g as u64 * sz)?, Tmp::new(g as u64 * sz)?);
-    let (rv, ri) = (Tmp::new(sz)?, Tmp::new(sz)?);
-    let k = format!("{}amax", T::P);
-    launch(&k, [g, 1, 1], [32, 1, 1], &[
-        i32v(n), i32v(min as i32), Arg::Addr(x as u64), i32v(0), i32v(incx), Arg::Addr(x as u64), Arg::Addr(pv.0),
-        Arg::Addr(pi.0),
+    let g = ((n as u32).div_ceil(256)).clamp(1, reduce_blocks());
+    let (pv, pi) = (Tmp::new(g as u64 * sz)?, Tmp::new(g as u64 * 4)?);
+    let (cnt, ri) = (Tmp::new(16)?, Tmp::new(16)?);
+    dev_write::<u32>(cnt.0, 0)?;
+    launch(&format!("{}amax1", T::P), [g, 1, 1], [256, 1, 1], &[
+        i32v(n), i32v(min as i32), Arg::Addr(x as u64), i32v(0), i32v(incx), Arg::Addr(pv.0), Arg::Addr(pi.0),
+        Arg::Addr(cnt.0), Arg::Addr(ri.0),
     ])?;
-    launch(&k, [1, 1, 1], [32, 1, 1], &[
-        i32v(g as i32), i32v(2 + min as i32), Arg::Addr(pv.0), i32v(0), i32v(1), Arg::Addr(pi.0), Arg::Addr(rv.0),
-        Arg::Addr(ri.0),
-    ])?;
-    result(h, r, dev_read::<T>(ri.0)?.to_f64() as c_int)
+    result(h, r, dev_read::<c_int>(ri.0)?)
 }
 
 // ------------------------------------------------------------------------------------------------- level 2 / 3
@@ -880,7 +880,7 @@ unsafe fn gemv_launch<T: Elem>(rows: i32, cols: i32, al: T, a: u64, rs: i32, cs:
     let (name, grid, block) = if cs == 1 || rows < 64 || std::env::var_os("ZLUDA_BLAS_GEMV_T").is_some() {
         ("gemv_t", [(rows as u32).div_ceil(8).min(8192), batch as u32, 1], [256, 1, 1])
     } else {
-        ("gemv_n", [(rows as u32).div_ceil(32).min(4096), batch as u32, 1], [32, 8, 1])
+        ("gemv_n", [(rows as u32).div_ceil(32).min(4096), batch as u32, 1], [32, match gemv_groups() { 0 if T::P == "s" => 32, 0 => 16, g => g }, 1])
     };
     launch(&format!("{}{}", T::P, name), grid, block, &[
         i32v(rows), i32v(cols), Arg::Value(al.bytes()), Arg::Addr(a), i32v(0), i32v(rs), i32v(cs), i32v(sa as i32),
@@ -1781,4 +1781,8 @@ pub unsafe extern "system" fn cublasGetCudartVersion() -> usize {
 #[no_mangle]
 pub unsafe extern "system" fn cublasGetStatusString(s: cublasStatus_t) -> *const c_char {
     cublasGetStatusName(s)
+}
+
+fn gemv_groups() -> u32 {
+    std::env::var("ZLUDA_BLAS_GEMV_GROUPS").ok().and_then(|s| s.parse().ok()).unwrap_or(0)
 }

@@ -679,3 +679,88 @@
         uint32_t t = (ctrl >> 4) & 15;
         return (uint32_t)f_ex2h(a & 0xFFFF, t, ctrl & F_FTZ) | ((uint32_t)f_ex2h(a >> 16, t, ctrl & F_FTZ) << 16);
     }
+
+    // sin / cos .approx{.ftz}.f32: correctly rounded (sincos_r), via a Payne-Hanek reduction
+    static inline uint64_t two_over_pi_word(int j)
+    {
+        switch (j)
+        {
+        case 1: return 0xA2F9836E;
+        case 2: return 0x4E441529;
+        case 3: return 0xFC2757D1;
+        case 4: return 0xF534DDC0;
+        case 5: return 0xDB629599;
+        case 6: return 0x3C439041;
+        case 7: return 0xFE5163AB;
+        case 8: return 0xDEBBC561;
+        default: return 0xB7246E3A;
+        }
+    }
+    // m * 2^e * 2/pi modulo 4, with 62 fractional bits
+    static inline uint64_t ph_reduce(uint64_t m, int e)
+    {
+        uint64_t y = 0;
+        for (int j = 1; j <= 9; j++)
+        {
+            int s = e + 62 - 32 * j;
+            if (s >= 64)
+                continue;
+            if (s <= -64)
+                break;
+            uint64_t p = m * two_over_pi_word(j);
+            y += s >= 0 ? (p << s) : (p >> -s);
+        }
+        return y;
+    }
+    static inline double d_sin_k(double r)
+    {
+        double r2 = r * r, t = r, s = r;
+        for (int i = 2; i <= 26; i += 2)
+        {
+            t = -t * r2 / (double)(i * (i + 1));
+            s += t;
+        }
+        return s;
+    }
+    static inline double d_cos_k(double r)
+    {
+        double r2 = r * r, t = 1.0, s = 1.0;
+        for (int i = 1; i <= 26; i += 2)
+        {
+            t = -t * r2 / (double)(i * (i + 1));
+            s += t;
+        }
+        return s;
+    }
+    uint32_t FUNC(fsincos_f32)(uint32_t a, uint32_t ctrl)
+    {
+        bool issin = !(ctrl & 1), ftz = ctrl & F_FTZ;
+        uint32_t pf = ftz ? PF_FTZ : 0;
+        XF x = xdec_t(a, T_F32, ftz);
+        if (x.c != XF_FIN)
+            return 0x7FFFFFFF;
+        if (x.m == 0)
+            return issin ? (uint32_t)xpost(x, T_F32, pf) : 0x3F800000u;
+        double ax = xf_to_d(xf_abs(x));
+        int q = 0;
+        double r = ax;
+        if (ax > 0.78539816339744830962)
+        {
+            uint64_t y = ph_reduce(x.m, x.e);
+            q = (int)(y >> 62);
+            int64_t f = (int64_t)(y & ((1ull << 62) - 1));
+            if (f >= (1ll << 61))
+            {
+                f -= 1ll << 62;
+                q = (q + 1) & 3;
+            }
+            r = (double)f * d_pow2(-62) * 1.57079632679489661923;
+        }
+        int k = issin ? q : (q + 1) & 3;
+        double v = (k & 1) ? d_cos_k(r) : d_sin_k(r);
+        if (k & 2)
+            v = -v;
+        if (issin && x.s)
+            v = -v;
+        return (uint32_t)d_round_to(v, T_F32, pf);
+    }

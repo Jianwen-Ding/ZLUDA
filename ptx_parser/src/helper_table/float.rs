@@ -312,6 +312,11 @@ fn approx<'i>(base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
                 .imm(code << 4 | (pk as u64) << 8 | ftz)
                 .build()
         }
+        ("sin" | "cos", "f32") => Call::new("fsincos_f32")
+            .dst(ops[0].op.clone(), ScalarType::B32)
+            .src(cvt::fimm(ops[1].op.clone(), 32), ScalarType::B32)
+            .imm((base == "cos") as u64 | ftz)
+            .build(),
         ("rcp" | "rsqrt", "f64") => Call::new("fapx64")
             .dst(ops[0].op.clone(), ScalarType::B64)
             .src(cvt::fimm(ops[1].op.clone(), 64), ScalarType::B64)
@@ -353,7 +358,7 @@ pub(super) fn lower<'i>(_opcode: &str, base: &str, m: &[&str], ops: &[HOp<'i>]) 
         "div" if m.contains(&"approx") => approx(base, m, ops),
         "div" | "sqrt" | "rcp" if !m.contains(&"approx") => divsqrt(base, m, ops),
         "neg" | "abs" => negabs(base, m, ops),
-        "tanh" | "rcp" | "rsqrt" | "ex2" => approx(base, m, ops),
+        "tanh" | "rcp" | "rsqrt" | "ex2" | "sin" | "cos" => approx(base, m, ops),
         _ => None,
     }
 }
@@ -376,6 +381,7 @@ pub(super) fn preempts(_opcode: &str, base: &str, m: &[&str]) -> bool {
         // the approximate forms the model defines exactly (see `approx`)
         "tanh" => true,
         "ex2" => m.iter().any(half),
+        "sin" | "cos" => m.last() == Some(&"f32"),
         "rcp" | "rsqrt" if m == ["approx", "f64"] || m == ["approx", "ftz", "f64"] => true,
         "div" if m == ["approx", "f32"] || m == ["approx", "ftz", "f32"] => true,
         // neg / abs .ftz (llvm.canonicalize is not available)

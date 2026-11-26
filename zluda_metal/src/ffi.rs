@@ -26,6 +26,7 @@ pub struct ZludaAirKernel {
     pub air: *mut u8,
     pub air_len: usize,
     pub globals_param_offset: u64,
+    pub dyn_smem_param_offset: u64,
 }
 
 #[repr(C)]

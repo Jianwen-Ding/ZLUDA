@@ -33,6 +33,8 @@ typedef struct ZludaAirKernel
     // Offset in the parameter buffer of the 64-bit address of the module's
     // device-globals buffer, or UINT64_MAX if the kernel uses no device globals
     uint64_t globals_param_offset;
+    // Offset in the parameter buffer of a u32 the launch sets to its dynamic shared memory size, or UINT64_MAX
+    uint64_t dyn_smem_param_offset;
 } ZludaAirKernel;
 
 // A writable module-scope `.global` variable, emulated as a slice of a

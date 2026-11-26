@@ -280,3 +280,123 @@
     SLCT(16, uint16_t)
     SLCT(32, uint32_t)
     SLCT(64, uint64_t)
+
+    // ---- bit instructions (Sail: ptx_int.sail bfind, fns, bmsk, szext, prmt; PTX-EXEC-INTX mul24, mad24, clmad) ----
+    static inline uint32_t bfind_bits(uint64_t a, int w, uint32_t ctrl)
+    {
+        if ((ctrl & 1) && ((a >> (w - 1)) & 1))
+            a = ~a;
+        if (w == 32)
+            a &= 0xFFFFFFFFull;
+        if (a == 0)
+            return 0xFFFFFFFFu;
+        uint32_t p = 63 - __builtin_clzll(a);
+        return (ctrl & 2) ? (uint32_t)(w - 1) - p : p;
+    }
+    uint32_t FUNC(bfind_32)(uint32_t a, uint32_t ctrl) { return bfind_bits(a, 32, ctrl); }
+    uint32_t FUNC(bfind_64)(uint64_t a, uint32_t ctrl) { return bfind_bits(a, 64, ctrl); }
+    uint32_t FUNC(fns_b32)(uint32_t m, uint32_t b, int32_t o)
+    {
+        if (b >= 32)
+            return 0xFFFFFFFFu;
+        if (o == 0)
+            return ((m >> b) & 1) ? b : 0xFFFFFFFFu;
+        int p = (int)b, n = (o > 0 ? o : -o) - 1, st = o > 0 ? 1 : -1;
+        while (p >= 0 && p < 32)
+        {
+            if ((m >> p) & 1)
+            {
+                if (n == 0)
+                    return (uint32_t)p;
+                n--;
+            }
+            p += st;
+        }
+        return 0xFFFFFFFFu;
+    }
+    uint32_t FUNC(bmsk_b32)(uint32_t a, uint32_t b, uint32_t clampm)
+    {
+        uint32_t a1 = a & 31, b1 = b & 31;
+        uint32_t mask0 = (clampm && a >= 32) ? 0u : (0xFFFFFFFFu << a1);
+        bool ovf = a1 + b1 >= 32 || (clampm && (a >= 32 || b >= 32));
+        uint32_t mask1 = ovf ? 0u : (b1 == 0 ? 0xFFFFFFFFu : (0xFFFFFFFFu << (a1 + b1)));
+        return mask0 & ~mask1;
+    }
+    uint32_t FUNC(szext_32)(uint32_t a, uint32_t b, uint32_t ctrl)
+    {
+        bool clampm = ctrl & 1, sgn = (ctrl >> 1) & 1;
+        if (clampm && b >= 32)
+            return a;
+        uint32_t n = clampm ? b : (b & 31);
+        if (n == 0)
+            return 0;
+        uint32_t mk = n >= 32 ? 0xFFFFFFFFu : ((1u << n) - 1u);
+        if (sgn && ((a >> (n - 1)) & 1))
+            return a | ~mk;
+        return a & mk;
+    }
+    // mode 1 f4e, 2 b4e, 3 rc8, 4 ecl, 5 ecr, 6 rc16
+    uint32_t FUNC(prmt_mode)(uint32_t a, uint32_t b, uint32_t c, uint32_t mode)
+    {
+        uint64_t v = ((uint64_t)b << 32) | a;
+        uint32_t r = 0, c3 = c & 3;
+        for (uint32_t i = 0; i < 4; i++)
+        {
+            uint32_t s;
+            switch (mode)
+            {
+            case 1: s = c3 + i; break;
+            case 2: s = (c3 - i) & 7; break;
+            case 3: s = c3; break;
+            case 4: s = c3 > i ? c3 : i; break;
+            case 5: s = c3 < i ? c3 : i; break;
+            default: s = (c & 1) * 2 + (i & 1); break;
+            }
+            r |= (uint32_t)((v >> (8 * (s & 7))) & 0xFF) << (8 * i);
+        }
+        return r;
+    }
+    // ctrl: 0 signed, 1 .hi, 2 .sat
+    uint32_t FUNC(mad24)(uint32_t a, uint32_t b, uint32_t c, uint32_t ctrl)
+    {
+        bool sg = ctrl & 1;
+        int64_t x = sg ? (int64_t)((int32_t)(a << 8) >> 8) : (int64_t)(a & 0xFFFFFF);
+        int64_t y = sg ? (int64_t)((int32_t)(b << 8) >> 8) : (int64_t)(b & 0xFFFFFF);
+        int64_t p = x * y;
+        if ((ctrl & 2) && (ctrl & 4))
+        {
+            int64_t v = (p >> 16) + (sg ? (int64_t)(int32_t)c : (int64_t)c);
+            if (sg)
+                v = v < INT32_MIN ? INT32_MIN : v > INT32_MAX ? INT32_MAX : v;
+            else
+                v = v < 0 ? 0 : v > 0xFFFFFFFFll ? 0xFFFFFFFFll : v;
+            return (uint32_t)v;
+        }
+        uint32_t m = (ctrl & 2) ? (uint32_t)(p >> 16) : (uint32_t)p;
+        return m + c;
+    }
+    uint64_t FUNC(clmad)(uint64_t a, uint64_t b, uint64_t c, uint32_t hi)
+    {
+        uint64_t lo = 0, h = 0;
+        for (int i = 0; i < 64; i++)
+            if ((a >> i) & 1)
+            {
+                lo ^= b << i;
+                if (i)
+                    h ^= b >> (64 - i);
+            }
+        return (hi ? h : lo) ^ c;
+    }
+    // dp4a.atype.btype: ctrl bit 0 a signed, bit 1 b signed; the accumulator is s32 if either is signed
+    uint32_t FUNC(dp4a_mixed)(uint32_t a, uint32_t b, uint32_t c, uint32_t ctrl)
+    {
+        int64_t acc = 0;
+        for (int i = 0; i < 4; i++)
+        {
+            uint32_t x = (a >> (8 * i)) & 0xFF, y = (b >> (8 * i)) & 0xFF;
+            int64_t xv = (ctrl & 1) ? (int64_t)(int8_t)x : (int64_t)x;
+            int64_t yv = (ctrl & 2) ? (int64_t)(int8_t)y : (int64_t)y;
+            acc += xv * yv;
+        }
+        return (uint32_t)(acc + (int64_t)c);
+    }

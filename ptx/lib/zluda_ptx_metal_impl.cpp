@@ -410,4 +410,8 @@ extern "C"
 #include "metal_impl/matrix.inc"
 #include "metal_impl/memory.inc"
 #include "metal_impl/tensor.inc"
+#include "metal_impl/warp.inc"
+#include "metal_impl/sreg.inc"
+#include "metal_impl/texture.inc"
+#include "metal_impl/multimem.inc"
 }

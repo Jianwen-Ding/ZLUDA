@@ -30,6 +30,8 @@
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Metadata.h>
+#include <llvm/Analysis/ValueTracking.h>
+#include <llvm/Support/KnownBits.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/IR/ReplaceConstant.h>
@@ -363,6 +365,76 @@ static void resolveCluster(Module &m)
     (void)expl;
 }
 
+// NaN constants: PTX arithmetic producing a NaN gives the canonical NaN (all ones but the sign: 0x7fffffff for .f32),
+// which the AGX hardware produces at run time (+canonical-nan); LLVM's constant folding of f32 gives its default quiet NaN
+// (0x7fc00000) instead. NaN constants of the program (bit patterns of the PTX source, the helper library) are hidden
+// behind opaque calls during the cleanups; afterwards every default NaN constant comes from folding and is replaced by
+// the canonical NaN, and the program's constants are restored. (f64 keeps NaN payloads in PTX, as LLVM's folding does.)
+static void hideSourceNaNs(Module &m)
+{
+    std::vector<std::pair<Instruction *, unsigned>> work;
+    for (Function &f : m)
+        for (Instruction &i : instructions(f))
+            for (unsigned k = 0; k < i.getNumOperands(); k++)
+                if (auto *cf = dyn_cast<ConstantFP>(i.getOperand(k)); cf && cf->isNaN() && cf->getType()->isFloatTy())
+                    work.push_back({&i, k});
+    for (auto [i, k] : work)
+    {
+        auto *cf = cast<ConstantFP>(i->getOperand(k));
+        Type *t = cf->getType();
+        Type *it = IntegerType::get(m.getContext(), t->getPrimitiveSizeInBits());
+        std::string name = "__zluda_nan_keep." + std::to_string(t->getTypeID()) + "." + std::to_string(it->getIntegerBitWidth());
+        FunctionCallee keep = m.getOrInsertFunction(name, FunctionType::get(t, {it}, false));
+        if (auto *fn = dyn_cast<Function>(keep.getCallee()))
+        {
+            fn->setDoesNotThrow();
+            fn->setDoesNotAccessMemory();
+            fn->setWillReturn();
+        }
+        Instruction *at = i;
+        if (auto *phi = dyn_cast<PHINode>(i))
+            at = phi->getIncomingBlock(k)->getTerminator();
+        IRBuilder<> b(at);
+        Value *v = b.CreateCall(keep, {ConstantInt::get(it, cf->getValueAPF().bitcastToAPInt())});
+        i->setOperand(k, v);
+    }
+}
+
+static void canonicalizeFoldedNaNs(Module &m)
+{
+    for (Function &f : m)
+        for (Instruction &i : instructions(f))
+            for (unsigned k = 0; k < i.getNumOperands(); k++)
+                if (auto *cf = dyn_cast<ConstantFP>(i.getOperand(k)); cf && cf->isNaN() && cf->getType()->isFloatTy())
+                {
+                    const fltSemantics &sem = cf->getValueAPF().getSemantics();
+                    APInt bits = cf->getValueAPF().bitcastToAPInt();
+                    if (bits != APFloat::getQNaN(sem).bitcastToAPInt())
+                        continue;
+                    APInt canon = APInt::getSignedMaxValue(bits.getBitWidth());
+                    i.setOperand(k, ConstantFP::get(cf->getType(), APFloat(sem, canon)));
+                }
+    std::vector<Function *> keeps;
+    for (Function &f : m)
+        if (f.getName().starts_with("__zluda_nan_keep."))
+            keeps.push_back(&f);
+    for (Function *fn : keeps)
+    {
+        std::vector<CallInst *> calls;
+        for (User *u : fn->users())
+            if (auto *ci = dyn_cast<CallInst>(u))
+                calls.push_back(ci);
+        for (CallInst *ci : calls)
+        {
+            auto *bits = cast<ConstantInt>(ci->getArgOperand(0));
+            ci->replaceAllUsesWith(ConstantFP::get(ci->getType(), APFloat(ci->getType()->getFltSemantics(), bits->getValue())));
+            ci->eraseFromParent();
+        }
+        if (fn->use_empty())
+            fn->eraseFromParent();
+    }
+}
+
 // alloca / stacksave / stackrestore (ptx/lib/metal_impl/memory.inc): a per-thread stack, an entry-block alloca of
 // each kernel, and its stack offset (the stack grows down from its end)
 static void resolveLocalStack(Module &m)
@@ -397,6 +469,129 @@ static void resolveLocalStack(Module &m)
                 v = new AddrSpaceCastInst(v, ci->getType(), "", ci);
             ci->replaceAllUsesWith(v);
             ci->eraseFromParent();
+        }
+    }
+}
+
+// Generic addresses that stay unresolved (PTX ISA 6.4.1.1 generic windows): a cvta of a .shared or .local address whose
+// generic value escapes static resolution (it goes through memory, or through integer arithmetic PointerRecovery
+// cannot follow) is the object's 32-bit address in a window of the generic address space, and the generic loads and
+// stores of the function then test the windows at run time. Only functions with such an escaping address pay for the
+// test; ordinary global-memory code is unchanged. A local window access is relative to one private object of the
+// function (the one whose address escapes).
+static const uint64_t GW_SHARED = 0x01000000, GW_LOCAL = 0x02000000, GW_SIZE = 0x01000000;
+static std::set<Function *> g_windowed;
+static void scanGenericWindows(Module &m)
+{
+    g_windowed.clear();
+    for (Function &f : m)
+        for (Instruction &i : instructions(f))
+            if (auto *asc = dyn_cast<AddrSpaceCastInst>(&i))
+                if (asc->getDestAddressSpace() == amd::Flat &&
+                    (asc->getSrcAddressSpace() == amd::Shared || asc->getSrcAddressSpace() == amd::Private))
+                    g_windowed.insert(&f);
+}
+static void resolveGenericWindows(Module &m)
+{
+    LLVMContext &c = m.getContext();
+    Type *i64 = Type::getInt64Ty(c), *i32 = Type::getInt32Ty(c), *i8 = Type::getInt8Ty(c);
+    for (Function *f : g_windowed)
+    {
+        Value *shBase = nullptr, *loBase = nullptr;
+        SmallVector<AddrSpaceCastInst *, 8> casts;
+        for (Instruction &i : instructions(*f))
+            if (auto *asc = dyn_cast<AddrSpaceCastInst>(&i))
+                if (asc->getDestAddressSpace() == amd::Flat &&
+                    (asc->getSrcAddressSpace() == amd::Shared || asc->getSrcAddressSpace() == amd::Private))
+                    casts.push_back(asc);
+        for (AddrSpaceCastInst *asc : casts)
+        {
+            Value *src = asc->getPointerOperand();
+            bool sh = asc->getSrcAddressSpace() == amd::Shared;
+            Value *obj = getUnderlyingObject(src);
+            if (sh && !shBase)
+                shBase = obj;
+            if (!sh && !loBase)
+                loBase = obj;
+            IRBuilder<> b(asc);
+            Value *off = b.CreateZExt(b.CreatePtrToInt(src, i32), i64);
+            Value *g = b.CreateIntToPtr(b.CreateAdd(off, ConstantInt::get(i64, sh ? GW_SHARED : GW_LOCAL)), asc->getType());
+            asc->replaceAllUsesWith(g);
+            asc->eraseFromParent();
+        }
+        // the generic accesses: the window of the address at run time
+        SmallVector<Instruction *, 16> acc;
+        for (Instruction &i : instructions(*f))
+        {
+            Value *p = nullptr;
+            if (auto *ld = dyn_cast<LoadInst>(&i))
+                p = ld->getPointerOperand();
+            else if (auto *st = dyn_cast<StoreInst>(&i))
+                p = st->getPointerOperand();
+            else if (auto *rmw = dyn_cast<AtomicRMWInst>(&i))
+                p = rmw->getPointerOperand();
+            else if (auto *cx = dyn_cast<AtomicCmpXchgInst>(&i))
+                p = cx->getPointerOperand();
+            if (p && p->getType()->getPointerAddressSpace() == amd::Flat)
+                acc.push_back(&i);
+        }
+        for (Instruction *i : acc)
+        {
+            unsigned opIdx = isa<StoreInst>(i) ? 1 : 0;
+            Value *p = i->getOperand(opIdx);
+            BasicBlock *bb = i->getParent();
+            BasicBlock *join = bb->splitBasicBlock(i, "gw.join");
+            bb->getTerminator()->eraseFromParent();
+            IRBuilder<> b(bb);
+            Value *x = b.CreatePtrToInt(p, i64);
+            // the global access stays the original instruction (moved into its own block)
+            BasicBlock *glBB = BasicBlock::Create(c, "gw.global", f, join);
+            i->removeFromParent();
+            i->insertInto(glBB, glBB->end());
+            BranchInst::Create(join, glBB);
+            SmallVector<std::pair<Value *, BasicBlock *>, 3> results;
+            if (!i->getType()->isVoidTy())
+                results.push_back({i, glBB});
+            BasicBlock *next = glBB;
+            for (int w = 0; w < 2; w++)
+            {
+                Value *base = w == 0 ? loBase : shBase;
+                if (!base)
+                    continue;
+                uint64_t wb = w == 0 ? GW_LOCAL : GW_SHARED;
+                unsigned as = w == 0 ? amd::Private : amd::Shared;
+                BasicBlock *test = BasicBlock::Create(c, "gw.test", f, next);
+                BasicBlock *hit = BasicBlock::Create(c, w == 0 ? "gw.local" : "gw.shared", f, next);
+                IRBuilder<> tb(test);
+                Value *rel = tb.CreateSub(x, ConstantInt::get(i64, wb));
+                tb.CreateCondBr(tb.CreateICmpULT(rel, ConstantInt::get(i64, GW_SIZE)), hit, next);
+                IRBuilder<> hb(hit);
+                Value *boff = hb.CreateSub(hb.CreateTrunc(rel, i32), hb.CreatePtrToInt(base, i32));
+                Value *q = hb.CreateGEP(i8, base, hb.CreateSExt(boff, i64));
+                if (q->getType()->getPointerAddressSpace() != as)
+                    q = hb.CreateAddrSpaceCast(q, PointerType::get(c, as));
+                Instruction *cl = i->clone();
+                cl->setOperand(opIdx, q);
+                hb.Insert(cl);
+                hb.CreateBr(join);
+                if (!i->getType()->isVoidTy())
+                    results.push_back({cl, hit});
+                next = test;
+            }
+            BranchInst::Create(next, bb);
+            if (!i->getType()->isVoidTy())
+            {
+                IRBuilder<> jb(&*join->getFirstInsertionPt());
+                PHINode *phi = jb.CreatePHI(i->getType(), results.size());
+                SmallVector<Use *, 8> uses;
+                for (Use &u : i->uses())
+                    uses.push_back(&u);
+                for (auto &[v, from] : results)
+                    phi->addIncoming(v, from);
+                for (Use *u : uses)
+                    if (u->getUser() != phi)
+                        u->set(phi);
+            }
         }
     }
 }
@@ -436,6 +631,19 @@ static void resolveIsSpacep(Module &m)
         uint64_t kind = cast<ConstantInt>(ci->getArgOperand(1))->getZExtValue();
         bool r = kind == 5 ? space == 1 : (uint64_t)space == kind;
         Value *arg = ci->getArgOperand(0);
+        if (space == 0 && !isa<GlobalValue>(p) && !isa<Argument>(p) && g_windowed.count(ci->getFunction()) && kind <= 2)
+        {
+            // an address of unknown origin in a function with generic windows: test the windows
+            IRBuilder<> b(ci);
+            Value *x = b.CreatePtrToInt(arg, b.getInt64Ty());
+            auto in = [&](uint64_t base) {
+                return b.CreateICmpULT(b.CreateSub(x, b.getInt64(base)), b.getInt64(GW_SIZE));
+            };
+            Value *v = kind == 1 ? in(GW_SHARED) : kind == 2 ? in(GW_LOCAL) : b.CreateNot(b.CreateOr(in(GW_SHARED), in(GW_LOCAL)));
+            ci->replaceAllUsesWith(b.CreateZExt(v, ci->getType()));
+            ci->eraseFromParent();
+            continue;
+        }
         GlobalVariable *block = m.getGlobalVariable("__zluda_cta_shared", true);
         MDNode *md = block ? block->getMetadata("zluda.cluster") : nullptr;
         Value *repl = ConstantInt::get(ci->getType(), r);
@@ -629,6 +837,8 @@ private:
             return stripCasts(pti->getPointerOperand())->getType()->getPointerAddressSpace();
         if (!visiting.insert(v).second)
             return ~1u; // cycle: neutral element
+        if (Value *x = identityAnd(v))
+            return baseAddressSpace(x, visiting);
         if (auto *bo = dyn_cast<BinaryOperator>(v))
         {
             if (bo->getOpcode() == Instruction::Add || bo->getOpcode() == Instruction::Sub ||
@@ -681,6 +891,26 @@ private:
         return ~0u;
     }
 
+    // `x & C` that keeps every bit x can have (a 32-bit pointer zero-extended, known alignment): x
+    Value *identityAnd(Value *v)
+    {
+        auto *bo = dyn_cast<BinaryOperator>(v);
+        if (!bo || bo->getOpcode() != Instruction::And)
+            return nullptr;
+        auto *c = dyn_cast<ConstantInt>(bo->getOperand(1));
+        if (!c)
+            return nullptr;
+        KnownBits kb = computeKnownBits(bo->getOperand(0), dl);
+        // threadgroup and thread addresses are 32-bit
+        SmallPtrSet<Value *, 16> visiting;
+        unsigned as = baseAddressSpace(bo->getOperand(0), visiting);
+        if ((as == amd::Shared || as == amd::Private) && kb.getBitWidth() > 32)
+            kb.Zero.setBitsFrom(32);
+        if ((~c->getValue() & ~kb.Zero).isZero())
+            return bo->getOperand(0);
+        return nullptr;
+    }
+
     bool recoverable(Value *v)
     {
         SmallPtrSet<Value *, 16> visiting;
@@ -710,6 +940,10 @@ private:
                         result = ConstantExpr::getGetElementPtr(Type::getInt8Ty(f.getContext()), base,
                                                                 ce->getOperand(1 - side));
             }
+        }
+        else if (Value *x = identityAnd(v))
+        {
+            result = recover(x);
         }
         else if (auto *bo = dyn_cast<BinaryOperator>(v))
         {
@@ -1687,7 +1921,13 @@ struct KernelInfo
     bool dynamicShared = false;
     uint64_t staticShared = 0;
     uint64_t globalsParamOffset = UINT64_MAX;
+    // offset of the hidden u32 holding the launch's dynamic shared memory size (%dynamic_smem_size), or UINT64_MAX
+    uint64_t dynSmemParamOffset = UINT64_MAX;
 };
+
+// names of the PTX module's .shared variables (before the helper library is linked): the static shared memory of
+// %total_smem_size counts these only
+static std::set<std::string> g_ptxShared;
 
 struct DeviceGlobal
 {
@@ -1842,6 +2082,17 @@ KernelInfo buildKernelWrapper(Module &m, Function *body, const DeviceGlobals &gl
         info.globalsParamOffset = offset;
         offset += 8;
     }
+    bool usesDynSmemSize = false;
+    if (Function *ph = m.getFunction("__zluda_metal_dynamic_smem_size"))
+        for (User *u : ph->users())
+            if (auto *i = dyn_cast<Instruction>(u); i && i->getFunction() == body)
+                usesDynSmemSize = true;
+    if (usesDynSmemSize)
+    {
+        offset = alignTo(offset, 4);
+        info.dynSmemParamOffset = offset;
+        offset += 4;
+    }
     info.paramsSize = offset;
 
     // Does the kernel use dynamic shared memory?
@@ -1942,6 +2193,58 @@ KernelInfo buildKernelWrapper(Module &m, Function *body, const DeviceGlobals &gl
         }
     }
 
+    // %dynamic_smem_size / the static .shared bytes of %total_smem_size (ptx/lib/metal_impl/sreg.inc)
+    for (const char *name : {"__zluda_metal_dynamic_smem_size", "__zluda_metal_static_smem_size"})
+    {
+        Function *ph = m.getFunction(name);
+        if (!ph)
+            continue;
+        SmallVector<CallInst *, 4> calls;
+        for (User *u : ph->users())
+            if (auto *ci = dyn_cast<CallInst>(u); ci && ci->getFunction() == w)
+                calls.push_back(ci);
+        if (calls.empty())
+            continue;
+        Value *v;
+        if (StringRef(name) == "__zluda_metal_dynamic_smem_size")
+        {
+            IRBuilder<> gb(&*w->getEntryBlock().getFirstInsertionPt());
+            v = gb.CreateLoad(gb.getInt32Ty(),
+                              gb.CreateConstInBoundsGEP1_64(gb.getInt8Ty(), w->getArg(0), info.dynSmemParamOffset),
+                              "zluda_dynamic_smem_size");
+        }
+        else
+        {
+            uint64_t total = 0;
+            for (GlobalVariable &gv : m.globals())
+            {
+                if (gv.getAddressSpace() != air::Threadgroup || isDynamicSharedGlobal(gv))
+                    continue;
+                bool used = false;
+                for (User *u : gv.users())
+                    if (auto *i = dyn_cast<Instruction>(u); i && i->getFunction() == w)
+                        used = true;
+                if (!used)
+                    continue;
+                uint64_t size = dl.getTypeAllocSize(gv.getValueType());
+                if (gv.getName() == "__zluda_cta_shared")
+                {
+                    if (MDNode *md = gv.getMetadata("zluda.cluster"))
+                        size = mdconst::extract<ConstantInt>(md->getOperand(0))->getZExtValue();
+                }
+                else if (!g_ptxShared.count(gv.getName().str()))
+                    continue;
+                uint64_t al = gv.getAlign() ? gv.getAlign()->value() : 1;
+                total = alignTo(total, al) + size;
+            }
+            v = ConstantInt::get(Type::getInt32Ty(c), total);
+        }
+        for (CallInst *ci : calls)
+        {
+            ci->replaceAllUsesWith(v);
+            ci->eraseFromParent();
+        }
+    }
 
     // Builtins
     std::map<std::string, unsigned> builtinArg = {
@@ -2527,8 +2830,11 @@ void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals
         }
         gv.setVisibility(GlobalValue::DefaultVisibility);
     }
+    hideSourceNaNs(m);
     runCleanup(m, true, true);
     resolveCluster(m);
+    // the per-thread stack before PointerRecovery: alloca's integer results keep their local provenance (isspacep)
+    resolveLocalStack(m);
     runCleanup(m, false, true);
     for (int iter = 0; iter < 4; iter++)
     {
@@ -2549,11 +2855,17 @@ void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals
             break;
         runCleanup(m, false, true);
     }
-    resolveLocalStack(m);
+    canonicalizeFoldedNaNs(m);
+    if (getenv("ZLUDA_AIR_DEBUG_RECOVERED"))
+        m.print(errs(), nullptr);
+    scanGenericWindows(m);
     resolveIsSpacep(m);
+    resolveGenericWindows(m);
     for (Function &f : m)
         if (!f.isDeclaration() && f.getCallingConv() != CallingConv::AMDGPU_KERNEL && !f.use_empty())
             fail("function could not be inlined into its kernel (recursion is not supported): " + f.getName());
+    if (getenv("ZLUDA_AIR_DEBUG_RESOLVED"))
+        m.print(errs(), nullptr);
     for (Function &f : m)
         for (Instruction &i : instructions(f))
             if (auto *asc = dyn_cast<AddrSpaceCastInst>(&i))
@@ -2738,6 +3050,10 @@ extern "C" int zluda_air_lower(const ZludaAirInput *input, ZludaAirOutput *outpu
             if (Linker::linkModules(*main, std::move(attrs), Linker::LinkOnlyNeeded))
                 fail("failed to link attributes module");
         }
+        g_ptxShared.clear();
+        for (GlobalVariable &gv : main->globals())
+            if (gv.getAddressSpace() == amd::Shared)
+                g_ptxShared.insert(gv.getName().str());
         auto impl = parse(ctx, input->impl_bc, input->impl_len, "zluda_ptx_metal_impl");
         impl->setDataLayout(main->getDataLayout());
         impl->setTargetTriple(main->getTargetTriple());
@@ -2783,6 +3099,7 @@ extern "C" int zluda_air_lower(const ZludaAirInput *input, ZludaAirOutput *outpu
             k.dynamic_shared = kernels[i].dynamicShared;
             k.static_shared = kernels[i].staticShared;
             k.globals_param_offset = kernels[i].globalsParamOffset;
+            k.dyn_smem_param_offset = kernels[i].dynSmemParamOffset;
             std::string bc = writeBitcode(*extractKernel(*main, kernels[i].name));
             k.air_len = bc.size();
             k.air = (uint8_t *)malloc(bc.size());

@@ -1,8 +1,213 @@
 //! lop3, testp, slct and other single instructions.
 use super::*;
 
+/// tried before the grammar: `mov` of special registers the grammar's types reject
+pub(super) fn preempts(_opcode: &str, base: &str, m: &[&str]) -> bool {
+    base == "bmsk"
+        // video shifts: the grammar's lowering lacks the secondary operations (video.rs has them all)
+        || matches!(base, "vshl" | "vshr")
+        // textures and surfaces in software (texture.rs): the grammar's forms need the descriptor objects too
+        || matches!(base, "tex" | "tld4" | "txq" | "suld" | "sust" | "sured" | "suq" | "istypep")
+        // packed integer lanes (float.rs ipack): the grammar's lowering is a 32-bit operation
+        || matches!(base, "add" | "sub" | "min" | "max" | "neg" | "abs")
+            && m.iter().any(|x| matches!(*x, "u8x4" | "s8x4" | "u16x2" | "s16x2"))
+        || base == "dp4a" && m.len() == 2 && m[0] != m[1]
+        || (base == "bar" || base == "barrier") && m.contains(&"red")
+        || base == "mov" && (m.contains(&"v4") || m.contains(&"v2") || m == ["u32"] || m == ["b32"] || m == ["s32"])
+}
+
+const VEC_SREGS: [&str; 8] =
+    ["%tid", "%ntid", "%ctaid", "%nctaid", "%clusterid", "%nclusterid", "%cluster_ctaid", "%cluster_nctaid"];
+const PRED_SREGS: [&str; 1] = ["%is_explicit_cluster"];
+
+/// mov.v4.u32 {a, b, c, d}, %tid;  (the members .x .y .z, then 0);  mov.u32 d, %is_explicit_cluster;  (0 / 1)
+fn mov_sreg<'i>(m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
+    let [d, a] = ops else { return None };
+    let ast::ParsedOperand::Reg(src) = a.op else { return None };
+    if PRED_SREGS.contains(&src) && !d.addr && matches!(d.op, ast::ParsedOperand::Reg(_)) && m.len() == 1 {
+        return Some(Ok(ast::Instruction::Selp {
+            data: scalar(m[0])?,
+            arguments: ast::SelpArgs { dst: d.op.clone(), src1: imm(1), src2: imm(0), src3: a.op.clone() },
+        }));
+    }
+    None
+}
+
+/// the movs of a vector special register read (mov_sreg): the first member is the instruction itself
+pub(super) fn mov_sreg_members<'i>(m: &[&str], ops: &[HOp<'i>]) -> Option<Vec<ast::Instruction<ParsedOperandStr<'i>>>> {
+    let [d, a] = ops else { return None };
+    let ast::ParsedOperand::Reg(src) = a.op else { return None };
+    if !VEC_SREGS.contains(&src) || !(m.contains(&"v4") || m.contains(&"v2")) {
+        return None;
+    }
+    let t = scalar(m.last()?)?;
+    let ast::ParsedOperand::VecPack(ds) = &d.op else { return None };
+    let mut out = Vec::new();
+    for (i, x) in ds.iter().enumerate() {
+        let Some(ast::RegOrImmediate::Reg(r)) = x else { continue };
+        let src = if i < 3 { ast::ParsedOperand::VecMember(src, i as u8) } else { imm(0) };
+        out.push(ast::Instruction::Mov {
+            data: ast::MovDetails { typ: ast::Type::Scalar(t) },
+            arguments: ast::MovArgs { dst: ast::ParsedOperand::Reg(*r), src },
+        });
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
 pub(super) fn lower<'i>(_opcode: &str, base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
     match base {
+        "bfind" => {
+            // bfind{.shiftamt}.type d, a;
+            let t = *m.last()?;
+            let [d, a] = ops else { return err("bfind operands") };
+            let wide = t.ends_with("64");
+            let ctrl = (is_signed(t) as u64) | ((m.contains(&"shiftamt") as u64) << 1);
+            Call::new(if wide { "bfind_64" } else { "bfind_32" })
+                .dst(d.op.clone(), ScalarType::U32)
+                .src(a.op.clone(), if wide { ScalarType::B64 } else { ScalarType::B32 })
+                .imm(ctrl)
+                .build()
+        }
+        "fns" => {
+            let [d, mk, b, o] = ops else { return err("fns operands") };
+            Call::new("fns_b32")
+                .dst(d.op.clone(), ScalarType::B32)
+                .src(mk.op.clone(), ScalarType::B32)
+                .src(b.op.clone(), ScalarType::U32)
+                .src(o.op.clone(), ScalarType::S32)
+                .build()
+        }
+        "bmsk" => {
+            let [d, a, b] = ops else { return err("bmsk operands") };
+            Call::new("bmsk_b32")
+                .dst(d.op.clone(), ScalarType::B32)
+                .src(a.op.clone(), ScalarType::U32)
+                .src(b.op.clone(), ScalarType::U32)
+                .imm(m.contains(&"clamp") as u64)
+                .build()
+        }
+        "szext" => {
+            let t = *m.last()?;
+            let [d, a, b] = ops else { return err("szext operands") };
+            Call::new("szext_32")
+                .dst(d.op.clone(), ScalarType::B32)
+                .src(a.op.clone(), ScalarType::B32)
+                .src(b.op.clone(), ScalarType::U32)
+                .imm((m.contains(&"clamp") as u64) | ((is_signed(t) as u64) << 1))
+                .build()
+        }
+        "prmt" => {
+            let mode = ["f4e", "b4e", "rc8", "ecl", "ecr", "rc16"].iter().position(|x| m.contains(x))? as u64 + 1;
+            let [d, a, b, c] = ops else { return err("prmt operands") };
+            Call::new("prmt_mode")
+                .dst(d.op.clone(), ScalarType::B32)
+                .src(a.op.clone(), ScalarType::B32)
+                .src(b.op.clone(), ScalarType::B32)
+                .src(c.op.clone(), ScalarType::B32)
+                .imm(mode)
+                .build()
+        }
+        "mad24" | "mul24" => {
+            // mad24.mode{.sat}.type d, a, b, c;  mul24.mode.type d, a, b;
+            let t = *m.last()?;
+            let (d, a, b, c) = match ops {
+                [d, a, b, c] if base == "mad24" => (d, a, b, Some(c)),
+                [d, a, b] if base == "mul24" => (d, a, b, None),
+                _ => return err("mad24 operands"),
+            };
+            let ctrl = (is_signed(t) as u64) | ((m.contains(&"hi") as u64) << 1) | ((m.contains(&"sat") as u64) << 2);
+            Call::new("mad24")
+                .dst(d.op.clone(), ScalarType::B32)
+                .src(a.op.clone(), ScalarType::B32)
+                .src(b.op.clone(), ScalarType::B32)
+                .src(c.map_or(imm(0), |c| c.op.clone()), ScalarType::B32)
+                .imm(ctrl)
+                .build()
+        }
+        "dp4a" => {
+            // dp4a.atype.btype d, a, b, c;
+            let [d, a, b, c] = ops else { return err("dp4a operands") };
+            if m.len() != 2 {
+                return None;
+            }
+            let ctrl = (is_signed(m[0]) as u64) | ((is_signed(m[1]) as u64) << 1);
+            Call::new("dp4a_mixed")
+                .dst(d.op.clone(), ScalarType::B32)
+                .src(a.op.clone(), ScalarType::B32)
+                .src(b.op.clone(), ScalarType::B32)
+                .src(c.op.clone(), ScalarType::B32)
+                .imm(ctrl)
+                .build()
+        }
+        "spcompress" | "spdecompress" => spc(base, m, ops),
+        "clmad" => {
+            let [d, a, b, c] = ops else { return err("clmad operands") };
+            Call::new("clmad")
+                .dst(d.op.clone(), ScalarType::B64)
+                .src(a.op.clone(), ScalarType::B64)
+                .src(b.op.clone(), ScalarType::B64)
+                .src(c.op.clone(), ScalarType::B64)
+                .imm(m.contains(&"hi") as u64)
+                .build()
+        }
+        "bar" | "barrier" if m.contains(&"red") => {
+            // bar{.cta}.red.popc{.aligned}.u32 d, a{, b}, {!}c;  bar{.cta}.red.op{.aligned}.pred p, a{, b}, {!}c;
+            let kind = ["popc", "and", "or"].iter().position(|k| m.contains(k))? as u64;
+            let (d, a, b, c) = match ops {
+                [d, a, c] => (d, a, None, c),
+                [d, a, b, c] => (d, a, Some(b), c),
+                _ => return err("bar.red operands"),
+            };
+            let call = if kind == 0 {
+                Call::new("nbar_red_popc").dst(d.op.clone(), ScalarType::U32)
+            } else {
+                Call::new("nbar_red_pred").dst(d.op.clone(), ScalarType::Pred)
+            };
+            call.src(a.op.clone(), ScalarType::U32)
+                .src(b.map_or(imm(0), |b| b.op.clone()), ScalarType::U32)
+                .src(c.op.clone(), ScalarType::Pred)
+                .imm(kind | ((c.neg as u64) << 4))
+                .build()
+        }
+        // ld{.ss}.type.proxy::readonly d, [a];  (PTX ISA 9.4: a hint without effect on the result); qualifier
+        // combinations the ISA text rules out (ld.volatile.relaxed.scope: a load, the model's evident meaning)
+        "ld" if m.contains(&"proxy::readonly") || (m.contains(&"volatile") && (m.contains(&"relaxed") || m.contains(&"acquire"))) => {
+            let [d, a] = ops else { return err("ld operands") };
+            if !a.addr {
+                return err("ld address");
+            }
+            let t = m.iter().rev().find_map(|x| scalar(x))?;
+            let ss = if m.contains(&"global") {
+                StateSpace::Global
+            } else if m.contains(&"shared") || m.contains(&"shared::cta") {
+                StateSpace::Shared
+            } else if m.contains(&"local") {
+                StateSpace::Local
+            } else if m.contains(&"const") {
+                StateSpace::Const
+            } else {
+                StateSpace::Generic
+            };
+            Some(Ok(ast::Instruction::Ld {
+                data: ast::LdDetails {
+                    qualifier: if m.contains(&"volatile") { ast::LdStQualifier::Volatile } else { ast::LdStQualifier::Weak },
+                    state_space: ss,
+                    caching: ast::LdCacheOperator::Cached,
+                    typ: ast::Type::Scalar(t),
+                    non_coherent: false,
+                },
+                arguments: ast::LdArgs { dst: d.op.clone(), src: a.op.clone() },
+            }))
+        }
+        "mov" => {
+            if let Some(mut v) = mov_sreg_members(m, ops) {
+                return Some(Ok(v.remove(0)));
+            }
+            mov_sreg(m, ops)
+        }
         "lop3" => {
             // lop3.b32 d, a, b, c, immLut;  lop3.BoolOp.b32 d|p, a, b, c, immLut, q;
             if ops.len() == 5 && m == ["b32"] {
@@ -90,4 +295,67 @@ pub(super) fn lower<'i>(_opcode: &str, base: &str, m: &[&str], ops: &[HOp<'i>]) 
         }
         _ => None,
     }
+}
+
+fn vec_items<'i>(o: &Op<'i>) -> Vec<Option<ast::RegOrImmediate<&'i str>>> {
+    match o {
+        ast::ParsedOperand::VecPack(v) => v.clone(),
+        ast::ParsedOperand::Reg(r) => vec![Some(ast::RegOrImmediate::Reg(*r))],
+        _ => Vec::new(),
+    }
+}
+
+/// spcompress / spdecompress (Sail: ptx_spc.sail): the destinations of the instruction form one vector of the helper
+/// (spcompress: the metadata words, then the compressed words)
+fn spc<'i>(base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
+    let es: u64 = if m.contains(&"b16") { 16 } else { 8 };
+    let ib: u64 = if m.contains(&"b4") { 4 } else { 2 };
+    let num = ["x1", "x2", "x4", "x8", "x16", "x32", "x64"].iter().position(|x| m.contains(x)).map_or(1, |i| 1u64 << i);
+    let sp = m.iter().find(|x| x.starts_with("sp::")).copied().unwrap_or("sp::2:4");
+    let (ns, nt) = match sp {
+        "sp::1:2" => (1, 2),
+        "sp::1:4" => (1, 4),
+        "sp::1:8" => (1, 8),
+        "sp::1:16" => (1, 16),
+        "sp::2:8" => (2, 8),
+        "sp::2:16" => (2, 16),
+        "sp::4:8" => (4, 8),
+        "sp::4:16" => (4, 16),
+        _ => (2, 4),
+    };
+    if base == "spcompress" {
+        let [mv, cv, dv, sd] = ops else { return err("spcompress operands") };
+        let (mi, ci, di) = (vec_items(&mv.op), vec_items(&cv.op), vec_items(&dv.op));
+        if mi.len() + ci.len() > 8 || di.len() > 8 {
+            return err("spcompress vector sizes");
+        }
+        let ctrl = es | ib << 5 | (di.len() as u64) << 8 | (mi.len() as u64) << 12 | (ci.len() as u64) << 16;
+        let mut out = mi;
+        out.extend(ci);
+        while out.len() < 8 {
+            out.push(None);
+        }
+        return Call::new("spcompress")
+            .dst_vec(ast::ParsedOperand::VecPack(out), 8, ScalarType::B32)
+            .src_vec(ast::ParsedOperand::VecPack(di), 8, ScalarType::B32)
+            .src(sd.op.clone(), ScalarType::B32)
+            .imm(ctrl)
+            .build();
+    }
+    let [dv, mv, cv] = ops else { return err("spdecompress operands") };
+    let (di, mi, ci) = (vec_items(&dv.op), vec_items(&mv.op), vec_items(&cv.op));
+    if di.len() > 8 || mi.len() > 4 || ci.len() > 4 {
+        return err("spdecompress vector sizes");
+    }
+    let ctrl = es | ib << 5 | (di.len() as u64) << 8 | num << 12 | ns << 20 | nt << 24;
+    let mut d = di;
+    while d.len() < 8 {
+        d.push(None);
+    }
+    Call::new("spdecompress")
+        .dst_vec(ast::ParsedOperand::VecPack(d), 8, ScalarType::B32)
+        .src_vec(ast::ParsedOperand::VecPack(mi), 4, ScalarType::B32)
+        .src_vec(ast::ParsedOperand::VecPack(ci), 4, ScalarType::B32)
+        .imm(ctrl)
+        .build()
 }

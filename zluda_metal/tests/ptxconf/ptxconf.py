@@ -35,8 +35,10 @@ DEFAULT_LIB = os.path.join(HERE, "..", "..", "target", "release", "libzluda_meta
 
 HARNESS = ("buffer", "launch", "print", "expect", "patch", "append", "tensormap", "texture", "sampler", "surface",
            "multimem", "fabric", "memmodel", "ub", "occupancy", "cooplaunch", "convergence", "isacheck")
-IGNORED = ("print", "memmodel", "isacheck", "convergence", "occupancy")
-UNSUPPORTED = ("texture", "sampler", "surface", "multimem", "fabric", "ub")
+# .ub strict: the model's undefined-behaviour checking; the programs that enable it expect their normal results (an
+# undefined behaviour the model would report is not detected here)
+IGNORED = ("print", "memmodel", "isacheck", "convergence", "occupancy", "ub")
+UNSUPPORTED = ()
 
 SIZES = {"u8": 1, "s8": 1, "b8": 1, "u16": 2, "s16": 2, "b16": 2, "f16": 2, "bf16": 2, "u32": 4, "s32": 4,
          "b32": 4, "f32": 4, "u64": 8, "s64": 8, "b64": 8, "f64": 8, "pred": 1, "b128": 16}
@@ -269,6 +271,41 @@ def parse_tensormap(body):
     return name, ty, buf, ints(ds), ints(ss), ints(bs), int(z, 0), im2col
 
 
+# .texture N .T BUF .dims { w, h, d } .attrs { ... };  .surface N .T BUF .dims { .. } .attrs { .. };
+# .sampler N .attrs { .. };  the descriptor objects of PTX-formalization's harness (sail/ptx/ptx_tex.sail harness_tex):
+# 16 little-endian u64 words in global memory, the handle is their address.
+# texture: 0 magic, 1 base, 2 type code, 3 channels, 4 filter, 5 addrmode, 6 normalized, 7 readnorm, 8 layers, 9-11 dims,
+#          12 levels, 13 flags, 14 samples, 15 mip filter;  sampler: 0 magic, 1 filter, 2 addrmode, 3 normalized,
+#          4 mip filter, 5 min LOD, 6 max LOD (1/256 units);  surface: 0 magic, 1 base, 2 texel bytes, 3 layers, 4-6 dims,
+#          7 format, 8 channels, 9 channel data type, 10 channel order, 11 memory layout, 12 array flag
+TX_CODE = {"u8": 0, "b8": 0, "u16": 1, "b16": 1, "u32": 2, "b32": 2, "s32": 3, "u64": 4, "b64": 4, "s64": 5, "f16": 6,
+           "f32": 7, "s8": 20, "s16": 21, "f64": 8, "bf16": 9, "tf32": 11}
+
+
+def object_words(kind, ty, addr, ds, as_):
+    nth = lambda l, i, d=0: l[i] if i < len(l) else d
+    if kind == "texture":
+        w = [1415075924, addr, TX_CODE.get(ty, 0), nth(as_, 0), nth(as_, 1), nth(as_, 2), nth(as_, 3), nth(as_, 4),
+             nth(as_, 5), nth(ds, 0), nth(ds, 1), nth(ds, 2), nth(as_, 6, 1), nth(as_, 7), nth(as_, 9), nth(as_, 8)]
+    elif kind == "surface":
+        w = [1398035526, addr, SIZES.get(ty, 4), nth(as_, 0), nth(ds, 0), nth(ds, 1), nth(ds, 2), nth(as_, 1, 11),
+             nth(as_, 2, 1), nth(as_, 3), nth(as_, 4), nth(as_, 5, 1), nth(as_, 6, int(nth(as_, 0) > 1)), 0, 0, 0]
+    else:
+        w = [1396920397, nth(as_, 0), nth(as_, 1), nth(as_, 2), nth(as_, 3), nth(as_, 4), nth(as_, 5, 1048576)] + [0] * 9
+    return [x & (2 ** 64 - 1) for x in w]
+
+
+# .multimem MM .size N { B0, B1, ... };  a window of N bytes whose addresses stand for the same offsets in each buffer
+# (sail/ptx/ptx_mm.sail harness_mm).  Multimem addresses are only accessed by multimem.* (ptx/lib/metal_impl/
+# multimem.inc), so the window holds its own description, at the start of every 4 KiB page (allocations are page
+# aligned): u64 words 0 magic, 1 window address, 2 size, 3 buffer count, 4.. buffer addresses.
+MM_MAGIC = 0x4D4D57494E444F57
+
+
+def multimem_words(base, page, size, addrs):
+    return [MM_MAGIC, base, size, len(addrs)] + list(addrs)
+
+
 def pack_vals(vals, ty):
     size = SIZES[ty]
     return b"".join(v.to_bytes(size, "little") for v in vals)
@@ -312,6 +349,69 @@ def run_program(path, lib):
                     b.ptr = cuda.alloc(bytes(b.data))
                 words = tensormap_words(ty, b.ptr, ds, ss, bs, z, im2col)
                 bufs[name] = last = Buffer(name, "u64", pack_vals(words, "u64"))
+            elif d in ("texture", "surface", "sampler"):
+                if d == "sampler":
+                    m = re.match(r"(\w+)\s+\.attrs\s*\{([^}]*)\}\s*$", body, re.S)
+                    if not m:
+                        raise Unsupported("sampler syntax")
+                    name, ty, addr, ds, as_ = m.group(1), None, 0, [], [int(x, 0) for x in split_list(m.group(2))]
+                else:
+                    m = re.match(r"(\w+)\s+\.(\w+)\s+(\w+)\s+\.dims\s*\{([^}]*)\}\s*\.attrs\s*\{([^}]*)\}\s*$", body, re.S)
+                    if not m:
+                        raise Unsupported(d + " syntax")
+                    name, ty, buf = m.group(1), m.group(2), m.group(3)
+                    b = bufs[buf]
+                    if b.ptr is None:
+                        b.ptr = cuda.alloc(bytes(b.data))
+                    addr = b.ptr
+                    ds = [int(x, 0) for x in split_list(m.group(4))]
+                    as_ = [int(x, 0) for x in split_list(m.group(5))]
+                bufs[name] = last = Buffer(name, "u64", pack_vals(object_words(d, ty, addr, ds, as_), "u64"))
+            elif d == "multimem":
+                m = re.match(r"(\w+)\s+\.size\s+(\w+)\s*\{([^}]*)\}\s*$", body, re.S)
+                if not m:
+                    raise Unsupported("multimem syntax")
+                name, size, members = m.group(1), int(m.group(2), 0), split_list(m.group(3))
+                addrs = []
+                for bn in members:
+                    b = bufs[bn]
+                    if b.ptr is None:
+                        b.ptr = cuda.alloc(bytes(b.data))
+                    addrs.append(b.ptr)
+                total = max(4096, (size + 4095) // 4096 * 4096)
+                w = Buffer(name, "u8", bytes(total))
+                w.ptr = cuda.alloc(bytes(total))
+                img = bytearray(total)
+                for pg in range(0, total, 4096):
+                    img[pg:pg + 8 * (4 + len(addrs))] = pack_vals(multimem_words(w.ptr, pg, size, addrs), "u64")
+                cuda.check(cuda.cuMemcpyHtoD_v2(w.ptr, bytes(img), total), "multimem")
+                bufs[name] = last = w
+            elif d == "fabric":
+                # .fabric ID .size N { B0, B1, ... };  the endpoint table of the helper library (multimem.inc):
+                # 16 entries of 8 u64 words: id + 1, size, buffer count, buffer addresses
+                m = re.match(r"(\w+)\s+\.size\s+(\w+)\s*\{([^}]*)\}\s*$", body, re.S)
+                if not m:
+                    raise Unsupported("fabric syntax")
+                eid, size, members = int(m.group(1), 0), int(m.group(2), 0), split_list(m.group(3))
+                addrs = []
+                for bn in members:
+                    b = bufs[bn]
+                    if b.ptr is None:
+                        b.ptr = cuda.alloc(bytes(b.data))
+                    addrs.append(b.ptr)
+                gp, gs = ctypes.c_uint64(), ctypes.c_size_t()
+                if cuda.cuModuleGetGlobal_v2(ctypes.byref(gp), ctypes.byref(gs), mod, b"__zluda_fabric_tab") == 0:
+                    tab = bytearray(cuda.read(gp.value, 8 * 128))
+                    slot = None
+                    for i in range(16):
+                        w = int.from_bytes(tab[64 * i:64 * i + 8], "little")
+                        if w == eid + 1 or (w == 0 and slot is None):
+                            slot = i
+                            if w == eid + 1:
+                                break
+                    words = ([eid + 1, size, len(addrs)] + addrs[:5] + [0] * 5)[:8]
+                    tab[64 * slot:64 * slot + 64] = pack_vals(words, "u64")
+                    cuda.check(cuda.cuMemcpyHtoD_v2(gp.value, bytes(tab), len(tab)), "fabric")
             elif d == "append":
                 m = re.match(r"(\w+)\s+\.(\w+)\s*=\s*(\{.*\})\s*$", body, re.S)
                 b = bufs[m.group(1)]

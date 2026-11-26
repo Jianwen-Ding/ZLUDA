@@ -64,6 +64,13 @@ def check_program(path, a):
             if r.returncode:
                 return [{"program": path, "kernel": "*", "status": "skip", "detail": "air2agx: " + r.stderr[-200:]}]
             ll[lvl] = {f: open(os.path.join(d, f)).read() for f in sorted(os.listdir(d))}
+            # memory(...) attributes inferred while ignoring reads of AGX constant memory (address
+            # space 4, which LLVM's alias analysis knows to be constant and alive2 does not) would
+            # make those reads UB for alive2: drop them (this only stops checking the inference)
+            for f, text in ll[lvl].items():
+                text = re.sub(r"\bmemory\([^)]*\)", "", text)
+                ll[lvl][f] = text
+                open(os.path.join(d, f), "w").write(text)
         for f in ll["0"]:
             src, tgt = os.path.join(t, "O0", f), os.path.join(t, "O3", f)
             if f not in ll["3"]:

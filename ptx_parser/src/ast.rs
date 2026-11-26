@@ -2014,12 +2014,14 @@ impl LdMatrixDetails {
             shape,
             number,
             transpose,
-            state_space: ss.unwrap_or(StateSpace::Shared),
+            // without .shared the address is generic (it must fall in the .shared window)
+            state_space: ss.unwrap_or(StateSpace::Generic),
             type_,
         }
     }
     pub fn get_loaded_type(&self) -> Type {
-        let count = self.number.get();
+        // an m16n16 matrix is two registers per thread
+        let count = self.number.get() * if matches!(self.shape, MatrixShape::M16n16) { 2 } else { 1 };
         Type::Vector(count, ScalarType::B32)
     }
 }

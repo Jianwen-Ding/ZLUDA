@@ -17,8 +17,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use agx_sim::func::{self, Dispatch, Memory};
 
-/// First device address handed out (above the 4 GiB of 32-bit addresses).
-const HEAP_BASE: u64 = 0x1_0000_0000;
+/// First device address handed out: below 4 GiB, so that the 32-bit pointers of
+/// `.address_size 32` modules (zero-extended) reach the buffers too.
+const HEAP_BASE: u64 = 0x1000_0000;
 const ALIGN: u64 = 256;
 
 struct Heap {

@@ -646,8 +646,17 @@ Value *emitCmpXchgStrong(IRBuilder<> &b, Value *ptr, Value *cmp, Value *desired,
     IRBuilder<> entryB(&*f->getEntryBlock().getFirstInsertionPt());
     AllocaInst *expected = entryB.CreateAlloca(t, nullptr, "cmpxchg.expected");
     BasicBlock *pre = b.GetInsertBlock();
-    BasicBlock *rest = pre->splitBasicBlock(b.GetInsertPoint(), "cmpxchg.end");
-    pre->getTerminator()->eraseFromParent();
+    BasicBlock *rest;
+    if (b.GetInsertPoint() == pre->end())
+    {
+        // a block under construction (emitCasLoop's loop): nothing to split off
+        rest = BasicBlock::Create(ctx, "cmpxchg.end", f, pre->getNextNode());
+    }
+    else
+    {
+        rest = pre->splitBasicBlock(b.GetInsertPoint(), "cmpxchg.end");
+        pre->getTerminator()->eraseFromParent();
+    }
     BasicBlock *loop = BasicBlock::Create(ctx, "cmpxchg.loop", f, rest);
     b.SetInsertPoint(pre);
     b.CreateBr(loop);
@@ -689,8 +698,14 @@ Value *emitCasLoop(IRBuilder<> &b, Value *ptr, Type *valTy, function_ref<Value *
     Value *success = nullptr;
     Value *observed = emitCmpXchgStrong(b, ptr, old, newVal, &success);
     BasicBlock *loopEnd = b.GetInsertBlock();
-    BasicBlock *done = loopEnd->splitBasicBlock(b.GetInsertPoint(), "atomic.done");
-    loopEnd->getTerminator()->eraseFromParent();
+    BasicBlock *done;
+    if (b.GetInsertPoint() == loopEnd->end())
+        done = rest;
+    else
+    {
+        done = loopEnd->splitBasicBlock(b.GetInsertPoint(), "atomic.done");
+        loopEnd->getTerminator()->eraseFromParent();
+    }
     b.SetInsertPoint(loopEnd);
     old->addIncoming(observed, loopEnd);
     b.CreateCondBr(success, done, loop);
@@ -1244,6 +1259,9 @@ bool lowerIntrinsic(CallInst *ci)
         return airMath("fmin", 2);
     if (name.starts_with("llvm.maximumnum."))
         return airMath("fmax", 2);
+    // lifetime markers of a newer clang (one pointer operand) that LLVM 18 does not recognize
+    if (name.starts_with("llvm.lifetime."))
+        return replace(nullptr);
     if (name.starts_with("llvm."))
         fail("unsupported LLVM intrinsic in Metal backend: " + name);
     return false;
@@ -1360,6 +1378,12 @@ DeviceGlobals collectDeviceGlobals(Module &m)
         result.vars.push_back({&gv, gv.getName().str(), offset, size});
         offset += size;
     }
+    // uses inside constant expressions (getelementptr (@x, 8)) become instructions, which the
+    // kernel wrappers rewrite to the device-globals buffer
+    std::vector<Constant *> cs;
+    for (auto &v : result.vars)
+        cs.push_back(v.gv);
+    convertUsersOfConstantsToInstructions(cs);
     result.init.assign(offset, 0);
     for (auto &v : result.vars)
         if (v.gv->hasInitializer())
@@ -1409,6 +1433,12 @@ KernelInfo buildKernelWrapper(Module &m, Function *body, const DeviceGlobals &gl
     // Device globals used by this kernel: their base address is appended to
     // the parameter buffer
     bool usesGlobals = false;
+    {
+        std::vector<Constant *> cs;
+        for (const DeviceGlobal &g : globals.vars)
+            cs.push_back(g.gv);
+        convertUsersOfConstantsToInstructions(cs);
+    }
     for (const DeviceGlobal &g : globals.vars)
         for (User *u : g.gv->users())
             if (auto *i = dyn_cast<Instruction>(u); i && i->getFunction() == body)
@@ -1470,6 +1500,12 @@ KernelInfo buildKernelWrapper(Module &m, Function *body, const DeviceGlobals &gl
                                     gb.CreateConstInBoundsGEP1_64(gb.getInt8Ty(), w->getArg(0), info.globalsParamOffset),
                                     "zluda_globals_address");
         Value *base = gb.CreateIntToPtr(addr, PointerType::get(c, air::Device), "zluda_globals");
+        {
+            std::vector<Constant *> cs;
+            for (const DeviceGlobal &g : globals.vars)
+                cs.push_back(g.gv);
+            convertUsersOfConstantsToInstructions(cs);
+        }
         for (const DeviceGlobal &g : globals.vars)
         {
             SmallVector<Use *, 8> uses;
@@ -1887,6 +1923,17 @@ static void portableFPModes(Module &m)
 
 void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals &globals)
 {
+    // a PTX body that falls off its end returns
+    for (Function &f : m)
+        for (BasicBlock &bb : f)
+            if (!bb.getTerminator())
+            {
+                IRBuilder<> rb(&bb);
+                if (f.getReturnType()->isVoidTy())
+                    rb.CreateRetVoid();
+                else
+                    rb.CreateUnreachable();
+            }
     // portable AIR: strictfp would keep the helpers from inlining before the modes are resolved
     if (g_portable_air)
         for (Function &f : m)

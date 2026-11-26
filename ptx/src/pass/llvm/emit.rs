@@ -297,26 +297,46 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
         array_init: &[ast::RegOrImmediate<SpirvWord>],
     ) -> Result<*mut LLVMValue, TranslateError> {
         let initializer = match type_ {
-            ast::Type::Array(None, scalar, dimensions) => {
-                if dimensions.len() != 1 {
-                    todo!()
-                }
-                if dimensions[0] as usize != array_init.len() {
-                    return Err(error_unreachable());
-                }
-                let type_ = get_scalar_type(self.context, *scalar);
+            ast::Type::Array(_, scalar, _) | ast::Type::Vector(_, scalar) => {
+                // arrays of any rank and of vectors: the values in element order, nested to
+                // the LLVM type (array of array of ... vector)
+                let elem_type = get_scalar_type(self.context, *scalar);
                 let mut elements = array_init
                     .iter()
                     .map(|elem| match elem {
                         ast::RegOrImmediate::Reg(reg) => {
-                            Ok(unsafe { LLVMConstPtrToInt(self.resolver.value(*reg)?, type_) })
+                            Ok(unsafe { LLVMConstPtrToInt(self.resolver.value(*reg)?, elem_type) })
                         }
                         ast::RegOrImmediate::Imm(imm) => {
                             Ok(get_immediate_value(self.context, scalar, imm))
                         }
                     })
-                    .collect::<Result<Vec<_>, _>>()?;
-                unsafe { LLVMConstArray2(type_, elements.as_mut_ptr(), elements.len() as u64) }
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter();
+                unsafe fn build(
+                    t: LLVMTypeRef,
+                    elements: &mut impl Iterator<Item = LLVMValueRef>,
+                ) -> Result<LLVMValueRef, TranslateError> {
+                    match LLVMGetTypeKind(t) {
+                        LLVMTypeKind::LLVMArrayTypeKind => {
+                            let et = LLVMGetElementType(t);
+                            let mut v = (0..LLVMGetArrayLength2(t))
+                                .map(|_| build(et, elements))
+                                .collect::<Result<Vec<_>, _>>()?;
+                            Ok(LLVMConstArray2(et, v.as_mut_ptr(), v.len() as u64))
+                        }
+                        LLVMTypeKind::LLVMVectorTypeKind => {
+                            let et = LLVMGetElementType(t);
+                            let mut v = (0..LLVMGetVectorSize(t))
+                                .map(|_| build(et, elements))
+                                .collect::<Result<Vec<_>, _>>()?;
+                            Ok(LLVMConstVector(v.as_mut_ptr(), v.len() as u32))
+                        }
+                        _ => Ok(elements.next().unwrap_or_else(|| LLVMConstNull(t))),
+                    }
+                }
+                let llvm_type = get_type(self.context, type_)?;
+                unsafe { build(llvm_type, &mut elements)? }
             }
             ast::Type::Scalar(scalar) => {
                 let initializer = match array_init {
@@ -465,6 +485,16 @@ fn get_immediate_value(
     imm: &ast::ImmediateValue,
 ) -> *mut LLVMValue {
     let type_ = get_scalar_type(context, *scalar_type);
+    // a predicate immediate is true when nonzero (`mov.pred p, 2;`)
+    if *scalar_type == ast::ScalarType::Pred {
+        let v = match imm {
+            ast::ImmediateValue::U64(x) => *x != 0,
+            ast::ImmediateValue::S64(x) => *x != 0,
+            ast::ImmediateValue::F32(x) => *x != 0.0,
+            ast::ImmediateValue::F64(x) => *x != 0.0,
+        };
+        return unsafe { LLVMConstInt(type_, v as u64, 0) };
+    }
     match imm {
         ast::ImmediateValue::U64(x) => get_const_int_unsigned(context, *scalar_type, *x),
         ast::ImmediateValue::S64(x) => get_const_int_signed(context, *scalar_type, *x),
@@ -492,7 +522,11 @@ fn get_input_argument_type(
     state_space: ast::StateSpace,
 ) -> Result<LLVMTypeRef, TranslateError> {
     match state_space {
-        ast::StateSpace::ParamEntry | ast::StateSpace::Shared => {
+        // pointers; helper functions (ast::Instruction::Helper) also take .global / generic ones
+        ast::StateSpace::ParamEntry
+        | ast::StateSpace::Shared
+        | ast::StateSpace::Global
+        | ast::StateSpace::Generic => {
             Ok(unsafe { LLVMPointerTypeInContext(context, get_state_space(state_space)?) })
         }
         ast::StateSpace::Reg => get_type(context, v_type),
@@ -1171,8 +1205,10 @@ impl<'a> MethodEmitContext<'a> {
         data: ast::CarryDetails,
         arguments: ast::SubExtendedArgs<SpirvWord>,
     ) -> Result<(), TranslateError> {
+        // CC.CF is the borrow after sub.cc / subc.cc, which subc subtracts and addc adds (PTX
+        // ISA 9.7.1.x; ZLUDA's hardware-validated subc_cc_s32): no inversion
         self.emit_extended_arithmetic(
-            true,
+            false,
             LLVMOpcode::LLVMSub,
             "usub",
             data,
@@ -1705,10 +1741,41 @@ impl<'a> MethodEmitContext<'a> {
         };
         let src1 = self.resolver.value(arguments.src1)?;
         let src2 = self.resolver.value(arguments.src2)?;
+        let signed = matches!(data, ptx_parser::DivDetails::Signed(_));
+        let (src2, zero) = unsafe { self.safe_divisor(src1, src2, signed) };
+        let q = unsafe { integer_div(self.builder, src1, src2, LLVM_UNNAMED.as_ptr()) };
+        // PTX: a quotient by zero is all ones
+        let ones = unsafe { LLVMConstAllOnes(LLVMTypeOf(src1)) };
         self.resolver.with_result(arguments.dst, |dst| unsafe {
-            integer_div(self.builder, src1, src2, dst)
+            LLVMBuildSelect(self.builder, zero, ones, q, dst)
         });
         Ok(())
+    }
+
+    /// A divisor LLVM's division is defined for, as PTX's integer division needs (PTX
+    /// defines x / 0 and x % 0, and MIN / -1 wraps): 1 in place of 0 and, for signed
+    /// division, of -1 when the dividend is the minimum. Returns it and whether it was 0.
+    unsafe fn safe_divisor(
+        &mut self,
+        src1: LLVMValueRef,
+        src2: LLVMValueRef,
+        signed: bool,
+    ) -> (LLVMValueRef, LLVMValueRef) {
+        let t = LLVMTypeOf(src2);
+        let b = self.builder;
+        let n = LLVM_UNNAMED.as_ptr();
+        let zero = LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntEQ, src2, LLVMConstInt(t, 0, 0), n);
+        let mut bad = zero;
+        if signed {
+            let bits = LLVMGetIntTypeWidth(t);
+            let min = LLVMConstInt(t, 1u64 << (bits - 1), 0);
+            let is_min = LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntEQ, src1, min, n);
+            let is_m1 = LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntEQ, src2, LLVMConstAllOnes(t), n);
+            let ovf = LLVMBuildAnd(b, is_min, is_m1, n);
+            bad = LLVMBuildOr(b, zero, ovf, n);
+        }
+        let safe = LLVMBuildSelect(b, bad, LLVMConstInt(t, 1, 0), src2, n);
+        (safe, zero)
     }
 
     fn emit_div_float(
@@ -2913,8 +2980,12 @@ impl<'a> MethodEmitContext<'a> {
         };
         let src1 = self.resolver.value(arguments.src1)?;
         let src2 = self.resolver.value(arguments.src2)?;
+        let signed = matches!(data.kind(), ptx_parser::ScalarKind::Signed);
+        let (src2, zero) = unsafe { self.safe_divisor(src1, src2, signed) };
+        let r = unsafe { llvm_fn(self.builder, src1, src2, LLVM_UNNAMED.as_ptr()) };
+        // PTX: a remainder by zero is the dividend
         self.resolver.with_result(arguments.dst, |dst_name| unsafe {
-            llvm_fn(self.builder, src1, src2, dst_name)
+            LLVMBuildSelect(self.builder, zero, src1, r, dst_name)
         });
         Ok(())
     }

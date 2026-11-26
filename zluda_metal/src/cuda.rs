@@ -58,6 +58,8 @@ pub struct Event {
 }
 
 pub struct Module {
+    /// `.address_size 32`: each module variable's allocation (name, address, size)
+    globals32: Vec<(String, CUdeviceptr, usize)>,
     compiled: compile::CompiledModule,
     /// device-globals buffer (0 if the module has no writable device variables)
     globals: CUdeviceptr,
@@ -66,6 +68,10 @@ pub struct Module {
 }
 
 pub struct Function {
+    /// `.address_size 32`: the source parameters and the hidden arguments' values
+    /// (64-bit base, then each module variable's 32-bit address)
+    explicit_params: Option<usize>,
+    hidden32: Vec<u64>,
     info: compile::Kernel,
     kernel: backend::Kernel,
     globals: CUdeviceptr,
@@ -701,7 +707,27 @@ unsafe fn load_module_from_ptx(module: *mut *mut Module, ptx: &str) -> CUresult 
             compiled.globals_init.len(),
         );
     }
+    let mut globals32 = vec![];
+    if let Some(m32) = &compiled.module32 {
+        for (name, init, _align) in &m32.globals {
+            let a = match backend::alloc(init.len().max(1) as u64) {
+                Ok(a) => a,
+                Err(e) => return report(e, CUDA_ERROR_OUT_OF_MEMORY),
+            };
+            if a + init.len() as u64 > u32::MAX as u64 {
+                return report(
+                    "a .address_size 32 module needs its memory below 4 GiB".into(),
+                    CUDA_ERROR_OUT_OF_MEMORY,
+                );
+            }
+            if let Some((host, _)) = backend::host_pointer(a) {
+                ptr::copy_nonoverlapping(init.as_ptr(), host, init.len());
+            }
+            globals32.push((name.clone(), a, init.len()));
+        }
+    }
     *module = Box::into_raw(Box::new(Module {
+        globals32,
         compiled,
         globals,
         library,
@@ -778,6 +804,9 @@ pub unsafe extern "system" fn cuModuleUnload(module: *mut Module) -> CUresult {
     if m.globals != 0 {
         backend::free(m.globals);
     }
+    for g in &m.globals32 {
+        backend::free(g.1);
+    }
     drop(m);
     CUDA_SUCCESS
 }
@@ -805,7 +834,20 @@ pub unsafe extern "system" fn cuModuleGetFunction(
         Ok(k) => k,
         Err(e) => return report(e, CUDA_ERROR_INVALID_IMAGE),
     };
+    let explicit_params = m
+        .compiled
+        .module32
+        .as_ref()
+        .and_then(|m32| m32.explicit_params.get(&name).copied());
+    // 32-bit addresses are the allocations' own (the AGX backend allocates below 4 GiB): base 0
+    let hidden32 = if explicit_params.is_some() {
+        std::iter::once(0u64).chain(m.globals32.iter().map(|g| g.1)).collect()
+    } else {
+        vec![]
+    };
     let f = Box::new(Function {
+        explicit_params,
+        hidden32,
         info: info.clone(),
         kernel,
         globals: m.globals,
@@ -827,6 +869,15 @@ pub unsafe extern "system" fn cuModuleGetGlobal_v2(
     }
     let m = &*module;
     let name = CStr::from_ptr(name).to_string_lossy();
+    if let Some(g) = m.globals32.iter().find(|g| g.0 == name) {
+        if !dptr.is_null() {
+            *dptr = g.1;
+        }
+        if !bytes.is_null() {
+            *bytes = g.2;
+        }
+        return CUDA_SUCCESS;
+    }
     match m.compiled.globals.iter().find(|g| g.name == name) {
         Some(g) => {
             if !dptr.is_null() {
@@ -926,8 +977,16 @@ pub unsafe extern "system" fn cuLaunchKernel(
         return CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES;
     }
     let mut params = vec![0u8; f.info.params_size as usize];
+    let explicit = f.explicit_params.unwrap_or(f.info.params.len());
+    for (k, v) in f.hidden32.iter().enumerate() {
+        if let Some(p) = f.info.params.get(explicit + k) {
+            let b = v.to_le_bytes();
+            params[p.offset as usize..p.offset as usize + p.size as usize]
+                .copy_from_slice(&b[..p.size as usize]);
+        }
+    }
     if !kernel_params.is_null() {
-        for (i, p) in f.info.params.iter().enumerate() {
+        for (i, p) in f.info.params.iter().enumerate().take(explicit) {
             let src = *kernel_params.add(i) as *const u8;
             if src.is_null() {
                 return CUDA_ERROR_INVALID_VALUE;

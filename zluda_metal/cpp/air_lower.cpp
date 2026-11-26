@@ -363,6 +363,76 @@ static void resolveCluster(Module &m)
     (void)expl;
 }
 
+// NaN constants: PTX arithmetic producing a NaN gives the canonical NaN (all ones but the sign: 0x7fffffff for .f32),
+// which the AGX hardware produces at run time (+canonical-nan); LLVM's constant folding gives its default quiet NaN
+// (0x7fc00000) instead. NaN constants of the program (bit patterns of the PTX source, the helper library) are hidden
+// behind opaque calls during the cleanups; afterwards every default NaN constant comes from folding and is replaced by
+// the canonical NaN, and the program's constants are restored.
+static void hideSourceNaNs(Module &m)
+{
+    std::vector<std::pair<Instruction *, unsigned>> work;
+    for (Function &f : m)
+        for (Instruction &i : instructions(f))
+            for (unsigned k = 0; k < i.getNumOperands(); k++)
+                if (auto *cf = dyn_cast<ConstantFP>(i.getOperand(k)); cf && cf->isNaN())
+                    work.push_back({&i, k});
+    for (auto [i, k] : work)
+    {
+        auto *cf = cast<ConstantFP>(i->getOperand(k));
+        Type *t = cf->getType();
+        Type *it = IntegerType::get(m.getContext(), t->getPrimitiveSizeInBits());
+        std::string name = "__zluda_nan_keep." + std::to_string(t->getTypeID()) + "." + std::to_string(it->getIntegerBitWidth());
+        FunctionCallee keep = m.getOrInsertFunction(name, FunctionType::get(t, {it}, false));
+        if (auto *fn = dyn_cast<Function>(keep.getCallee()))
+        {
+            fn->setDoesNotThrow();
+            fn->setDoesNotAccessMemory();
+            fn->setWillReturn();
+        }
+        Instruction *at = i;
+        if (auto *phi = dyn_cast<PHINode>(i))
+            at = phi->getIncomingBlock(k)->getTerminator();
+        IRBuilder<> b(at);
+        Value *v = b.CreateCall(keep, {ConstantInt::get(it, cf->getValueAPF().bitcastToAPInt())});
+        i->setOperand(k, v);
+    }
+}
+
+static void canonicalizeFoldedNaNs(Module &m)
+{
+    for (Function &f : m)
+        for (Instruction &i : instructions(f))
+            for (unsigned k = 0; k < i.getNumOperands(); k++)
+                if (auto *cf = dyn_cast<ConstantFP>(i.getOperand(k)); cf && cf->isNaN())
+                {
+                    const fltSemantics &sem = cf->getValueAPF().getSemantics();
+                    APInt bits = cf->getValueAPF().bitcastToAPInt();
+                    if (bits != APFloat::getQNaN(sem).bitcastToAPInt())
+                        continue;
+                    APInt canon = APInt::getSignedMaxValue(bits.getBitWidth());
+                    i.setOperand(k, ConstantFP::get(cf->getType(), APFloat(sem, canon)));
+                }
+    std::vector<Function *> keeps;
+    for (Function &f : m)
+        if (f.getName().starts_with("__zluda_nan_keep."))
+            keeps.push_back(&f);
+    for (Function *fn : keeps)
+    {
+        std::vector<CallInst *> calls;
+        for (User *u : fn->users())
+            if (auto *ci = dyn_cast<CallInst>(u))
+                calls.push_back(ci);
+        for (CallInst *ci : calls)
+        {
+            auto *bits = cast<ConstantInt>(ci->getArgOperand(0));
+            ci->replaceAllUsesWith(ConstantFP::get(ci->getType(), APFloat(ci->getType()->getFltSemantics(), bits->getValue())));
+            ci->eraseFromParent();
+        }
+        if (fn->use_empty())
+            fn->eraseFromParent();
+    }
+}
+
 // alloca / stacksave / stackrestore (ptx/lib/metal_impl/memory.inc): a per-thread stack, an entry-block alloca of
 // each kernel, and its stack offset (the stack grows down from its end)
 static void resolveLocalStack(Module &m)
@@ -2441,6 +2511,7 @@ void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals
         }
         gv.setVisibility(GlobalValue::DefaultVisibility);
     }
+    hideSourceNaNs(m);
     runCleanup(m, true, true);
     resolveCluster(m);
     runCleanup(m, false, true);
@@ -2463,6 +2534,7 @@ void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals
             break;
         runCleanup(m, false, true);
     }
+    canonicalizeFoldedNaNs(m);
     resolveLocalStack(m);
     resolveIsSpacep(m);
     for (Function &f : m)

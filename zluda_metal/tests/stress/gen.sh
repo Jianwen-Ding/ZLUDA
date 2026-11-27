@@ -30,6 +30,9 @@ for s in $SEEDS; do
     g intx-s$s gen_intx.py "$N" "$s"
     g fmisc-s$s gen_fmisc.py "$N" "$s"
     g lop3-s$s gen_lop3.py "$N" "$s"
+    # its kernels need more registers than N (512) threads leave without a bound (CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES,
+    # as CUDA would): bound them as a CUDA programmer would, with .maxntid (__launch_bounds__)
+    [ -f "$OUT/lop3-s$s.ptx" ] && sed -i "s/^\(\.visible \.entry .*)\)\$/\1 .maxntid $N, 1, 1/" "$OUT/lop3-s$s.ptx"
     g video-s$s gen_video.py "$N" "$s"
     g ieee-diff-s$s gen_ieee_diff.py "$N" "$s"
     for w in 16 32 64; do g rounding-diff-f$w-s$s gen_round_diff.py "$N" "$s" "$w"; done

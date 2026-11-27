@@ -2376,6 +2376,15 @@ KernelInfo buildKernelWrapper(Module &m, Function *body, const DeviceGlobals &gl
     w->addFnAttr("frame-pointer", "none");
     if (body->hasFnAttribute("zluda-cluster-dims-agx"))
         w->addFnAttr("agx-cluster-dims", body->getFnAttribute("zluda-cluster-dims-agx").getValueAsString());
+    // .maxntid / .reqntid (the translator's "amdgpu-flat-work-group-size"="min,max"): the backend keeps the
+    // kernel's registers within what max threads a threadgroup need (llvm/docs/AGXUsage.rst)
+    if (body->hasFnAttribute("amdgpu-flat-work-group-size"))
+    {
+        auto [lo, hi] = body->getFnAttribute("amdgpu-flat-work-group-size").getValueAsString().split(',');
+        unsigned n = 0;
+        if (!hi.getAsInteger(10, n) && n > 0 && n <= 1024)
+            w->addFnAttr("agx-max-threads-per-threadgroup", std::to_string(n));
+    }
     w->addParamAttr(0, Attribute::NoUndef);
     const char *argNames[] = {"zluda_params", "tid", "ctaid", "ntid", "nctaid", "laneid", "zluda_dynamic_shared"};
     for (unsigned i = 0; i < w->arg_size() && i < 7; i++)
@@ -2625,7 +2634,7 @@ void stripTargetAttributes(Module &m)
         AttrBuilder ab(m.getContext(), al.getFnAttrs());
         for (const Attribute &a : al.getFnAttrs())
             if (a.isStringAttribute() && !(g_portable_air && a.getKindAsString().starts_with("denormal-fp-math")) &&
-                a.getKindAsString() != "agx-cluster-dims")
+                a.getKindAsString() != "agx-cluster-dims" && a.getKindAsString() != "agx-max-threads-per-threadgroup")
                 ab.removeAttribute(a.getKindAsString());
         ab.removeAttribute(Attribute::StrictFP);
         f.setAttributes(al.removeFnAttributes(m.getContext()).addFnAttributes(m.getContext(), ab));

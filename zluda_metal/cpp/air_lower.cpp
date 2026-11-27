@@ -974,7 +974,7 @@ private:
     static Value *addressZExt(Value *v)
     {
         auto *z = dyn_cast<ZExtInst>(v);
-        if (!z || z->getSrcTy()->getIntegerBitWidth() != 32)
+        if (!z || !z->getSrcTy()->isIntegerTy(32))
             return nullptr;
         return z->getOperand(0);
     }

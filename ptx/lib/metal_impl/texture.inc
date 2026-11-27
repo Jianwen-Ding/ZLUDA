@@ -11,10 +11,10 @@
         SM_MAGIC = 1396920397u,
         SF_MAGIC = 1398035526u
     };
-    static inline uint64_t tdW(uint64_t h, int i) { return ((const volatile TX_GLOBAL uint64_t *)(uintptr_t)h)[i]; }
+    static inline uint64_t tdW(uint64_t h, int i) { return ((const TX_GLOBAL uint64_t *)(uintptr_t)h)[i]; }
     static inline uint64_t tx_rd(uint64_t a, int n)
     {
-        const volatile TX_GLOBAL uint8_t *p = (const volatile TX_GLOBAL uint8_t *)(uintptr_t)a;
+        const TX_GLOBAL uint8_t *p = (const TX_GLOBAL uint8_t *)(uintptr_t)a;
         uint64_t v = 0;
         for (int i = 0; i < n; i++)
             v |= (uint64_t)p[i] << (8 * i);

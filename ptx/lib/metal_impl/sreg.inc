@@ -18,13 +18,13 @@
     uint32_t FUNC(sreg_nwarpid)() { return (tg_volume() + 31u) / 32u; }
     uint32_t FUNC(sreg_warpsize)() { return 32; }
     // %smid in [0, %nsmid): the CTAs spread round-robin over the multiprocessors the driver reports
-    // (cuDeviceGetAttribute MULTIPROCESSOR_COUNT, 8); %nsmid may exceed the count in PTX, never be below it
-    uint32_t FUNC(sreg_nsmid)() { return 8; }
+    // (cuDeviceGetAttribute MULTIPROCESSOR_COUNT, 38: agx::CORES); %nsmid may exceed the count in PTX, never be below it
+    uint32_t FUNC(sreg_nsmid)() { return 38; }
     uint32_t FUNC(sreg_smid)()
     {
         uint32_t linear = __zluda_ptx_impl_sreg_ctaid(0) +
                           __zluda_ptx_impl_sreg_nctaid(0) * (__zluda_ptx_impl_sreg_ctaid(1) + __zluda_ptx_impl_sreg_nctaid(1) * __zluda_ptx_impl_sreg_ctaid(2));
-        return linear % 8u;
+        return linear % 38u;
     }
     uint64_t FUNC(sreg_gridid)() { return 0; }
     uint64_t FUNC(sreg_current_graph_exec)() { return 0; }

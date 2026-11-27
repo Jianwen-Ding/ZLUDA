@@ -37,7 +37,7 @@ const FIFO_HEADER: u64 = 16;
 /// the clock rate the device reports (cuDeviceGetAttribute CLOCK_RATE, kHz)
 const CLOCK_KHZ: u64 = 1_398_000;
 /// the multiprocessors the device reports: a launch's instructions are spread over them for %clock64
-const SMS: u64 = 8;
+const SMS: u64 = crate::agx::CORES as u64;
 
 struct State {
     limits: [u64; LIMITS],

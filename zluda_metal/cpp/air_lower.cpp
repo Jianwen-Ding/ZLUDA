@@ -40,6 +40,7 @@
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/Support/Format.h>
 #include <llvm/Transforms/IPO/AlwaysInliner.h>
 #include <llvm/Transforms/IPO/GlobalDCE.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
@@ -53,6 +54,8 @@
 #include <llvm/Transforms/Utils/Local.h>
 #include <llvm/Transforms/Utils/ValueMapper.h>
 
+#include <chrono>
+#include <cmath>
 #include <cstring>
 #include <map>
 #include <set>
@@ -159,6 +162,17 @@ Type *mapType(Type *t)
         return FunctionType::get(mapType(ft->getReturnType()), params, ft->isVarArg());
     }
     return t;
+}
+
+// ZLUDA_COMPILE_TIMES: the time of each phase on stderr
+static bool g_times = false;
+static std::chrono::steady_clock::time_point g_t0;
+static void lap(const char *what)
+{
+    if (g_times)
+        errs() << "zluda-compile-time air:" << what << " "
+               << format("%.2f", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g_t0).count())
+               << " ms\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -2797,6 +2811,340 @@ static bool isF32Op(Instruction &i)
     return false;
 }
 
+// Binary32 operations that cannot meet a subnormal value need no !agx.keep-denormals: on normal operands and
+// results (and zeros, infinities, NaNs) the hardware's flushing operations are the IEEE ones, correctly rounded
+// (llvm/docs/AGXUsage.rst: fadd, fmul, fma keep the hardware instruction; fdiv and sqrt are correctly rounded on
+// flushed operands with a flushed result). FRange bounds |v| over the finite nonzero values v can take (zeros,
+// infinities and NaNs are always possible); a value is subnormal-free when lo >= 2^-126. The bounds come from
+// constants, integer and half conversions (|v| >= 1, >= 2^-24), square roots (>= 2^-74.5 of any binary32), and
+// products, quotients and sums of bounded values: a rounded result keeps a bound that is a binary32 power of two
+// (rounding is monotonic), and a nonzero sum or fused multiply-add is a multiple of the operands' smallest ulp
+// (> lo 2^-24 for a value >= lo, lo_a lo_b 2^-48 for an exact product).
+struct FRange
+{
+    double lo = 0, hi = INFINITY; // lo > hi: no finite nonzero value
+    bool nd() const { return lo >= 0x1p-126; }
+};
+struct FRangeAnalysis
+{
+    std::map<const Value *, FRange> memo;
+    std::set<const Value *> active;
+    // Granularity: every finite value of v is an integer multiple of 2^gran(v) (rounding keeps that: a rounded
+    // result is the exact value or a multiple of its own spacing, which is then a multiple of 2^g), so a nonzero
+    // value is at least 2^gran. Sums keep the smaller granularity, products add them, conversions from integers
+    // give 0 and from half -24: accumulations of products of halves or integers stay subnormal-free through loops.
+    // An optimistic fixed point over the function (GRAN_ZERO: no finite nonzero value yet), GRAN_ANY below -149.
+    static constexpr int GRAN_ZERO = 1 << 20, GRAN_ANY = -(1 << 20);
+    std::map<const Value *, int> gran;
+    int granOf(const Value *v) const
+    {
+        if (auto *c = dyn_cast<ConstantFP>(v))
+        {
+            if (!c->getType()->isFloatTy())
+                return GRAN_ANY;
+            const APFloat &x = c->getValueAPF();
+            if (x.isZero() || x.isInfinity() || x.isNaN())
+                return GRAN_ZERO;
+            uint32_t u = (uint32_t)x.bitcastToAPInt().getZExtValue();
+            uint32_t e = (u >> 23) & 0xFF, m = u & 0x7FFFFF;
+            if (e)
+                m |= 0x800000;
+            return (e ? (int)e - 150 : -149) + __builtin_ctz(m);
+        }
+        auto it = gran.find(v);
+        return it == gran.end() ? GRAN_ANY : it->second;
+    }
+    static int addG(int a, int b)
+    {
+        if (a == GRAN_ZERO || b == GRAN_ZERO)
+            return GRAN_ZERO;
+        if (a == GRAN_ANY || b == GRAN_ANY)
+            return GRAN_ANY;
+        return a + b < -149 ? GRAN_ANY : a + b;
+    }
+    int granStep(const Instruction &i) const
+    {
+        auto g = [&](unsigned k) { return granOf(i.getOperand(k)); };
+        switch (i.getOpcode())
+        {
+        case Instruction::SIToFP:
+        case Instruction::UIToFP:
+            return 0;
+        case Instruction::FPExt:
+            return i.getOperand(0)->getType()->isHalfTy() ? -24 : GRAN_ANY;
+        case Instruction::FNeg:
+            return g(0);
+        case Instruction::Select:
+            return std::min(g(1), g(2));
+        case Instruction::PHI:
+        {
+            int r = GRAN_ZERO;
+            for (const Use &u : cast<PHINode>(&i)->incoming_values())
+                r = std::min(r, granOf(u.get()));
+            return r;
+        }
+        case Instruction::FAdd:
+        case Instruction::FSub:
+            return std::min(g(0), g(1));
+        case Instruction::FMul:
+            return addG(g(0), g(1));
+        case Instruction::Call:
+            if (const Function *f = cast<CallInst>(&i)->getCalledFunction())
+                switch (f->getIntrinsicID())
+                {
+                case Intrinsic::fabs:
+                case Intrinsic::copysign:
+                    return g(0);
+                case Intrinsic::minnum:
+                case Intrinsic::maxnum:
+                case Intrinsic::minimum:
+                case Intrinsic::maximum:
+                    return std::min(g(0), g(1));
+                case Intrinsic::fma:
+                case Intrinsic::fmuladd:
+                    return std::min(addG(g(0), g(1)), g(2));
+                default:
+                    break;
+                }
+            return GRAN_ANY;
+        default:
+            return GRAN_ANY;
+        }
+    }
+    explicit FRangeAnalysis(Function &f)
+    {
+        std::vector<Instruction *> vals;
+        for (Instruction &i : instructions(f))
+            if (i.getType()->isFloatTy())
+            {
+                vals.push_back(&i);
+                gran[&i] = GRAN_ZERO;
+            }
+        bool changed = true;
+        for (int iter = 0; changed; iter++)
+        {
+            if (iter > 200)
+            {
+                gran.clear(); // (no fixed point in reasonable time: nothing is known)
+                return;
+            }
+            changed = false;
+            for (Instruction *i : vals)
+            {
+                int n = std::min(gran[i], granStep(*i));
+                if (n < -149)
+                    n = GRAN_ANY;
+                if (n != gran[i])
+                {
+                    gran[i] = n;
+                    changed = true;
+                }
+            }
+        }
+    }
+    static double p2floor(double v) // the largest power of two <= v (v > 0), for the monotonic rounding bounds
+    {
+        if (!(v > 0))
+            return 0;
+        int e;
+        std::frexp(v, &e);
+        return std::ldexp(1.0, e - 1);
+    }
+    static FRange unite(FRange a, FRange b) { return {std::min(a.lo, b.lo), std::max(a.hi, b.hi)}; }
+    FRange get(const Value *v, int depth = 0)
+    {
+        if (auto it = memo.find(v); it != memo.end())
+            return it->second;
+        FRange unknown;
+        if (depth > 24 || active.count(v))
+            return unknown;
+        active.insert(v);
+        FRange r = compute(v, depth + 1);
+        active.erase(v);
+        int g = granOf(v);
+        if (g == GRAN_ZERO)
+            r = {INFINITY, 0};
+        else if (g != GRAN_ANY && r.lo <= r.hi)
+            r.lo = std::max(r.lo, std::ldexp(1.0, g));
+        memo[v] = r;
+        return r;
+    }
+    // the bound of a sum of values in a and b (nonzero sums are multiples of the smaller granularity)
+    static FRange sum(FRange a, FRange b, double ga, double gb)
+    {
+        if (a.lo > a.hi)
+            return b;
+        if (b.lo > b.hi)
+            return a;
+        return {p2floor(std::min(ga, gb)), a.hi + b.hi};
+    }
+    FRange compute(const Value *v, int d)
+    {
+        FRange unknown;
+        if (!v->getType()->isFloatTy())
+            return unknown;
+        if (auto *c = dyn_cast<ConstantFP>(v))
+        {
+            const APFloat &x = c->getValueAPF();
+            if (x.isZero() || x.isInfinity() || x.isNaN())
+                return {INFINITY, 0};
+            double a = std::fabs(x.convertToFloat());
+            return {a, a};
+        }
+        auto *i = dyn_cast<Instruction>(v);
+        if (!i)
+            return unknown;
+        auto op = [&](unsigned k) { return get(i->getOperand(k), d); };
+        switch (i->getOpcode())
+        {
+        case Instruction::SIToFP:
+        case Instruction::UIToFP:
+            return {1.0, std::ldexp(1.0, i->getOperand(0)->getType()->getScalarSizeInBits())};
+        case Instruction::FPExt:
+            if (i->getOperand(0)->getType()->isHalfTy())
+                return {0x1p-24, 65504.0};
+            return unknown;
+        case Instruction::FNeg:
+            return op(0);
+        case Instruction::Select:
+            return unite(op(1), op(2));
+        case Instruction::PHI:
+        {
+            FRange r{INFINITY, 0};
+            for (const Use &u : cast<PHINode>(i)->incoming_values())
+            {
+                // a loop-carried value: the bound must hold for every incoming value (no fixed point is computed:
+                // a cycle is unknown)
+                r = unite(r, get(u.get(), d));
+                if (r.lo == 0)
+                    break;
+            }
+            return r;
+        }
+        case Instruction::FMul:
+        {
+            FRange a = op(0), b = op(1);
+            if (a.lo > a.hi || b.lo > b.hi)
+                return {INFINITY, 0};
+            if (a.lo == 0 || b.lo == 0)
+                return unknown;
+            return {p2floor(a.lo * b.lo), a.hi * b.hi};
+        }
+        case Instruction::FDiv:
+        {
+            FRange a = op(0), b = op(1);
+            if (a.lo > a.hi || b.lo > b.hi)
+                return {INFINITY, 0};
+            if (a.lo == 0 || b.lo == 0 || b.hi == INFINITY)
+                return unknown;
+            return {p2floor(a.lo / b.hi), a.hi / b.lo};
+        }
+        case Instruction::FAdd:
+        case Instruction::FSub:
+        {
+            FRange a = op(0), b = op(1);
+            if (a.lo == 0 || b.lo == 0)
+                return unknown;
+            return sum(a, b, a.lo * 0x1p-24, b.lo * 0x1p-24);
+        }
+        case Instruction::Call:
+        {
+            const Function *f = cast<CallInst>(i)->getCalledFunction();
+            if (!f)
+                return unknown;
+            switch (f->getIntrinsicID())
+            {
+            case Intrinsic::fabs:
+            case Intrinsic::copysign:
+                return op(0);
+            case Intrinsic::minnum:
+            case Intrinsic::maxnum:
+            case Intrinsic::minimum:
+            case Intrinsic::maximum:
+                return unite(op(0), op(1));
+            case Intrinsic::sqrt:
+            {
+                FRange a = op(0);
+                if (a.lo > a.hi)
+                    return a;
+                double lo = a.lo >= 0x1p-149 ? a.lo : 0x1p-149;
+                return {p2floor(std::sqrt(lo)), std::sqrt(std::min(a.hi, 0x1p128))};
+            }
+            case Intrinsic::fma:
+            case Intrinsic::fmuladd:
+            {
+                FRange a = op(0), b = op(1), c = op(2);
+                if (a.lo == 0 || b.lo == 0 || c.lo == 0)
+                    return unknown;
+                FRange p = a.lo > a.hi || b.lo > b.hi ? FRange{INFINITY, 0} : FRange{a.lo * b.lo, a.hi * b.hi};
+                return sum(p, c, p.lo * 0x1p-48, c.lo * 0x1p-24);
+            }
+            default:
+                return unknown;
+            }
+        }
+        default:
+            return unknown;
+        }
+    }
+    // a constant that a subnormal operand cannot change the rounded sum with (|c| >= 2^-100, rounding to nearest:
+    // a subnormal is below half the spacing of binary32 values around c, and sums with normal values are either
+    // >= |c| / 2 or multiples of 2^-124)
+    static bool bigConstant(const Value *v)
+    {
+        auto *c = dyn_cast<ConstantFP>(v);
+        if (!c || !c->getType()->isFloatTy())
+            return false;
+        const APFloat &x = c->getValueAPF();
+        return x.isInfinity() || x.isNaN() || (!x.isZero() && std::fabs(x.convertToFloat()) >= 0x1p-100);
+    }
+    // a constant that compares with a subnormal as with zero (normal, infinite or NaN)
+    static bool normalConstant(const Value *v)
+    {
+        auto *c = dyn_cast<ConstantFP>(v);
+        if (!c || !c->getType()->isFloatTy())
+            return false;
+        const APFloat &x = c->getValueAPF();
+        return x.isInfinity() || x.isNaN() || (!x.isZero() && !x.isDenormal());
+    }
+    // the operation (rounding to nearest) gives the IEEE result in every denormal mode
+    bool subnormalFree(Instruction &i)
+    {
+        auto nd = [&](const Value *v) { return get(v).nd(); };
+        if (auto *fc = dyn_cast<FCmpInst>(&i))
+        {
+            const Value *a = fc->getOperand(0), *b = fc->getOperand(1);
+            return (nd(a) && nd(b)) || normalConstant(a) || normalConstant(b);
+        }
+        switch (i.getOpcode())
+        {
+        case Instruction::FAdd:
+        case Instruction::FSub:
+            if (bigConstant(i.getOperand(0)) || bigConstant(i.getOperand(1)))
+                return true;
+            [[fallthrough]];
+        case Instruction::FMul:
+        case Instruction::FDiv:
+            return nd(i.getOperand(0)) && nd(i.getOperand(1)) && nd(&i);
+        default:
+            break;
+        }
+        if (auto *ci = dyn_cast<CallInst>(&i))
+            if (const Function *f = ci->getCalledFunction())
+                switch (f->getIntrinsicID())
+                {
+                case Intrinsic::sqrt:
+                    return nd(ci->getArgOperand(0)); // the root of a normal value is normal
+                case Intrinsic::fma:
+                case Intrinsic::fmuladd:
+                    return nd(ci->getArgOperand(0)) && nd(ci->getArgOperand(1)) && nd(ci->getArgOperand(2)) && nd(&i);
+                default:
+                    break;
+                }
+        return false;
+    }
+};
+
 static bool resolveFPModes(Function &f)
 {
     if (f.isDeclaration())
@@ -2813,6 +3161,8 @@ static bool resolveFPModes(Function &f)
     MDNode *keep = MDNode::get(c, {});
     std::set<BasicBlock *> done;
     std::vector<std::pair<Instruction *, Value *>> pendingErase;
+    FRangeAnalysis ranges(f);
+    static const bool noRange = getenv("ZLUDA_AGX_NO_FRANGE") != nullptr; // (every IEEE operation tagged)
     while (!work.empty())
     {
         BasicBlock *bb = work.back();
@@ -2862,7 +3212,8 @@ static bool resolveFPModes(Function &f)
             }
             // (ZLUDA_AGX_FTZ_ALL: a measurement aid, not PTX: every float operation flushes)
             // (floating point mode fast-ftz: the hardware's flushing operations)
-            if (m.ieee32 && isF32Op(i) && !g_fp_ftz && !getenv("ZLUDA_AGX_FTZ_ALL"))
+            if (m.ieee32 && isF32Op(i) && !g_fp_ftz && !getenv("ZLUDA_AGX_FTZ_ALL") &&
+                !(m.r32 == 0 && !noRange && ranges.subnormalFree(i)))
                 i.setMetadata("agx.keep-denormals", keep);
             // plain operations in a directed-rounding region (the helper library's) round in it too
             if (auto *bo = dyn_cast<BinaryOperator>(&i))
@@ -2908,11 +3259,12 @@ static bool resolveFPModes(Function &f)
 
 // Fast floating point mode: the .approx transcendentals of the library (the formal model's definitions, in
 // software) become short float evaluations: the hardware's approximations (air.fast_<fn>, agx-lower-air: the
-// LLVM intrinsic with afn), tanh by tanhF. Half precision forms are computed in float and rounded to nearest.
-// Division and square root stay correctly rounded (a reciprocal-based division is wrong by far more than a few
-// ulp for divisors beyond 2^126), as does div.approx (whose range behavior PTX defines). Control words as in
-// ptx_parser/src/helper_table/float.rs: bits 4-7 type (1 f32, 2 f16, 3 bf16), 8 packed, 12 .ftz; fsincos_f32
-// bit 0 cos.
+// LLVM intrinsic with afn), tanh by tanhF: sin, cos, tanh, ex2, lg2, rsqrt and sqrt .approx (as ZLUDA's own lowering
+// of these did before the model's definitions were). Half precision forms are computed in float and rounded to
+// nearest. Division and the non-.approx square root stay correctly rounded (a reciprocal-based division is wrong by
+// far more than a few ulp for divisors beyond 2^126), as does div.approx (whose range behavior PTX defines). Control
+// words as in ptx_parser/src/helper_table/float.rs: bits 4-7 type (1 f32, 2 f16, 3 bf16), 8 packed, 12 .ftz;
+// fsincos_f32 bit 0 cos; fdivsqrt_f32 bits 0-1 the operation (1 sqrt), 20 .approx.
 static void fastFPHelpers(Module &m)
 {
     LLVMContext &c = m.getContext();
@@ -2986,10 +3338,34 @@ static void fastFPHelpers(Module &m)
         Type *rt = ci->getType();
         if (!rt->isIntegerTy())
             continue;
+        // binary32 forms (.ftz: the operand and the result flushed)
+        auto fast32 = [&](StringRef fn, unsigned ctrlArg = 1) {
+            bool ftz = ctrlAt(ctrlArg) & 4096;
+            auto flush = [&](Value *u) -> Value * {
+                if (!ftz)
+                    return u;
+                Value *sub = b.CreateICmpEQ(b.CreateAnd(u, b.getInt32(0x7F800000)), b.getInt32(0));
+                return b.CreateSelect(sub, b.CreateAnd(u, b.getInt32(0x80000000u)), u);
+            };
+            Value *x = b.CreateBitCast(flush(ci->getArgOperand(0)), f32);
+            Value *v = fast(b, fn, x);
+            // without .ftz the operation keeps subnormal operands and results whatever the kernel's mode (ZLUDA
+            // gives a kernel whose float instructions are all helper calls the flushing mode)
+            if (!ftz && g_portable_air && !g_fp_ftz)
+                if (auto *vi = dyn_cast<Instruction>(v))
+                    vi->setMetadata("agx.keep-denormals", MDNode::get(c, {}));
+            return flush(b.CreateBitCast(v, i32));
+        };
         if (n == "fsincos_f32" && ctrlAt(1) >= 0)
-            r = b.CreateBitCast(fast(b, ctrlAt(1) & 1 ? "cos" : "sin", b.CreateBitCast(ci->getArgOperand(0), f32)), i32);
+            r = fast32(ctrlAt(1) & 1 ? "cos" : "sin");
         else if (n == "frsqrt_f32" && ctrlAt(1) >= 0)
-            r = b.CreateBitCast(fast(b, "rsqrt", b.CreateBitCast(ci->getArgOperand(0), f32)), i32);
+            r = fast32("rsqrt");
+        else if (n == "fex2_f32" && ctrlAt(1) >= 0)
+            r = fast32("exp2");
+        else if (n == "flg2_f32" && ctrlAt(1) >= 0)
+            r = fast32("log2");
+        else if (n == "fdivsqrt_f32" && ctrlAt(2) >= 0 && (ctrlAt(2) & (1 << 20)) && (ctrlAt(2) & 3) == 1)
+            r = fast32("sqrt", 2); // sqrt.approx
         else if ((n == "ftanh_32" || n == "ftanh_16" || n == "fex2h_32" || n == "fex2h_16") && ctrlAt(1) >= 0)
         {
             int64_t ctrl = ctrlAt(1);
@@ -3120,6 +3496,43 @@ static void lowerIEEEHelperCalls(Module &m)
     }
 }
 
+// __zluda_nd_{fadd,fsub,fmul,fdiv,fma,sqrt}_f32 (zluda_ptx_metal_impl.cpp): binary32 operations of the helper library
+// whose operands and results are never subnormal, so that the hardware's flushing operation is the IEEE one. They
+// become the plain LLVM operation after the floating point modes are resolved: rounding to nearest, without
+// !agx.keep-denormals.
+static void lowerNoDenormalHelperCalls(Module &m)
+{
+    std::vector<CallInst *> calls;
+    for (Function &f : m)
+        if (f.isDeclaration() && f.getName().starts_with("__zluda_nd_"))
+            for (User *u : f.users())
+                if (auto *ci = dyn_cast<CallInst>(u))
+                    calls.push_back(ci);
+    for (CallInst *ci : calls)
+    {
+        StringRef n = ci->getCalledFunction()->getName().drop_front(strlen("__zluda_nd_"));
+        IRBuilder<> b(ci);
+        Value *a0 = ci->getArgOperand(0);
+        Value *r = nullptr;
+        if (n == "fadd_f32")
+            r = b.CreateFAdd(a0, ci->getArgOperand(1));
+        else if (n == "fsub_f32")
+            r = b.CreateFSub(a0, ci->getArgOperand(1));
+        else if (n == "fmul_f32")
+            r = b.CreateFMul(a0, ci->getArgOperand(1));
+        else if (n == "fdiv_f32")
+            r = b.CreateFDiv(a0, ci->getArgOperand(1));
+        else if (n == "fma_f32")
+            r = b.CreateIntrinsic(Intrinsic::fma, {a0->getType()}, {a0, ci->getArgOperand(1), ci->getArgOperand(2)});
+        else if (n == "sqrt_f32")
+            r = b.CreateUnaryIntrinsic(Intrinsic::sqrt, a0);
+        else
+            fail("unknown no-denormal helper operation " + n.str());
+        ci->replaceAllUsesWith(r);
+        ci->eraseFromParent();
+    }
+}
+
 // CUDA's device faults (src/cuda.rs, sticky context errors): a `trap` (llvm.trap; the AGX trap instruction does
 // nothing, ptx-re-blockers B21) and a failed device assert (__assertfail) record themselves in the module variable
 // __zluda_fault ([8 x i32]: 0 flags, bit 0 trap, bit 1 assert; 1 line; 2-3 message, 4-5 file, 6-7 function, as
@@ -3242,11 +3655,14 @@ void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals
         gv.setVisibility(GlobalValue::DefaultVisibility);
     }
     hideSourceNaNs(m);
+    lap("prepare");
     runCleanup(m, true, true);
+    lap("inline+cleanup");
     resolveCluster(m);
     // the per-thread stack before PointerRecovery: alloca's integer results keep their local provenance (isspacep)
     resolveLocalStack(m);
     runCleanup(m, false, true);
+    lap("cleanup2");
     for (int iter = 0; iter < 4; iter++)
     {
         // address arithmetic folded into constant expressions (ptrtoint (addrspacecast @shared)
@@ -3266,6 +3682,7 @@ void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals
             break;
         runCleanup(m, false, true);
     }
+    lap("pointer-recovery");
     canonicalizeFoldedNaNs(m);
     if (getenv("ZLUDA_AIR_DEBUG_RECOVERED"))
         m.print(errs(), nullptr);
@@ -3292,6 +3709,8 @@ void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals
     exposeThreadgroupGlobals(m);
     if (g_portable_air)
         portableFPModes(m);
+    lowerNoDenormalHelperCalls(m);
+    lap("fp-modes");
 
     // ---- Phase 2: AIR address spaces ----
     remapAddressSpaces(m);
@@ -3312,6 +3731,7 @@ void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals
         g.gv = nullptr;
     }
 
+    lap("entry-points");
     // ---- Phase 4: instruction / intrinsic lowering ----
     for (Function &f : m)
     {
@@ -3370,6 +3790,7 @@ void lowerModuleToAir(Module &m, std::vector<KernelInfo> &kernels, DeviceGlobals
                         break;
                     }
     addModuleMetadata(m);
+    lap("intrinsics");
 }
 
 std::unique_ptr<Module> parse(LLVMContext &ctx, const void *data, size_t len, StringRef name)
@@ -3378,6 +3799,19 @@ std::unique_ptr<Module> parse(LLVMContext &ctx, const void *data, size_t len, St
     auto mod = parseBitcodeFile(buf->getMemBufferRef(), ctx);
     if (!mod)
         fail("cannot parse bitcode " + name + ": " + toString(mod.takeError()));
+    return std::move(*mod);
+}
+
+// the helper library, read lazily: linking materializes only the functions the module uses (the buffer is the
+// caller's and outlives the module)
+std::unique_ptr<Module> parseLazy(LLVMContext &ctx, const void *data, size_t len, StringRef name)
+{
+    MemoryBufferRef buf(StringRef((const char *)data, len), name);
+    auto mod = getLazyBitcodeModule(buf, ctx);
+    if (!mod)
+        fail("cannot parse bitcode " + name + ": " + toString(mod.takeError()));
+    if (Error e = (*mod)->materializeMetadata()) // (as llvm-link: the module-level metadata before linking)
+        fail("cannot parse bitcode " + name + ": " + toString(std::move(e)));
     return std::move(*mod);
 }
 
@@ -3444,6 +3878,8 @@ extern "C" int zluda_air_lower(const ZludaAirInput *input, ZludaAirOutput *outpu
     try
     {
         LLVMContext ctx;
+        g_times = getenv("ZLUDA_COMPILE_TIMES") != nullptr;
+        g_t0 = std::chrono::steady_clock::now();
         g_portable_air = input->portable_air != 0;
         g_fp_fast = input->fp_fast != 0;
         g_fp_ftz = input->fp_ftz != 0;
@@ -3478,11 +3914,29 @@ extern "C" int zluda_air_lower(const ZludaAirInput *input, ZludaAirOutput *outpu
         for (const char *name : {"malloc", "free"})
             if (Function *f = main->getFunction(name); f && f->isDeclaration())
                 f->setName(std::string("__zluda_ptx_impl_") + name);
-        auto impl = parse(ctx, input->impl_bc, input->impl_len, "zluda_ptx_metal_impl");
-        impl->setDataLayout(main->getDataLayout());
-        impl->setTargetTriple(main->getTargetTriple());
+        lap("parse-main");
+        auto impl = parseLazy(ctx, input->impl_bc, input->impl_len, "zluda_ptx_metal_impl");
+        lap("parse-impl");
+        // the helpers are __attribute__((used)) so that clang keeps them all in the bitcode; the module's
+        // llvm.used / llvm.compiler.used lists (appending variables, which LinkOnlyNeeded always links) would make
+        // the linker bring in (and the cleanup inline and optimize) every one. They become private variables that
+        // nothing references (not erased: the lazily read module's value table still refers to them).
+        for (const char *n : {"llvm.used", "llvm.compiler.used"})
+            if (GlobalVariable *gv = impl->getGlobalVariable(n))
+            {
+                gv->setName(std::string("__zluda_impl_") + (n + 5));
+                gv->setLinkage(GlobalValue::PrivateLinkage);
+            }
+        // The linked functions take the module's data layout and triple (ZLUDA's: none, so 64-bit pointers in every
+        // address space while the pointers are recovered). The library's own must stay while it is read lazily (its
+        // allocas are in its alloca address space), and the linker gives a module without one the library's: the
+        // module's are restored after linking.
+        std::string mainDL = main->getDataLayoutStr(), mainTriple = main->getTargetTriple();
         if (Linker::linkModules(*main, std::move(impl), Linker::LinkOnlyNeeded))
             fail("failed to link Metal implementation library");
+        main->setDataLayout(mainDL);
+        main->setTargetTriple(mainTriple);
+        lap("link-impl");
         adaptHelperCalls(*main);
         faultReporting(*main);
         if (g_fp_fast)
@@ -3492,6 +3946,7 @@ extern "C" int zluda_air_lower(const ZludaAirInput *input, ZludaAirOutput *outpu
         std::vector<KernelInfo> kernels;
         DeviceGlobals globals;
         lowerModuleToAir(*main, kernels, globals);
+        lap("lower");
         std::string verifyErrors;
         raw_string_ostream vos(verifyErrors);
         if (verifyModule(*main, &vos))
@@ -3532,6 +3987,7 @@ extern "C" int zluda_air_lower(const ZludaAirInput *input, ZludaAirOutput *outpu
             k.air = (uint8_t *)malloc(bc.size());
             memcpy(k.air, bc.data(), bc.size());
         }
+        lap("write-kernels");
         output->global_count = globals.vars.size();
         output->globals = (ZludaAirGlobal *)calloc(globals.vars.size() + 1, sizeof(ZludaAirGlobal));
         for (size_t i = 0; i < globals.vars.size(); i++)

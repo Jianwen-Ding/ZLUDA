@@ -65,6 +65,17 @@ extern "C"
     float __zluda_ieee_sqrt_f32(float);
     float __zluda_ieee_fma_f32(float, float, float);
 
+    // Binary32 operations whose operands and results are never subnormal (proven, or checked exhaustively, by
+    // the helper using them): every denormal mode gives the IEEE result, so air_lower.cpp
+    // (lowerNoDenormalHelperCalls) emits the plain operation (llvm.sqrt for the root), rounding to nearest, without
+    // !agx.keep-denormals
+    __attribute__((const)) float __zluda_nd_fadd_f32(float, float);
+    __attribute__((const)) float __zluda_nd_fsub_f32(float, float);
+    __attribute__((const)) float __zluda_nd_fmul_f32(float, float);
+    __attribute__((const)) float __zluda_nd_fdiv_f32(float, float);
+    __attribute__((const)) float __zluda_nd_fma_f32(float, float, float);
+    __attribute__((const)) float __zluda_nd_sqrt_f32(float);
+
     // ---------------------------------------------------------------------
     // Special registers
     // ---------------------------------------------------------------------
@@ -77,7 +88,11 @@ extern "C"
         return __zluda_metal_cluster_dim(0) * __zluda_metal_cluster_dim(1) * __zluda_metal_cluster_dim(2);
     }
     static inline uint32_t cta_ntid_z() { return __zluda_metal_threads_per_threadgroup(2) / cluster_size(); }
-    static inline uint32_t cluster_rank() { return __zluda_metal_thread_position_in_threadgroup(2) / cta_ntid_z(); }
+    // (without clusters, tid.z < ntid.z: rank 0 and tid.z itself, with no division)
+    static inline uint32_t cluster_rank()
+    {
+        return cluster_size() == 1 ? 0 : __zluda_metal_thread_position_in_threadgroup(2) / cta_ntid_z();
+    }
     // the CTA's position in its cluster along dim
     static inline uint32_t cluster_cta(uint32_t dim)
     {
@@ -88,7 +103,7 @@ extern "C"
     uint32_t FUNC(sreg_tid)(uint8_t member)
     {
         uint32_t t = __zluda_metal_thread_position_in_threadgroup(member);
-        return member == 2 ? t % cta_ntid_z() : t;
+        return member == 2 && cluster_size() != 1 ? t % cta_ntid_z() : t;
     }
     uint32_t FUNC(sreg_ntid)(uint8_t member)
     {
@@ -113,7 +128,8 @@ extern "C"
     uint32_t FUNC(sreg_cluster_ctaid)(uint8_t member) { return cluster_cta(member); }
     uint32_t FUNC(sreg_cluster_nctaid)(uint8_t member) { return member > 2 ? 1 : __zluda_metal_cluster_dim(member); }
     bool FUNC(sreg_is_explicit_cluster)() { return __zluda_metal_explicit_cluster() != 0; }
-    uint32_t FUNC(sreg_laneid)() { return __zluda_metal_thread_index_in_simdgroup(); }
+    // (SIMD groups are 32 wide: the mask lets shuffle index checks such as lane ^ c > 31 fold)
+    uint32_t FUNC(sreg_laneid)() { return __zluda_metal_thread_index_in_simdgroup() & 31; }
     uint32_t FUNC(sreg_lanemask_le)() { return (2U << __zluda_ptx_impl_sreg_laneid()) - 1U; }
     uint32_t FUNC(sreg_lanemask_lt)() { return (1U << __zluda_ptx_impl_sreg_laneid()) - 1U; }
     uint32_t FUNC(sreg_lanemask_ge)() { return (~0U) << __zluda_ptx_impl_sreg_laneid(); }

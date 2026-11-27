@@ -262,9 +262,14 @@ fn compare<'i>(base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
 
 /// div / sqrt{.rnd}{.ftz}.sat.f32 (exact, then clamped)
 fn divsqrt<'i>(base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
-    if m.last() != Some(&"f32") || m.contains(&"approx") || m.contains(&"full") {
+    // sqrt.approx{.ftz}.f32 is the correctly rounded root too (fpSqrt); bit 20 marks it for the fast floating
+    // point modes, which use the hardware's approximation
+    let approx = m.contains(&"approx");
+    if m.last() != Some(&"f32") || m.contains(&"full") || (approx && base != "sqrt") {
         return None;
     }
+    let m: Vec<&str> = m.iter().copied().filter(|x| *x != "approx").collect();
+    let m = &m[..];
     let opc = match base {
         "div" => 0,
         "sqrt" => 1,
@@ -272,7 +277,7 @@ fn divsqrt<'i>(base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
         _ => return None,
     };
     let ctrl = match fmods(&m[..m.len() - 1]) {
-        Ok(c) => c | opc,
+        Ok(c) => c | opc | (approx as u64) << 20,
         Err(e) => return err(e),
     };
     let b = if opc == 0 { cvt::fimm(ops.get(2)?.op.clone(), 32) } else { imm(0) };
@@ -312,6 +317,17 @@ fn approx<'i>(base: &str, m: &[&str], ops: &[HOp<'i>]) -> R<'i> {
                 .imm(code << 4 | (pk as u64) << 8 | ftz)
                 .build()
         }
+        // the model's correctly rounded 2^x and log2 x (ptx_math.sail exp2_r, log2_r)
+        ("ex2", "f32") => Call::new("fex2_f32")
+            .dst(ops[0].op.clone(), ScalarType::B32)
+            .src(cvt::fimm(ops[1].op.clone(), 32), ScalarType::B32)
+            .imm(ftz)
+            .build(),
+        ("lg2", "f32") => Call::new("flg2_f32")
+            .dst(ops[0].op.clone(), ScalarType::B32)
+            .src(cvt::fimm(ops[1].op.clone(), 32), ScalarType::B32)
+            .imm(ftz)
+            .build(),
         ("sin" | "cos", "f32") => Call::new("fsincos_f32")
             .dst(ops[0].op.clone(), ScalarType::B32)
             .src(cvt::fimm(ops[1].op.clone(), 32), ScalarType::B32)
@@ -399,8 +415,9 @@ pub(super) fn lower<'i>(_opcode: &str, base: &str, m: &[&str], ops: &[HOp<'i>]) 
         "set" | "setp" => compare(base, m, ops),
         "div" if m.contains(&"approx") => approx(base, m, ops),
         "div" | "sqrt" | "rcp" if !m.contains(&"approx") => divsqrt(base, m, ops),
+        "sqrt" => divsqrt(base, m, ops),
         "neg" | "abs" => negabs(base, m, ops),
-        "tanh" | "rcp" | "rsqrt" | "ex2" | "sin" | "cos" => approx(base, m, ops),
+        "tanh" | "rcp" | "rsqrt" | "ex2" | "lg2" | "sin" | "cos" => approx(base, m, ops),
         _ => None,
     }
 }
@@ -422,9 +439,13 @@ pub(super) fn preempts(_opcode: &str, base: &str, m: &[&str]) -> bool {
         "min" | "max" => m.iter().any(half) || m.contains(&"f64") || any(&["ftz", "NaN", "xorsign", "abs"]),
         // the approximate forms the model defines exactly (see `approx`)
         "tanh" => true,
-        "ex2" => m.iter().any(half),
+        // (ex2, lg2 and rsqrt .approx.f32 as well: ZLUDA's lowering is the hardware's approximation)
+        "ex2" => m.iter().any(half) || m.last() == Some(&"f32"),
+        "lg2" => m.last() == Some(&"f32"),
         "sin" | "cos" => m.last() == Some(&"f32"),
         "rcp" | "rsqrt" if m == ["approx", "f64"] || m == ["approx", "ftz", "f64"] => true,
+        "rsqrt" if m == ["approx", "f32"] || m == ["approx", "ftz", "f32"] => true,
+        "sqrt" if m == ["approx", "f32"] || m == ["approx", "ftz", "f32"] => true,
         "div" if m == ["approx", "f32"] || m == ["approx", "ftz", "f32"] => true,
         // neg / abs .ftz (llvm.canonicalize is not available)
         // (abs.f64: "NaN input is passed through unchanged")

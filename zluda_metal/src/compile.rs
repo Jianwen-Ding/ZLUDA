@@ -114,6 +114,14 @@ impl FpMode {
 }
 
 pub fn compile_ptx(ptx: &str, opts: Options) -> Result<CompiledModule, String> {
+    // ZLUDA_COMPILE_TIMES=1: the time of each phase on stderr (air_lower.cpp adds its own)
+    let times = std::env::var_os("ZLUDA_COMPILE_TIMES").is_some();
+    let t0 = std::time::Instant::now();
+    let mut lap = |what: &str| {
+        if times {
+            eprintln!("zluda-compile-time {what} {:.2} ms", t0.elapsed().as_secs_f64() * 1e3);
+        }
+    };
     let ptx = ptx_parser::preprocess(ptx);
     let ast = ptx_parser::parse_module_checked(&ptx).map_err(|errs| {
         errs.iter()
@@ -121,6 +129,7 @@ pub fn compile_ptx(ptx: &str, opts: Options) -> Result<CompiledModule, String> {
             .collect::<Vec<_>>()
             .join("\n")
     })?;
+    lap("parse");
     let module = ptx::to_llvm_module(
         ast,
         ptx::Attributes {
@@ -134,8 +143,11 @@ pub fn compile_ptx(ptx: &str, opts: Options) -> Result<CompiledModule, String> {
         .then(|| module.llvm_ir.print_module_to_string().to_str().to_string());
     let main_bc = module.llvm_ir.write_bitcode_to_memory();
     let attributes_bc = module.attributes_ir.write_bitcode_to_memory();
+    lap("translate");
     let lowered = lower_to_air(&main_bc, &attributes_bc, opts.keep_text, opts.portable_air, opts.fp_fast, opts.fp_ftz)?;
+    lap("air-lower");
     let metallib = write_metallib(&lowered.kernels)?;
+    lap("metallib");
     let module32 = module.metadata32.as_ref().map(|m| Module32 {
         explicit_params: m
             .explicit_args_size_align

@@ -346,7 +346,7 @@ ZLUDA_AGX_AIR2AGX=../../llvm-project/build/bin/llvm-air2agx \
 * AGX pipeline, texture code size: texture fetches are the helper library's software sampler
   (`ptx/lib/metal_impl/texture.inc`, the formalization's filtering computed in emulated binary64), inlined at
   every call because AGX calls are still experimental (`-agx-experimental-leaf-calls`). PTX-formalization's
-  `tex-mip.ptx`, 35 fetches in one kernel, becomes 10.8 MB of AGX IR and takes 24 s at -O3 (too large for
+  `tex-mip.ptx`, 35 fetches in one kernel, becomes 8.3 MB of AGX IR and takes 22 s at -O3 (10.8 MB and 24 s before its descriptor and texel reads stopped being volatile) (too large for
   `opt_check.py --per-pass`, which prints the module after every pass). Ways out: outlined sampler calls once
   leaf calls are validated on hardware, or a binary32 / hardware-sampler path for fast mode.
 * On the software device, warp-level operations inside divergent code where
